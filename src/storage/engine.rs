@@ -6,6 +6,7 @@
 //!     and are served via io_uring on the reaper thread.
 
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -463,5 +464,11 @@ impl StorageEngine {
 
     pub fn is_nvme_mode(&self) -> bool {
         self.nvme.is_some()
+    }
+
+    /// Get a pre-opened read fd for an object (from NVMe fd pool).
+    /// Returns None if not in NVMe mode or object not found.
+    pub fn get_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
+        self.nvme.as_ref()?.fd_pool_get(oid)
     }
 }

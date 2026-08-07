@@ -312,6 +312,11 @@ impl NvmeBackend {
         self.fd_pool.len()
     }
 
+    /// Get a pre-opened fd from the pool for an object.
+    pub fn fd_pool_get(&self, oid: ObjectId) -> Option<RawFd> {
+        self.fd_pool.get(oid)
+    }
+
     /// The io_uring reaper loop — runs on a dedicated thread.
     /// Uses io_uring registered files when available for kernel-side fd optimization.
     fn reaper_loop(

@@ -2,9 +2,8 @@
 
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 use valkey_module::ThreadSafeContext;
-use std::os::raw::c_void;
 
-use crate::storage::api::{SyncGetResult, ObjectMeta, AsyncReadCallback};
+use crate::storage::api::SyncGetResult;
 use crate::storage::engine;
 use crate::threadpool;
 
@@ -63,47 +62,38 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         }
         SyncGetResult::NeedsAsync => {
             ctx.log_debug(&format!("BO.GET key={} -> NeedsAsync (submitting to threadpool)", String::from_utf8_lossy(key_bytes)));
-            // On NVMe only. Block client, read to verify, reply OK <len>.
-            // Data is NOT kept in pool — just read, confirm, free.
+            // On NVMe only. Block client, read inline on worker thread's io_uring.
             let blocked = ctx.block_client();
             let key_owned = key_bytes.to_vec();
 
             threadpool::pool().spawn(move || {
-                let (tx, rx) = crossbeam_channel::bounded::<u64>(1);
-
-                extern "C" fn read_cb(
-                    user_data: *mut c_void,
-                    _data: *const u8,
-                    len: u64,
-                    _meta: ObjectMeta,
-                    _handle: *mut c_void,
-                    error_code: i32,
-                ) {
-                    let tx = unsafe {
-                        Box::from_raw(user_data as *mut crossbeam_channel::Sender<u64>)
-                    };
-                    if error_code == 0 && len > 0 {
-                        let _ = tx.send(len);
-                    } else {
-                        let _ = tx.send(0);
-                    }
-                    // NOTE: _data buffer is freed by the reaper after callback returns.
-                    // We do NOT copy or retain it. Just read the length.
+                // Get the object metadata to find the fd and length.
+                let meta = engine::engine().get_meta(&key_owned);
+                if meta.object_id.0 == 0 {
+                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
+                    thread_ctx.reply(Ok(ValkeyValue::Null));
+                    return;
                 }
 
-                engine::engine().get_async(
-                    &key_owned,
-                    read_cb,
-                    Box::into_raw(Box::new(tx)) as *mut c_void,
-                );
+                // Get pre-opened fd from the NVMe backend's fd pool.
+                let fd = engine::engine().get_read_fd(meta.object_id);
+                if fd.is_none() {
+                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
+                    thread_ctx.reply(Ok(ValkeyValue::Null));
+                    return;
+                }
+                let fd = fd.unwrap();
 
-                let len = rx.recv().unwrap_or(0);
+                // Inline io_uring read on this worker's thread-local ring.
+                let ok = threadpool::with_worker_uring(|uring| {
+                    uring.read_verify(fd, meta.len)
+                }).unwrap_or(false);
 
                 let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                if len == 0 {
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
+                if ok {
+                    thread_ctx.reply(Ok(ValkeyValue::BulkString(format!("OK {}", meta.len))));
                 } else {
-                    thread_ctx.reply(Ok(ValkeyValue::BulkString(format!("OK {}", len))));
+                    thread_ctx.reply(Ok(ValkeyValue::Null));
                 }
             });
 
@@ -226,51 +216,43 @@ pub fn bo_getrange(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         }
         SyncGetResult::NotFound => Ok(ValkeyValue::Null),
         SyncGetResult::NeedsAsync => {
-            // Block client, read from NVMe, promote to pool, then return the range.
+            // Block client, inline io_uring read on worker, return range.
             let blocked = ctx.block_client();
             let key_owned = key_bytes.to_vec();
 
             threadpool::pool().spawn(move || {
-                let (tx, rx) = crossbeam_channel::bounded::<(Vec<u8>, u64)>(1);
-
-                extern "C" fn read_cb(
-                    user_data: *mut c_void,
-                    data: *const u8,
-                    data_len: u64,
-                    _meta: ObjectMeta,
-                    _handle: *mut c_void,
-                    error_code: i32,
-                ) {
-                    let tx = unsafe {
-                        Box::from_raw(user_data as *mut crossbeam_channel::Sender<(Vec<u8>, u64)>)
-                    };
-                    if error_code == 0 && !data.is_null() {
-                        let bytes = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
-                        let _ = tx.send((bytes.to_vec(), data_len));
-                    } else {
-                        let _ = tx.send((Vec::new(), 0));
-                    }
+                let meta = engine::engine().get_meta(&key_owned);
+                if meta.object_id.0 == 0 {
+                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
+                    thread_ctx.reply(Ok(ValkeyValue::Null));
+                    return;
                 }
 
-                engine::engine().get_async(
-                    &key_owned,
-                    read_cb,
-                    Box::into_raw(Box::new(tx)) as *mut c_void,
-                );
+                let fd = engine::engine().get_read_fd(meta.object_id);
+                if fd.is_none() {
+                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
+                    thread_ctx.reply(Ok(ValkeyValue::Null));
+                    return;
+                }
+                let fd = fd.unwrap();
 
-                let (data, total_len) = rx.recv().unwrap_or_default();
+                // Inline io_uring read — get the actual data for the range
+                let data = threadpool::with_worker_uring(|uring| {
+                    uring.read_file(fd, meta.len)
+                }).flatten();
 
                 let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                if data.is_empty() {
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                } else {
-                    // Promote to pool for future reads.
-                    let actual_offset = std::cmp::min(offset, total_len);
-                    let actual_len = std::cmp::min(len, total_len - actual_offset);
-                    let range = data[actual_offset as usize..(actual_offset + actual_len) as usize].to_vec();
-
-                    engine::engine().promote_to_pool(&key_owned, data);
-                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(range)));
+                match data {
+                    Some(data) => {
+                        let total_len = data.len() as u64;
+                        let actual_offset = std::cmp::min(offset, total_len);
+                        let actual_len = std::cmp::min(len, total_len - actual_offset);
+                        let range = data[actual_offset as usize..(actual_offset + actual_len) as usize].to_vec();
+                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(range)));
+                    }
+                    None => {
+                        thread_ctx.reply(Ok(ValkeyValue::Null));
+                    }
                 }
             });
 
