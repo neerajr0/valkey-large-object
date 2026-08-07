@@ -69,8 +69,8 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     // Initialize the storage engine.
     engine::init_engine(EngineConfig { mode, max_bytes, data_dir: data_dir.clone() });
 
-    // Initialize the worker thread pool (64 threads for blocking I/O).
-    threadpool::init_pool(64);
+    // Initialize the worker thread pool (500 threads for blocking I/O).
+    threadpool::init_pool(500);
 
     // Export the shared API so the transport module can discover it.
     // Safety: API_TABLE is a static with 'static lifetime.
