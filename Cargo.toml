@@ -1,0 +1,37 @@
+[package]
+name = "valkey-bigobj"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Valkey NVMe/DRAM tiered storage module for large immutable objects"
+repository = "https://github.com/valkey-io/valkey-bigobj"
+
+[dependencies]
+valkey-module = { version = "0.1.5", features = ["min-valkey-compatibility-version-8-0"] }
+valkey-module-macros = "0"
+linkme = "0"
+libc = "0.2"
+crc32c = "0.6"
+io-uring = "0.7"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+rstest = "0.23.0"
+
+[lib]
+crate-type = ["cdylib"]
+name = "valkey_bigobj"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 0
+debug = 2
+
+[features]
+default = ["nvme"]
+nvme = []
+dram-only = []
+enable-system-alloc = ["valkey-module/enable-system-alloc"]
