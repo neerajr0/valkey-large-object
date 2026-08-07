@@ -276,8 +276,6 @@ impl StorageEngine {
             Some(obj) => {
                 match &obj.data {
                     Some(data) => {
-                        eprintln!("bigobj DEBUG: get_sync key={} -> Present (data len={})", 
-                            String::from_utf8_lossy(key), data.len());
                         // In buffer pool — return immediately.
                         let handle = ValueHandle::new(obj.clone());
                         let handle_arc = Arc::new(handle);
@@ -295,8 +293,6 @@ impl StorageEngine {
                         }
                     }
                     None => {
-                        eprintln!("bigobj DEBUG: get_sync key={} -> NeedsAsync", 
-                            String::from_utf8_lossy(key));
                         // On NVMe only — caller must use async.
                         SyncGetResult::NeedsAsync
                     }

@@ -53,11 +53,16 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     match engine::engine().get_sync(key_bytes) {
         SyncGetResult::Present { len, handle, .. } => {
             // Already in buffer pool — just report size, release handle.
+            ctx.log_debug(&format!("BO.GET key={} -> Present len={}", String::from_utf8_lossy(key_bytes), len));
             engine::engine().release_handle(handle as u64);
             Ok(ValkeyValue::BulkString(format!("OK {}", len)))
         }
-        SyncGetResult::NotFound => Ok(ValkeyValue::Null),
+        SyncGetResult::NotFound => {
+            ctx.log_debug(&format!("BO.GET key={} -> NotFound", String::from_utf8_lossy(key_bytes)));
+            Ok(ValkeyValue::Null)
+        }
         SyncGetResult::NeedsAsync => {
+            ctx.log_debug(&format!("BO.GET key={} -> NeedsAsync (submitting to threadpool)", String::from_utf8_lossy(key_bytes)));
             // On NVMe only. Block client, read to verify, reply OK <len>.
             // Data is NOT kept in pool — just read, confirm, free.
             let blocked = ctx.block_client();
