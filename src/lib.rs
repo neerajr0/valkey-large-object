@@ -14,7 +14,7 @@ use valkey_module::{
 pub mod commands;
 pub mod data_type;
 pub mod storage;
-pub mod threadpool;
+pub mod uring_engine;
 
 use crate::data_type::BIGOBJ_TYPE;
 use crate::storage::engine::{self, EngineConfig, StorageMode};
@@ -69,8 +69,8 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     // Initialize the storage engine.
     engine::init_engine(EngineConfig { mode, max_bytes, data_dir: data_dir.clone() });
 
-    // Initialize the worker thread pool (500 threads for blocking I/O).
-    threadpool::init_pool(500);
+    // Initialize the io_uring read engine (single poller thread).
+    uring_engine::init();
 
     // Export the shared API so the transport module can discover it.
     // Safety: API_TABLE is a static with 'static lifetime.

@@ -5,7 +5,7 @@ use valkey_module::ThreadSafeContext;
 
 use crate::storage::api::SyncGetResult;
 use crate::storage::engine;
-use crate::threadpool;
+use crate::uring_engine;
 
 /// BO.SET key value
 /// Stores a large immutable object. Returns OK.
@@ -59,35 +59,24 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             Ok(ValkeyValue::Null)
         }
         SyncGetResult::NeedsAsync => {
-            // On NVMe only. Block client, pread on tokio worker thread directly.
+            // On NVMe only. Submit io_uring read directly from main thread.
+            // Poller thread will UnblockClient when read completes.
+            let meta = engine::engine().get_meta(key_bytes);
+            let fd = engine::engine().get_read_fd(meta.object_id);
+            if fd.is_none() || meta.object_id.0 == 0 {
+                return Ok(ValkeyValue::Null);
+            }
+
             let blocked = ctx.block_client();
-            let key_owned = key_bytes.to_vec();
+            let client_data = Box::into_raw(Box::new(uring_engine::ClientData {
+                blocked_client: blocked,
+                object_len: meta.len,
+            }));
 
-            threadpool::spawn(move || {
-                let meta = engine::engine().get_meta(&key_owned);
-                if meta.object_id.0 == 0 {
-                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                    return;
-                }
-
-                let fd = engine::engine().get_read_fd(meta.object_id);
-                if fd.is_none() {
-                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                    return;
-                }
-                let fd = fd.unwrap();
-
-                // Direct pread (O_DIRECT, blocking) — same pattern as IAM module's UDS I/O
-                let ok = threadpool::direct_read_verify(fd, meta.len);
-
-                let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                if ok {
-                    thread_ctx.reply(Ok(ValkeyValue::BulkString(format!("OK {}", meta.len))));
-                } else {
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                }
+            uring_engine::engine().submit(uring_engine::ReadRequest {
+                fd: fd.unwrap(),
+                len: meta.len,
+                client_data,
             });
 
             Ok(ValkeyValue::NoReply)
@@ -209,45 +198,8 @@ pub fn bo_getrange(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         }
         SyncGetResult::NotFound => Ok(ValkeyValue::Null),
         SyncGetResult::NeedsAsync => {
-            // Block client, inline io_uring read on worker, return range.
-            let blocked = ctx.block_client();
-            let key_owned = key_bytes.to_vec();
-
-            threadpool::spawn(move || {
-                let meta = engine::engine().get_meta(&key_owned);
-                if meta.object_id.0 == 0 {
-                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                    return;
-                }
-
-                let fd = engine::engine().get_read_fd(meta.object_id);
-                if fd.is_none() {
-                    let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                    thread_ctx.reply(Ok(ValkeyValue::Null));
-                    return;
-                }
-                let fd = fd.unwrap();
-
-                // Direct pread to get the data for the range
-                let data = threadpool::direct_read_data(fd, meta.len);
-
-                let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
-                match data {
-                    Some(data) => {
-                        let total_len = data.len() as u64;
-                        let actual_offset = std::cmp::min(offset, total_len);
-                        let actual_len = std::cmp::min(len, total_len - actual_offset);
-                        let range = data[actual_offset as usize..(actual_offset + actual_len) as usize].to_vec();
-                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(range)));
-                    }
-                    None => {
-                        thread_ctx.reply(Ok(ValkeyValue::Null));
-                    }
-                }
-            });
-
-            Ok(ValkeyValue::NoReply)
+            // TODO: GETRANGE on cold NVMe data needs data-returning io_uring path
+            Err(ValkeyError::Str("ERR object not in buffer pool, use BO.GET first"))
         }
         SyncGetResult::Error { .. } => {
             Err(ValkeyError::Str("ERR internal storage error"))
