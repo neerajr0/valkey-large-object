@@ -22,13 +22,16 @@ pub fn runtime() -> &'static Runtime {
     unsafe { RUNTIME.as_ref().expect("Tokio runtime not initialized") }
 }
 
-/// Spawn a blocking task on the tokio blocking thread pool.
-/// Each blocking thread has its own io_uring ring (thread-local).
-pub fn spawn_blocking<F>(f: F)
+/// Spawn a task on the tokio runtime (async green thread).
+/// For blocking io_uring work, the task internally calls spawn_blocking.
+pub fn spawn<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    runtime().spawn(async move {
+    runtime().handle().spawn(async move {
+        // io_uring submit_and_wait is blocking, so we use spawn_blocking
+        // inside the async task — this is the same pattern as ElastiCacheRedisIAM
+        // where async tasks do blocking UDS I/O.
         tokio::task::spawn_blocking(f).await.ok();
     });
 }
