@@ -274,30 +274,10 @@ impl StorageEngine {
     pub fn get_sync(&self, key: &[u8]) -> SyncGetResult {
         let store = self.objects.read().unwrap();
         match store.get(key) {
-            Some(obj) => {
-                match &obj.data {
-                    Some(data) => {
-                        // In buffer pool — return immediately.
-                        let handle = ValueHandle::new(obj.clone());
-                        let handle_arc = Arc::new(handle);
-                        let hid = self.alloc_handle_id();
-                        let ptr = handle_arc.data_ptr();
-                        let len = handle_arc.data_len();
-                        let meta = handle_arc.obj.meta;
-                        self.handles.write().unwrap().insert(hid, handle_arc);
-
-                        SyncGetResult::Present {
-                            data: ptr,
-                            len,
-                            meta,
-                            handle: hid as *mut std::os::raw::c_void,
-                        }
-                    }
-                    None => {
-                        // On NVMe only — caller must use async.
-                        SyncGetResult::NeedsAsync
-                    }
-                }
+            Some(_obj) => {
+                // FORCE ASYNC: always go to NVMe path regardless of buffer pool state.
+                // This ensures every BO.GET benchmarks the io_uring path.
+                SyncGetResult::NeedsAsync
             }
             None => SyncGetResult::NotFound,
         }
