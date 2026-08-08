@@ -63,7 +63,7 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             let blocked = ctx.block_client();
             let key_owned = key_bytes.to_vec();
 
-            threadpool::pool().spawn(move || {
+            threadpool::spawn_blocking(move || {
                 // Get the object metadata to find the fd and length.
                 let meta = engine::engine().get_meta(&key_owned);
                 if meta.object_id.0 == 0 {
@@ -217,7 +217,7 @@ pub fn bo_getrange(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             let blocked = ctx.block_client();
             let key_owned = key_bytes.to_vec();
 
-            threadpool::pool().spawn(move || {
+            threadpool::spawn_blocking(move || {
                 let meta = engine::engine().get_meta(&key_owned);
                 if meta.object_id.0 == 0 {
                     let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);

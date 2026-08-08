@@ -1,95 +1,49 @@
-//! Fixed-size thread pool where each worker owns an io_uring ring.
-//! Workers do inline io_uring reads — no channel hop to a separate reaper.
-//! This eliminates 3 out of 4 channel transitions in the read path:
-//!   Old: main → channel → worker → channel → reaper → io_uring → channel → worker → UnblockClient
-//!   New: main → channel → worker → io_uring (inline) → UnblockClient
+//! Tokio-based thread pool for blocking NVMe I/O.
+//! Uses tokio::task::spawn_blocking which dispatches to a dedicated blocking thread pool.
+//! Each blocking task gets its own thread-local io_uring ring for inline reads.
 
-use crossbeam_channel::{Sender, Receiver, bounded};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
+use tokio::runtime::Runtime;
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+/// Global tokio runtime.
+static mut RUNTIME: Option<Runtime> = None;
 
-/// A fixed-size thread pool for blocking NVMe I/O.
-/// Each worker thread has its own io_uring instance for inline reads.
-pub struct ThreadPool {
-    sender: Sender<Job>,
-    shutdown: Arc<AtomicBool>,
-    _workers: Vec<thread::JoinHandle<()>>,
+pub fn init_pool(max_threads: usize) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)  // async workers (minimal — we mostly use blocking)
+        .max_blocking_threads(max_threads)  // blocking threads for io_uring reads
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    unsafe { RUNTIME = Some(rt); }
 }
 
-/// Global thread pool instance.
-static mut POOL: Option<ThreadPool> = None;
-
-pub fn init_pool(size: usize) {
-    unsafe {
-        POOL = Some(ThreadPool::new(size));
-    }
+pub fn runtime() -> &'static Runtime {
+    unsafe { RUNTIME.as_ref().expect("Tokio runtime not initialized") }
 }
 
-pub fn pool() -> &'static ThreadPool {
-    unsafe { POOL.as_ref().expect("ThreadPool not initialized") }
+/// Spawn a blocking task on the tokio blocking thread pool.
+/// Each blocking thread has its own io_uring ring (thread-local).
+pub fn spawn_blocking<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    runtime().spawn(async move {
+        tokio::task::spawn_blocking(f).await.ok();
+    });
 }
 
 /// Per-worker io_uring context for inline reads.
-/// Each worker can submit and complete reads without cross-thread communication.
 pub struct WorkerUring {
     ring: io_uring::IoUring,
 }
 
 impl WorkerUring {
     fn new() -> Option<Self> {
-        // Each worker gets a small ring (32 entries — only 1 in-flight per job)
         io_uring::IoUring::new(32).ok().map(|ring| Self { ring })
     }
 
-    /// Perform a blocking O_DIRECT read using io_uring.
-    /// Returns the data read, or None on failure.
-    /// The fd must already be open (from the fd pool).
-    pub fn read_file(&mut self, fd: RawFd, len: u64) -> Option<Vec<u8>> {
-        let aligned_len = align_up(len) as usize;
-        let layout = std::alloc::Layout::from_size_align(aligned_len, 4096).unwrap();
-        let buf_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if buf_ptr.is_null() {
-            return None;
-        }
-
-        // Submit read
-        let read_op = io_uring::opcode::Read::new(
-            io_uring::types::Fd(fd),
-            buf_ptr,
-            aligned_len as u32,
-        )
-        .offset(0)
-        .build()
-        .user_data(1);
-
-        unsafe {
-            self.ring.submission().push(&read_op).ok()?;
-        }
-
-        // Submit and wait for completion
-        self.ring.submit_and_wait(1).ok()?;
-
-        // Reap
-        let cqe = self.ring.completion().next()?;
-        let result = cqe.result();
-
-        if result >= 0 {
-            // Success — copy actual data (not aligned padding) into a Vec
-            let data = unsafe { std::slice::from_raw_parts(buf_ptr, len as usize) }.to_vec();
-            unsafe { std::alloc::dealloc(buf_ptr, layout); }
-            Some(data)
-        } else {
-            unsafe { std::alloc::dealloc(buf_ptr, layout); }
-            None
-        }
-    }
-
-    /// Perform a blocking read and return just the length (no data copy).
-    /// Used by BO.GET which only needs confirmation, not the actual bytes.
+    /// Blocking O_DIRECT read using io_uring. Returns true if read succeeded.
     pub fn read_verify(&mut self, fd: RawFd, len: u64) -> bool {
         let aligned_len = align_up(len) as usize;
         let layout = std::alloc::Layout::from_size_align(aligned_len, 4096).unwrap();
@@ -114,18 +68,58 @@ impl WorkerUring {
         unsafe { std::alloc::dealloc(buf_ptr, layout); }
         ok
     }
+
+    /// Blocking O_DIRECT read, returns the data.
+    pub fn read_file(&mut self, fd: RawFd, len: u64) -> Option<Vec<u8>> {
+        let aligned_len = align_up(len) as usize;
+        let layout = std::alloc::Layout::from_size_align(aligned_len, 4096).unwrap();
+        let buf_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if buf_ptr.is_null() {
+            return None;
+        }
+
+        let read_op = io_uring::opcode::Read::new(
+            io_uring::types::Fd(fd),
+            buf_ptr,
+            aligned_len as u32,
+        )
+        .offset(0)
+        .build()
+        .user_data(1);
+
+        unsafe {
+            if self.ring.submission().push(&read_op).is_err() {
+                std::alloc::dealloc(buf_ptr, layout);
+                return None;
+            }
+        }
+
+        if self.ring.submit_and_wait(1).is_err() {
+            unsafe { std::alloc::dealloc(buf_ptr, layout); }
+            return None;
+        }
+
+        let ok = self.ring.completion().next().map(|c| c.result() >= 0).unwrap_or(false);
+        if ok {
+            let data = unsafe { std::slice::from_raw_parts(buf_ptr, len as usize) }.to_vec();
+            unsafe { std::alloc::dealloc(buf_ptr, layout); }
+            Some(data)
+        } else {
+            unsafe { std::alloc::dealloc(buf_ptr, layout); }
+            None
+        }
+    }
 }
 
 fn align_up(n: u64) -> u64 {
     (n + 4095) & !4095
 }
 
-/// Thread-local io_uring ring (one per worker).
 thread_local! {
     static WORKER_URING: std::cell::RefCell<Option<WorkerUring>> = std::cell::RefCell::new(None);
 }
 
-/// Get or initialize the thread-local io_uring ring.
+/// Access the thread-local io_uring ring (initialized on first use).
 pub fn with_worker_uring<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut WorkerUring) -> R,
@@ -137,43 +131,4 @@ where
         }
         borrow.as_mut().map(f)
     })
-}
-
-impl ThreadPool {
-    pub fn new(size: usize) -> Self {
-        let (sender, receiver): (Sender<Job>, Receiver<Job>) = bounded(size * 4);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::with_capacity(size);
-
-        for i in 0..size {
-            let rx = receiver.clone();
-            let shut = shutdown.clone();
-
-            let handle = thread::Builder::new()
-                .name(format!("bigobj-worker-{}", i))
-                .spawn(move || {
-                    // Initialize thread-local io_uring on first use (lazy in with_worker_uring)
-                    while !shut.load(Ordering::Relaxed) {
-                        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                            Ok(job) => job(),
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("Failed to spawn worker thread");
-
-            workers.push(handle);
-        }
-
-        Self { sender, shutdown, _workers: workers }
-    }
-
-    /// Submit a job to the pool.
-    pub fn spawn<F>(&self, job: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.sender.send(Box::new(job)).ok();
-    }
 }
