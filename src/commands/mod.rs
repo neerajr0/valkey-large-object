@@ -59,12 +59,11 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             Ok(ValkeyValue::Null)
         }
         SyncGetResult::NeedsAsync => {
-            // On NVMe only. Block client, read inline on worker thread's io_uring.
+            // On NVMe only. Block client, pread on tokio worker thread directly.
             let blocked = ctx.block_client();
             let key_owned = key_bytes.to_vec();
 
             threadpool::spawn(move || {
-                // Get the object metadata to find the fd and length.
                 let meta = engine::engine().get_meta(&key_owned);
                 if meta.object_id.0 == 0 {
                     let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
@@ -72,7 +71,6 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     return;
                 }
 
-                // Get pre-opened fd from the NVMe backend's fd pool.
                 let fd = engine::engine().get_read_fd(meta.object_id);
                 if fd.is_none() {
                     let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
@@ -81,10 +79,8 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 }
                 let fd = fd.unwrap();
 
-                // Inline io_uring read on this worker's thread-local ring.
-                let ok = threadpool::with_worker_uring(|uring| {
-                    uring.read_verify(fd, meta.len)
-                }).unwrap_or(false);
+                // Direct pread (O_DIRECT, blocking) — same pattern as IAM module's UDS I/O
+                let ok = threadpool::direct_read_verify(fd, meta.len);
 
                 let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
                 if ok {
@@ -233,10 +229,8 @@ pub fn bo_getrange(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 }
                 let fd = fd.unwrap();
 
-                // Inline io_uring read — get the actual data for the range
-                let data = threadpool::with_worker_uring(|uring| {
-                    uring.read_file(fd, meta.len)
-                }).flatten();
+                // Direct pread to get the data for the range
+                let data = threadpool::direct_read_data(fd, meta.len);
 
                 let thread_ctx = ThreadSafeContext::with_blocked_client(blocked);
                 match data {
