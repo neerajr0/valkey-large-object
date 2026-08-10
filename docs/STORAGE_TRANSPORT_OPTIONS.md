@@ -90,7 +90,10 @@ trait Transport {
 
 ## Option 2: Single Module + EFA Crate [Recommended]
 
-One `.so`. EFA logic is a Rust crate (`libefa-rs`) as a Cargo dependency.
+We have a Rust Crate that handles the transport EFA/libfabric logic. And we have a Storage Module that handles data type + storage logic + commands / blocking etc. This results in one single `.so` artifact and the EFA logic can be in a Rust crate which is re-usable across any project which wishes to do so.
+
+- Transport EFA logic is a Rust crate (`libefa-rs`) as a Cargo dependency
+- One `.so`
 
 ### DMA.GET
 
@@ -147,7 +150,7 @@ One `.so`. EFA logic is a Rust crate (`libefa-rs`) as a Cargo dependency.
 
 ### Interface
 
-Crate handles EFA/libfabric. Module handles storage + commands. Crate is ~200-400 lines on top of the existing libfabric Rust crate.
+Crate handles the transport EFA/libfabric. BigObj Storage Module handles storage + commands.
 
 ```rust
 // --- libefa-rs crate public API ---
