@@ -1,11 +1,4 @@
 //! valkey-bigobj: NVMe-backed storage module for large immutable objects (KV cache tensors).
-//!
-//! Single module architecture:
-//!   - data_type: Valkey data type registration (BoValue in keyspace)
-//!   - storage/nvme: NVMe file I/O with pre-opened fd pool
-//!   - storage/engine: thin wrapper (object store + NVMe backend)
-//!   - uring_engine: io_uring poller for async reads
-//!   - commands: BO.SET/GET/DEL/EXISTS/LEN/INFO/EVICT
 
 use valkey_module::{valkey_module, Context, Status, ValkeyString};
 
@@ -21,8 +14,10 @@ pub const MODULE_NAME: &str = "bigobj";
 pub const MODULE_VERSION: i32 = 1;
 
 fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
-    let mut max_bytes: u64 = 1024 * 1024 * 1024; // 1 GB default
+    let mut max_bytes: u64 = 1024 * 1024 * 1024;
     let mut data_dir = String::new();
+    let mut pool_buf_size: usize = 65536;  // 64KB default
+    let mut pool_buf_count: usize = 1024;
 
     let mut i = 0;
     while i < args.len() {
@@ -42,6 +37,22 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
                     data_dir = args[i].to_string_lossy().to_string();
                 }
             }
+            "pool-buf-size" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].to_string_lossy().parse::<usize>() {
+                        pool_buf_size = v;
+                    }
+                }
+            }
+            "pool-buf-count" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].to_string_lossy().parse::<usize>() {
+                        pool_buf_count = v;
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -52,16 +63,23 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Initialize storage engine (NVMe backend + object store).
-    let dir = std::path::PathBuf::from(&data_dir);
-    engine::init_engine(dir.clone(), max_bytes);
+    // Validate pool-buf-size is 4KB aligned
+    if pool_buf_size % 4096 != 0 {
+        ctx.log_warning("bigobj: pool-buf-size must be 4KB aligned");
+        return Status::Err;
+    }
 
-    // Initialize the io_uring poller thread.
-    uring_engine::init();
+    // Initialize storage engine.
+    let dir = std::path::PathBuf::from(&data_dir);
+    engine::init_engine(dir, max_bytes);
+
+    // Initialize io_uring poller with configured buffer pool.
+    uring_engine::init(pool_buf_size, pool_buf_count);
 
     ctx.log_notice(&format!(
-        "bigobj: initialized data_dir={} max_bytes={}",
-        data_dir, max_bytes
+        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} (pool={}MB)",
+        data_dir, max_bytes, pool_buf_size, pool_buf_count,
+        (pool_buf_size * pool_buf_count) / (1024 * 1024)
     ));
 
     Status::Ok

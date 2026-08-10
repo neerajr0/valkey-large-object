@@ -104,9 +104,9 @@ pub struct ReadEngine {
 
 static mut READ_ENGINE: Option<ReadEngine> = None;
 
-pub fn init() {
+pub fn init(buf_size: usize, buf_count: usize) {
     unsafe {
-        READ_ENGINE = Some(ReadEngine::new());
+        READ_ENGINE = Some(ReadEngine::new(buf_size, buf_count));
     }
 }
 
@@ -118,13 +118,17 @@ fn align_up(n: u64) -> u64 {
     (n + 4095) & !4095
 }
 
-/// Pool config: 1024 buffers × 64KB each = 64MB.
-/// Covers objects up to 64KB without malloc. Larger objects fall back.
-const POOL_BUF_COUNT: usize = 1024;
-const POOL_BUF_SIZE: usize = 64 * 1024; // 64KB per buffer
+/// Pool config passed at init from module configs.
+static mut POOL_BUF_SIZE: usize = 65536;
+static mut POOL_BUF_COUNT: usize = 1024;
 
 impl ReadEngine {
-    fn new() -> Self {
+    fn new(buf_size: usize, buf_count: usize) -> Self {
+        unsafe {
+            POOL_BUF_SIZE = buf_size;
+            POOL_BUF_COUNT = buf_count;
+        }
+
         let (tx, rx) = bounded::<ReadRequest>(4096);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -162,7 +166,9 @@ impl ReadEngine {
         };
 
         // Pre-allocate buffer pool (owned by the poller thread — no sharing needed).
-        let mut pool = BufferPool::new(POOL_BUF_COUNT, POOL_BUF_SIZE);
+        let pool_size = unsafe { POOL_BUF_SIZE };
+        let pool_count = unsafe { POOL_BUF_COUNT };
+        let mut pool = BufferPool::new(pool_count, pool_size);
 
         let mut pending: HashMap<u64, PendingRead> = HashMap::new();
         let mut next_token: u64 = 1;
@@ -285,7 +291,9 @@ impl ReadEngine {
 
     /// Sync fallback if io_uring isn't available.
     fn sync_fallback_loop(rx: Receiver<ReadRequest>, shutdown: Arc<AtomicBool>) {
-        let mut pool = BufferPool::new(POOL_BUF_COUNT, POOL_BUF_SIZE);
+        let pool_size = unsafe { POOL_BUF_SIZE };
+        let pool_count = unsafe { POOL_BUF_COUNT };
+        let mut pool = BufferPool::new(pool_count, pool_size);
 
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
