@@ -6,7 +6,7 @@
 use valkey_module::{native_types::ValkeyType, raw};
 use std::os::raw::c_void;
 
-use crate::storage::api::{ObjectId, ObjectMeta};
+use crate::storage::engine::{ObjectId, ObjectMeta};
 use crate::storage::engine;
 
 /// The per-key value struct stored in Valkey's keyspace.

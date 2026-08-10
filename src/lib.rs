@@ -1,15 +1,13 @@
-//! valkey-bigobj: NVMe/DRAM tiered storage module for large immutable objects.
+//! valkey-bigobj: NVMe-backed storage module for large immutable objects (KV cache tensors).
 //!
-//! Architecture:
-//!   - Module B (this): owns the data type + storage engine + shared API export
-//!   - Module A (vrdma/transport): discovers this API via GetSharedAPI, handles
-//!     RDMA reads (pin/unpin/memory_region) and replication (subscribe to mutations)
-//!
-//! v1: DRAM-only mode. All objects in memory. NVMe path is a future addition.
+//! Single module architecture:
+//!   - data_type: Valkey data type registration (BoValue in keyspace)
+//!   - storage/nvme: NVMe file I/O with pre-opened fd pool
+//!   - storage/engine: thin wrapper (object store + NVMe backend)
+//!   - uring_engine: io_uring poller for async reads
+//!   - commands: BO.SET/GET/DEL/EXISTS/LEN/INFO/EVICT
 
-use valkey_module::{
-    valkey_module, Context, Status, ValkeyResult, ValkeyString,
-};
+use valkey_module::{valkey_module, Context, Status, ValkeyString};
 
 pub mod commands;
 pub mod data_type;
@@ -17,36 +15,19 @@ pub mod storage;
 pub mod uring_engine;
 
 use crate::data_type::BIGOBJ_TYPE;
-use crate::storage::engine::{self, EngineConfig, StorageMode};
-use crate::storage::export::API_TABLE;
-use crate::storage::api::BIGOBJ_STORAGE_API_NAME;
+use crate::storage::engine;
 
 pub const MODULE_NAME: &str = "bigobj";
 pub const MODULE_VERSION: i32 = 1;
 
 fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
-    // Parse module load args: mode=dram|nvme max-bytes=N data-dir=PATH
-    let mut mode = StorageMode::DramOnly;
     let mut max_bytes: u64 = 1024 * 1024 * 1024; // 1 GB default
-    let mut data_dir = std::path::PathBuf::from("/tmp/bigobj-data");
+    let mut data_dir = String::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].to_string_lossy();
         match arg.as_ref() {
-            "mode" => {
-                i += 1;
-                if i < args.len() {
-                    match args[i].to_string_lossy().as_ref() {
-                        "dram" => mode = StorageMode::DramOnly,
-                        "nvme" => mode = StorageMode::NvmeTiered,
-                        _ => {
-                            ctx.log_warning("bigobj: invalid mode, use 'dram' or 'nvme'");
-                            return Status::Err;
-                        }
-                    }
-                }
-            }
             "max-bytes" => {
                 i += 1;
                 if i < args.len() {
@@ -58,7 +39,7 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
             "data-dir" => {
                 i += 1;
                 if i < args.len() {
-                    data_dir = std::path::PathBuf::from(args[i].to_string_lossy().to_string());
+                    data_dir = args[i].to_string_lossy().to_string();
                 }
             }
             _ => {}
@@ -66,32 +47,21 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
         i += 1;
     }
 
-    // Initialize the storage engine.
-    engine::init_engine(EngineConfig { mode, max_bytes, data_dir: data_dir.clone() });
-
-    // Initialize the io_uring read engine (single poller thread).
-    uring_engine::init();
-
-    // Export the shared API so the transport module can discover it.
-    // Safety: API_TABLE is a static with 'static lifetime.
-    let api_ptr = &API_TABLE as *const _ as *const std::os::raw::c_void;
-    let api_name = BIGOBJ_STORAGE_API_NAME.as_ptr() as *const std::os::raw::c_char;
-
-    // Call ValkeyModule_ExportSharedAPI(ctx, name, ptr)
-    // This is available via the raw module API.
-    unsafe {
-        let raw_ctx = ctx.get_raw();
-        let export_fn = valkey_module::raw::RedisModule_ExportSharedAPI.unwrap();
-        let result = export_fn(raw_ctx, api_name, api_ptr as *mut std::os::raw::c_void);
-        if result != 0 {
-            ctx.log_warning("bigobj: failed to export shared API");
-            return Status::Err;
-        }
+    if data_dir.is_empty() {
+        ctx.log_warning("bigobj: data-dir is required");
+        return Status::Err;
     }
 
+    // Initialize storage engine (NVMe backend + object store).
+    let dir = std::path::PathBuf::from(&data_dir);
+    engine::init_engine(dir.clone(), max_bytes);
+
+    // Initialize the io_uring poller thread.
+    uring_engine::init();
+
     ctx.log_notice(&format!(
-        "bigobj: initialized mode={:?} max_bytes={}",
-        mode, max_bytes
+        "bigobj: initialized data_dir={} max_bytes={}",
+        data_dir, max_bytes
     ));
 
     Status::Ok
@@ -116,6 +86,5 @@ valkey_module! {
         ["BO.LEN", commands::bo_len, "readonly fast", 1, 1, 1],
         ["BO.INFO", commands::bo_info, "readonly", 0, 0, 0],
         ["BO.EVICT", commands::bo_evict, "write", 1, 1, 1],
-        ["BO.GETRANGE", commands::bo_getrange, "readonly", 1, 1, 1],
     ],
 }
