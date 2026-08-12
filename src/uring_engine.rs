@@ -30,6 +30,9 @@ pub struct ReadRequest {
 pub struct ClientData {
     pub blocked_client: valkey_module::BlockedClient,
     pub object_len: u64,
+    /// In keep_read_fds=false mode, the fd was opened just for this read and
+    /// must be closed once the read completes. None when the fd is pooled.
+    pub close_fd_after: Option<RawFd>,
 }
 
 unsafe impl Send for ReadRequest {}
@@ -177,6 +180,7 @@ impl ReadEngine {
                                 let fallback_buf = unsafe { std::alloc::alloc(fallback_layout) };
                                 if fallback_buf.is_null() {
                                     let cd = unsafe { Box::from_raw(req.client_data) };
+                                    if let Some(fd) = cd.close_fd_after { unsafe { libc::close(fd); } }
                                     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(cd.blocked_client);
                                     thread_ctx.reply(Ok(valkey_module::ValkeyValue::Null));
                                     continue;
@@ -269,6 +273,8 @@ impl ReadEngine {
 
                     // Unblock client.
                     let cd = unsafe { Box::from_raw(pr.client_data) };
+                    // Close the on-demand fd if this GET opened one (keep_read_fds=false).
+                    if let Some(fd) = cd.close_fd_after { unsafe { libc::close(fd); } }
                     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(cd.blocked_client);
                     if success {
                         thread_ctx.reply(Ok(valkey_module::ValkeyValue::BulkString(
@@ -304,6 +310,7 @@ impl ReadEngine {
                         false
                     };
                     let cd = unsafe { Box::from_raw(req.client_data) };
+                    if let Some(fd) = cd.close_fd_after { unsafe { libc::close(fd); } }
                     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(cd.blocked_client);
                     if success {
                         thread_ctx.reply(Ok(valkey_module::ValkeyValue::BulkString(

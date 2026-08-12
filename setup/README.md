@@ -55,8 +55,9 @@ sudo ./setup-storage.sh --yes --devices "/dev/nvme1n1 /dev/nvme2n1"
 Idempotent: if `/mnt/bigobj-data` is already mounted (or the LV exists), it does
 nothing destructive.
 
-Requires `lvm2` and `xfsprogs` (e.g. `sudo dnf install -y lvm2 xfsprogs`, or
-`apt-get install lvm2 xfsprogs`).
+Requires `lvm2` and `xfsprogs`. If missing, the script detects your package
+manager and prints the exact install command (e.g. `sudo dnf install -y lvm2
+xfsprogs`, or `sudo apt-get install -y lvm2 xfsprogs`).
 
 ## Tunables (`setup.conf`, all optional)
 

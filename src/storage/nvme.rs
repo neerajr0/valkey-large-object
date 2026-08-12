@@ -59,14 +59,20 @@ impl Drop for FdPool {
 pub struct NvmeBackend {
     data_dir: PathBuf,
     fd_pool: FdPool,
+    /// If true (default), a read fd is opened at write time and held in the pool
+    /// forever (no open() on the GET hot path — costs 1 fd + pinned inode per
+    /// object). If false, no fd is pooled; GET opens on demand and closes after
+    /// the read. This flag is the A/B switch for the fd-overhead experiment.
+    keep_read_fds: bool,
 }
 
 impl NvmeBackend {
-    pub fn new(data_dir: &Path, _reaper_count: usize) -> io::Result<Self> {
+    pub fn new(data_dir: &Path, _reaper_count: usize, keep_read_fds: bool) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             fd_pool: FdPool::new(),
+            keep_read_fds,
         })
     }
 
@@ -85,6 +91,12 @@ impl NvmeBackend {
             return Some(fd2);
         }
         Some(fd)
+    }
+
+    /// Open a fresh read fd WITHOUT pooling it. Caller owns it and must close it
+    /// (used in keep_read_fds=false mode: open per GET, close after the read).
+    pub fn open_read_fd_ondemand(&self, oid: ObjectId) -> Option<RawFd> {
+        self.open_read_fd(oid)
     }
 
     /// Write an object to NVMe. Opens a read fd and stores in pool.
@@ -126,9 +138,11 @@ impl NvmeBackend {
             return Err(io::Error::last_os_error());
         }
 
-        // Open read fd and store in pool.
-        if let Some(read_fd) = self.open_read_fd(oid) {
-            self.fd_pool.insert(oid, read_fd);
+        // Open read fd and store in pool (only in keep_read_fds mode).
+        if self.keep_read_fds {
+            if let Some(read_fd) = self.open_read_fd(oid) {
+                self.fd_pool.insert(oid, read_fd);
+            }
         }
 
         Ok(())
@@ -138,8 +152,10 @@ impl NvmeBackend {
     fn write_buffered(&self, oid: ObjectId, data: &[u8]) -> io::Result<()> {
         let path = self.obj_path(oid);
         fs::write(&path, data)?;
-        if let Some(read_fd) = self.open_read_fd(oid) {
-            self.fd_pool.insert(oid, read_fd);
+        if self.keep_read_fds {
+            if let Some(read_fd) = self.open_read_fd(oid) {
+                self.fd_pool.insert(oid, read_fd);
+            }
         }
         Ok(())
     }

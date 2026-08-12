@@ -41,9 +41,9 @@ pub fn engine() -> &'static StorageEngine {
     unsafe { ENGINE.as_ref().expect("StorageEngine not initialized") }
 }
 
-pub fn init_engine(data_dir: PathBuf, max_bytes: u64) {
+pub fn init_engine(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool) {
     unsafe {
-        ENGINE = Some(StorageEngine::new(data_dir, max_bytes));
+        ENGINE = Some(StorageEngine::new(data_dir, max_bytes, keep_read_fds));
     }
 }
 
@@ -67,8 +67,8 @@ unsafe impl Send for StorageEngine {}
 unsafe impl Sync for StorageEngine {}
 
 impl StorageEngine {
-    fn new(data_dir: PathBuf, max_bytes: u64) -> Self {
-        let nvme = NvmeBackend::new(&data_dir, 4)
+    fn new(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool) -> Self {
+        let nvme = NvmeBackend::new(&data_dir, 4, keep_read_fds)
             .expect("Failed to init NVMe backend");
 
         Self {
@@ -162,9 +162,15 @@ impl StorageEngine {
         store.get(key).map(|obj| obj.meta)
     }
 
-    /// Get pre-opened read fd for an object.
+    /// Get pre-opened read fd for an object (pooled; None in keep_read_fds=false mode).
     pub fn get_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
         self.nvme.fd_pool_get(oid)
+    }
+
+    /// Open a fresh, un-pooled read fd for an object. Caller must close it after
+    /// use. Used in keep_read_fds=false mode (open per GET, close after read).
+    pub fn open_read_fd_ondemand(&self, oid: ObjectId) -> Option<RawFd> {
+        self.nvme.open_read_fd_ondemand(oid)
     }
 
     /// Evict from buffer pool (keep on NVMe).

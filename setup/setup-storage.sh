@@ -73,9 +73,26 @@ log() { echo "[setup] $*"; }
 die() { echo "[setup] ERROR: $*" >&2; exit 1; }
 
 # ── Required tools ────────────────────────────────────────────────────────────
+# lvm2 provides pv*/vg*/lv*; xfsprogs provides mkfs.xfs; util-linux provides
+# lsblk/findmnt/mount (usually already present).
+missing=()
 for bin in lsblk findmnt pvcreate vgcreate lvcreate mkfs.xfs mount pvs; do
-    command -v "${bin}" >/dev/null 2>&1 || die "missing required tool: ${bin} (install lvm2 / xfsprogs)"
+    command -v "${bin}" >/dev/null 2>&1 || missing+=("${bin}")
 done
+if [ "${#missing[@]}" -gt 0 ]; then
+    # Suggest the right install command for the detected package manager.
+    if command -v dnf >/dev/null 2>&1;   then install_cmd="sudo dnf install -y lvm2 xfsprogs"
+    elif command -v yum >/dev/null 2>&1; then install_cmd="sudo yum install -y lvm2 xfsprogs"
+    elif command -v apt-get >/dev/null 2>&1; then install_cmd="sudo apt-get update && sudo apt-get install -y lvm2 xfsprogs"
+    elif command -v zypper >/dev/null 2>&1;  then install_cmd="sudo zypper install -y lvm2 xfsprogs"
+    elif command -v pacman >/dev/null 2>&1;  then install_cmd="sudo pacman -S --noconfirm lvm2 xfsprogs"
+    else install_cmd="install the 'lvm2' and 'xfsprogs' packages with your package manager"
+    fi
+    log "missing required tool(s): ${missing[*]}"
+    log "install them and re-run:"
+    log "    ${install_cmd}"
+    die "prerequisites not met"
+fi
 
 # ── Identify the root disk (never touch it) ───────────────────────────────────
 root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"          # e.g. /dev/nvme0n1p1 or /dev/mapper/...

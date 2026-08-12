@@ -18,6 +18,7 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     let mut data_dir = String::new();
     let mut pool_buf_size: usize = 65536;  // 64KB default
     let mut pool_buf_count: usize = 1024;
+    let mut keep_read_fds: bool = true;    // hold 1 read fd per object (default)
 
     let mut i = 0;
     while i < args.len() {
@@ -53,6 +54,13 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
                     }
                 }
             }
+            "keep-read-fds" => {
+                i += 1;
+                if i < args.len() {
+                    let v = args[i].to_string_lossy();
+                    keep_read_fds = matches!(v.as_ref(), "1" | "true" | "yes");
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -71,14 +79,14 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
 
     // Initialize storage engine.
     let dir = std::path::PathBuf::from(&data_dir);
-    engine::init_engine(dir, max_bytes);
+    engine::init_engine(dir, max_bytes, keep_read_fds);
 
     // Initialize io_uring poller with configured buffer pool.
     uring_engine::init(pool_buf_size, pool_buf_count);
 
     ctx.log_notice(&format!(
-        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} (pool={}MB)",
-        data_dir, max_bytes, pool_buf_size, pool_buf_count,
+        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} keep_read_fds={} (pool={}MB)",
+        data_dir, max_bytes, pool_buf_size, pool_buf_count, keep_read_fds,
         (pool_buf_size * pool_buf_count) / (1024 * 1024)
     ));
 

@@ -39,19 +39,27 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         Some((meta, _in_pool)) => {
             // Always go through io_uring for benchmarking purposes.
             // In production: check in_pool and return immediately if true.
-            let fd = engine::engine().get_read_fd(meta.object_id);
-            if fd.is_none() {
-                return Ok(ValkeyValue::Null);
-            }
+            //
+            // Resolve the read fd. In keep_read_fds mode it's pooled (no open()
+            // on the hot path). Otherwise we open one on demand HERE (on the main
+            // thread) and flag it to be closed once the read completes.
+            let (fd, close_fd_after) = match engine::engine().get_read_fd(meta.object_id) {
+                Some(fd) => (fd, None),                 // pooled — do not close
+                None => match engine::engine().open_read_fd_ondemand(meta.object_id) {
+                    Some(fd) => (fd, Some(fd)),          // opened for this read — close after
+                    None => return Ok(ValkeyValue::Null),
+                },
+            };
 
             let blocked = ctx.block_client();
             let client_data = Box::into_raw(Box::new(uring_engine::ClientData {
                 blocked_client: blocked,
                 object_len: meta.len,
+                close_fd_after,
             }));
 
             uring_engine::engine().submit(uring_engine::ReadRequest {
-                fd: fd.unwrap(),
+                fd,
                 len: meta.len,
                 client_data,
             });
