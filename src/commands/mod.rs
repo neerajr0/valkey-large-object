@@ -45,10 +45,14 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             // thread) and flag it to be closed once the read completes.
             let (fd, close_fd_after) = match engine::engine().get_read_fd(meta.object_id) {
                 Some(fd) => (fd, None),                 // pooled — do not close
-                None => match engine::engine().open_read_fd_ondemand(meta.object_id) {
-                    Some(fd) => (fd, Some(fd)),          // opened for this read — close after
-                    None => return Ok(ValkeyValue::Null),
-                },
+                None => {
+                    // On-demand open: shard dir is chosen by the key's Valkey slot.
+                    let slot = crate::slot::key_hash_slot(key_bytes);
+                    match engine::engine().open_read_fd_ondemand(slot, meta.object_id) {
+                        Some(fd) => (fd, Some(fd)),      // opened for this read — close after
+                        None => return Ok(ValkeyValue::Null),
+                    }
+                }
             };
 
             let blocked = ctx.block_client();

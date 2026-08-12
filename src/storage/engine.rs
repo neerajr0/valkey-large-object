@@ -41,9 +41,9 @@ pub fn engine() -> &'static StorageEngine {
     unsafe { ENGINE.as_ref().expect("StorageEngine not initialized") }
 }
 
-pub fn init_engine(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool) {
+pub fn init_engine(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool, dir_shards: usize) {
     unsafe {
-        ENGINE = Some(StorageEngine::new(data_dir, max_bytes, keep_read_fds));
+        ENGINE = Some(StorageEngine::new(data_dir, max_bytes, keep_read_fds, dir_shards));
     }
 }
 
@@ -67,8 +67,8 @@ unsafe impl Send for StorageEngine {}
 unsafe impl Sync for StorageEngine {}
 
 impl StorageEngine {
-    fn new(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool) -> Self {
-        let nvme = NvmeBackend::new(&data_dir, 4, keep_read_fds)
+    fn new(data_dir: PathBuf, max_bytes: u64, keep_read_fds: bool, dir_shards: usize) -> Self {
+        let nvme = NvmeBackend::new(&data_dir, 4, keep_read_fds, dir_shards)
             .expect("Failed to init NVMe backend");
 
         Self {
@@ -93,6 +93,9 @@ impl StorageEngine {
     /// Store a value. Writes to NVMe + keeps in buffer pool.
     pub fn put(&self, key: &[u8], value: &[u8]) -> ObjectMeta {
         let oid = self.alloc_oid();
+        // Shard directory is chosen by the key's Valkey hash slot. The old
+        // object (on overwrite) shares this key, hence the same slot.
+        let slot = crate::slot::key_hash_slot(key);
         let meta = ObjectMeta {
             object_id: oid,
             len: value.len() as u64,
@@ -101,7 +104,7 @@ impl StorageEngine {
         };
 
         // Write to NVMe.
-        if let Err(e) = self.nvme.write_object(oid, value) {
+        if let Err(e) = self.nvme.write_object(slot, oid, value) {
             eprintln!("bigobj: NVMe write failed for oid {}: {}", oid.0, e);
         }
 
@@ -120,7 +123,7 @@ impl StorageEngine {
             if old.data.is_some() {
                 self.buffer_pool_bytes.fetch_sub(old.meta.len, Ordering::Relaxed);
             }
-            self.nvme.delete_object(old.meta.object_id);
+            self.nvme.delete_object(slot, old.meta.object_id);
         }
 
         idx.insert(oid.0, key.to_vec());
@@ -132,6 +135,7 @@ impl StorageEngine {
 
     /// Delete a key.
     pub fn delete(&self, key: &[u8]) -> bool {
+        let slot = crate::slot::key_hash_slot(key);
         let mut store = self.objects.write().unwrap();
         let mut idx = self.oid_index.write().unwrap();
 
@@ -141,7 +145,7 @@ impl StorageEngine {
             if old.data.is_some() {
                 self.buffer_pool_bytes.fetch_sub(old.meta.len, Ordering::Relaxed);
             }
-            self.nvme.delete_object(old.meta.object_id);
+            self.nvme.delete_object(slot, old.meta.object_id);
             true
         } else {
             false
@@ -167,10 +171,11 @@ impl StorageEngine {
         self.nvme.fd_pool_get(oid)
     }
 
-    /// Open a fresh, un-pooled read fd for an object. Caller must close it after
-    /// use. Used in keep_read_fds=false mode (open per GET, close after read).
-    pub fn open_read_fd_ondemand(&self, oid: ObjectId) -> Option<RawFd> {
-        self.nvme.open_read_fd_ondemand(oid)
+    /// Open a fresh, un-pooled read fd for an object. `slot` = the key's Valkey
+    /// hash slot (selects the shard dir). Caller must close it after use. Used in
+    /// keep_read_fds=false mode (open per GET, close after read).
+    pub fn open_read_fd_ondemand(&self, slot: u16, oid: ObjectId) -> Option<RawFd> {
+        self.nvme.open_read_fd_ondemand(slot, oid)
     }
 
     /// Evict from buffer pool (keep on NVMe).

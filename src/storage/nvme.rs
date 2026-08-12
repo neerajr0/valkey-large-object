@@ -1,6 +1,9 @@
 //! NVMe file-backed storage: write via O_DIRECT + fallocate.
 //!
-//! File layout: {data_dir}/{object_id_hex}.dat
+//! File layout (dir_shards <= 1):  {data_dir}/{object_id_hex}.dat
+//! File layout (dir_shards > 1):   {data_dir}/{slot_hex}/{object_id_hex}.dat
+//!   where slot = Valkey key hash slot, sharded across dir_shards subdirectories
+//!   to spread open()/create() across independent directory-inode locks.
 //! Pre-opened fd pool: after write, a read fd is kept open for the io_uring poller.
 //! Reads are handled by uring_engine.rs (not here).
 
@@ -64,24 +67,44 @@ pub struct NvmeBackend {
     /// object). If false, no fd is pooled; GET opens on demand and closes after
     /// the read. This flag is the A/B switch for the fd-overhead experiment.
     keep_read_fds: bool,
+    /// Number of subdirectories objects are sharded across (by Valkey slot).
+    /// 1 = flat (all files in data_dir). >1 = data_dir/{slot % dir_shards}/…dat,
+    /// which spreads open()/create() across independent directory-inode locks
+    /// (and, with XFS inode64, across allocation groups). 16384 = one dir per
+    /// Valkey slot.
+    dir_shards: usize,
 }
 
 impl NvmeBackend {
-    pub fn new(data_dir: &Path, _reaper_count: usize, keep_read_fds: bool) -> io::Result<Self> {
+    pub fn new(data_dir: &Path, _reaper_count: usize, keep_read_fds: bool, dir_shards: usize) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
+        // Pre-create the shard directories once at init.
+        if dir_shards > 1 {
+            for s in 0..dir_shards {
+                fs::create_dir_all(data_dir.join(format!("{:04x}", s)))?;
+            }
+        }
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             fd_pool: FdPool::new(),
             keep_read_fds,
+            dir_shards,
         })
     }
 
-    fn obj_path(&self, oid: ObjectId) -> PathBuf {
-        self.data_dir.join(format!("{:016x}.dat", oid.0))
+    /// Path for an object. `slot` is the Valkey hash slot of the key (0..16383);
+    /// it selects the shard directory. Ignored when dir_shards <= 1 (flat).
+    fn obj_path(&self, slot: u16, oid: ObjectId) -> PathBuf {
+        if self.dir_shards > 1 {
+            let shard = (slot as usize) % self.dir_shards;
+            self.data_dir.join(format!("{:04x}", shard)).join(format!("{:016x}.dat", oid.0))
+        } else {
+            self.data_dir.join(format!("{:016x}.dat", oid.0))
+        }
     }
 
-    fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
-        let path = self.obj_path(oid);
+    fn open_read_fd(&self, slot: u16, oid: ObjectId) -> Option<RawFd> {
+        let path = self.obj_path(slot, oid);
         let c_path = CString::new(path.to_str()?).ok()?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT, 0) };
         if fd < 0 {
@@ -95,13 +118,14 @@ impl NvmeBackend {
 
     /// Open a fresh read fd WITHOUT pooling it. Caller owns it and must close it
     /// (used in keep_read_fds=false mode: open per GET, close after the read).
-    pub fn open_read_fd_ondemand(&self, oid: ObjectId) -> Option<RawFd> {
-        self.open_read_fd(oid)
+    pub fn open_read_fd_ondemand(&self, slot: u16, oid: ObjectId) -> Option<RawFd> {
+        self.open_read_fd(slot, oid)
     }
 
-    /// Write an object to NVMe. Opens a read fd and stores in pool.
-    pub fn write_object(&self, oid: ObjectId, data: &[u8]) -> io::Result<()> {
-        let path = self.obj_path(oid);
+    /// Write an object to NVMe. `slot` selects the shard directory. Opens a read
+    /// fd and stores it in the pool (keep_read_fds mode only).
+    pub fn write_object(&self, slot: u16, oid: ObjectId, data: &[u8]) -> io::Result<()> {
+        let path = self.obj_path(slot, oid);
         let aligned_size = align_up(data.len() as u64) as usize;
         let c_path = CString::new(path.to_str().unwrap()).unwrap();
 
@@ -113,13 +137,13 @@ impl NvmeBackend {
             )
         };
         if fd < 0 {
-            return self.write_buffered(oid, data);
+            return self.write_buffered(slot, oid, data);
         }
 
         let ret = unsafe { libc::fallocate(fd, 0, 0, aligned_size as libc::off_t) };
         if ret != 0 {
             unsafe { libc::close(fd); }
-            return self.write_buffered(oid, data);
+            return self.write_buffered(slot, oid, data);
         }
 
         let layout = std::alloc::Layout::from_size_align(aligned_size, ALIGN as usize).unwrap();
@@ -140,7 +164,7 @@ impl NvmeBackend {
 
         // Open read fd and store in pool (only in keep_read_fds mode).
         if self.keep_read_fds {
-            if let Some(read_fd) = self.open_read_fd(oid) {
+            if let Some(read_fd) = self.open_read_fd(slot, oid) {
                 self.fd_pool.insert(oid, read_fd);
             }
         }
@@ -149,21 +173,21 @@ impl NvmeBackend {
     }
 
     /// Fallback write without O_DIRECT.
-    fn write_buffered(&self, oid: ObjectId, data: &[u8]) -> io::Result<()> {
-        let path = self.obj_path(oid);
+    fn write_buffered(&self, slot: u16, oid: ObjectId, data: &[u8]) -> io::Result<()> {
+        let path = self.obj_path(slot, oid);
         fs::write(&path, data)?;
         if self.keep_read_fds {
-            if let Some(read_fd) = self.open_read_fd(oid) {
+            if let Some(read_fd) = self.open_read_fd(slot, oid) {
                 self.fd_pool.insert(oid, read_fd);
             }
         }
         Ok(())
     }
 
-    /// Delete an object file and close its pooled fd.
-    pub fn delete_object(&self, oid: ObjectId) {
+    /// Delete an object file and close its pooled fd. `slot` selects the shard dir.
+    pub fn delete_object(&self, slot: u16, oid: ObjectId) {
         self.fd_pool.remove(oid);
-        let path = self.obj_path(oid);
+        let path = self.obj_path(slot, oid);
         let _ = fs::remove_file(&path);
     }
 

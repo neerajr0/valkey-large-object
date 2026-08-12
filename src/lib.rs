@@ -4,6 +4,7 @@ use valkey_module::{valkey_module, Context, Status, ValkeyString};
 
 pub mod commands;
 pub mod data_type;
+pub mod slot;
 pub mod storage;
 pub mod uring_engine;
 
@@ -19,6 +20,7 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     let mut pool_buf_size: usize = 65536;  // 64KB default
     let mut pool_buf_count: usize = 1024;
     let mut keep_read_fds: bool = true;    // hold 1 read fd per object (default)
+    let mut dir_shards: usize = 1;         // 1 = flat; 16384 = one dir per Valkey slot
 
     let mut i = 0;
     while i < args.len() {
@@ -61,6 +63,15 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
                     keep_read_fds = matches!(v.as_ref(), "1" | "true" | "yes");
                 }
             }
+            "dir-shards" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].to_string_lossy().parse::<usize>() {
+                        // Clamp to [1, 16384] (16384 = one dir per Valkey slot).
+                        dir_shards = v.clamp(1, crate::slot::NUM_SLOTS as usize);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -79,14 +90,14 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
 
     // Initialize storage engine.
     let dir = std::path::PathBuf::from(&data_dir);
-    engine::init_engine(dir, max_bytes, keep_read_fds);
+    engine::init_engine(dir, max_bytes, keep_read_fds, dir_shards);
 
     // Initialize io_uring poller with configured buffer pool.
     uring_engine::init(pool_buf_size, pool_buf_count);
 
     ctx.log_notice(&format!(
-        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} keep_read_fds={} (pool={}MB)",
-        data_dir, max_bytes, pool_buf_size, pool_buf_count, keep_read_fds,
+        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} keep_read_fds={} dir_shards={} (pool={}MB)",
+        data_dir, max_bytes, pool_buf_size, pool_buf_count, keep_read_fds, dir_shards,
         (pool_buf_size * pool_buf_count) / (1024 * 1024)
     ));
 
