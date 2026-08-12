@@ -3,7 +3,7 @@
 ## Architecture
 
 - **One `.so`** — single Valkey module artifact with three internal layers:
-  - **Data Type** — Valkey keyspace integration: LoValue struct, commands (LO.GET/SET/DEL, DMA.HELLO/GET/SET), RDB callbacks, TIERING.REF, BlockClient management
+  - **Data Type** — Valkey keyspace integration: LoValue struct, commands (LO.HELLO, LO.GET, LO.SET), RDB callbacks, TIERING.REF, BlockClient management
   - **Storage** — Buffer pool + NVMe I/O: pool_get/put, pin/unpin, io_uring read/write, registered buffers, disk eviction
   - **Transport crate** (libefa-rs) — EFA/libfabric lifecycle, multi-device LB, completion handling. Cargo dependency, reusable by any Rust project.
 
@@ -32,10 +32,10 @@ Module OnLoad:
       counts against ulimit -l locked memory accounting, so 2GB pool = ~4GB locked memory reported.
       EC2 instances typically have unlimited memlock.)
 
-DMA.HELLO (per client connection):
+LO.HELLO (per client connection):
   5. Session::new(client_regions)   → create fi_endpoint on each EFA device, insert client AV entries
 
-DMA.GET / DMA.SET (per operation):
+LO.GET / LO.SET (per operation):
   6. storage.pin(buf)               → prevent eviction during DMA
   7. session.write/read(buf, ...)   → non-blocking, completion via callback
   8. On completion callback (fires on transport CQ thread or io_uring poller thread):
@@ -59,7 +59,8 @@ Module unload:
 
 The data type layer owns:
 - `LoValue` struct in Valkey's keyspace (accessed via `ValkeyModule_OpenKey`)
-- Command handlers (LO.GET, LO.SET, LO.DEL, DMA.HELLO, DMA.GET, DMA.SET)
+- Command handlers (LO.HELLO, LO.GET, LO.SET)
+- Native Valkey `DEL` triggers module free callback → deletes NVMe file
 - OID generation (monotonic counter)
 - RDB callbacks (save/load references)
 - TIERING.REF replication
@@ -98,7 +99,7 @@ Uses `PoolBuffer` from the transport crate as the shared buffer descriptor.
 pub enum StorageError {
     IoError { code: i32 },     // io_uring read/write failed
     PoolExhausted,             // no free buffers available
-    ObjectTooLarge,            // object exceeds pool buffer size - Debatable (see DMA.GET/SET handling)
+    ObjectTooLarge,            // object exceeds pool buffer size - Debatable (see LO.GET/SET handling)
 }
 
 trait Storage {
@@ -186,7 +187,7 @@ pub struct EfaContext { /* fi_fabric + fi_domain per device, fi_eq, registered M
 
 /// EFA endpoint address — 32 bytes, opaque to callers.
 /// Contains GID (16B) + QPN (2B) + pad (2B) + QKEY (4B).
-/// Obtained via fi_getname(). Exchanged during DMA.HELLO so each side can fi_av_insert the peer.
+/// Obtained via fi_getname(). Exchanged during LO.HELLO so each side can fi_av_insert the peer.
 pub struct EfaAddress(pub [u8; 32]);
 
 impl EfaContext {
@@ -208,7 +209,7 @@ impl EfaContext {
 }
 
 /// Client-side memory region descriptor.
-/// Received during DMA.HELLO. Represents one contiguous registered region on the client
+/// Received during LO.HELLO. Represents one contiguous registered region on the client
 /// (typically one per GPU memory pool — 1 to 8 total, NOT per object).
 pub struct ClientRegion {
     pub rkey: u64,           // remote key (fi_write takes uint64_t key; EFA uses 32-bit, zero-extended)
@@ -224,7 +225,7 @@ impl Session {
     /// client_regions are stored for per-op targeting (region_idx → rkey + remote_addr).
     pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress, client_regions: &[ClientRegion]) -> Result<Self, TransportError>;
 
-    /// Server addresses to return in DMA.HELLO reply.
+    /// Server addresses to return in LO.HELLO reply.
     pub fn server_addrs(&self) -> Vec<EfaAddress>;
 
     /// DMA write: server buffer → client region.
@@ -278,7 +279,7 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
 
 ---
 
-## DMA.GET Command Flow
+## LO.GET Command Flow
 
 ```
 (a) Main thread (command handler):
@@ -293,7 +294,7 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
     // This buffer is still 4KB-aligned (for O_DIRECT) but not from the pool's free-list.
     // It must be individually registered with io_uring and EFA before use, and deregistered after.
     // TODO: implement oversized buffer path (pool_get_sized or direct mmap + register)
-    // OR we will have to reject the command during the DMA.SET itself to not allow divergence.
+    // OR we will have to reject the command during the LO.SET itself to not allow divergence.
     buf = if lo_value.len <= storage.pool_buf_size() {
         storage.pool_get()          // fast path: pre-registered pool slot
     } else {
@@ -331,7 +332,7 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
 
 ---
 
-## DMA.SET Command Flow
+## LO.SET Command Flow
 
 ```
 (a) Main thread (command handler):
@@ -383,6 +384,37 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
 
 ---
 
+## TCP vs EFA Transport Paths
+
+Large objects need to support both RDMA-capable clients (GPU inference with EFA) and regular TCP clients (general applications, debugging, migration tooling).
+
+**Current thinking: same command, optional args determine transport.**
+
+```
+LO.GET key [region_idx remote_offset]
+  - With args:    client has LO.HELLO session → NVMe read → RDMA write to client GPU
+  - Without args: no session required → NVMe read → TCP bulk reply
+
+LO.SET key len [region_idx remote_offset]
+  - With args:    client has LO.HELLO session → RDMA read from client GPU → NVMe write
+  - Without args: no session required → client sends bytes inline (TCP bulk) → NVMe write
+```
+
+Server knows if the connection has a DMA session. Trailing args give the client explicit control over GPU memory placement.
+
+**Alternative: separate commands.**
+
+```
+LO.GET  key                           → always TCP reply
+LO.DGET key region_idx remote_offset  → always RDMA (requires LO.HELLO)
+```
+
+Pros: no ambiguity, no arg-count dispatch. Cons: two commands for the same logical operation.
+
+**Decision: TBD.** Starting with optional trailing args (fewer commands, one client library path). Can split later if the arg-count dispatch causes issues.
+
+---
+
 ## Key Design Decisions
 
 | Concern | Decision |
@@ -391,7 +423,7 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
 | Concurrency | All I/O ops (NVMe + EFA) are non-blocking with callbacks. No thread ever blocks on another subsystem. |
 | Reply mechanism | `BlockClient` with `reply_callback`. `UnblockClient` called from any thread. Reply fires on main thread. No ThreadSafeContext needed. |
 | Memory registration | Buffer pool dual-registered with io_uring + EFA once at startup. Same physical pages, no conflicts. Zero per-op registration cost. |
-| rkey model | Client sends 1-8 `ClientRegion` descriptors during DMA.HELLO. Per-op specifies `region_idx` + `remote_offset`. |
+| rkey model | Client sends 1-8 `ClientRegion` descriptors during LO.HELLO. Per-op specifies `region_idx` + `remote_offset`. |
 | Multi-EFA LB | Internal to `Session`. Best-of-two on in-flight count. Storage/data type unaware. |
 | Buffer ownership | Storage owns + allocates. Transport reads/writes into them. Pin/unpin prevents eviction during DMA. |
 | Error handling | Typed errors (`TransportError`, `StorageError`) propagated through callbacks to `UnblockClient` → reply callback → client. |
