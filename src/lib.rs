@@ -1,0 +1,190 @@
+//! ValkeyLargeObj: Large Object Module + Transport Crate
+//!
+//! Architecture (from interface doc):
+//!   Data Type (commands, LoValue, keyspace)
+//!       ↓ calls
+//!   Storage (buffer pool, io_uring, NVMe files)
+//!       ↓ passes buffers to
+//!   Transport (EFA, fi_write/fi_read)
+//!
+//! Commands: LO.HELLO, LO.GET, LO.SET
+//! Deletion: native Valkey DEL triggers module free callback.
+
+use std::sync::atomic::AtomicI64;
+use std::sync::Mutex;
+
+use valkey_module::configuration::ConfigurationFlags;
+use valkey_module::{valkey_module, Context, Status, ValkeyGILGuard, ValkeyString};
+
+use tokio::runtime::Runtime;
+
+pub mod commands;
+pub mod data_type;
+pub mod storage;
+pub mod transport;
+
+use crate::data_type::LO_TYPE;
+
+pub const MODULE_NAME: &str = "largeobj";
+pub const MODULE_VERSION: i32 = 1;
+
+// ─── Module Configurations (ValkeyModule Config API) ─────────────────────────
+
+lazy_static::lazy_static! {
+    /// Data directory for NVMe object files. Required. Immutable after load.
+    static ref CFG_DATA_DIR: Mutex<String> = Mutex::new(String::new());
+
+    /// Buffer pool slot size in bytes. Must be 4KB-aligned. Immutable after load.
+    /// Default: 4MB (suitable for KV cache chunks).
+    static ref CFG_POOL_BUF_SIZE: AtomicI64 = AtomicI64::new(4 * 1024 * 1024);
+
+    /// Number of buffer pool slots. Immutable after load.
+    /// Default: 512 (512 * 4MB = 2GB pool).
+    static ref CFG_POOL_BUF_COUNT: AtomicI64 = AtomicI64::new(512);
+
+    /// Maximum total bytes on NVMe. 0 = unlimited. Supports memory notation (e.g. "10gb").
+    static ref CFG_MAX_BYTES: AtomicI64 = AtomicI64::new(0);
+
+    /// Number of tokio worker threads for transport CQ polling. Immutable after load.
+    static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
+}
+
+// ─── Global Runtime ──────────────────────────────────────────────────────────
+
+/// Tokio runtime — owned by the module, handle passed to transport crate.
+static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+
+pub fn runtime_handle() -> &'static tokio::runtime::Handle {
+    RUNTIME.get().expect("runtime not initialized").handle()
+}
+
+// ─── Config Accessors ────────────────────────────────────────────────────────
+
+pub fn data_dir() -> String {
+    CFG_DATA_DIR.lock().unwrap().clone()
+}
+
+pub fn pool_buf_size() -> usize {
+    CFG_POOL_BUF_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn pool_buf_count() -> usize {
+    CFG_POOL_BUF_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_bytes() -> u64 {
+    CFG_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn transport_threads() -> usize {
+    CFG_TRANSPORT_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+// ─── Config Validators ───────────────────────────────────────────────────────
+
+use valkey_module::configuration::ConfigurationContext;
+use valkey_module::configuration::ConfigurationValue;
+use valkey_module::ValkeyError;
+
+fn validate_pool_buf_size<G, T: ConfigurationValue<i64>>(
+    config_ctx: &ConfigurationContext,
+    _name: &str,
+    val: &'static T,
+) -> Result<(), ValkeyError> {
+    let v = val.get(config_ctx);
+    if v < 4096 {
+        return Err(ValkeyError::Str("pool-buf-size must be at least 4096"));
+    }
+    if v as usize % 4096 != 0 {
+        return Err(ValkeyError::Str("pool-buf-size must be 4KB aligned"));
+    }
+    Ok(())
+}
+
+// ─── Module Lifecycle ────────────────────────────────────────────────────────
+
+fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
+    // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
+    let dir = data_dir();
+    if dir.is_empty() {
+        ctx.log_warning("largeobj: data-dir is required");
+        return Status::Err;
+    }
+
+    // Ensure data directory exists.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        ctx.log_warning(&format!("largeobj: failed to create data-dir: {}", e));
+        return Status::Err;
+    }
+
+    // Step 0: Create tokio runtime (module owns it, transport borrows handle).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(transport_threads())
+        .thread_name("lo-transport")
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    RUNTIME.set(rt).ok();
+
+    // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
+    transport::init(runtime_handle());
+
+    // Step 2+3: Storage allocates buffer pool + register with io_uring.
+    storage::init(pool_buf_size(), pool_buf_count(), &dir);
+    storage::register_buffers();
+
+    // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
+    let pool_bufs = storage::pool_buffer_descriptors();
+    transport::register_buffers(&pool_bufs);
+
+    ctx.log_notice(&format!(
+        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",
+        dir,
+        pool_buf_count(),
+        pool_buf_size(),
+        (pool_buf_count() * pool_buf_size()) as f64 / (1024.0 * 1024.0),
+        transport_threads(),
+    ));
+
+    Status::Ok
+}
+
+fn deinitialize(_ctx: &Context) -> Status {
+    transport::deregister_buffers();
+    transport::shutdown();
+    storage::deregister_buffers();
+    storage::shutdown();
+    Status::Ok
+}
+
+valkey_module! {
+    name: MODULE_NAME,
+    version: MODULE_VERSION,
+    allocator: (valkey_module::alloc::ValkeyAlloc, valkey_module::alloc::ValkeyAlloc),
+    data_types: [LO_TYPE],
+    init: initialize,
+    deinit: deinitialize,
+    commands: [
+        ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
+        ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
+        ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+    ],
+    configurations: [
+        i64: [
+            ["pool-buf-size", &*CFG_POOL_BUF_SIZE, 4_194_304, 4096, 1_073_741_824,
+             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<ValkeyString, AtomicI64>))],
+            ["pool-buf-count", &*CFG_POOL_BUF_COUNT, 512, 1, 65536,
+             ConfigurationFlags::IMMUTABLE, None, None],
+            ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
+             ConfigurationFlags::MEMORY, None, None],
+            ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
+             ConfigurationFlags::IMMUTABLE, None, None],
+        ],
+        string: [
+            ["data-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+        ],
+        bool: [],
+        enum: [],
+        module_args_as_configuration: true,
+    ]
+}
