@@ -137,7 +137,7 @@ trait Storage {
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: &PoolBuffer,
+        buf: &mut PoolBuffer,
         len: u64,
         on_complete: Box<dyn FnOnce(Result<u64, StorageError>) + Send>,  // Ok(bytes_read)
     );
@@ -184,6 +184,11 @@ pub enum TransportError {
 
 pub struct EfaContext { /* fi_fabric + fi_domain per device, fi_eq, registered MRs */ }
 
+/// EFA endpoint address — 32 bytes, opaque to callers.
+/// Contains GID (16B) + QPN (2B) + pad (2B) + QKEY (4B).
+/// Obtained via fi_getname(). Exchanged during DMA.HELLO so each side can fi_av_insert the peer.
+pub struct EfaAddress(pub [u8; 32]);
+
 impl EfaContext {
     /// Discover EFA devices, create fabric + domain per device.
     pub fn init() -> Result<Self, TransportError>;
@@ -206,8 +211,8 @@ impl EfaContext {
 /// Received during DMA.HELLO. Represents one contiguous registered region on the client
 /// (typically one per GPU memory pool — 1 to 8 total, NOT per object).
 pub struct ClientRegion {
-    pub rkey: Vec<u8>,       // remote key for this region
-    pub remote_addr: u64,    // base address of the region on the client
+    pub rkey: u64,           // remote key (fi_write takes uint64_t key; EFA uses 32-bit, zero-extended)
+    pub remote_addr: u64,    // base virtual address of the region on the client
     pub len: u64,            // total length of the region
 }
 
@@ -215,30 +220,33 @@ pub struct Session { /* endpoints per EFA device, AV entries, client regions, LB
 
 impl Session {
     /// Create a session. Internally creates fi_endpoint on each EFA device,
-    /// inserts client address into each device's AV.
-    pub fn new(ctx: &EfaContext, client_regions: &[ClientRegion]) -> Result<Self, TransportError>;
+    /// inserts peer address into each device's AV (fi_av_insert).
+    /// client_regions are stored for per-op targeting (region_idx → rkey + remote_addr).
+    pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress, client_regions: &[ClientRegion]) -> Result<Self, TransportError>;
 
     /// Server addresses to return in DMA.HELLO reply.
-    pub fn server_addrs(&self) -> Vec<Vec<u8>>;
+    pub fn server_addrs(&self) -> Vec<EfaAddress>;
 
     /// DMA write: server buffer → client region.
     /// Non-blocking. Internally load-balances across EFA devices (best-of-two on in-flight).
+    /// region_idx selects which ClientRegion to target (resolves to rkey + base addr internally).
     /// Calls on_complete from the transport CQ thread when done.
     pub fn write(
         &self,
         buf: &PoolBuffer,
-        len: u64,
+        len: usize,
         region_idx: u32,
         remote_offset: u64,
         on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
     );
 
     /// DMA read: client region → server buffer.
-    /// Non-blocking. Calls on_complete when data has arrived in local_buf.
+    /// Non-blocking. Calls on_complete when data has arrived in buf.
+    /// region_idx selects which ClientRegion to read from.
     pub fn read(
         &self,
-        buf: &PoolBuffer,
-        len: u64,
+        buf: &mut PoolBuffer,
+        len: usize,
         region_idx: u32,
         remote_offset: u64,
         on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
