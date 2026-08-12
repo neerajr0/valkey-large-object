@@ -42,10 +42,10 @@ pub trait Storage: Send + Sync {
     fn pool_put(&self, buf: PoolBuffer);
 
     /// Pin buffer — prevents eviction/reuse during in-flight DMA or io_uring op.
-    fn pin(&self, buf: &PoolBuffer);
+    fn pin(&self, ptr: *mut u8);
 
     /// Unpin buffer — allows eviction/reuse.
-    fn unpin(&self, buf: &PoolBuffer);
+    fn unpin(&self, ptr: *mut u8);
 
     /// Pool buffer size (all buffers are this fixed size).
     fn pool_buf_size(&self) -> usize;
@@ -62,22 +62,24 @@ pub trait Storage: Send + Sync {
 
     /// Read object bytes from NVMe into buf. Async via io_uring ReadFixed.
     /// object_id maps directly to file path: {data_dir}/{oid:016x}.dat
+    /// Takes PoolBuffer by value (ownership transfers to storage during I/O).
+    /// Returns (PoolBuffer, bytes_read) in callback — caller gets buf back.
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: &mut PoolBuffer,
+        buf: PoolBuffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Result<u64, StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(PoolBuffer, Result<u64, StorageError>) + Send>,
     );
 
     /// Write buf to NVMe as a new object. Async via io_uring.
-    /// Returns (ObjectId, crc32c) via callback.
+    /// Takes PoolBuffer by value. Returns (PoolBuffer, ObjectId, crc32c) via callback.
     /// Atomicity: O_TMPFILE → write → linkat.
     fn write_new(
         &self,
-        buf: &PoolBuffer,
+        buf: PoolBuffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Result<(ObjectId, u32), StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(ObjectId, u32), StorageError>) + Send>,
     );
 
     /// Delete an object file from NVMe. Called on key deletion or eviction.

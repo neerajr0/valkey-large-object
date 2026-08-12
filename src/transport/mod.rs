@@ -77,13 +77,12 @@ pub struct EfaContext {
 
 impl EfaContext {
     /// Discover EFA devices, create fabric + domain per device.
-    /// Fails gracefully if no EFA device (returns Unavailable).
-    pub fn new(_rt_handle: &tokio::runtime::Handle) -> Result<Self, TransportError> {
+    /// Synchronous — no runtime needed.
+    pub fn new() -> Result<Self, TransportError> {
         // TODO: Actual EFA discovery via fi_getinfo("efa", ...)
         //   1. fi_getinfo with hints (provider="efa", ep_type=FI_EP_RDM, caps=FI_RMA)
         //   2. fi_fabric() per returned info
         //   3. fi_domain() per fabric
-        //   4. Spawn CQ poller task on rt_handle
         //
         // For now, return Unavailable (no EFA on dev desktop).
         Ok(Self {
@@ -150,44 +149,39 @@ impl Session {
 
     /// DMA write: server buffer → client region.
     /// Non-blocking. region_idx selects which ClientRegion (resolves to rkey + base addr).
+    /// Takes PoolBuffer ownership during DMA. Returns it in callback.
     pub fn write(
         &self,
-        _buf: &PoolBuffer,
-        _len: usize,
+        buf: PoolBuffer,
+        len: usize,
         region_idx: u32,
         _remote_offset: u64,
-        on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,
     ) {
         if region_idx as usize >= self.client_regions.len() {
-            on_complete(Err(TransportError::RegionOutOfBounds));
+            on_complete(buf, Err(TransportError::RegionOutOfBounds));
             return;
         }
-        // TODO: Post fi_writemsg to send queue (non-blocking).
-        //   - Resolve region_idx → rkey + (remote_addr + remote_offset)
-        //   - Select EFA device via best-of-two LB on in-flight count
-        //   - Submit fi_writemsg with local buf desc + remote rkey/addr
-        //   - CQ poller task calls on_complete when CQE arrives
-        //
-        // Stub: immediate success for testing without EFA.
-        on_complete(Ok(()));
+        // TODO: Post fi_writemsg, CQ poller fires on_complete.
+        on_complete(buf, Ok(()));
     }
 
     /// DMA read: client region → server buffer.
-    /// Non-blocking. region_idx selects which ClientRegion to read from.
+    /// Non-blocking. Takes PoolBuffer ownership. Returns it in callback.
     pub fn read(
         &self,
-        _buf: &mut PoolBuffer,
-        _len: usize,
+        buf: PoolBuffer,
+        len: usize,
         region_idx: u32,
         _remote_offset: u64,
-        on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,
     ) {
         if region_idx as usize >= self.client_regions.len() {
-            on_complete(Err(TransportError::RegionOutOfBounds));
+            on_complete(buf, Err(TransportError::RegionOutOfBounds));
             return;
         }
-        // TODO: Post fi_readmsg (non-blocking), CQ poller fires on_complete.
-        on_complete(Ok(()));
+        // TODO: Post fi_readmsg, CQ poller fires on_complete.
+        on_complete(buf, Ok(()));
     }
 
     /// Tear down session. In-flight ops receive SessionClosed.
@@ -201,8 +195,8 @@ impl Session {
 
 static EFA_CTX: OnceLock<EfaContext> = OnceLock::new();
 
-pub fn init(rt_handle: &tokio::runtime::Handle) {
-    match EfaContext::new(rt_handle) {
+pub fn init() {
+    match EfaContext::new() {
         Ok(ctx) => {
             EFA_CTX.set(ctx).ok();
         }

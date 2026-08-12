@@ -10,7 +10,7 @@
 //! Commands: LO.HELLO, LO.GET, LO.SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
@@ -47,6 +47,10 @@ lazy_static::lazy_static! {
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
+
+    /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
+    /// For benchmarking NVMe read throughput without TCP output buffer overhead.
+    static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -78,6 +82,10 @@ pub fn max_bytes() -> u64 {
 
 pub fn transport_threads() -> usize {
     CFG_TRANSPORT_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn bench_mode() -> bool {
+    CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ─── Config Validators ───────────────────────────────────────────────────────
@@ -127,7 +135,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     RUNTIME.set(rt).ok();
 
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
-    transport::init(runtime_handle());
+    transport::init();
 
     // Step 2+3: Storage allocates buffer pool + register with io_uring.
     storage::init(pool_buf_size(), pool_buf_count(), &dir);
@@ -183,7 +191,9 @@ valkey_module! {
         string: [
             ["data-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
         ],
-        bool: [],
+        bool: [
+            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
+        ],
         enum: [],
         module_args_as_configuration: true,
     ]

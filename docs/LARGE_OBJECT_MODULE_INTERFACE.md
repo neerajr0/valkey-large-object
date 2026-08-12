@@ -5,14 +5,18 @@
 - **One `.so`** — single Valkey module artifact with three internal layers:
   - **Data Type** — Valkey keyspace integration: LoValue struct, commands (LO.HELLO, LO.GET, LO.SET), RDB callbacks, TIERING.REF, BlockClient management
   - **Storage** — Buffer pool + NVMe I/O: pool_get/put, pin/unpin, io_uring read/write, registered buffers, disk eviction
-  - **Transport crate** (libefa-rs) — EFA/libfabric lifecycle, multi-device LB, completion handling. Cargo dependency, reusable by any Rust project.
+  - **Transport crate** (libefa-rs) — EFA/libfabric lifecycle, multi-device LB, completion handling. Cargo dependency, reusable by any Rust project. **Runtime-agnostic: does not own threads or an async runtime.**
+
+**Runtime ownership:** The module owns a tokio runtime (created at OnLoad, configured via module args: thread count, core pinning). The transport crate exposes `async fn write/read`. The module `.await`s them from tasks spawned on its runtime. Transport's internal CQ polling is opaque to the module — we don't pass it a Handle or spawn its tasks.
 
 ```
 Data Type (commands, LoValue, keyspace)
     ↓ calls
 Storage (buffer pool, io_uring, NVMe files)
     ↓ passes buffers to
-Transport (EFA, fi_write/fi_read)
+Transport (EFA — exposes async fn, internal CQ polling opaque)
+    ↑
+Module Runtime (tokio, owned by module — spawns per-command tasks that .await transport)
 ```
 
 Transport never calls storage or data type. Storage never touches Valkey keys.
@@ -23,11 +27,12 @@ Transport never calls storage or data type. Storage never touches Valkey keys.
 
 ```
 Module OnLoad:
-  1. Transport::init()              → discover EFA devices, create fi_fabric + fi_domain per device
-  2. Storage allocates buffer pool  → fixed-size buffers, 4KB-aligned, owned by storage
-  3. Storage::register_buffers()    → IORING_REGISTER_BUFFERS (kernel pins pages for NVMe DMA)
-  4. Transport::register_buffers()  → fi_mr_reg same buffers across all EFA domains (NIC learns phys addrs)
-     (Order between 3 and 4 does not matter — both independently pin pages via get_user_pages.
+  1. Module creates tokio runtime   → thread count + core pinning from module config args
+  2. Transport::init()              → discover EFA devices, create fi_fabric + fi_domain (sync, no runtime needed)
+  3. Storage allocates buffer pool  → fixed-size buffers, 4KB-aligned, owned by storage
+  4. Storage::register_buffers()    → IORING_REGISTER_BUFFERS (kernel pins pages for NVMe DMA)
+  5. Transport::register_buffers()  → fi_mr_reg same buffers across all EFA domains (NIC learns phys addrs)
+     (Order between 4 and 5 does not matter — both independently pin pages via get_user_pages.
       Dual-registration on the same physical pages has no conflicts. Only concern: each registration
       counts against ulimit -l locked memory accounting, so 2GB pool = ~4GB locked memory reported.
       EC2 instances typically have unlimited memlock.)
@@ -192,10 +197,14 @@ pub struct EfaAddress(pub [u8; 32]);
 
 impl EfaContext {
     /// Discover EFA devices, create fabric + domain per device.
+    /// Synchronous — no runtime needed. Fails with DeviceNotFound if no EFA hardware.
     pub fn init() -> Result<Self, TransportError>;
 
     /// Number of EFA devices available.
     pub fn device_count(&self) -> usize;
+
+    /// Whether EFA hardware is present and initialized.
+    pub fn is_available(&self) -> bool;
 
     /// Register buffers with all EFA domains for zero-cost per-op DMA.
     /// Buffers must be 4KB-aligned.
@@ -229,29 +238,27 @@ impl Session {
     pub fn server_addrs(&self) -> Vec<EfaAddress>;
 
     /// DMA write: server buffer → client region.
-    /// Non-blocking. Internally load-balances across EFA devices (best-of-two on in-flight).
+    /// Async — awaits CQ completion. Module spawns this as a task on its tokio runtime.
+    /// Internally load-balances across EFA devices (best-of-two on in-flight).
     /// region_idx selects which ClientRegion to target (resolves to rkey + base addr internally).
-    /// Calls on_complete from the transport CQ thread when done.
-    pub fn write(
+    pub async fn write(
         &self,
         buf: &PoolBuffer,
         len: usize,
         region_idx: u32,
         remote_offset: u64,
-        on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
-    );
+    ) -> Result<(), TransportError>;
 
     /// DMA read: client region → server buffer.
-    /// Non-blocking. Calls on_complete when data has arrived in buf.
+    /// Async — awaits CQ completion. Module spawns this as a task on its tokio runtime.
     /// region_idx selects which ClientRegion to read from.
-    pub fn read(
+    pub async fn read(
         &self,
         buf: &mut PoolBuffer,
         len: usize,
         region_idx: u32,
         remote_offset: u64,
-        on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
-    );
+    ) -> Result<(), TransportError>;
 
     /// Tear down session. In-flight ops receive SessionClosed in their callbacks.
     pub fn close(self);
@@ -314,11 +321,12 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
                 UnblockClient(bc, ErrResult(e));
             }
             Ok(bytes_read) => {
-                // Transport layer: send to client GPU
-                session.write(buf, bytes_read, region_idx, remote_offset, move |write_result| {
+                // Transport layer: send to client GPU (module spawns task on its runtime)
+                runtime.spawn(async move {
+                    let result = session.write(buf, bytes_read, region_idx, remote_offset).await;
                     storage.unpin(buf);
                     storage.pool_put(buf);
-                    UnblockClient(bc, write_result.into());
+                    UnblockClient(bc, result.into());
                 });
             }
         }
@@ -350,8 +358,9 @@ No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it 
     storage.pin(buf)
     bc = BlockClient(ctx, dma_set_reply_fn, free_fn)
 
-    // Transport layer: read from client GPU into buf
-    session.read(buf, len, region_idx, remote_offset, move |read_result| {
+    // Transport layer: read from client GPU into buf (module spawns task on its runtime)
+    runtime.spawn(async move {
+        let read_result = session.read(buf, len, region_idx, remote_offset).await;
         match read_result {
             Err(e) => {
                 storage.unpin(buf); storage.pool_put(buf);
@@ -420,12 +429,13 @@ Pros: no ambiguity, no arg-count dispatch. Cons: two commands for the same logic
 | Concern | Decision |
 |---|---|
 | Layer separation | Data type = keyspace + commands. Storage = pool + disk I/O (by OID, not key). Transport = EFA. Each layer has a clean API boundary. |
-| Concurrency | All I/O ops (NVMe + EFA) are non-blocking with callbacks. No thread ever blocks on another subsystem. |
-| Reply mechanism | `BlockClient` with `reply_callback`. `UnblockClient` called from any thread. Reply fires on main thread. No ThreadSafeContext needed. |
+| Runtime ownership | Module owns tokio runtime (thread count + core pinning). Transport crate exposes `async fn` — internal CQ polling is opaque. No Handle passed. |
+| Concurrency | NVMe ops: io_uring with callbacks (CQ poller on module runtime). EFA ops: async functions awaited on module runtime. No thread ever blocks on another subsystem. |
+| Reply mechanism | `BlockClient` with `reply_callback`. `UnblockClient` called from any thread/task. Reply fires on main thread. No ThreadSafeContext needed. |
 | Memory registration | Buffer pool dual-registered with io_uring + EFA once at startup. Same physical pages, no conflicts. Zero per-op registration cost. |
 | rkey model | Client sends 1-8 `ClientRegion` descriptors during LO.HELLO. Per-op specifies `region_idx` + `remote_offset`. |
 | Multi-EFA LB | Internal to `Session`. Best-of-two on in-flight count. Storage/data type unaware. |
 | Buffer ownership | Storage owns + allocates. Transport reads/writes into them. Pin/unpin prevents eviction during DMA. |
-| Error handling | Typed errors (`TransportError`, `StorageError`) propagated through callbacks to `UnblockClient` → reply callback → client. |
-| Callback threading | Callbacks fire on io_uring poller or transport CQ thread. Never block — only unpin/pool_put/UnblockClient (all O(1)). |
+| Error handling | Typed errors (`TransportError`, `StorageError`) propagated through callbacks/await to `UnblockClient` → reply callback → client. |
+| Transport API style | `async fn write/read` — module spawns tasks on its runtime. No callback variants needed. |
 | Storage addressing | Storage takes `ObjectId`, not Valkey keys. Key→OID resolution is the data type layer's job (reads LoValue from keyspace). |

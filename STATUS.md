@@ -12,10 +12,10 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | Module registration (valkey_module! macro) | ✅ | LO.HELLO, LO.GET, LO.SET registered |
-| Config via ValkeyModule Config API | ✅ | data-dir, pool-buf-size, pool-buf-count, max-bytes, transport-threads |
+| Config via ValkeyModule Config API | ✅ | data-dir, pool-buf-size, pool-buf-count, max-bytes, transport-threads, bench-mode |
 | Config validator (4KB alignment) | ✅ | Rejects at CONFIG SET time |
 | module_args_as_configuration | ✅ | loadmodule args map to configs |
-| Tokio runtime (module-owned) | ✅ | Spawns on init, transport borrows handle |
+| Tokio runtime (module-owned) | ✅ | Spawns on init. Transport exposes async fn — internal CQ polling opaque. No handle passed. |
 | Lifecycle: init → register → shutdown | ✅ | Follows interface doc steps 1-4, 11-12 |
 
 ---
@@ -29,9 +29,7 @@
 | OID monotonic counter | ✅ | AtomicU64, updated on RDB load |
 | RDB save/load callbacks | ✅ | |
 | Free callback (DEL → delete NVMe file) | ✅ | |
-| TIERING.REF replication | ❌ | Propagates OID/len/crc to replicas |
-| Replica RDB load (pull queue build) | ❌ | |
-| Slot migration hooks (OnSlotImportReadyCheck) | ❌ | |
+| Data type callbacks (copy, digest, mem_usage) | ❌ | Optional but good for production |
 
 ---
 
@@ -40,12 +38,13 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | LO.HELLO — parse peer addr + regions, create session | ✅ | |
-| LO.GET — EFA path (NVMe read → RDMA write) | 🟡 | BlockClient wiring in progress, ownership fix needed |
-| LO.GET — TCP path (NVMe read → bulk reply) | 🟡 | Same — branch at completion callback |
-| LO.SET — EFA path (RDMA read → NVMe write) | 🟡 | Same |
-| LO.SET — TCP path (inline bulk → NVMe write) | 🟡 | Copies arg bytes into pool buf, submits write |
-| BlockClient/UnblockClient async chain | 🟡 | Structure in place, Rust ownership issue with PoolBuffer move being resolved |
-| Reply callback stores LoValue in keyspace (SET) | 🟡 | Currently replies with metadata string, needs keyspace write |
+| LO.GET — EFA path (NVMe read → RDMA write) | 🟡 | Stubbed — EFA transport returns immediate Ok() |
+| LO.GET — TCP path (NVMe read → bulk reply) | ✅ | NVMe read via io_uring → reply with bulk bytes. Bench-mode returns size only. |
+| LO.SET — EFA path (RDMA read → NVMe write) | 🟡 | Stubbed — EFA transport returns immediate Ok() |
+| LO.SET — TCP path (inline bulk → NVMe write) | ✅ | Copies arg bytes into pool buf, writes to NVMe, stores LoValue in keyspace |
+| BlockClient/UnblockClient async chain | ✅ | ThreadSafeContext used for reply + keyspace write |
+| Reply callback stores LoValue in keyspace (SET) | ✅ | Opens key writable, sets module type value |
+| Bench-mode config (reply size only on GET) | ✅ | `bench-mode yes` loadarg — skips bulk copy, returns integer |
 | Session store (per-client HashMap) | ✅ | |
 | Client disconnect cleanup | ❌ | Should remove session on disconnect |
 
@@ -78,8 +77,8 @@
 | Fallback to regular Read if register fails | ✅ | |
 | Error drain loop (if io_uring unavailable) | ✅ | |
 | Graceful shutdown | ✅ | Drains pending ops then exits |
-| IORING_REGISTER_FILES (pre-registered fds) | ❌ | Eliminates fget/fput atomics per op. Fixed fd table + slot index. |
-| Fd pool (open once per object, reuse on reads) | ❌ | Currently open/close per request |
+| IORING_REGISTER_FILES (pre-registered fds) | ❌ | Kernel optimization: eliminates fget/fput atomics per SQE. Requires fd pool as prerequisite (fds must stay open). |
+| Fd pool (open once per object, reuse on reads) | ✅ | HashMap<ObjectId, RawFd> + RwLock. Open once on first write, reuse on reads. |
 | Multi-poller investigation | ❌ | One poller may saturate on multi-NVMe (16-drive i8g). Evaluate multiple rings. |
 | O_TMPFILE atomic write | ❌ | Currently uses tmp+rename. O_TMPFILE → linkat is cleaner (no dir entry until commit). |
 | io_uring SQ polling (IORING_SETUP_SQPOLL) | ❌ | Kernel-side submission polling — eliminates submit() syscall. Burns a core. |
@@ -98,6 +97,7 @@
 | Startup reconciliation (NVMe dir vs keyspace) | ❌ | Delete orphaned files after crash |
 | fallocate on write (pre-allocate space) | ❌ | Avoids extent allocation during write |
 | Multiple stripe directories | ❌ | Kevin's POC had this for multi-drive parallelism |
+| NVMe SMART logging/health monitoring | ❌ | Periodic SMART data collection, early failure detection |
 
 ---
 
@@ -123,15 +123,63 @@
 
 ---
 
+## Replication
+
+### Replication Control (metadata stream)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| TIERING.REF command | ❌ | Propagates (key, oid, len, crc) via replication stream to replicas |
+| Replication start/stop callbacks | ❌ | Module hooks for when replication begins/ends |
+| RDB save: write refs (not data) | ✅ | RDB callbacks save oid/len/crc only |
+| RDB load: build pull queue from refs | ❌ | On replica RDB load, queue all OIDs for pulling |
+| Core replication state reflection | ❌ | VM_SetClusterFlags(NO_FAILOVER) while queue non-empty |
+| Core replication lag reflection | ❌ | VM_SetReplicationAckOffset — hold back ACK so lag metric reflects pending pulls |
+| Cut-off period | ❌ | Grace period before declaring pull failed / giving up |
+
+### Replication Data Pull Engine
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Pull queue (ObjectId queue) | ❌ | Built from RDB refs + TIERING.REF stream |
+| Pull engine thread/task | ❌ | Replica pulls objects from primary via LO.GET |
+| Client pool for pull connections | ❌ | Pool of authenticated connections to primary |
+| Auth/ACL/TLS for pull clients | ❌ | Replica→primary auth, encryption |
+| Congestion control | ❌ | Backpressure — limit in-flight pulls to avoid overwhelming primary |
+| Pull completion → clear queue entry | ❌ | On successful pull, write to NVMe + remove from queue |
+| Queue drain detection | ❌ | When queue empty, clear NO_FAILOVER flag + resume ACK offset |
+| Slot migration: OnSlotImportReadyCheck | ❌ | Return 0 until all objects for slot are pulled |
+
+---
+
+## Observability
+
+| Item | Status | Notes |
+|------|--------|-------|
+| INFO largeobj section | ❌ | Module stats in INFO output |
+| Objects stored count | ❌ | Total LoValues in keyspace |
+| NVMe bytes used | ❌ | Total bytes on disk |
+| Buffer pool utilization | ❌ | in-use / total buffers |
+| io_uring submissions/completions | ❌ | Throughput counters |
+| io_uring latency histogram | ❌ | p50/p99 read/write latency |
+| EFA sessions active | ❌ | Count of LO.HELLO sessions |
+| EFA bytes transferred | ❌ | RDMA read/write bytes |
+| Pull queue depth | ❌ | Pending pulls on replica |
+| Pull throughput (objects/sec, bytes/sec) | ❌ | |
+| NVMe SMART health | ❌ | Periodic SMART data, early failure detection |
+
+---
+
 ## Integration & Testing
 
 | Item | Status | Notes |
 |------|--------|-------|
 | Builds clean (cargo build) | ✅ | Produces libvalkey_largeobj.so |
-| Load into Valkey and run LO.SET/LO.GET | ❌ | Needs BlockClient chain fixed first |
-| Basic integration test (TCP path) | ❌ | |
+| Load into Valkey and run LO.SET/LO.GET | ✅ | Full roundtrip verified: SET writes to NVMe + keyspace, GET reads and returns bulk data |
+| Bench-mode perf test (gp3 baseline) | ✅ | c=1: ~2K rps, c=8: ~4.3K rps (gp3 IOPS ceiling). Matches expected 52-74x slower than NVMe. |
+| Basic integration test (TCP path) | ❌ | Automated test suite |
 | EFA integration test (requires i8g with EFA ENI) | ❌ | |
-| Benchmark (compare to NVMEBenchmark branch) | ❌ | |
+| Benchmark on i8ge (compare to NVMEBenchmark) | ❌ | Expected: ~72K rps/c=1, ~166K rps/c=100 at 4KB |
 | CI setup | ❌ | |
 
 ---
