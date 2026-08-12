@@ -225,7 +225,23 @@ Population: 950,176 objects (4 KB), 750 clients, 60s, cold cache, server pinned
 | Arm | TPS (RPS) | avg | P50 | P95 | P99 | Open fds during GET |
 |---|---|---|---|---|---|---|
 | `keep-read-fds 1` (pooled) | **176,186** | 0.231 ms | **0.239 ms** | 0.303 ms | 0.343 ms | 950,887 (~object_count) |
-| `keep-read-fds 0` (open per GET) | _(pending — Arm B)_ | | | | | ~tens (valkey only) |
+| `keep-read-fds 0` (open per GET) | **118,601** | 5.694 ms | **4.751 ms** | 7.895 ms | 24.159 ms | ~780 (transient in-flight) |
+
+**Effect of pooling: +48% throughput (176K vs 119K RPS), ~20× lower P50
+(0.24 ms vs 4.75 ms), ~70× lower P99.** Both arms used the same ~950K-object
+population, 750 clients, 60s, cold cache, server pinned 0-31 / bench 32-63.
+
+**Sanity re-run of Arm A** (pooled, on the *experimental* binary rather than
+origin-tip): 178,069 RPS, P50 0.239 ms, P99 0.327 ms, 951,096 fds, SUnreclaim
+2.08 GB — matches the original Arm A within ~1%. Confirms the result is
+reproducible and the experimental binary's `keep-read-fds 1` path is equivalent
+to mainline.
+
+Why Arm B is so much slower: `bo_get` performs `open()` (and the poller
+`close()`) synchronously **on the main thread**, before blocking the client.
+Post-`drop_caches`, many opens fault the inode in from NVMe, stalling the
+single event loop per GET. Arm A's main thread only does a HashMap lookup for
+the pooled fd, then hands off to the io_uring poller — it never blocks on I/O.
 
 **Baseline check:** Arm A's 176K RPS / 0.239 ms P50 matches (slightly beats)
 Karthik's README 4 KB result (~166K RPS / ~0.44 ms P50). Baseline validated. ✅
@@ -237,6 +253,52 @@ main thread.
 
 ---
 
+### Arm B memory (post-GET snapshot, `keep-read-fds 0`, 949,957 objects)
+
+Apples-to-apples with Arm A's post-GET snapshot (both after `drop_caches` + GET).
+
+```
+object_count:   949957
+fds:            11           (idle; ~780 transient during GET)
+RSS:            4239224 kB   (~4.04 GB — same as Arm A; DRAM copies dominate)
+Slab:           2055028 kB   (~1.96 GB)
+SReclaimable:   1275592 kB
+SUnreclaim:      779436 kB   (~0.74 GB)
+xfs_inode  active_objs=956768   (reclaimable now — NOT pinned by open fds)
+filp       active_objs=19362    (~3.7 MB vs Arm A's 185 MB)
+dentry     active_objs=1022826
+```
+
+Note: the Arm B *post-load* snapshot (before GET) showed SUnreclaim 2.58 GB and
+xfs_inode 1.56M — contaminated by the fresh 3M-write inode cache. The post-GET
+numbers above (after drop_caches) are the clean comparison.
+
+---
+
 ## Observations / conclusions
 
-_(to be filled in as results come in)_
+**Memory cost of pooling fds (holding 1 read fd per object):**
+- ~1 fd per object (950,887 vs 11 idle).
+- **~1.24 GB pinned, non-reclaimable kernel memory** at 950K objects
+  (SUnreclaim 1.98 GB pooled vs 0.74 GB not-pooled), ≈ **1.3–1.7 KB/fd**,
+  linear in object count (agrees across 632K, 950K data points).
+  Breakdown: `filp` (struct file) ~185 MB + pinned `xfs_inode` ~940 MB.
+- The DRAM object-copy buffer pool (~40 GB at 10M × 4KB) is a *separate*,
+  larger memory axis (userspace RSS), unaffected by the fd choice.
+
+**Performance value of pooling fds:**
+- **+48% GET throughput** (176K vs 119K RPS) and **~20× lower P50** (0.24 vs
+  4.75 ms) at 4 KB objects, because pooling removes a synchronous
+  `open()`/`close()` from the main-thread hot path.
+
+**Conclusion / recommendation:**
+Neither extreme is ideal. "Pool every fd forever" (current default) is fast but
+costs ~1.7 KB pinned kernel memory per object and doesn't scale to 10s of
+millions of objects (fd-limit + pinned-memory wall). "Never pool" is scalable
+but pays a large main-thread open()/close() penalty per GET.
+→ The right design is a **bounded LRU fd cache** (hold the hot N fds open,
+open-on-demand for the cold tail): keeps ~Arm-A throughput for the working set
+while capping fds/pinned-memory at N regardless of object count. The
+even-longer-term fix is a **slab/packed-file layout** (offset+len in
+ObjectMeta) so object count is fully decoupled from fd count.
+See the backlog doc's "Claude's TODOs" — this test quantifies both sides.
