@@ -90,6 +90,8 @@ pub struct ObjectId(pub u64);
 
 Storage operates on **OIDs and file paths**, never on Valkey keys. The command handler resolves key → OID via the data type layer, then calls storage.
 
+Uses `PoolBuffer` from the transport crate as the shared buffer descriptor.
+
 ```rust
 /// Error types for storage operations.
 #[derive(Debug)]
@@ -104,16 +106,16 @@ trait Storage {
 
     /// Get a buffer from the pool. Returns None if pool exhausted.
     /// Returned buffer is a registered slot (valid for io_uring ReadFixed and EFA fi_write).
-    fn pool_get(&self) -> Option<*mut u8>;
+    fn pool_get(&self) -> Option<PoolBuffer>;
 
     /// Return a buffer to the pool.
-    fn pool_put(&self, buf: *mut u8);
+    fn pool_put(&self, buf: PoolBuffer);
 
     /// Pin buffer — prevents eviction/reuse during in-flight DMA or io_uring op.
-    fn pin(&self, buf: *mut u8);
+    fn pin(&self, buf: &PoolBuffer);
 
     /// Unpin buffer — allows eviction/reuse.
-    fn unpin(&self, buf: *mut u8);
+    fn unpin(&self, buf: &PoolBuffer);
 
     /// Pool buffer size (all buffers are this fixed size).
     fn pool_buf_size(&self) -> usize;
@@ -135,7 +137,7 @@ trait Storage {
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: *mut u8,
+        buf: &PoolBuffer,
         len: u64,
         on_complete: Box<dyn FnOnce(Result<u64, StorageError>) + Send>,  // Ok(bytes_read)
     );
@@ -145,7 +147,7 @@ trait Storage {
     /// Atomicity: O_TMPFILE → write → linkat (file invisible until complete).
     fn write_new(
         &self,
-        buf: *const u8,
+        buf: &PoolBuffer,
         len: u64,
         on_complete: Box<dyn FnOnce(Result<(ObjectId, u32), StorageError>) + Send>,  // Ok((oid, crc32c))
     );
@@ -160,6 +162,13 @@ trait Storage {
 ## Transport Crate API (libefa-rs)
 
 ```rust
+/// Shared type: both storage and transport speak this language.
+/// Defined in the transport crate; storage depends on it.
+pub struct PoolBuffer {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
 /// Error types for transport operations.
 #[derive(Debug)]
 pub enum TransportError {
@@ -184,7 +193,7 @@ impl EfaContext {
 
     /// Register buffers with all EFA domains for zero-cost per-op DMA.
     /// Buffers must be 4KB-aligned.
-    pub fn register_buffers(&self, bufs: &[(*mut u8, usize)]) -> Result<(), TransportError>;
+    pub fn register_buffers(&self, bufs: &[PoolBuffer]) -> Result<(), TransportError>;
 
     /// Deregister previously registered buffers.
     pub fn deregister_buffers(&self) -> Result<(), TransportError>;
@@ -217,7 +226,7 @@ impl Session {
     /// Calls on_complete from the transport CQ thread when done.
     pub fn write(
         &self,
-        local_buf: *const u8,
+        buf: &PoolBuffer,
         len: u64,
         region_idx: u32,
         remote_offset: u64,
@@ -228,7 +237,7 @@ impl Session {
     /// Non-blocking. Calls on_complete when data has arrived in local_buf.
     pub fn read(
         &self,
-        local_buf: *mut u8,
+        buf: &PoolBuffer,
         len: u64,
         region_idx: u32,
         remote_offset: u64,
