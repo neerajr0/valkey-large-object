@@ -275,6 +275,67 @@ numbers above (after drop_caches) are the clean comparison.
 
 ---
 
+## Experiment 2: directory sharding (per-Valkey-slot subdirs)
+
+Objects sharded into `{data_dir}/{slot:04x}/{oid}.dat`, slot = Valkey key hash
+slot (CRC16 % 16384). Hypothesis: reduce single-directory inode-lock contention
+so opens can parallelize. Toggle: `dir-shards N` (1 = flat, 16384 = per-slot).
+
+### Result (non-pooling `keep-read-fds 0`, 950K × 4KB, 750c/60s, cold cache)
+
+| Variant | RPS | P50 | avg | P99 |
+|---|---|---|---|---|
+| Flat (`dir-shards 1`) | 118,601 | 4.75 ms | 5.69 ms | 24.16 ms |
+| Sharded (`dir-shards 16384`) | **106,859** | **5.54 ms** | 6.32 ms | 18.67 ms |
+| (pooled baseline, ref) | 176,186 | 0.24 ms | — | — |
+
+**Sharding alone slightly REGRESSED throughput (−10%) and median (+17%)** — as
+predicted. With on-demand `open()` still **serialized on the main thread**, there
+is no concurrent directory-lock contention to relieve, so sharding only adds
+cost: (1) deeper path = extra directory lookup per open; (2) after drop_caches,
+each cold GET now faults the shard-directory inode *and* the file inode (~2×
+metadata faults), and the 16384 dir inodes are mostly cold too.
+
+Nuance: **P99 improved** (18.7 vs 24.2 ms) — spreading files across XFS
+allocation groups smooths worst-case metadata variance, but the added
+path-resolution cost dominates the common case.
+
+**Conclusion: sharding is an ENABLER for parallel opens, not a standalone win.**
+It only pays off once opens run concurrently (io-wq async openat or a userspace
+open-thread pool) — then the shards stop those parallel opens from re-serializing
+on one directory lock. Next experiment: parallel opens, measured flat vs sharded.
+
+### Isolation run + confound (IMPORTANT — earlier comparison is not trustworthy)
+
+Re-ran non-pooling on the *sharding build* with `dir-shards 1` (flat path + CRC16,
+no extra directory level):
+
+| Run | Build | RPS | P50 |
+|---|---|---|---|
+| Old flat | pre-sharding | 118,601 | 4.75 ms |
+| New, dir-shards 1 | sharding build | 108,596 | 5.23 ms |
+| New, dir-shards 16384 | sharding build | 106,859 | 5.54 ms |
+
+Findings:
+- `dir-shards 1` (108K) ≈ `dir-shards 16384` (107K): the extra **directory level
+  was NOT the cause** — the "path depth" hypothesis is falsified.
+- The real gap is old-build (119K) → new-build (108K) at the *same* flat layout.
+  Code-wise the only GET-path difference is the CRC16 slot compute (~0.15 µs ≈
+  ~1.5%), which cannot explain ~8%.
+- **Prime confound: orphaned `.dat` files accumulate across restart+reload cycles**
+  (in-memory state is wiped on restart, but files persist and are never cleaned),
+  bloating the flat root directory and slowing cold opens. Plus the non-pooling
+  path is inherently noisier than pooled (disk-open-bound; pooled reproduced
+  within 1%, these did not).
+
+**→ The 119/108/107 spread is within the confound/noise band. The sharding
+result is INCONCLUSIVE.** To attribute anything, control disk state:
+`rm -rf /mnt/bigobj-data/*` between runs, and run each config 2–3× for a variance
+band. Only then compare flat vs sharded (and later flat vs sharded under parallel
+opens, which is where sharding should actually matter).
+
+---
+
 ## Observations / conclusions
 
 **Memory cost of pooling fds (holding 1 read fd per object):**
