@@ -1,9 +1,28 @@
 //! Command handlers for BO.SET, BO.GET, BO.DEL, BO.EXISTS, BO.LEN, BO.INFO, BO.EVICT
 
+use std::os::unix::io::RawFd;
+
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::storage::engine;
 use crate::uring_engine;
+
+/// Block the client and hand a ready fd to the io_uring read pipeline.
+/// `close_fd_after` is Some when the fd was opened on demand for this GET (the
+/// poller closes it after the read) and None when it is a pooled fd.
+fn block_and_read(ctx: &Context, len: u64, fd: RawFd, close_fd_after: Option<RawFd>) {
+    let blocked = ctx.block_client();
+    let client_data = Box::into_raw(Box::new(uring_engine::ClientData {
+        blocked_client: blocked,
+        object_len: len,
+        close_fd_after,
+    }));
+    uring_engine::engine().submit(uring_engine::ReadRequest {
+        fd,
+        len,
+        client_data,
+    });
+}
 
 /// BO.SET key value
 pub fn bo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
@@ -34,42 +53,48 @@ pub fn bo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let key = &args[1];
     let key_bytes = key.as_slice();
 
-    match engine::engine().get_status(key_bytes) {
-        None => Ok(ValkeyValue::Null),
-        Some((meta, _in_pool)) => {
-            // Always go through io_uring for benchmarking purposes.
-            // In production: check in_pool and return immediately if true.
-            //
-            // Resolve the read fd. In keep_read_fds mode it's pooled (no open()
-            // on the hot path). Otherwise we open one on demand HERE (on the main
-            // thread) and flag it to be closed once the read completes.
-            let (fd, close_fd_after) = match engine::engine().get_read_fd(meta.object_id) {
-                Some(fd) => (fd, None),                 // pooled — do not close
-                None => {
-                    // On-demand open: shard dir is chosen by the key's Valkey slot.
-                    let slot = crate::slot::key_hash_slot(key_bytes);
-                    match engine::engine().open_read_fd_ondemand(slot, meta.object_id) {
-                        Some(fd) => (fd, Some(fd)),      // opened for this read — close after
-                        None => return Ok(ValkeyValue::Null),
-                    }
-                }
-            };
+    // Always go through io_uring for benchmarking purposes.
+    // In production: check in_pool and return immediately if true.
+    let (meta, _in_pool) = match engine::engine().get_status(key_bytes) {
+        Some(v) => v,
+        None => return Ok(ValkeyValue::Null),
+    };
 
-            let blocked = ctx.block_client();
-            let client_data = Box::into_raw(Box::new(uring_engine::ClientData {
-                blocked_client: blocked,
-                object_len: meta.len,
-                close_fd_after,
-            }));
+    // Fast path: fd already pooled (keep_read_fds mode) — no open() needed.
+    if let Some(fd) = engine::engine().get_read_fd(meta.object_id) {
+        block_and_read(ctx, meta.len, fd, None);
+        return Ok(ValkeyValue::NoReply);
+    }
 
-            uring_engine::engine().submit(uring_engine::ReadRequest {
-                fd,
-                len: meta.len,
-                client_data,
-            });
+    // Non-pooling: an fd must be opened on demand. The shard dir is chosen by the
+    // key's Valkey hash slot.
+    let slot = crate::slot::key_hash_slot(key_bytes);
 
+    // Preferred (open-threads > 0): offload the potentially-blocking open() to the
+    // worker pool. Block the client FIRST — the worker unblocks it on open failure.
+    if crate::open_pool::enabled() {
+        let blocked = ctx.block_client();
+        let client_data = Box::into_raw(Box::new(uring_engine::ClientData {
+            blocked_client: blocked,
+            object_len: meta.len,
+            close_fd_after: None, // the worker fills this in once it has the fd
+        }));
+        crate::open_pool::pool().submit(crate::open_pool::OpenRequest {
+            slot,
+            oid: meta.object_id,
+            len: meta.len,
+            client_data,
+        });
+        return Ok(ValkeyValue::NoReply);
+    }
+
+    // Fallback (open-threads 0): open inline on the main thread (original behavior).
+    match engine::engine().open_read_fd_ondemand(slot, meta.object_id) {
+        Some(fd) => {
+            block_and_read(ctx, meta.len, fd, Some(fd));
             Ok(ValkeyValue::NoReply)
         }
+        None => Ok(ValkeyValue::Null),
     }
 }
 

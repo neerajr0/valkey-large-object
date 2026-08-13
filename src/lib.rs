@@ -4,6 +4,7 @@ use valkey_module::{valkey_module, Context, Status, ValkeyString};
 
 pub mod commands;
 pub mod data_type;
+pub mod open_pool;
 pub mod slot;
 pub mod storage;
 pub mod uring_engine;
@@ -21,6 +22,7 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     let mut pool_buf_count: usize = 1024;
     let mut keep_read_fds: bool = true;    // hold 1 read fd per object (default)
     let mut dir_shards: usize = 1;         // 1 = flat; 16384 = one dir per Valkey slot
+    let mut open_threads: usize = 0;       // 0 = open() inline on main thread (default)
 
     let mut i = 0;
     while i < args.len() {
@@ -72,6 +74,16 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
                     }
                 }
             }
+            "open-threads" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].to_string_lossy().parse::<usize>() {
+                        // Number of worker threads that perform on-demand open()s
+                        // off the main thread (non-pooling mode). 0 = inline.
+                        open_threads = v;
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -95,9 +107,16 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     // Initialize io_uring poller with configured buffer pool.
     uring_engine::init(pool_buf_size, pool_buf_count);
 
+    // Initialize the open-offload worker pool. Only meaningful in non-pooling mode
+    // (pooled GETs never open() on the hot path), so gate on that to avoid spawning
+    // idle threads. open_threads = 0 keeps open() inline on the main thread.
+    if !keep_read_fds && open_threads > 0 {
+        open_pool::init(open_threads);
+    }
+
     ctx.log_notice(&format!(
-        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} keep_read_fds={} dir_shards={} (pool={}MB)",
-        data_dir, max_bytes, pool_buf_size, pool_buf_count, keep_read_fds, dir_shards,
+        "bigobj: initialized data_dir={} max_bytes={} pool_buf_size={} pool_buf_count={} keep_read_fds={} dir_shards={} open_threads={} (pool={}MB)",
+        data_dir, max_bytes, pool_buf_size, pool_buf_count, keep_read_fds, dir_shards, open_threads,
         (pool_buf_size * pool_buf_count) / (1024 * 1024)
     ));
 
