@@ -10,18 +10,40 @@
 //! Commands: LO.HELLO, LO.GET, LO.SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
+// ─── Initialization Order ────────────────────────────────────────────────────
+//
+// Module init proceeds in strict order. Commands are safe to call ONLY after
+// all steps complete:
+//
+//   1. transport::init()       — discover EFA devices, create fabric/domain.
+//   2. storage::init(buf_size, buf_count, data_dir)
+//                              — allocate pool buffers, create PoolStorage.
+//                              — scan data_dir for existing .dat files to
+//                                recover OID counter (avoids OID collision).
+//   3. storage::register_buffers()
+//                              — IORING_REGISTER_BUFFERS pins pool pages for
+//                                ReadFixed/WriteFixed zero-copy I/O.
+//   4. transport::register_buffers()
+//                              — fi_mr_reg same pool buffers with EFA domains
+//                                for RDMA fi_write/fi_read.
+//
+// After step 4, commands (LO.GET, LO.SET, LO.HELLO) may execute safely.
+// ─────────────────────────────────────────────────────────────────────────────
+
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, Status, ValkeyGILGuard, ValkeyString};
+use valkey_module::{valkey_module, Context, Status, ValkeyString};
 
 use tokio::runtime::Runtime;
 
 pub mod commands;
 pub mod data_type;
+pub mod errors;
 pub mod storage;
 pub mod transport;
+pub mod types;
 
 use crate::data_type::LO_TYPE;
 

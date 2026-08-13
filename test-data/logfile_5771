@@ -1,0 +1,13 @@
+2263:M 13 Aug 2026 21:42:15.886 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+2263:M 13 Aug 2026 21:42:15.886 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+2263:M 13 Aug 2026 21:42:15.886 * Valkey version=255.255.255, bits=64, commit=afabf680, modified=0, pid=2263, just started
+2263:M 13 Aug 2026 21:42:15.886 * Configuration loaded
+2263:M 13 Aug 2026 21:42:15.916 * monotonic clock: X86 TSC @ 2400.17 ticks/us
+2263:M 13 Aug 2026 21:42:15.917 * Running mode=standalone, port=5771.
+2263:M 13 Aug 2026 21:42:15.917 * Legacy Redis Module /home/karsubba/valkey-bigobj/target/release/libvalkey_largeobj.so found
+2263:M 13 Aug 2026 21:42:15.917 * <largeobj> Created new data type 'largeob-k'
+2263:M 13 Aug 2026 21:42:15.917 * <largeobj> largeobj: initialized data_dir=/local/home/karsubba/valkey-bigobj/test-data pool=128x4096=0MB transport_threads=2
+2263:M 13 Aug 2026 21:42:15.917 * Module 'largeobj' loaded from /home/karsubba/valkey-bigobj/target/release/libvalkey_largeobj.so
+2263:M 13 Aug 2026 21:42:15.918 * Static Module 'lua' successfully loaded
+2263:M 13 Aug 2026 21:42:15.918 * Server initialized
+2263:M 13 Aug 2026 21:42:15.918 * Ready to accept connections tcp

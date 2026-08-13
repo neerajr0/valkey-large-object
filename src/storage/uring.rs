@@ -16,7 +16,7 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::storage::StorageError;
+use crate::storage::{NvmeEngine, StorageError};
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
@@ -41,6 +41,10 @@ pub enum IoRequest {
     },
 }
 
+// SAFETY: IoRequest contains raw pointers (as usize) and boxed closures.
+// The pointers refer to pool-allocated buffers that are stable for module lifetime.
+// The closures are Send. The enum is only sent across a bounded channel to the
+// poller thread which is the sole consumer.
 unsafe impl Send for IoRequest {}
 
 // ─── Pending Operation Tracking ──────────────────────────────────────────────
@@ -55,15 +59,21 @@ enum PendingOp {
     },
 }
 
-// ─── UringEngine ─────────────────────────────────────────────────────────────
+// ─── UringNvmeEngine ─────────────────────────────────────────────────────────
 
-pub struct UringEngine {
+pub struct UringNvmeEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
     poller: Option<thread::JoinHandle<()>>,
 }
 
-impl UringEngine {
+impl NvmeEngine for UringNvmeEngine {
+    fn submit(&self, req: IoRequest) {
+        self.tx.send(req).ok();
+    }
+}
+
+impl UringNvmeEngine {
     /// Create engine and spawn CQ poller thread.
     /// `iovecs` are the pool buffers to register with the kernel.
     pub fn new(iovecs: Vec<libc::iovec>) -> Self {
@@ -80,7 +90,8 @@ impl UringEngine {
         let poller = thread::Builder::new()
             .name("lo-uring-poller".into())
             .spawn(move || {
-                // Reconstruct iovecs inside the thread.
+                // SAFETY: Reconstruct iovecs inside the poller thread from (usize, usize) pairs.
+                // The underlying memory is pool-allocated and stable for module lifetime.
                 let iovecs: Vec<libc::iovec> = buf_info
                     .iter()
                     .map(|&(ptr, len)| libc::iovec {
@@ -97,11 +108,6 @@ impl UringEngine {
             shutdown,
             poller: Some(poller),
         }
-    }
-
-    /// Submit an I/O request. Non-blocking. Called from any thread.
-    pub fn submit(&self, req: IoRequest) {
-        self.tx.send(req).ok();
     }
 
     /// Shutdown the engine. Drains pending ops then exits.
@@ -131,6 +137,8 @@ impl UringEngine {
 
         // Register buffers — pins pages for ReadFixed/WriteFixed.
         let use_fixed = if !iovecs.is_empty() {
+            // SAFETY: iovecs point to pool-allocated, page-aligned memory that is stable
+            // for the module's lifetime. The kernel pins these pages for zero-copy I/O.
             unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok()
         } else {
             false
@@ -216,6 +224,8 @@ impl UringEngine {
                         };
                         pending.insert(token, op);
 
+                        // SAFETY: The SQE references stable pool memory. ring.submission()
+                        // is only accessed from this single poller thread (no races).
                         unsafe {
                             if ring.submission().is_full() {
                                 ring.submit().ok();

@@ -1,23 +1,15 @@
 //! Transport Crate API (libefa-rs)
 //!
+//! This is a place holder mod which will be replaced by an actual dependency.
 //! EFA/libfabric lifecycle, multi-device LB, completion handling.
 //! Transport never calls storage or data type.
 //! Module owns the tokio runtime; transport borrows the handle for CQ poller tasks.
 
 use std::sync::OnceLock;
 
-// ─── Shared Types ────────────────────────────────────────────────────────────
+use crate::types::PoolBuffer;
 
-/// Shared buffer descriptor — both storage and transport speak this language.
-/// Defined here in the transport crate; storage depends on it.
-pub struct PoolBuffer {
-    pub ptr: *mut u8,
-    pub len: usize,
-}
-
-// Safety: PoolBuffer is a descriptor. The underlying memory is stable (pool-allocated, never moved).
-unsafe impl Send for PoolBuffer {}
-unsafe impl Sync for PoolBuffer {}
+// ─── EFA Types ───────────────────────────────────────────────────────────────
 
 /// EFA endpoint address — 32 bytes, opaque to callers.
 /// Contains GID (16B) + QPN (2B) + pad (2B) + QKEY (4B).
@@ -153,7 +145,7 @@ impl Session {
     pub fn write(
         &self,
         buf: PoolBuffer,
-        len: usize,
+        _len: usize,
         region_idx: u32,
         _remote_offset: u64,
         on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,
@@ -171,7 +163,7 @@ impl Session {
     pub fn read(
         &self,
         buf: PoolBuffer,
-        len: usize,
+        _len: usize,
         region_idx: u32,
         _remote_offset: u64,
         on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,

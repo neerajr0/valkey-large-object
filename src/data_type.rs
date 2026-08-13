@@ -30,6 +30,13 @@ impl ObjectId {
     pub fn file_path(&self, data_dir: &str) -> String {
         format!("{}/{:016x}.dat", data_dir, self.0)
     }
+
+    /// Initialize OID counter to at least `val`.
+    /// Used at startup after scanning data_dir for existing .dat files.
+    /// Ensures new OIDs never collide with on-disk objects surviving a restart.
+    pub fn init_counter(val: u64) {
+        OID_COUNTER.fetch_max(val, Ordering::Relaxed);
+    }
 }
 
 // ─── LoValue ─────────────────────────────────────────────────────────────────
@@ -48,6 +55,8 @@ pub struct LoValue {
 // ─── RDB Callbacks ───────────────────────────────────────────────────────────
 
 unsafe extern "C" fn lo_rdb_save(rdb: *mut raw::RedisModuleIO, value: *mut std::ffi::c_void) {
+    // SAFETY: value is a valid LoValue pointer created by us in rdb_load or set_value.
+    // rdb is a valid RedisModuleIO context provided by the engine during RDB save.
     let lo = &*(value as *const LoValue);
     raw::save_unsigned(rdb, lo.object_id.0);
     raw::save_unsigned(rdb, lo.len);
@@ -58,6 +67,8 @@ unsafe extern "C" fn lo_rdb_load(
     rdb: *mut raw::RedisModuleIO,
     _encver: i32,
 ) -> *mut std::ffi::c_void {
+    // SAFETY: rdb is a valid RedisModuleIO context provided by the engine during RDB load.
+    // We allocate LoValue on the heap and return ownership to the engine.
     let oid = raw::load_unsigned(rdb).unwrap_or(0);
     let len = raw::load_unsigned(rdb).unwrap_or(0);
     let crc = raw::load_unsigned(rdb).unwrap_or(0) as u32;
@@ -76,6 +87,8 @@ unsafe extern "C" fn lo_rdb_load(
 /// Free callback — triggered by native Valkey DEL.
 /// Deletes the NVMe file for this object.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
+    // SAFETY: value is a valid LoValue pointer that we previously returned from
+    // rdb_load or set_value. We take ownership back and drop it after deleting the file.
     let lo = Box::from_raw(value as *mut LoValue);
     // Delete NVMe file via storage layer.
     crate::storage::delete(lo.object_id);

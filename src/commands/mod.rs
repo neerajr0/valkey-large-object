@@ -11,18 +11,19 @@
 //!   - TCP: bytes already inline in RESP, fill buf, then NVMe write
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
+use crate::errors;
 use crate::storage::{self, Storage};
-use crate::transport::{self, ClientRegion, EfaAddress, PoolBuffer, Session};
+use crate::transport::{self, ClientRegion, EfaAddress, Session};
 
 // ─── Per-Client Session Store ────────────────────────────────────────────────
 
 lazy_static::lazy_static! {
-    static ref SESSIONS: Mutex<HashMap<u64, Session>> = Mutex::new(HashMap::new());
+    static ref SESSIONS: Mutex<HashMap<u64, Arc<Session>>> = Mutex::new(HashMap::new());
 }
 
 // ─── Reply Data ──────────────────────────────────────────────────────────────
@@ -43,14 +44,14 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let efa_ctx = transport::efa_context();
     if !efa_ctx.is_available() {
-        return Err(ValkeyError::Str("ERR EFA unavailable on this instance"));
+        return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
     }
 
     let peer_hex = args[1].to_string_lossy();
     let peer_bytes = hex_decode(&peer_hex)
-        .map_err(|_| ValkeyError::Str("ERR invalid peer address hex"))?;
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
     if peer_bytes.len() != 32 {
-        return Err(ValkeyError::Str("ERR peer address must be 32 bytes"));
+        return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
     }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&peer_bytes);
@@ -59,31 +60,31 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let num_regions: usize = args[2]
         .to_string_lossy()
         .parse()
-        .map_err(|_| ValkeyError::Str("ERR invalid num_regions"))?;
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_NUM_REGIONS))?;
 
     let expected_args = 3 + num_regions * 3;
     if args.len() < expected_args {
-        return Err(ValkeyError::Str("ERR insufficient region args"));
+        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_REGION_ARGS));
     }
 
     let mut regions = Vec::with_capacity(num_regions);
     for i in 0..num_regions {
         let base = 3 + i * 3;
         let rkey: u64 = args[base].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid rkey"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
         let remote_addr: u64 = args[base + 1].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid remote_addr"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
         let len: u64 = args[base + 2].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid region len"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_LEN))?;
         regions.push(ClientRegion { rkey, remote_addr, len });
     }
 
     let session = Session::new(efa_ctx, &peer_addr, regions)
-        .map_err(|e| ValkeyError::String(format!("ERR session create: {}", e)))?;
+        .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
     let server_addrs = session.server_addrs();
 
     let client_id = ctx.get_client_id();
-    SESSIONS.lock().unwrap().insert(client_id, session);
+    SESSIONS.lock().unwrap().insert(client_id, Arc::new(session));
 
     let reply: Vec<ValkeyValue> = server_addrs
         .iter()
@@ -110,21 +111,30 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let efa_args = if args.len() >= 4 {
         let region_idx: u32 = args[2].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid region_idx"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
         let remote_offset: u64 = args[3].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid remote_offset"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
         Some((region_idx, remote_offset))
     } else {
         None
     };
 
     let client_id = ctx.get_client_id();
-    if efa_args.is_some() && !SESSIONS.lock().unwrap().contains_key(&client_id) {
-        return Err(ValkeyError::Str("ERR no DMA session (call LO.HELLO first)"));
-    }
+
+    // Clone the Arc<Session> BEFORE entering the async callback chain.
+    // This avoids locking SESSIONS inside the io_uring completion callback.
+    let session_arc = if efa_args.is_some() {
+        let sessions = SESSIONS.lock().unwrap();
+        match sessions.get(&client_id) {
+            Some(s) => Some(Arc::clone(s)),
+            None => return Err(ValkeyError::Str(errors::ERR_NO_DMA_SESSION)),
+        }
+    } else {
+        None
+    };
 
     let storage = storage::get();
-    let buf = storage.pool_get().ok_or(ValkeyError::Str("ERR pool exhausted"))?;
+    let buf = storage.pool_get().ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
     let buf_ptr = buf.ptr as usize;
     storage.pin(buf_ptr as *mut u8);
 
@@ -137,13 +147,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             Err(e) => {
                 storage.unpin(buf_ptr as *mut u8);
                 storage.pool_put(buf);
-                unblock_client(blocked_client, ReplyData::Err(format!("ERR NVMe read: {}", e)));
+                unblock_client(blocked_client, ReplyData::Err(
+                    format!("{}: {}", errors::ERR_NVME_READ, e),
+                ));
             }
             Ok(bytes_read) => {
                 if let Some((region_idx, remote_offset)) = efa_args {
-                    // EFA: RDMA write buf → client GPU
-                    let sessions = SESSIONS.lock().unwrap();
-                    if let Some(session) = sessions.get(&client_id) {
+                    // EFA: RDMA write buf → client GPU.
+                    // session_arc was cloned before entering this callback — no lock needed.
+                    if let Some(session) = session_arc {
                         session.write(buf, bytes_read as usize, region_idx, remote_offset,
                             Box::new(move |buf, write_result| {
                                 let storage = storage::get();
@@ -151,7 +163,9 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                                 storage.pool_put(buf);
                                 let reply = match write_result {
                                     Ok(()) => ReplyData::GetOk { bytes_read },
-                                    Err(e) => ReplyData::Err(format!("ERR EFA write: {}", e)),
+                                    Err(e) => ReplyData::Err(
+                                        format!("{}: {}", errors::ERR_EFA_WRITE, e),
+                                    ),
                                 };
                                 unblock_client(blocked_client, reply);
                             }),
@@ -159,7 +173,9 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     } else {
                         storage.unpin(buf_ptr as *mut u8);
                         storage.pool_put(buf);
-                        unblock_client(blocked_client, ReplyData::Err("ERR session gone".into()));
+                        unblock_client(blocked_client, ReplyData::Err(
+                            errors::ERR_SESSION_GONE.to_string(),
+                        ));
                     }
                 } else {
                     // TCP: copy bytes from buf, release buf, reply with data
@@ -169,6 +185,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                         storage.pool_put(buf);
                         unblock_client(blocked_client, ReplyData::GetOk { bytes_read });
                     } else {
+                        // SAFETY: buf.ptr is valid pool memory, bytes_read <= buf.len.
                         let data = unsafe {
                             std::slice::from_raw_parts(buf.ptr, bytes_read as usize).to_vec()
                         };
@@ -193,29 +210,37 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let key_name = args[1].clone();
     let obj_len: u64 = args[2].to_string_lossy().parse()
-        .map_err(|_| ValkeyError::Str("ERR invalid len"))?;
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
 
     let storage = storage::get();
     if obj_len > storage.pool_buf_size() as u64 {
-        return Err(ValkeyError::Str("ERR object exceeds buffer size"));
+        return Err(ValkeyError::Str(errors::ERR_OBJECT_EXCEEDS_BUF));
     }
 
     let efa_args = if args.len() >= 5 {
         let region_idx: u32 = args[3].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid region_idx"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
         let remote_offset: u64 = args[4].to_string_lossy().parse()
-            .map_err(|_| ValkeyError::Str("ERR invalid remote_offset"))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
         Some((region_idx, remote_offset))
     } else {
         None
     };
 
     let client_id = ctx.get_client_id();
-    if efa_args.is_some() && !SESSIONS.lock().unwrap().contains_key(&client_id) {
-        return Err(ValkeyError::Str("ERR no DMA session (call LO.HELLO first)"));
-    }
 
-    let mut buf = storage.pool_get().ok_or(ValkeyError::Str("ERR pool exhausted"))?;
+    // Clone Arc<Session> before entering async path.
+    let session_arc = if efa_args.is_some() {
+        let sessions = SESSIONS.lock().unwrap();
+        match sessions.get(&client_id) {
+            Some(s) => Some(Arc::clone(s)),
+            None => return Err(ValkeyError::Str(errors::ERR_NO_DMA_SESSION)),
+        }
+    } else {
+        None
+    };
+
+    let buf = storage.pool_get().ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
     let buf_ptr = buf.ptr as usize;
     storage.pin(buf_ptr as *mut u8);
 
@@ -223,9 +248,8 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     if let Some((region_idx, remote_offset)) = efa_args {
         // EFA: read from client GPU into buf, then NVMe write.
-        let sessions = SESSIONS.lock().unwrap();
         let key_for_reply = key_name.as_slice().to_vec();
-        if let Some(session) = sessions.get(&client_id) {
+        if let Some(session) = session_arc {
             session.read(buf, obj_len as usize, region_idx, remote_offset,
                 Box::new(move |buf, read_result| {
                     match read_result {
@@ -237,8 +261,12 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                                 storage.unpin(buf_ptr as *mut u8);
                                 storage.pool_put(buf);
                                 let reply = match write_result {
-                                    Ok((oid, crc)) => ReplyData::SetOk { key_name: key_for_reply, oid, len: obj_len, crc },
-                                    Err(e) => ReplyData::Err(format!("ERR NVMe write: {}", e)),
+                                    Ok((oid, crc)) => ReplyData::SetOk {
+                                        key_name: key_for_reply, oid, len: obj_len, crc,
+                                    },
+                                    Err(e) => ReplyData::Err(
+                                        format!("{}: {}", errors::ERR_NVME_WRITE, e),
+                                    ),
                                 };
                                 unblock_client(blocked_client, reply);
                             }));
@@ -247,7 +275,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             let storage = storage::get();
                             storage.unpin(buf_ptr as *mut u8);
                             storage.pool_put(buf);
-                            unblock_client(blocked_client, ReplyData::Err(format!("ERR EFA read: {}", e)));
+                            unblock_client(blocked_client, ReplyData::Err(
+                                format!("{}: {}", errors::ERR_EFA_READ, e),
+                            ));
                         }
                     }
                 }),
@@ -255,13 +285,17 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         } else {
             storage.unpin(buf_ptr as *mut u8);
             storage.pool_put(buf);
-            unblock_client(blocked_client, ReplyData::Err("ERR session gone".into()));
+            unblock_client(blocked_client, ReplyData::Err(
+                errors::ERR_SESSION_GONE.to_string(),
+            ));
         }
     } else {
         // TCP: bytes come inline as args[3].
         if args.len() > 3 {
             let data = args[3].as_slice();
             let copy_len = data.len().min(obj_len as usize);
+            // SAFETY: buf.ptr is a valid pool buffer with capacity >= buf_size >= obj_len.
+            // data.as_ptr() is valid for data.len() bytes. copy_len <= both.
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr, copy_len) };
         }
 
@@ -272,8 +306,12 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             storage.unpin(buf_ptr as *mut u8);
             storage.pool_put(buf);
             let reply = match write_result {
-                Ok((oid, crc)) => ReplyData::SetOk { key_name: key_for_reply, oid, len: obj_len, crc },
-                Err(e) => ReplyData::Err(format!("ERR NVMe write: {}", e)),
+                Ok((oid, crc)) => ReplyData::SetOk {
+                    key_name: key_for_reply, oid, len: obj_len, crc,
+                },
+                Err(e) => ReplyData::Err(
+                    format!("{}: {}", errors::ERR_NVME_WRITE, e),
+                ),
             };
             unblock_client(blocked_client, reply);
         }));

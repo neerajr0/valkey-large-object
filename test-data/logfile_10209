@@ -1,0 +1,13 @@
+53178:M 13 Aug 2026 19:56:29.099 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+53178:M 13 Aug 2026 19:56:29.099 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+53178:M 13 Aug 2026 19:56:29.099 * Valkey version=255.255.255, bits=64, commit=afabf680, modified=0, pid=53178, just started
+53178:M 13 Aug 2026 19:56:29.099 * Configuration loaded
+53178:M 13 Aug 2026 19:56:29.130 * monotonic clock: X86 TSC @ 2400.17 ticks/us
+53178:M 13 Aug 2026 19:56:29.130 * Running mode=standalone, port=10209.
+53178:M 13 Aug 2026 19:56:29.130 * Legacy Redis Module /home/karsubba/valkey-bigobj/target/release/libvalkey_largeobj.so found
+53178:M 13 Aug 2026 19:56:29.130 * <largeobj> Created new data type 'largeob-k'
+53178:M 13 Aug 2026 19:56:29.131 * <largeobj> largeobj: initialized data_dir=test-data pool=128x4096=0MB transport_threads=2
+53178:M 13 Aug 2026 19:56:29.131 * Module 'largeobj' loaded from /home/karsubba/valkey-bigobj/target/release/libvalkey_largeobj.so
+53178:M 13 Aug 2026 19:56:29.131 * Static Module 'lua' successfully loaded
+53178:M 13 Aug 2026 19:56:29.131 * Server initialized
+53178:M 13 Aug 2026 19:56:29.131 * Ready to accept connections tcp

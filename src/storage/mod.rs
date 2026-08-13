@@ -4,8 +4,9 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
-use crate::transport::PoolBuffer;
+use crate::types::PoolBuffer;
 
+pub mod fd_pool;
 pub mod pool;
 pub mod uring;
 
@@ -26,6 +27,14 @@ impl std::fmt::Display for StorageError {
             Self::ObjectTooLarge => write!(f, "object exceeds buffer size"),
         }
     }
+}
+
+// ─── NvmeEngine Trait ────────────────────────────────────────────────────────
+
+/// NvmeEngine trait — abstraction over the io_uring submission path.
+/// Implemented by UringNvmeEngine (production) and SyncNvmeEngine (tests).
+pub trait NvmeEngine: Send + Sync {
+    fn submit(&self, req: uring::IoRequest);
 }
 
 // ─── Storage Trait (from interface doc) ──────────────────────────────────────
@@ -105,18 +114,20 @@ pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
     STORAGE.set(storage).ok();
 }
 
+/// Shutdown: drain in-flight ops, close fds, clean up files.
+/// Called from module deinit. TODO: implement when shutdown path is built.
+pub fn shutdown() {
+    // Future: UringNvmeEngine::shutdown() drains pending ops.
+    // Future: FdPool closes all open fds.
+    // Future: Orphan reconciliation (delete .dat files with no keyspace entry).
+}
+
 pub fn register_buffers() {
-    // TODO: Implement io_uring IORING_REGISTER_BUFFERS for pool buffers.
-    // This pins pages in kernel for ReadFixed/WriteFixed zero-copy DMA.
     let _ = get().register_buffers();
 }
 
 pub fn deregister_buffers() {
     let _ = get().deregister_buffers();
-}
-
-pub fn shutdown() {
-    // TODO: Drain in-flight io_uring ops, release ring, unmap buffers.
 }
 
 /// Return PoolBuffer descriptors for transport layer to fi_mr_reg.
