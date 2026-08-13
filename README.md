@@ -90,7 +90,7 @@ build.sh              — build + test automation
 STATUS.md             — work tracker (done + remaining)
 ```
 
-## Performance (i8g.48xlarge, 16 NVMe striped)
+## Performance (i8ge.48xlarge, 16 NVMe striped)
 
 | Object Size | Clients | RPS | p50 Latency |
 |-------------|---------|-----|-------------|
