@@ -1,2 +1,16 @@
-/target
-dump.rdb
+# Build
+target/
+
+# Test artifacts
+test-data/
+tests/build/
+tests/__pycache__/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
