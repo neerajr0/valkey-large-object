@@ -98,7 +98,7 @@
 | Disk eviction policy | ❌ | When approaching max-bytes, evict coldest objects |
 | Startup reconciliation (NVMe dir vs keyspace) | ❌ | Delete orphaned files after crash |
 | fallocate on write (pre-allocate space) | ❌ | Avoids extent allocation during write |
-| Multiple stripe directories | ❌ | Kevin's POC had this for multi-drive parallelism |
+| Multiple stripe directories | ❌ | For multi-drive parallelism |
 | NVMe SMART logging/health monitoring | ❌ | Periodic SMART data collection, early failure detection |
 
 ---
@@ -118,7 +118,7 @@
 | Session::read (fi_readmsg → CQ callback) | 🟡 | Immediate Ok(()) stub |
 | Session::close | 🟡 | No-op |
 | server_addrs (fi_getname) | 🟡 | Returns empty vec |
-| Actual libfabric FFI integration | ❌ | Kenny's transport crate will provide this |
+| Actual libfabric FFI integration | ❌ | Transport crate will provide this |
 | Multi-EFA device LB (best-of-two) | ❌ | |
 | CQ poller tasks on tokio runtime | ❌ | |
 | Dual-registration (same pages to io_uring + EFA) | 🟡 | Architecture defined, EFA side stubbed |
@@ -186,13 +186,3 @@
 
 ---
 
-## Ownership
-
-| Layer | Primary Owner | Helper/Next Stage |
-|-------|--------------|-------------------|
-| Module entry + config + lifecycle | Karthik | — |
-| Data type + commands + BlockClient wiring | Karthik | — |
-| Transport crate (libefa-rs) | Kenny | — |
-| io_uring engine + NVMe storage | Karthik (scaffold) | **NVMe engineer** (productionize: REGISTER_FILES, fd pool, multi-poller, eviction, O_TMPFILE, reconciliation) |
-| Replication (TIERING.REF, pull, hydration) | TBD | — |
-| Slot migration | TBD | — |
