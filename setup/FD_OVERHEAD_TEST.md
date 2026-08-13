@@ -334,6 +334,48 @@ result is INCONCLUSIVE.** To attribute anything, control disk state:
 band. Only then compare flat vs sharded (and later flat vs sharded under parallel
 opens, which is where sharding should actually matter).
 
+### Clean-workspace baseline (non-pooling, dir-shards 1) — TRUSTWORTHY
+
+Workspace reformatted (`bench-reset.sh`) so only one run's ~950K files exist
+(object_count 950,410 == dat files 950,410 — zero orphans). 3 GET runs:
+
+| Run | RPS | P50 |
+|---|---|---|
+| 1 | 115,561 | 5.119 ms |
+| 2 | 116,480 | 5.063 ms |
+| 3 | 115,253 | 5.127 ms |
+
+**Variance band: 115.3–116.5K RPS (~1% spread) — tight and reproducible.**
+Memory: 11 fds, SUnreclaim 0.71 GB, filp 21,756 (non-pooling confirmed).
+
+Verdict: the earlier "regression" (108.6K dirty run) was the **orphan confound**,
+now removed. Clean non-pooling flat = ~116K, within ~2.5% of the pre-sharding
+build (118.6K) — accounted for by the CRC16 slot compute (~1.5%) + single-run
+noise. **No meaningful code regression.** This ~116K is the trustworthy
+non-pooling-flat baseline for future clean comparisons (vs sharded, vs parallel
+opens). Pooled remains ~176K — the ~34% gap is the real, structural cost of
+open()-on-main-thread, unchanged by the sharding work.
+
+### Clean flat vs sharded (both clean workspace) — does sharding help serially?
+
+| Config (clean, non-pooling) | RPS | P50 |
+|---|---|---|
+| Flat (dir-shards 1), 3-run band | 115.3–116.5K | ~5.1 ms |
+| Sharded 1024 (1 run) | 111,386 | 5.32 ms |
+| Sharded 16384 (dirty, ignore) | ~107K | 5.54 ms |
+
+**Sharding does NOT help serial opens — it slightly regresses (~4% at 1024),
+monotonically worse with more shards (116K → 111K → ~107K).** This is the pure
+directory-depth cost (extra path component + more cold shard-dir inode faults per
+open), now visible without the orphan confound. With opens serial on the main
+thread there is no concurrency for sharding to exploit, so it is neutral-to-
+negative standalone. Caveat: 1024 is a single run vs flat's 3-run band; ~4% is
+likely real (flat band ~1%) but 3 runs would confirm.
+
+**Confirmed: sharding is only worthwhile paired with PARALLEL opens** (io-wq /
+open-thread pool), where shards stop concurrent openers serializing on one
+directory lock. That is the decisive next experiment.
+
 ---
 
 ## Observations / conclusions
