@@ -4,9 +4,11 @@
 //! Fd pool: open once per object on write, reuse on every read, close on delete.
 //! io_uring: ReadFixed/WriteFixed with registered buffers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::{Mutex, RwLock};
+use std::sync::{OnceLock, RwLock};
+
+use crossbeam_queue::ArrayQueue;
 
 use crate::data_type::ObjectId;
 use crate::transport::PoolBuffer;
@@ -59,12 +61,12 @@ pub struct PoolStorage {
     #[allow(dead_code)]
     buf_count: usize,
     data_dir: String,
-    /// Free list of pool buffer indices.
-    free_list: Mutex<VecDeque<usize>>,
+    /// Lock-free free list of pool buffer indices.
+    free_list: ArrayQueue<usize>,
     /// All pool buffers. Stable for lifetime of module.
     buffers: Vec<PoolBuffer>,
-    /// io_uring engine (owns the ring + poller thread).
-    uring: Mutex<Option<UringEngine>>,
+    /// io_uring engine (initialized once, never changes).
+    uring: OnceLock<UringEngine>,
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
 }
@@ -75,7 +77,7 @@ unsafe impl Sync for PoolStorage {}
 impl PoolStorage {
     pub fn new(buf_size: usize, buf_count: usize, data_dir: &str) -> Self {
         let mut buffers = Vec::with_capacity(buf_count);
-        let mut free_list = VecDeque::with_capacity(buf_count);
+        let free_list = ArrayQueue::new(buf_count);
 
         for i in 0..buf_count {
             let layout =
@@ -85,16 +87,16 @@ impl PoolStorage {
                 panic!("largeobj: failed to allocate pool buffer {}", i);
             }
             buffers.push(PoolBuffer { ptr, len: buf_size });
-            free_list.push_back(i);
+            free_list.push(i).unwrap();
         }
 
         Self {
             buf_size,
             buf_count,
             data_dir: data_dir.to_string(),
-            free_list: Mutex::new(free_list),
+            free_list,
             buffers,
-            uring: Mutex::new(None),
+            uring: OnceLock::new(),
             fd_pool: FdPool::new(),
         }
     }
@@ -137,8 +139,7 @@ impl PoolStorage {
 
 impl Storage for PoolStorage {
     fn pool_get(&self) -> Option<PoolBuffer> {
-        let mut fl = self.free_list.lock().unwrap();
-        fl.pop_front().map(|idx| PoolBuffer {
+        self.free_list.pop().map(|idx| PoolBuffer {
             ptr: self.buffers[idx].ptr,
             len: self.buffers[idx].len,
         })
@@ -146,8 +147,7 @@ impl Storage for PoolStorage {
 
     fn pool_put(&self, buf: PoolBuffer) {
         if let Some(idx) = self.buffers.iter().position(|b| b.ptr == buf.ptr) {
-            let mut fl = self.free_list.lock().unwrap();
-            fl.push_back(idx);
+            self.free_list.push(idx).ok();
         }
     }
 
@@ -174,14 +174,12 @@ impl Storage for PoolStorage {
             .collect();
 
         let engine = UringEngine::new(iovecs);
-        *self.uring.lock().unwrap() = Some(engine);
+        self.uring.set(engine).map_err(|_| StorageError::IoError { code: -1 })?;
         Ok(())
     }
 
     fn deregister_buffers(&self) -> Result<(), StorageError> {
-        if let Some(mut engine) = self.uring.lock().unwrap().take() {
-            engine.shutdown();
-        }
+        // OnceLock: engine lives for module lifetime. Shutdown handled in Drop.
         Ok(())
     }
 
@@ -215,11 +213,14 @@ impl Storage for PoolStorage {
         let buf_ptr = buf.ptr as usize;
         let buf_len = buf.len;
 
-        // Check engine availability before moving on_complete.
-        if self.uring.lock().unwrap().is_none() {
-            on_complete(buf, Err(StorageError::IoError { code: -1 }));
-            return;
-        }
+        // Engine must be initialized (set once at module load via register_buffers).
+        let engine = match self.uring.get() {
+            Some(e) => e,
+            None => {
+                on_complete(buf, Err(StorageError::IoError { code: -1 }));
+                return;
+            }
+        };
 
         let req = IoRequest::Read {
             fd,
@@ -232,7 +233,7 @@ impl Storage for PoolStorage {
             }),
         };
 
-        self.uring.lock().unwrap().as_ref().unwrap().submit(req);
+        engine.submit(req);
     }
 
     fn write_new(
@@ -268,13 +269,16 @@ impl Storage for PoolStorage {
         let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, len as usize) };
         let crc = crc32c::crc32c(slice);
 
-        // Check engine availability before moving on_complete.
-        if self.uring.lock().unwrap().is_none() {
-            unsafe { libc::close(fd) };
-            let _ = std::fs::remove_file(&tmp_path);
-            on_complete(buf, Err(StorageError::IoError { code: -1 }));
-            return;
-        }
+        // Engine must be initialized.
+        let engine = match self.uring.get() {
+            Some(e) => e,
+            None => {
+                unsafe { libc::close(fd) };
+                let _ = std::fs::remove_file(&tmp_path);
+                on_complete(buf, Err(StorageError::IoError { code: -1 }));
+                return;
+            }
+        };
 
         let tmp_path_for_cb = tmp_path.clone();
         let final_path_for_cb = final_path.clone();
@@ -311,7 +315,7 @@ impl Storage for PoolStorage {
             }),
         };
 
-        if let Some(engine) = self.uring.lock().unwrap().as_ref() {
+        if let Some(engine) = self.uring.get() {
             engine.submit(req);
         } else {
             unsafe { libc::close(fd) };
