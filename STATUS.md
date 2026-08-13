@@ -1,188 +1,169 @@
-# ValkeyLargeObj Module — Status & Remaining Work
+# ValkeyLargeObj Module — Status
 
-## Legend
-- ✅ Done (compiles, logic in place)
-- 🟡 Stubbed (interface defined, placeholder impl)
-- ❌ Not started
+Single source of truth for what's done and what's remaining.
 
----
+## Done
 
-## Module Entry (`src/lib.rs`)
+### Module Core
+- Module registration, config API, lifecycle, tokio runtime
+- LoValue data type, ObjectId, RDB save/load, free callback (DEL → delete NVMe)
+- LO.HELLO, LO.GET (TCP + bench-mode), LO.SET (TCP) — full roundtrip working
+- EFA paths stubbed (Session::write/read return Ok immediately)
+- BlockClient/UnblockClient async chain, keyspace write on reply
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Module registration (valkey_module! macro) | ✅ | LO.HELLO, LO.GET, LO.SET registered |
-| Config via ValkeyModule Config API | ✅ | data-dir, pool-buf-size, pool-buf-count, max-bytes, transport-threads, bench-mode |
-| Config validator (4KB alignment) | ✅ | Rejects at CONFIG SET time |
-| module_args_as_configuration | ✅ | loadmodule args map to configs |
-| Tokio runtime (module-owned) | ✅ | Spawns on init. Transport exposes async fn — internal CQ polling opaque. No handle passed. |
-| Lifecycle: init → register → shutdown | ✅ | Follows interface doc steps 1-4, 11-12 |
+### Storage
+- Buffer pool: lock-free ArrayQueue, 4KB-aligned alloc, pool_get/pool_put
+- PoolBuffer in `src/types.rs` with `idx: u16` (O(1) lookup)
+- NvmeEngine trait (`storage/mod.rs`), UringNvmeEngine (`uring.rs`)
+- io_uring: ring init, IORING_REGISTER_BUFFERS, ReadFixed/WriteFixed, CQ poller thread
+- FdPool: open-once-per-object, reuse on reads, close on delete (`fd_pool.rs`)
+- File management: tmp+rename atomicity, aligned reads, fallback paths
+- OnceLock for engine (zero-cost after init)
 
----
+### Code Quality
+- `src/errors.rs` — centralized error constants
+- `src/storage/fd_pool.rs` — extracted from pool.rs
+- `// SAFETY:` on all unsafe blocks
+- `Arc<Session>` — cloned before io_uring callback (no lock on poller thread)
+- Lifecycle init-order docs in `lib.rs`
+- `.gitignore`
 
-## Data Type Layer (`src/data_type.rs`)
-
-| Item | Status | Notes |
-|------|--------|-------|
-| LoValue struct (object_id, len, crc32c) | ✅ | |
-| ObjectId (deterministic file path) | ✅ | `{data_dir}/{oid:016x}.dat` |
-| OID monotonic counter | ✅ | AtomicU64, updated on RDB load |
-| RDB save/load callbacks | ✅ | |
-| Free callback (DEL → delete NVMe file) | ✅ | |
-| Data type callbacks (copy, digest, mem_usage) | ❌ | Optional but good for production |
-
----
-
-## Commands (`src/commands/mod.rs`)
-
-| Item | Status | Notes |
-|------|--------|-------|
-| LO.HELLO — parse peer addr + regions, create session | ✅ | |
-| LO.GET — EFA path (NVMe read → RDMA write) | 🟡 | Stubbed — EFA transport returns immediate Ok() |
-| LO.GET — TCP path (NVMe read → bulk reply) | ✅ | NVMe read via io_uring → reply with bulk bytes. Bench-mode returns size only. |
-| LO.SET — EFA path (RDMA read → NVMe write) | 🟡 | Stubbed — EFA transport returns immediate Ok() |
-| LO.SET — TCP path (inline bulk → NVMe write) | ✅ | Copies arg bytes into pool buf, writes to NVMe, stores LoValue in keyspace |
-| BlockClient/UnblockClient async chain | ✅ | ThreadSafeContext used for reply + keyspace write |
-| Reply callback stores LoValue in keyspace (SET) | ✅ | Opens key writable, sets module type value |
-| Bench-mode config (reply size only on GET) | ✅ | `bench-mode yes` loadarg — skips bulk copy, returns integer |
-| Session store (per-client HashMap) | ✅ | |
-| Client disconnect cleanup | ❌ | Should remove session on disconnect |
+### Testing & Benchmarks
+- `build.sh` — cargo build + clone valkey from source + test framework + pytest
+- Integration tests: 7 tests, valkey-bloom pattern (valkey-test-framework)
+- `bench.sh` — per-size server restart, io-threads 8, taskset, --duration, c=750
+- Benchmark results: 4KB=150K rps (io-threads 8), NVMe reads confirmed via /proc/diskstats
 
 ---
 
-## Storage Layer (`src/storage/`)
+## Remaining — High Priority
 
-### Buffer Pool (`pool.rs`)
+| Item | Notes |
+|------|-------|
+| IORING_REGISTER_FILES | Pre-register fds with kernel. Eliminates fget/fput atomics per SQE. |
+| Startup reconciliation | After crash: scan data_dir, delete orphaned .dat files not in keyspace. |
+| Client disconnect cleanup | Remove EFA session from SESSIONS map on client disconnect. |
+| Data type callbacks (copy, mem_usage) | Needed for COPY command, MEMORY USAGE. |
 
-| Item | Status | Notes |
-|------|--------|-------|
-| 4KB-aligned allocation | ✅ | `alloc_zeroed` with Layout alignment |
-| Lock-free free list (crossbeam ArrayQueue) | ✅ | Replaced Mutex<VecDeque>. Zero contention between main thread and poller. |
-| pool_get / pool_put | ✅ | Lock-free (ArrayQueue pop/push) |
-| pin / unpin | 🟡 | API defined, currently no-op (free list removal acts as implicit pin) |
-| Pin/unpin tracking bitmap | ❌ | Needed for eviction to know which bufs are safe |
-| DRAM buffer pool eviction | ❌ | When pool exhausted, evict unpinned bufs (LRU or clock) |
-| Pool stats (in-use count, hit rate) | ❌ | |
-| Oversized buffer path (objects > pool_buf_size) | ❌ | One-off mmap + register for large objects |
-| buf_index_for O(1) lookup | ❌ | Currently O(N) linear scan over all buffers to find index. Replace with HashMap<ptr,idx> or store index in PoolBuffer struct. ~5-10% overhead at 150K rps. |
+## Remaining — Medium Priority
 
-### io_uring Engine (`uring.rs`)
+| Item | Notes |
+|------|-------|
+| Multi-poller investigation | One io_uring ring may saturate on 16-drive i8g. Evaluate multiple rings. |
+| O_TMPFILE atomic write | Replace tmp+rename with O_TMPFILE → linkat (no dir entry until commit). |
+| Disk space accounting (max-bytes) | Enforce NVMe capacity limit, trigger eviction when approaching. |
+| fallocate on write | Pre-allocate space to avoid extent allocation during write. |
+| Pin/unpin tracking bitmap | Needed for buffer eviction to know which bufs are in-flight. |
+| DRAM buffer pool eviction | LRU/clock when pool exhausted (future tiering layer). |
+| INFO largeobj section | Module stats: objects stored, NVMe bytes, pool utilization, io_uring throughput. |
 
-| Item | Status | Notes |
-|------|--------|-------|
-| io_uring engine OnceLock (zero-cost access) | ✅ | Replaced Mutex<Option<UringEngine>>. Initialized once at module load, zero overhead on hot path. |
-| io_uring ring init | ✅ | `IoUring::new(256)` |
-| IORING_REGISTER_BUFFERS (pool buffers) | ✅ | Pins pages once at startup |
-| ReadFixed opcode | ✅ | Uses registered buffer index |
-| WriteFixed opcode | ✅ | |
-| CQ poller thread | ✅ | Drains channel → submits SQEs → reaps CQEs → fires callbacks |
-| Fallback to regular Read if register fails | ✅ | |
-| Error drain loop (if io_uring unavailable) | ✅ | |
-| Graceful shutdown | ✅ | Drains pending ops then exits |
-| IORING_REGISTER_FILES (pre-registered fds) | ❌ | Kernel optimization: eliminates fget/fput atomics per SQE. Requires fd pool as prerequisite (fds must stay open). |
-| Fd pool (open once per object, reuse on reads) | ✅ | HashMap<ObjectId, RawFd> + RwLock. Open once on first write, reuse on reads. |
-| Multi-poller investigation | ❌ | One poller may saturate on multi-NVMe (16-drive i8g). Evaluate multiple rings. |
-| O_TMPFILE atomic write | ❌ | Currently uses tmp+rename. O_TMPFILE → linkat is cleaner (no dir entry until commit). |
-| io_uring SQ polling (IORING_SETUP_SQPOLL) | ❌ | Kernel-side submission polling — eliminates submit() syscall. Burns a core. |
-| Batched submissions | 🟡 | Drains up to 64 per loop. Not adaptive. |
-| Aligned read length (4KB ceiling for O_DIRECT) | ✅ | `align_up()` rounds to 4KB boundary |
+## Remaining — Lower Priority (do alongside feature work)
 
-### NVMe File Management
-
-| Item | Status | Notes |
-|------|--------|-------|
-| Write: create file, write data, crc32c | ✅ | tmp + rename atomicity |
-| Read: open file, submit ReadFixed | ✅ | |
-| Delete: unlink file | ✅ | Via free callback |
-| Disk space accounting (max-bytes enforcement) | ❌ | |
-| Disk eviction policy | ❌ | When approaching max-bytes, evict coldest objects |
-| Startup reconciliation (NVMe dir vs keyspace) | ❌ | Delete orphaned files after crash |
-| fallocate on write (pre-allocate space) | ❌ | Avoids extent allocation during write |
-| Multiple stripe directories | ❌ | For multi-drive parallelism |
-| NVMe SMART logging/health monitoring | ❌ | Periodic SMART data collection, early failure detection |
+| Item | Notes |
+|------|-------|
+| Callback state machine | Replace nested closures with GetState/SetState enums + advance(). Do when replication needs to insert a step. See design below. |
+| Keyspace write on main thread | Move keyspace mutation to reply_callback (blocked on valkeymodule-rs). |
+| Graceful shutdown drain | Wire UringNvmeEngine::shutdown() into module deinit, drain in-flight ops. |
+| Storage retryable error enum | EAGAIN/ring-full vs ENOENT/corruption. `is_retryable()` for back-pressure. |
+| Unit tests | ObjectId, PoolBuffer lifecycle, FdPool, NvmeEngine mock. |
+| io_uring SQ polling (SQPOLL) | Kernel-side submission polling. Burns a core but eliminates submit() syscall. |
+| Multiple stripe directories | For multi-drive parallelism beyond LVM. |
+| NVMe SMART monitoring | Periodic SMART data collection, early failure detection. |
+| Oversized buffer path | One-off mmap + register for objects > pool_buf_size. |
+| CI setup | Automated build + test on push. |
 
 ---
 
-## Transport Layer (`src/transport/mod.rs`)
+## Replication (not started — entire subsystem)
 
-| Item | Status | Notes |
-|------|--------|-------|
-| PoolBuffer shared type | ✅ | `{ ptr: *mut u8, len: usize }` |
-| EfaAddress type ([u8; 32]) | ✅ | |
-| ClientRegion (rkey: u64, remote_addr, len) | ✅ | |
-| TransportError enum | ✅ | |
-| EfaContext struct + init | 🟡 | Stubbed — returns `available: false` on dev desktop |
-| EfaContext::register_buffers (fi_mr_reg) | 🟡 | No-op when EFA unavailable |
-| Session::new (fi_av_insert peer) | 🟡 | Stores regions, no actual fi_* calls |
-| Session::write (fi_writemsg → CQ callback) | 🟡 | Immediate Ok(()) stub |
-| Session::read (fi_readmsg → CQ callback) | 🟡 | Immediate Ok(()) stub |
-| Session::close | 🟡 | No-op |
-| server_addrs (fi_getname) | 🟡 | Returns empty vec |
-| Actual libfabric FFI integration | ❌ | Transport crate will provide this |
-| Multi-EFA device LB (best-of-two) | ❌ | |
-| CQ poller tasks on tokio runtime | ❌ | |
-| Dual-registration (same pages to io_uring + EFA) | 🟡 | Architecture defined, EFA side stubbed |
+### Metadata Stream
+- TIERING.REF command (propagates key+oid+len+crc via replication)
+- Replication start/stop module hooks
+- RDB load: build pull queue from refs
+- Core state: VM_SetClusterFlags(NO_FAILOVER) while queue non-empty
+- Core lag: VM_SetReplicationAckOffset — hold back ACK until hydration complete
+- Cut-off period (grace before declaring pull failed)
+
+### Data Pull Engine
+- Pull queue (ObjectId queue from RDB refs + TIERING.REF stream)
+- Pull engine thread (replica pulls via LO.GET from primary)
+- Client pool for pull connections (auth/ACL/TLS)
+- Congestion control (limit in-flight pulls)
+- Queue drain detection → clear NO_FAILOVER, resume ACK offset
+- Slot migration: OnSlotImportReadyCheck (return 0 until slot objects pulled)
 
 ---
 
-## Replication
+## Transport (stubbed — replaced by libefa-rs crate)
 
-### Replication Control (metadata stream)
-
-| Item | Status | Notes |
-|------|--------|-------|
-| TIERING.REF command | ❌ | Propagates (key, oid, len, crc) via replication stream to replicas |
-| Replication start/stop callbacks | ❌ | Module hooks for when replication begins/ends |
-| RDB save: write refs (not data) | ✅ | RDB callbacks save oid/len/crc only |
-| RDB load: build pull queue from refs | ❌ | On replica RDB load, queue all OIDs for pulling |
-| Core replication state reflection | ❌ | VM_SetClusterFlags(NO_FAILOVER) while queue non-empty |
-| Core replication lag reflection | ❌ | VM_SetReplicationAckOffset — hold back ACK so lag metric reflects pending pulls |
-| Cut-off period | ❌ | Grace period before declaring pull failed / giving up |
-
-### Replication Data Pull Engine
-
-| Item | Status | Notes |
-|------|--------|-------|
-| Pull queue (ObjectId queue) | ❌ | Built from RDB refs + TIERING.REF stream |
-| Pull engine thread/task | ❌ | Replica pulls objects from primary via LO.GET |
-| Client pool for pull connections | ❌ | Pool of authenticated connections to primary |
-| Auth/ACL/TLS for pull clients | ❌ | Replica→primary auth, encryption |
-| Congestion control | ❌ | Backpressure — limit in-flight pulls to avoid overwhelming primary |
-| Pull completion → clear queue entry | ❌ | On successful pull, write to NVMe + remove from queue |
-| Queue drain detection | ❌ | When queue empty, clear NO_FAILOVER flag + resume ACK offset |
-| Slot migration: OnSlotImportReadyCheck | ❌ | Return 0 until all objects for slot are pulled |
+All transport methods are stubs. Real implementation comes from external libefa-rs crate:
+- EfaContext discovery (fi_getinfo, fi_fabric, fi_domain)
+- Session creation (fi_endpoint, fi_av_insert)
+- DMA write/read (fi_writemsg/fi_readmsg + CQ poll)
+- Multi-EFA device load balancing
+- Buffer dual-registration (io_uring + EFA on same pages)
 
 ---
 
-## Observability
+## Callback State Machine Design (for replication phase)
 
-| Item | Status | Notes |
-|------|--------|-------|
-| INFO largeobj section | ❌ | Module stats in INFO output |
-| Objects stored count | ❌ | Total LoValues in keyspace |
-| NVMe bytes used | ❌ | Total bytes on disk |
-| Buffer pool utilization | ❌ | in-use / total buffers |
-| io_uring submissions/completions | ❌ | Throughput counters |
-| io_uring latency histogram | ❌ | p50/p99 read/write latency |
-| EFA sessions active | ❌ | Count of LO.HELLO sessions |
-| EFA bytes transferred | ❌ | RDMA read/write bytes |
-| Pull queue depth | ❌ | Pending pulls on replica |
-| Pull throughput (objects/sec, bytes/sec) | ❌ | |
-| NVMe SMART health | ❌ | Periodic SMART data, early failure detection |
+**LO.GET states:**
+```
+TCP:   NvmeRead → Reply(bulk data)
+EFA:   NvmeRead → EfaWrite → Reply(size integer)
+```
 
----
+**LO.SET states:**
+```
+TCP:   CopyInline → NvmeWrite → KeyspaceWrite → Replicate → Reply(OK)
+EFA:   EfaRead → NvmeWrite → KeyspaceWrite → Replicate → Reply(OK)
+```
 
-## Integration & Testing
+**Structs:**
+```rust
+struct GetContext {
+    buf: Option<PoolBuffer>,
+    object_id: ObjectId,
+    obj_len: u64,
+    blocked_client: BlockedClient,
+    session: Option<Arc<Session>>,   // None = TCP, Some = EFA
+    efa_args: Option<(u32, u64)>,    // (region_idx, remote_offset)
+}
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Builds clean (cargo build) | ✅ | Produces libvalkey_largeobj.so |
-| Load into Valkey and run LO.SET/LO.GET | ✅ | Full roundtrip verified: SET writes to NVMe + keyspace, GET reads and returns bulk data |
-| Bench-mode perf test (gp3 baseline) | ✅ | c=1: ~2K rps, c=8: ~4.3K rps (gp3 IOPS ceiling). Matches expected 52-74x slower than NVMe. |
-| Basic integration test (TCP path) | ❌ | Automated test suite |
-| EFA integration test (requires i8g with EFA ENI) | ❌ | |
-| Benchmark on i8ge (compare to NVMEBenchmark) | ❌ | Expected: ~72K rps/c=1, ~166K rps/c=100 at 4KB |
-| CI setup | ❌ | |
+struct SetContext {
+    buf: Option<PoolBuffer>,
+    key_name: Vec<u8>,
+    obj_len: u64,
+    blocked_client: BlockedClient,
+    session: Option<Arc<Session>>,
+    efa_args: Option<(u32, u64)>,
+    object_id: Option<ObjectId>,     // set after NvmeWrite completes
+    crc: Option<u32>,
+}
 
----
+enum GetState { NvmeRead, EfaWrite, Reply }
+enum SetState { SourceData, NvmeWrite, KeyspaceWrite, Replicate, Reply }
+```
 
+**Transitions:**
+```rust
+fn advance_get(ctx: GetContext, state: GetState, result: Result<...>) {
+    match state {
+        NvmeRead => if ctx.session.is_some() { → EfaWrite } else { → Reply }
+        EfaWrite → Reply
+        Reply → unpin, pool_put, unblock_client
+    }
+}
+
+fn advance_set(ctx: SetContext, state: SetState, result: Result<...>) {
+    match state {
+        SourceData → NvmeWrite  (EFA: buf filled from GPU. TCP: already filled.)
+        NvmeWrite → KeyspaceWrite  (store oid+crc in ctx)
+        KeyspaceWrite → Replicate  (open_key_writable, set_value)
+        Replicate → Reply  (propagate TIERING.REF)
+        Reply → unpin, pool_put, unblock_client(OK)
+    }
+}
+```
+
+**Assessment:** Current nesting is 2-3 levels (lo_get: 105 lines, lo_set: 116 lines). Readable today. The state machine adds ~100 lines for zero functional change. **Do alongside the first replication commit that inserts a step between NvmeWrite and Reply.**
