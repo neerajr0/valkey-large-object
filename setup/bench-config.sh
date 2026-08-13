@@ -21,6 +21,7 @@ _CFG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${POOL_BUF_COUNT:=5000}"    # io_uring registered buffer count
 : "${KEEP_READ_FDS:=1}"        # 1 = pool fds, 0 = open-per-GET
 : "${DIR_SHARDS:=1}"           # 1 = flat, 16384 = per-Valkey-slot subdirs
+: "${OPEN_THREADS:=0}"         # N open() worker threads (0 = inline; non-pooling only)
 : "${FD_LIMIT:=20000000}"      # ulimit -n for the server
 : "${SERVER_CPUS:=0-31}"       # taskset for valkey-server
 

@@ -11,7 +11,7 @@
 #
 # The fd-recycling penalty lives on the GET path only: BO.SET never opens a read
 # fd in keep-read-fds 0 mode, so profile a GET workload against a keep-read-fds 0
-# server to see it. Start that server first:  ./bench-server.sh 0 <shards>
+# server to see it. Start that server first:  ./bench-server.sh -k 0 -d <shards> -o 0
 #
 # Usage:
 #   ./bench-perf.sh                # profile a GET workload (default), 20s window

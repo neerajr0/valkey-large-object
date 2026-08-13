@@ -4,7 +4,7 @@
 # this SUSTAINS the cold state by dropping the inode/dentry cache on a loop for the
 # whole window, so open() keeps faulting and the bottleneck stays on screen.
 #
-# Run against a NON-POOLING server:   ./bench-server.sh 0 1   (keep-read-fds 0)
+# Run against a NON-POOLING server:   ./bench-server.sh -k 0 -d 1 -o 1
 # then populate:                       ./bench-load.sh
 #
 # Three views are captured:
@@ -28,12 +28,12 @@ COLD_SECS="$((PERF_SECS + TRACE_SECS + 8))"   # keep dropping caches this long
 
 command -v perf >/dev/null 2>&1 || { echo "[bench] perf not found (sudo dnf install -y perf)"; exit 1; }
 PID="$(pgrep -o valkey-server || true)"
-[ -n "$PID" ] || { echo "[bench] no valkey-server running — ./bench-server.sh 0 1 first"; exit 1; }
+[ -n "$PID" ] || { echo "[bench] no valkey-server running — ./bench-server.sh -k 0 -d 1 -o 1 first"; exit 1; }
 
 # Warn if the server is actually pooling (then there are no per-GET opens to see).
 if grep -q 'keep_read_fds=true' <(grep 'bigobj: initialized' "$LOGFILE" 2>/dev/null | tail -1); then
   echo "[bench] WARNING: server is keep_read_fds=true (POOLING) — there are no per-GET open()s."
-  echo "[bench]          restart non-pooling:  ./bench-server.sh 0 1"
+  echo "[bench]          restart non-pooling:  ./bench-server.sh -k 0 -d 1 -o 1"
 fi
 
 snapshot_cpu() {
