@@ -167,3 +167,40 @@ fn advance_set(ctx: SetContext, state: SetState, result: Result<...>) {
 ```
 
 **Assessment:** Current nesting is 2-3 levels (lo_get: 105 lines, lo_set: 116 lines). Readable today. The state machine adds ~100 lines for zero functional change. **Do alongside the first replication commit that inserts a step between NvmeWrite and Reply.**
+
+---
+
+## DRAM Tier (not started — future extension)
+
+Buffer pool today is transient: GET reads NVMe → buf → reply → pool_put (buf contents discarded).
+DRAM tier retains hot objects in pool buffers across requests — second GET for same key hits DRAM, not NVMe.
+
+### Architecture
+
+```
+LO.GET key:
+  1. pool.lookup(object_id) → HIT:  pin, reply from DRAM, unpin (no io_uring, no NVMe)
+                            → MISS: pool.reserve() → io_uring read → reply → buf stays in pool (cached)
+```
+
+### Tasks
+
+| Item | Notes |
+|------|-------|
+| Named buffers | Associate buf with object_id after read. Buf stays in pool keyed by OID. |
+| Cache index (ObjectId → buf_idx) | O(1) lookup on GET hot path. HashMap or array if OIDs are dense. Main-thread only (no cross-thread sync for hits). |
+| Eviction policy (LRU or clock) | When pool full and new object needs loading, evict coldest unpinned buffer. |
+| Pin/unpin enforcement | Pin = buffer in-flight (io_uring read, EFA DMA, TCP reply). Cannot be evicted. Unpin = safe to evict. Bitmap or atomic per-buffer flag. |
+| Admission policy | Not all objects should be cached. Options: cache-on-second-access, cache-if-size ≤ threshold, always-cache. |
+| Invalidation on DEL/overwrite | LO.SET to existing key or DEL must remove the buffer from cache index. Free callback already deletes NVMe file — extend to clear cache entry. |
+| Memory accounting | Report DRAM tier usage via INFO. Respect max-memory or dedicated pool-max-bytes config. |
+| Warm-up on RDB load | Optionally pre-fill DRAM cache for first N objects during RDB load (configurable). |
+| Interaction with eviction (NVMe tier) | If DRAM-cached object is evicted from NVMe tier (disk full), DRAM copy becomes authoritative until next write-back. |
+| Metrics | Cache hit/miss ratio, eviction count, DRAM bytes used, hit latency vs miss latency. |
+
+### Design Decisions (pending)
+
+- **Pool size partitioning:** Fixed DRAM tier size (e.g., 50% of pool for cache, 50% for in-flight), or dynamic (any free buffer can become cache)?
+- **Write-through vs write-back:** On LO.SET, always write to NVMe immediately (current behavior, DRAM is read cache only)? Or buffer writes in DRAM and flush lazily?
+- **Consistency:** If same object is cached in DRAM and someone does LO.SET with new data, the DRAM copy must be invalidated atomically before the new write completes.
+- **Interaction with replication:** Replica's DRAM cache is independent (populated by its own pull engine reads). No cache state in replication stream.
