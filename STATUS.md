@@ -57,18 +57,20 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | 4KB-aligned allocation | ✅ | `alloc_zeroed` with Layout alignment |
-| Free list (VecDeque<usize>) | ✅ | |
-| pool_get / pool_put | ✅ | |
+| Lock-free free list (crossbeam ArrayQueue) | ✅ | Replaced Mutex<VecDeque>. Zero contention between main thread and poller. |
+| pool_get / pool_put | ✅ | Lock-free (ArrayQueue pop/push) |
 | pin / unpin | 🟡 | API defined, currently no-op (free list removal acts as implicit pin) |
 | Pin/unpin tracking bitmap | ❌ | Needed for eviction to know which bufs are safe |
 | DRAM buffer pool eviction | ❌ | When pool exhausted, evict unpinned bufs (LRU or clock) |
 | Pool stats (in-use count, hit rate) | ❌ | |
 | Oversized buffer path (objects > pool_buf_size) | ❌ | One-off mmap + register for large objects |
+| buf_index_for O(1) lookup | ❌ | Currently O(N) linear scan over all buffers to find index. Replace with HashMap<ptr,idx> or store index in PoolBuffer struct. ~5-10% overhead at 150K rps. |
 
 ### io_uring Engine (`uring.rs`)
 
 | Item | Status | Notes |
 |------|--------|-------|
+| io_uring engine OnceLock (zero-cost access) | ✅ | Replaced Mutex<Option<UringEngine>>. Initialized once at module load, zero overhead on hot path. |
 | io_uring ring init | ✅ | `IoUring::new(256)` |
 | IORING_REGISTER_BUFFERS (pool buffers) | ✅ | Pins pages once at startup |
 | ReadFixed opcode | ✅ | Uses registered buffer index |
