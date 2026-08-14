@@ -36,6 +36,18 @@ if grep -q 'keep_read_fds=true' <(grep 'bigobj: initialized' "$LOGFILE" 2>/dev/n
   echo "[bench]          restart non-pooling:  ./bench-server.sh -k 0 -d 1 -o 1"
 fi
 
+# GUARD: a server RESTART wipes the in-memory object index (we run --save "", and
+# the module does not rebuild the index from the .dat files on startup). If the
+# index is empty, EVERY GET misses and returns Null WITHOUT opening a file — you'd
+# measure null-reply throughput, not real cold GETs. So reload after any restart.
+OBJ_CNT="$($CLI BO.INFO 2>/dev/null | grep -o 'object_count:[0-9]*' | cut -d: -f2)"
+if [ "${OBJ_CNT:-0}" -lt 1 ]; then
+  echo "[bench] ERROR: object_count=${OBJ_CNT:-0} — the in-memory index is EMPTY." >&2
+  echo "[bench]        A server restart wiped it. Run ./bench-load.sh, then re-run this." >&2
+  exit 1
+fi
+bc_echo "object_count=$OBJ_CNT (index populated — GETs will hit real objects)"
+
 snapshot_cpu() {
   local out="$1"; : > "$out"; local tid st comm ticks
   for tid in $(sudo ls "/proc/$PID/task" 2>/dev/null); do
@@ -60,7 +72,8 @@ cleanup() {
 trap cleanup EXIT
 
 # --- launch the GET workload in the background ---
-bc_echo "starting GET workload ($CLIENTS clients, ${WORK_SECS}s) ..."
+bc_echo "GET workload: taskset -c $BENCH_CPUS $BENCH -c $CLIENTS --duration $WORK_SECS -r $KEYSPACE BO.GET bo:key:__rand_int__"
+bc_echo "  (running in background; live output → /tmp/bigobj-perf-cold-bench.out)"
 taskset -c "$BENCH_CPUS" $BENCH -c "$CLIENTS" --duration "$WORK_SECS" \
   -r "$KEYSPACE" BO.GET bo:key:__rand_int__ >/tmp/bigobj-perf-cold-bench.out 2>&1 &
 WORK_BG=$!

@@ -374,7 +374,82 @@ likely real (flat band ~1%) but 3 runs would confirm.
 
 **Confirmed: sharding is only worthwhile paired with PARALLEL opens** (io-wq /
 open-thread pool), where shards stop concurrent openers serializing on one
-directory lock. That is the decisive next experiment.
+directory lock. That is the decisive next experiment. **(Now answered — see
+Experiment 3: it does, dramatically, in the cold + parallel regime.)**
+
+---
+
+## Experiment 3: open-offload worker pool (`open-threads N`)
+
+Motivated by the cold profile (`bench-perf-cold.sh`): with non-pooling, the
+on-demand `open()` runs synchronously on the Valkey main thread and **blocks it**
+on a cold inode/directory fault from NVMe. Sustained cold, throughput collapses to
+~8K RPS with the main thread ~85% of wall-clock inside `openat` (and only ~25%
+CPU — the rest is off-CPU, asleep on disk). On-CPU, the dominant leaf is
+`xfs_dir2_node_lookup` (walking the directory B-tree of ~950K entries).
+
+**Implementation** (`open-threads N` arg, `src/open_pool.rs`): in non-pooling mode,
+`bo_get` blocks the client and hands the open to a pool of N worker threads via a
+second crossbeam channel (SPMC). Each worker does the blocking `open()` off the
+main thread, then submits the read to the existing io_uring poller (the read
+channel becomes MPSC). `open-threads 0` = original inline behavior (control).
+Pipeline: `main → [open chan] → open worker: open() → [read chan] → poller → UnblockClient`.
+
+### Methodology note (IMPORTANT — a restart wipes the in-memory index)
+
+A server restart wipes the **in-memory** object index (we run `--save ""`, and the
+module does not rebuild the index from the `.dat` files on startup). The files
+persist on disk, but `bo_get` gates on the in-memory index first — so after a
+restart with **no reload**, every GET misses and returns Null *without opening a
+file*. That measures null-reply throughput (~140K), not real cold GETs — the tell
+is `openat` ≈ 0 in the trace. **Reload after every restart.** `bench-perf-cold.sh`
+now aborts if `object_count == 0`. All numbers below are with a populated index
+(real `openat` counts in the tens of thousands).
+
+### Results (sustained cold via `drop_caches` every 1s, non-pooling, 950K × 4KB, 750c)
+
+| Config (cold, non-pooling) | Cold RPS | P50 | avg openat | Bottleneck (from %CPU + on-CPU) |
+|---|---|---|---|---|
+| inline (`open-threads 0`) | 8,388 | 78 ms | 188 µs | main thread BLOCKED in `openat` (25.8% CPU, off-CPU); on-CPU `openat → xfs_dir2_node_lookup` |
+| 1 worker, flat | 12,834 | 14 ms | 188 µs | the single worker (serial cold opens, 96% wall in `openat`); main freed |
+| **16 workers, 1024 shards** | **112,837** | **4.9 ms** | **~100 µs** | **main thread — network egress `tcp_sendmsg` (101.5% CPU)** |
+| *(ref) pooled* | *176,186* | *0.24 ms* | *—* | *main thread — network* |
+| *(ref) warm non-pooling* | *~150K* | *—* | *—* | *main thread — network* |
+
+**Findings:**
+- **Offload works, provably.** Main-thread `openat` calls: 22,277 (inline) → 50
+  (1 worker) → 46 (16 workers). Opens move onto the `bigobj-open-*` threads; the
+  main thread's on-CPU profile flips from the cold-open path to the network path.
+- **1 worker ≈ 1.5×** (8.4K → 12.8K): it relocates the block from the main thread
+  to a single worker, which then serializes on ~188 µs cold opens (~5K/s ceiling).
+- **16 workers + sharding ≈ 13.5×** (8.4K → 112.8K): parallel opens (16 workers,
+  none pegged, ~23.5% CPU each) **plus** sharding shrinking the directory B-tree —
+  per-open latency 188 µs → ~100 µs, because each shard dir holds ~930 files
+  instead of 950K, making `xfs_dir2_node_lookup` cheap. **Sharding finally pays off
+  — only here, in the cold + parallel regime** (warm or serial it was
+  neutral-to-negative, per Experiment 2).
+- **The bottleneck moved back to the main thread** (101.5% CPU, `tcp_sendmsg`) —
+  the SAME ceiling as pooled/warm. The cold-open stall is fully escaped.
+- **More than ~16 workers won't help:** workers are only ~23.5% busy; the main
+  thread is saturated. Now network/main-thread-bound, not open-bound (~12 workers
+  would sustain 112K: ~112K × 100 µs ≈ 11 worker-seconds/sec).
+- **The poller rose to 52.4%** (was ~15%): now fed by 16 workers (MPSC), doing
+  ~112K reads + closes/sec. Headroom remains, but it's the next thing to saturate.
+
+### Bottom line
+
+**Non-pooling + 16 open-workers + 1024 shards recovers ~113K RPS cold — ~64% of
+pooled's 176K — WITHOUT pinning ~950K fds or ~2 GB of non-reclaimable kernel
+memory, and without the cold-collapse.** Thesis validated: you can drop the fd pool
+and stay fast, provided you (1) offload `open()` off the main thread, (2)
+parallelize it across enough workers, and (3) shard directories so parallel cold
+opens don't serialize on one directory B-tree/lock. The residual gap to pooled
+(113K vs 176K) is main-thread network egress + per-GET offload overhead
+(block/unblock + channel sends); the lever from here is Valkey `io-threads`
+(offload the socket writes) — same conclusion as the warm profile.
+
+Caveat: numbers are under `drop_caches` every 1s (aggressively cold). Real
+production with a partly-warm cache sits higher, toward the ~150K warm figure.
 
 ---
 
@@ -397,11 +472,20 @@ directory lock. That is the decisive next experiment.
 **Conclusion / recommendation:**
 Neither extreme is ideal. "Pool every fd forever" (current default) is fast but
 costs ~1.7 KB pinned kernel memory per object and doesn't scale to 10s of
-millions of objects (fd-limit + pinned-memory wall). "Never pool" is scalable
-but pays a large main-thread open()/close() penalty per GET.
-→ The right design is a **bounded LRU fd cache** (hold the hot N fds open,
-open-on-demand for the cold tail): keeps ~Arm-A throughput for the working set
-while capping fds/pinned-memory at N regardless of object count. The
-even-longer-term fix is a **slab/packed-file layout** (offset+len in
+millions of objects (fd-limit + pinned-memory wall). "Never pool" is scalable but,
+naively (inline open on the main thread), pays a large per-GET penalty that
+*collapses* under a cold cache (~8K RPS — Experiment 3).
+→ **Validated fix (Experiment 3): non-pooling + open-offload worker pool +
+directory sharding.** Offloading `open()` to ~16 worker threads and sharding into
+~1024 dirs recovers ~113K RPS *cold* (~64% of pooled) with only ~11 fds and
+~0.74 GB kernel memory — decoupling throughput from the fd/pinned-memory wall. This
+is the scalable path: keep the memory profile of "never pool" while approaching the
+throughput of "pool everything."
+→ A **bounded LRU fd cache** (hold the hot N fds, open-on-demand for the cold tail)
+remains complementary — it would shrink the offload pool's work to the cold tail
+only. The even-longer-term fix is a **slab/packed-file layout** (offset+len in
 ObjectMeta) so object count is fully decoupled from fd count.
-See the backlog doc's "Claude's TODOs" — this test quantifies both sides.
+→ Remaining ceiling is the single-threaded network egress on the main thread
+(`tcp_sendmsg`), unchanged across pooled/warm/offloaded — the next lever is Valkey
+`io-threads`.
+See the backlog doc's "Claude's TODOs" — this test quantifies all sides.
