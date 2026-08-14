@@ -4,10 +4,12 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
-use crate::types::PoolBuffer;
+use crate::types::PinnedBuffer;
+pub use buffer::Buffer;
 
 pub mod fd_pool;
-pub mod pool;
+pub mod buffer;
+pub mod engine;
 pub mod uring;
 
 // ─── Error Types ─────────────────────────────────────────────────────────────
@@ -45,16 +47,8 @@ pub trait Storage: Send + Sync {
     // ─── Buffer Pool ─────────────────────────────────────────────────────
 
     /// Get a buffer from the pool. Returns None if pool exhausted.
-    fn pool_get(&self) -> Option<PoolBuffer>;
-
-    /// Return a buffer to the pool.
-    fn pool_put(&self, buf: PoolBuffer);
-
-    /// Pin buffer — prevents eviction/reuse during in-flight DMA or io_uring op.
-    fn pin(&self, ptr: *mut u8);
-
-    /// Unpin buffer — allows eviction/reuse.
-    fn unpin(&self, ptr: *mut u8);
+    /// The returned Buffer is owned — Drop returns it to the pool automatically.
+    fn pool_get(&self) -> Option<Buffer>;
 
     /// Pool buffer size (all buffers are this fixed size).
     fn pool_buf_size(&self) -> usize;
@@ -69,26 +63,24 @@ pub trait Storage: Send + Sync {
 
     // ─── NVMe I/O ───────────────────────────────────────────────────────
 
-    /// Read object bytes from NVMe into buf. Async via io_uring ReadFixed.
-    /// object_id maps directly to file path: {data_dir}/{oid:016x}.dat
-    /// Takes PoolBuffer by value (ownership transfers to storage during I/O).
-    /// Returns (PoolBuffer, bytes_read) in callback — caller gets buf back.
+    /// Read object from NVMe into buf. Async via io_uring ReadFixed.
+    /// Takes Buffer by value (ownership transfers to storage during I/O).
+    /// Returns (Buffer, bytes_read) in callback — caller gets buf back.
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<u64, StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
     );
 
     /// Write buf to NVMe as a new object. Async via io_uring.
-    /// Takes PoolBuffer by value. Returns (PoolBuffer, ObjectId, crc32c) via callback.
-    /// Atomicity: O_TMPFILE → write → linkat.
+    /// Takes Buffer by value. Returns (Buffer, ObjectId, crc32c) via callback.
     fn write_new(
         &self,
-        buf: PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(ObjectId, u32), StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
     );
 
     /// Delete an object file from NVMe. Called on key deletion or eviction.
@@ -98,10 +90,17 @@ pub trait Storage: Send + Sync {
 // ─── Global Storage Instance ─────────────────────────────────────────────────
 
 use std::sync::OnceLock;
-static STORAGE: OnceLock<pool::PoolStorage> = OnceLock::new();
+static STORAGE: OnceLock<engine::StorageEngine> = OnceLock::new();
 
-pub fn get() -> &'static pool::PoolStorage {
+pub fn get() -> &'static engine::StorageEngine {
     STORAGE.get().expect("storage not initialized")
+}
+
+/// Called by Buffer::drop() to return a buffer to the pool.
+pub fn return_buffer(pinned: &'static crate::types::PinnedBuffer, idx: u16) {
+    if let Some(storage) = STORAGE.get() {
+        storage.buffer_pool().put_back(pinned, idx);
+    }
 }
 
 /// Convenience: delete an object's NVMe file.
@@ -110,8 +109,10 @@ pub fn delete(object_id: crate::data_type::ObjectId) {
 }
 
 pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
-    let storage = pool::PoolStorage::new(buf_size, buf_count, data_dir);
+    let storage = engine::StorageEngine::new(buf_size, buf_count, data_dir);
     STORAGE.set(storage).ok();
+    // Fill the pool now that StorageEngine is in the static OnceLock.
+    get().init_pool();
 }
 
 /// Shutdown: drain in-flight ops, close fds, clean up files.
@@ -130,7 +131,7 @@ pub fn deregister_buffers() {
     let _ = get().deregister_buffers();
 }
 
-/// Return PoolBuffer descriptors for transport layer to fi_mr_reg.
-pub fn pool_buffer_descriptors() -> Vec<PoolBuffer> {
+/// Return Buffer descriptors for transport layer to fi_mr_reg.
+pub fn pinned_buffers() -> &'static [PinnedBuffer] {
     get().buffer_descriptors()
 }

@@ -135,18 +135,13 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let storage = storage::get();
     let buf = storage.pool_get().ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
-    let buf_ptr = buf.ptr as usize;
-    storage.pin(buf_ptr as *mut u8);
 
     let blocked_client = ctx.block_client();
 
     // NVMe read — buf moved in, comes back in callback.
     storage.read_into(object_id, buf, obj_len, Box::new(move |buf, read_result| {
-        let storage = storage::get();
         match read_result {
             Err(e) => {
-                storage.unpin(buf_ptr as *mut u8);
-                storage.pool_put(buf);
                 unblock_client(blocked_client, ReplyData::Err(
                     format!("{}: {}", errors::ERR_NVME_READ, e),
                 ));
@@ -157,10 +152,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     // session_arc was cloned before entering this callback — no lock needed.
                     if let Some(session) = session_arc {
                         session.write(buf, bytes_read as usize, region_idx, remote_offset,
-                            Box::new(move |buf, write_result| {
-                                let storage = storage::get();
-                                storage.unpin(buf_ptr as *mut u8);
-                                storage.pool_put(buf);
+                            Box::new(move |_buf, write_result| {
                                 let reply = match write_result {
                                     Ok(()) => ReplyData::GetOk { bytes_read },
                                     Err(e) => ReplyData::Err(
@@ -171,8 +163,6 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             }),
                         );
                     } else {
-                        storage.unpin(buf_ptr as *mut u8);
-                        storage.pool_put(buf);
                         unblock_client(blocked_client, ReplyData::Err(
                             errors::ERR_SESSION_GONE.to_string(),
                         ));
@@ -181,16 +171,12 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     // TCP: copy bytes from buf, release buf, reply with data
                     // In bench-mode: reply with size only (skips TCP output buffer copy)
                     if crate::bench_mode() {
-                        storage.unpin(buf_ptr as *mut u8);
-                        storage.pool_put(buf);
                         unblock_client(blocked_client, ReplyData::GetOk { bytes_read });
                     } else {
-                        // SAFETY: buf.ptr is valid pool memory, bytes_read <= buf.len.
+                        // SAFETY: buf.ptr() is valid pool memory, bytes_read <= buf.len.
                         let data = unsafe {
-                            std::slice::from_raw_parts(buf.ptr, bytes_read as usize).to_vec()
+                            std::slice::from_raw_parts(buf.ptr(), bytes_read as usize).to_vec()
                         };
-                        storage.unpin(buf_ptr as *mut u8);
-                        storage.pool_put(buf);
                         unblock_client(blocked_client, ReplyData::GetOkTcp { data });
                     }
                 }
@@ -241,8 +227,6 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     let buf = storage.pool_get().ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
-    let buf_ptr = buf.ptr as usize;
-    storage.pin(buf_ptr as *mut u8);
 
     let blocked_client = ctx.block_client();
 
@@ -256,10 +240,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                         Ok(()) => {
                             // Now write buf to NVMe.
                             let storage = storage::get();
-                            storage.write_new(buf, obj_len, Box::new(move |buf, write_result| {
-                                let storage = storage::get();
-                                storage.unpin(buf_ptr as *mut u8);
-                                storage.pool_put(buf);
+                            storage.write_new(buf, obj_len, Box::new(move |_buf, write_result| {
                                 let reply = match write_result {
                                     Ok((oid, crc)) => ReplyData::SetOk {
                                         key_name: key_for_reply, oid, len: obj_len, crc,
@@ -272,9 +253,6 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             }));
                         }
                         Err(e) => {
-                            let storage = storage::get();
-                            storage.unpin(buf_ptr as *mut u8);
-                            storage.pool_put(buf);
                             unblock_client(blocked_client, ReplyData::Err(
                                 format!("{}: {}", errors::ERR_EFA_READ, e),
                             ));
@@ -283,8 +261,6 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 }),
             );
         } else {
-            storage.unpin(buf_ptr as *mut u8);
-            storage.pool_put(buf);
             unblock_client(blocked_client, ReplyData::Err(
                 errors::ERR_SESSION_GONE.to_string(),
             ));
@@ -294,17 +270,14 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         if args.len() > 3 {
             let data = args[3].as_slice();
             let copy_len = data.len().min(obj_len as usize);
-            // SAFETY: buf.ptr is a valid pool buffer with capacity >= buf_size >= obj_len.
+            // SAFETY: buf.ptr() is a valid pool buffer with capacity >= buf_size >= obj_len.
             // data.as_ptr() is valid for data.len() bytes. copy_len <= both.
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr, copy_len) };
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr(), copy_len) };
         }
 
         // Write buf to NVMe.
         let key_for_reply = key_name.as_slice().to_vec();
-        storage.write_new(buf, obj_len, Box::new(move |buf, write_result| {
-            let storage = storage::get();
-            storage.unpin(buf_ptr as *mut u8);
-            storage.pool_put(buf);
+        storage.write_new(buf, obj_len, Box::new(move |_buf, write_result| {
             let reply = match write_result {
                 Ok((oid, crc)) => ReplyData::SetOk {
                     key_name: key_for_reply, oid, len: obj_len, crc,
