@@ -17,7 +17,7 @@
 //
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
 //   2. storage::init(buf_size, buf_count, data_dir)
-//                              — allocate pool buffers, create PoolStorage.
+//                              — allocate pool buffers, create StorageEngine.
 //                              — scan data_dir for existing .dat files to
 //                                recover OID counter (avoids OID collision).
 //   3. storage::register_buffers()
@@ -164,8 +164,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     storage::register_buffers();
 
     // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
-    let pool_bufs = storage::pool_buffer_descriptors();
-    transport::register_buffers(&pool_bufs);
+    let pinned = storage::pinned_buffers();
+    transport::register_buffers(pinned);
 
     ctx.log_notice(&format!(
         "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",

@@ -3,7 +3,7 @@
 //! The data type layer owns:
 //! - LoValue struct in keyspace (accessed via ValkeyModule_OpenKey)
 //! - OID generation (monotonic counter)
-//! - RDB callbacks (save/load references)
+//! - RDB callbacks (save/load references) (TODO)
 //! - TIERING.REF replication (TODO)
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
 
@@ -18,7 +18,11 @@ use valkey_module::raw;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(pub u64);
 
-/// Monotonic OID counter. Each node generates unique IDs independently.
+/// Monotonic OID counter.
+/// TODO: Not yet unique per node. Currently a plain counter starting at 1.
+/// Two nodes in a cluster will generate colliding OIDs.
+/// Fix: hash VM_GetMyClusterID() to 16 bits, OR into top bits of counter.
+/// Requires raw FFI call (no safe wrapper in valkey-module crate yet).
 static OID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl ObjectId {
@@ -52,38 +56,6 @@ pub struct LoValue {
     pub crc32c: u32,         // integrity checksum (verified on replication pull)
 }
 
-// ─── RDB Callbacks ───────────────────────────────────────────────────────────
-
-unsafe extern "C" fn lo_rdb_save(rdb: *mut raw::RedisModuleIO, value: *mut std::ffi::c_void) {
-    // SAFETY: value is a valid LoValue pointer created by us in rdb_load or set_value.
-    // rdb is a valid RedisModuleIO context provided by the engine during RDB save.
-    let lo = &*(value as *const LoValue);
-    raw::save_unsigned(rdb, lo.object_id.0);
-    raw::save_unsigned(rdb, lo.len);
-    raw::save_unsigned(rdb, lo.crc32c as u64);
-}
-
-unsafe extern "C" fn lo_rdb_load(
-    rdb: *mut raw::RedisModuleIO,
-    _encver: i32,
-) -> *mut std::ffi::c_void {
-    // SAFETY: rdb is a valid RedisModuleIO context provided by the engine during RDB load.
-    // We allocate LoValue on the heap and return ownership to the engine.
-    let oid = raw::load_unsigned(rdb).unwrap_or(0);
-    let len = raw::load_unsigned(rdb).unwrap_or(0);
-    let crc = raw::load_unsigned(rdb).unwrap_or(0) as u32;
-
-    // Update OID counter to avoid collisions after RDB load.
-    OID_COUNTER.fetch_max(oid + 1, Ordering::Relaxed);
-
-    let lo = Box::new(LoValue {
-        object_id: ObjectId(oid),
-        len,
-        crc32c: crc,
-    });
-    Box::into_raw(lo) as *mut std::ffi::c_void
-}
-
 /// Free callback — triggered by native Valkey DEL.
 /// Deletes the NVMe file for this object.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
@@ -101,8 +73,8 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
     0,           // encoding version
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
-        rdb_load: Some(lo_rdb_load),
-        rdb_save: Some(lo_rdb_save),
+        rdb_load: None,             // TODO
+        rdb_save: None,             // TODO
         aof_rewrite: None,          // TODO
         free: Some(lo_free),
         mem_usage: None,            // TODO
@@ -114,7 +86,7 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
         free_effort: None,          // TODO
         unlink: None,
         copy: None,                 // TODO
-        defrag: None,
+        defrag: None,               // TODO
         mem_usage2: None,
         free_effort2: None,
         unlink2: None,

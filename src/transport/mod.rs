@@ -7,7 +7,8 @@
 
 use std::sync::OnceLock;
 
-use crate::types::PoolBuffer;
+use crate::types::PinnedBuffer;
+use crate::storage::Buffer;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
 
@@ -92,7 +93,7 @@ impl EfaContext {
     }
 
     /// Register pool buffers with all EFA domains (fi_mr_reg).
-    pub fn register_buffers(&self, _bufs: &[PoolBuffer]) -> Result<(), TransportError> {
+    pub fn register_buffers(&self, _bufs: &[PinnedBuffer]) -> Result<(), TransportError> {
         if !self.available {
             return Ok(()); // No-op if no EFA
         }
@@ -141,14 +142,14 @@ impl Session {
 
     /// DMA write: server buffer → client region.
     /// Non-blocking. region_idx selects which ClientRegion (resolves to rkey + base addr).
-    /// Takes PoolBuffer ownership during DMA. Returns it in callback.
+    /// Takes Buffer ownership during DMA. Returns it in callback.
     pub fn write(
         &self,
-        buf: PoolBuffer,
+        buf: Buffer,
         _len: usize,
         region_idx: u32,
         _remote_offset: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     ) {
         if region_idx as usize >= self.client_regions.len() {
             on_complete(buf, Err(TransportError::RegionOutOfBounds));
@@ -159,14 +160,14 @@ impl Session {
     }
 
     /// DMA read: client region → server buffer.
-    /// Non-blocking. Takes PoolBuffer ownership. Returns it in callback.
+    /// Non-blocking. Takes Buffer ownership. Returns it in callback.
     pub fn read(
         &self,
-        buf: PoolBuffer,
+        buf: Buffer,
         _len: usize,
         region_idx: u32,
         _remote_offset: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     ) {
         if region_idx as usize >= self.client_regions.len() {
             on_complete(buf, Err(TransportError::RegionOutOfBounds));
@@ -208,7 +209,7 @@ pub fn efa_context() -> &'static EfaContext {
     EFA_CTX.get().expect("transport not initialized")
 }
 
-pub fn register_buffers(bufs: &[PoolBuffer]) {
+pub fn register_buffers(bufs: &[PinnedBuffer]) {
     let _ = efa_context().register_buffers(bufs);
 }
 

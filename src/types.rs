@@ -1,21 +1,55 @@
 //! Shared types used across storage and transport layers.
-//!
-//! PoolBuffer is the one type both storage and transport need — it lives here
-//! to avoid circular dependencies.
 
-/// Shared buffer descriptor — both storage and transport speak this language.
-/// Pool-allocated, 4KB-aligned, stable for module lifetime.
-/// Registered with both io_uring (IORING_REGISTER_BUFFERS) and EFA (fi_mr_reg).
-pub struct PoolBuffer {
-    pub ptr: *mut u8,
-    pub len: usize,
-    /// Registered buffer index — set at pool creation, used for ReadFixed/WriteFixed.
-    /// Eliminates the O(N) buf_index_for() linear scan on every I/O op.
-    pub idx: u16,
+use std::alloc::Layout;
+
+/// Raw kernel-pinned memory slot. Fixed array, registered with IORING_REGISTER_BUFFERS
+/// and fi_mr_reg. Never moves, never reallocated. Lives for module lifetime.
+/// Transport layer uses this directly for DMA operations.
+///
+/// Memory is 4KB-aligned (required for O_DIRECT) and owned via Box<[u8]>.
+pub struct PinnedBuffer {
+    mem: Box<[u8]>,
 }
 
-// SAFETY: PoolBuffer is a descriptor. The underlying memory is pool-allocated,
-// page-aligned, and never moved or reallocated for the module's lifetime.
-// Access is synchronized by the pool free-list (only one owner at a time).
-unsafe impl Send for PoolBuffer {}
-unsafe impl Sync for PoolBuffer {}
+impl PinnedBuffer {
+    /// Allocate a new 4KB-aligned, zeroed buffer of `size` bytes.
+    pub fn new(size: usize) -> Self {
+        let layout = Layout::from_size_align(size, 4096).expect("invalid buffer layout");
+        // SAFETY: layout is valid (size > 0, alignment is power of 2).
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: ptr is valid, aligned, zeroed, and allocated with the given layout.
+        // We transfer ownership to Box which will dealloc with the global allocator.
+        // Note: Box::from_raw uses Layout::for_value which may differ from our layout.
+        // We use Vec::from_raw_parts to preserve the exact allocation.
+        let mem = unsafe { Vec::from_raw_parts(ptr, size, size) }.into_boxed_slice();
+        Self { mem }
+    }
+
+    /// Raw pointer to buffer memory. Used by io_uring SQE submission and EFA DMA.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mem.as_ptr()
+    }
+
+    /// Mutable raw pointer. Used by io_uring ReadFixed (kernel writes into this).
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mem.as_ptr() as *mut u8
+    }
+
+    /// Buffer length in bytes.
+    pub fn len(&self) -> usize {
+        self.mem.len()
+    }
+
+    /// Slice view of the buffer contents.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mem
+    }
+
+    /// Mutable slice view.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.mem
+    }
+}

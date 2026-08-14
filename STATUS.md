@@ -38,14 +38,64 @@ Single source of truth for what's done and what's remaining.
 
 ## Remaining — High Priority
 
+
+
+Review thread model and locking and concurrency
+Review unsafe operations
+Make the object-id unique across all nodes/shards
+Remove the free-list and change PoolBuffer to Buffer and use Rust ownership for tranfers. No pinning needed.
+Find crate for the io-uring poller
+Solve DRAM using in memory pool in module
+Check for consistency things.... For example, delete/evict/free while inflight.
+
+
+
 | Item | Notes |
 |------|-------|
 | IORING_REGISTER_FILES | Pre-register fds with kernel. Eliminates fget/fput atomics per SQE. |
+| ObjectId per-node uniqueness | Currently a plain counter — collides across nodes. Need: hash VM_GetMyClusterID() into top 16 bits. Blocked on raw FFI (no safe wrapper in valkey-module crate). |
 | Startup reconciliation | After crash: scan data_dir, delete orphaned .dat files not in keyspace. |
 | Client disconnect cleanup | Remove EFA session from SESSIONS map on client disconnect. |
 | Data type callbacks (copy, mem_usage) | Needed for COPY command, MEMORY USAGE. |
 
 ## Remaining — Medium Priority
+
+### Per-key request coordination (read coalescing + consistency)
+
+**Problem:** Today each GET independently does `pool_get → io_uring read → reply`. Two concurrent GETs on the same key issue two separate NVMe reads into two separate buffers. SET has no awareness of in-flight reads.
+
+**Solution:** A per-key state tracker:
+
+```rust
+enum KeyState {
+    Idle,
+    Reading { waiters: Vec<BlockedClient> },  // readers queued behind first reader
+    Writing,                                   // exclusive — blocks GETs and other SETs
+}
+// HashMap<ObjectId, KeyState> on PoolStorage or a RequestCoordinator struct
+```
+
+**Read coalescing (singleflight pattern):**
+- First GET for a key: `Idle → Reading { waiters: [] }`, submits io_uring read.
+- Subsequent GETs for same key: push BlockedClient into `waiters`, NO new io_uring read.
+- CQE fires: reply to original + all waiters from same buffer. Back to `Idle`.
+- Benefit: at 750 clients / 500 keys = ~1.5 readers/key average. Coalescing cuts NVMe IOPS nearly in half. Also reduces pool buffer pressure (1 buffer serves N clients).
+
+**Write exclusion (optional, for strong consistency):**
+- SET: if `Reading(n) > 0` → block SET until reads drain. If `Idle` → `Writing`, proceed.
+- GET: if `Writing` → block GET until write completes.
+- Result: serializable per-key. No stale reads from pipelined GET+SET.
+
+**Consistency model comparison:**
+| Model | Behavior | Fit |
+|-------|----------|-----|
+| Read-committed (current) | GET may return pre-SET data | KVCache (write-once, read-many) |
+| Coalescing only (no write exclusion) | Multiple GETs share one read, SET still races | General workload with read-heavy hot keys |
+| Full per-key lock | Serializable. SET waits for reads. | General-purpose store with key overwrites |
+
+**Natural fit with DRAM tier:** First read populates cache; coalesced waiters hit the newly-cached buffer. Subsequent GETs hit DRAM without any io_uring submission.
+
+**Status:** Not implemented. Planned for when multi-client same-key workloads are benchmarked.
 
 | Item | Notes |
 |------|-------|

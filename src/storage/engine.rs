@@ -6,10 +6,10 @@
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
-use crossbeam_queue::ArrayQueue;
 
 use crate::data_type::ObjectId;
-use crate::types::PoolBuffer;
+use crate::types::PinnedBuffer;
+use super::buffer::{Buffer, BufferPool};
 
 use super::fd_pool::FdPool;
 use super::uring::{IoRequest, UringNvmeEngine};
@@ -17,62 +17,56 @@ use super::{NvmeEngine, Storage, StorageError};
 
 // ─── Pool Storage ────────────────────────────────────────────────────────────
 
-pub struct PoolStorage {
+// Look at thread safety of this when we are re-entering this on the completion callback.
+pub struct StorageEngine {
     buf_size: usize,
     #[allow(dead_code)]
     buf_count: usize,
     data_dir: String,
-    /// Lock-free free list of pool buffer indices.
-    free_list: ArrayQueue<usize>,
-    /// All pool buffers. Stable for lifetime of module.
-    buffers: Vec<PoolBuffer>,
+    /// The buffer pool. Buffers taken out via get(), returned via Drop.
+    pool: BufferPool,
+    /// Fixed array of kernel-pinned memory. Registered with io_uring at startup.
+    pinned_buffers: Vec<PinnedBuffer>,
     /// io_uring engine (initialized once, never changes). Trait object for testability.
     uring: OnceLock<Box<dyn NvmeEngine>>,
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
 }
 
-// SAFETY: PoolStorage is accessed from multiple threads (main thread + io_uring callbacks).
-// Interior sync is provided by: ArrayQueue (lock-free), OnceLock (write-once), FdPool (RwLock).
-// buffers Vec is never mutated after construction.
-unsafe impl Send for PoolStorage {}
-unsafe impl Sync for PoolStorage {}
 
-impl PoolStorage {
+impl StorageEngine {
     pub fn new(buf_size: usize, buf_count: usize, data_dir: &str) -> Self {
-        let mut buffers = Vec::with_capacity(buf_count);
-        let free_list = ArrayQueue::new(buf_count);
+        let mut pinned_buffers = Vec::with_capacity(buf_count);
 
-        for i in 0..buf_count {
-            let layout =
-                std::alloc::Layout::from_size_align(buf_size, 4096).expect("invalid layout");
-            // SAFETY: Layout is valid (size > 0, alignment is power of 2).
-            // alloc_zeroed returns a valid pointer or null (checked below).
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-            if ptr.is_null() {
-                panic!("largeobj: failed to allocate pool buffer {}", i);
-            }
-            buffers.push(PoolBuffer { ptr, len: buf_size, idx: i as u16 });
-            free_list.push(i).unwrap();
+        for _i in 0..buf_count {
+            pinned_buffers.push(PinnedBuffer::new(buf_size));
         }
 
         Self {
             buf_size,
             buf_count,
             data_dir: data_dir.to_string(),
-            free_list,
-            buffers,
+            pool: BufferPool::new(),
+            pinned_buffers,
             uring: OnceLock::new(),
             fd_pool: FdPool::new(),
         }
     }
 
+    /// Fill the buffer pool with Buffers. Must be called after StorageEngine is placed in OnceLock.
+    pub fn init_pool(&'static self) {
+        self.pool.fill(&self.pinned_buffers);
+    }
+
+    /// Access the buffer pool (for Drop return path).
+    pub fn buffer_pool(&self) -> &BufferPool {
+        &self.pool
+    }
+
     /// Return all buffer descriptors for transport registration (fi_mr_reg).
-    pub fn buffer_descriptors(&self) -> Vec<PoolBuffer> {
-        self.buffers
-            .iter()
-            .map(|b| PoolBuffer { ptr: b.ptr, len: b.len, idx: b.idx })
-            .collect()
+    /// Return buffer pointer/len info for transport registration (fi_mr_reg).
+    pub fn buffer_descriptors(&self) -> &[PinnedBuffer] {
+        &self.pinned_buffers
     }
 
     /// Delete convenience method (called from data_type free callback).
@@ -97,26 +91,10 @@ impl PoolStorage {
     }
 }
 
-impl Storage for PoolStorage {
-    fn pool_get(&self) -> Option<PoolBuffer> {
-        self.free_list.pop().map(|idx| PoolBuffer {
-            ptr: self.buffers[idx].ptr,
-            len: self.buffers[idx].len,
-            idx: idx as u16,
-        })
-    }
-
-    fn pool_put(&self, buf: PoolBuffer) {
-        // Use the idx field directly — O(1) instead of O(N) linear scan.
-        self.free_list.push(buf.idx as usize).ok();
-    }
-
-    fn pin(&self, _ptr: *mut u8) {
-        // TODO: Pin bitmap for eviction policy. Currently pool_get removal acts as implicit pin.
-    }
-
-    fn unpin(&self, _ptr: *mut u8) {
-        // TODO: Clear pin in bitmap.
+impl Storage for StorageEngine {
+    // Note: Check for a cleaner way to pass on the popped object.
+    fn pool_get(&self) -> Option<Buffer> {
+        self.pool.get()
     }
 
     fn pool_buf_size(&self) -> usize {
@@ -125,11 +103,11 @@ impl Storage for PoolStorage {
 
     fn register_buffers(&self) -> Result<(), StorageError> {
         let iovecs: Vec<libc::iovec> = self
-            .buffers
+            .pinned_buffers
             .iter()
-            .map(|b| libc::iovec {
-                iov_base: b.ptr as *mut libc::c_void,
-                iov_len: b.len,
+            .map(|pb| libc::iovec {
+                iov_base: pb.as_mut_ptr() as *mut libc::c_void,
+                iov_len: pb.len(),
             })
             .collect();
 
@@ -146,9 +124,9 @@ impl Storage for PoolStorage {
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<u64, StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
     ) {
         // Get fd from pool (or open if miss).
         let fd = match self.fd_pool.get(object_id) {
@@ -170,11 +148,6 @@ impl Storage for PoolStorage {
             }
         };
 
-        // Use idx directly from the buffer — no linear scan needed.
-        let buf_index = buf.idx;
-        let buf_ptr = buf.ptr as usize;
-        let buf_len = buf.len;
-
         // Engine must be initialized (set once at module load via register_buffers).
         let engine = match self.uring.get() {
             Some(e) => e,
@@ -186,16 +159,9 @@ impl Storage for PoolStorage {
 
         let req = IoRequest::Read {
             fd,
-            buf_ptr,
-            buf_index,
+            buf,
             len,
-            on_complete: Box::new(move |result| {
-                // SAFETY: buf_ptr came from a pool-allocated buffer. The pool guarantees
-                // this memory is valid for the module lifetime. We reconstruct the PoolBuffer
-                // to return ownership to the caller via the callback.
-                let buf = PoolBuffer { ptr: buf_ptr as *mut u8, len: buf_len, idx: buf_index };
-                on_complete(buf, result);
-            }),
+            on_complete,
         };
 
         engine.submit(req);
@@ -203,9 +169,9 @@ impl Storage for PoolStorage {
 
     fn write_new(
         &self,
-        buf: PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(PoolBuffer, Result<(ObjectId, u32), StorageError>) + Send>,
+        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
     ) {
         let oid = ObjectId::next();
         let final_path = oid.file_path(&self.data_dir);
@@ -228,14 +194,9 @@ impl Storage for PoolStorage {
             return;
         }
 
-        // Use idx directly from the buffer.
-        let buf_index = buf.idx;
-        let buf_ptr = buf.ptr as usize;
-        let buf_len = buf.len;
-
         // Compute crc32c before submitting write.
-        // SAFETY: buf_ptr is a valid pool buffer pointer, len bytes are within allocation.
-        let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, len as usize) };
+        // SAFETY: buf.ptr() is a valid pool buffer pointer, len bytes are within allocation.
+        let slice = unsafe { std::slice::from_raw_parts(buf.ptr(), len as usize) };
         let crc = crc32c::crc32c(slice);
 
         // Engine must be initialized.
@@ -255,14 +216,11 @@ impl Storage for PoolStorage {
 
         let req = IoRequest::Write {
             fd,
-            buf_ptr,
-            buf_index,
+            buf,
             len,
-            on_complete: Box::new(move |result| {
+            on_complete: Box::new(move |buf, result| {
                 // SAFETY: fd is the valid descriptor we opened above. Closed exactly once here.
                 unsafe { libc::close(fd) };
-                // SAFETY: Reconstruct PoolBuffer — same invariant as read_into callback.
-                let buf = PoolBuffer { ptr: buf_ptr as *mut u8, len: buf_len, idx: buf_index };
 
                 match result {
                     Ok(()) => {
@@ -293,13 +251,4 @@ impl Storage for PoolStorage {
     }
 }
 
-impl Drop for PoolStorage {
-    fn drop(&mut self) {
-        for buf in &self.buffers {
-            let layout = std::alloc::Layout::from_size_align(self.buf_size, 4096).unwrap();
-            // SAFETY: Each buffer was allocated with this exact layout in new().
-            // We dealloc each exactly once during drop.
-            unsafe { std::alloc::dealloc(buf.ptr, layout) };
-        }
-    }
-}
+// No manual Drop needed — PinnedBuffer owns Box<[u8]> which deallocates automatically.
