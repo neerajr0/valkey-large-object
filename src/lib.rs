@@ -43,7 +43,6 @@ pub mod data_type;
 pub mod errors;
 pub mod storage;
 pub mod transport;
-pub mod types;
 
 use crate::data_type::LO_TYPE;
 
@@ -165,7 +164,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
     let pinned = storage::pinned_buffers();
-    transport::register_buffers(pinned);
+    let slices: Vec<&[u8]> = pinned.iter().map(|pb| pb.as_slice()).collect();
+    transport::register_buffers(&slices);
 
     ctx.log_notice(&format!(
         "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",

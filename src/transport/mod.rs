@@ -7,7 +7,6 @@
 
 use std::sync::OnceLock;
 
-use crate::types::PinnedBuffer;
 use crate::storage::Buffer;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
@@ -93,7 +92,7 @@ impl EfaContext {
     }
 
     /// Register pool buffers with all EFA domains (fi_mr_reg).
-    pub fn register_buffers(&self, _bufs: &[PinnedBuffer]) -> Result<(), TransportError> {
+    pub fn register_buffers(&self, _bufs: &[&[u8]]) -> Result<(), TransportError> {
         if !self.available {
             return Ok(()); // No-op if no EFA
         }
@@ -209,7 +208,7 @@ pub fn efa_context() -> &'static EfaContext {
     EFA_CTX.get().expect("transport not initialized")
 }
 
-pub fn register_buffers(bufs: &[PinnedBuffer]) {
+pub fn register_buffers(bufs: &[&[u8]]) {
     let _ = efa_context().register_buffers(bufs);
 }
 

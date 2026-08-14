@@ -5,17 +5,43 @@
 
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
-
+use std::alloc::Layout;
 
 use crate::data_type::ObjectId;
-use crate::types::PinnedBuffer;
 use super::buffer::{Buffer, BufferPool};
 
 use super::fd_pool::FdPool;
 use super::uring::{IoRequest, UringNvmeEngine};
 use super::{NvmeEngine, Storage, StorageError};
 
-// ─── Pool Storage ────────────────────────────────────────────────────────────
+// ─── PinnedBuffer ────────────────────────────────────────────────────────────
+
+/// 4KB-aligned kernel-pinned memory. Registered with IORING_REGISTER_BUFFERS
+/// and fi_mr_reg. Never moves, never reallocated. Lives for module lifetime.
+pub struct PinnedBuffer {
+    mem: Box<[u8]>,
+}
+
+impl PinnedBuffer {
+    /// Allocate a new 4KB-aligned, zeroed buffer of `size` bytes.
+    pub fn new(size: usize) -> Self {
+        let layout = Layout::from_size_align(size, 4096).expect("invalid buffer layout");
+        // SAFETY: layout is valid (size > 0, alignment is power of 2).
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: ptr is valid, aligned, zeroed. Vec takes ownership of the allocation.
+        let mem = unsafe { Vec::from_raw_parts(ptr, size, size) }.into_boxed_slice();
+        Self { mem }
+    }
+
+    pub fn as_mut_ptr(&self) -> *mut u8 { self.mem.as_ptr() as *mut u8 }
+    pub fn len(&self) -> usize { self.mem.len() }
+    pub fn as_slice(&self) -> &[u8] { &self.mem }
+}
+
+// ─── StorageEngine ───────────────────────────────────────────────────────────
 
 // Look at thread safety of this when we are re-entering this on the completion callback.
 pub struct StorageEngine {

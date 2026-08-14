@@ -4,7 +4,7 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
-use crate::types::PinnedBuffer;
+use engine::PinnedBuffer;
 pub use buffer::Buffer;
 
 pub mod fd_pool;
@@ -97,7 +97,7 @@ pub fn get() -> &'static engine::StorageEngine {
 }
 
 /// Called by Buffer::drop() to return a buffer to the pool.
-pub fn return_buffer(pinned: &'static crate::types::PinnedBuffer, idx: u16) {
+pub fn return_buffer(pinned: &'static engine::PinnedBuffer, idx: u16) {
     if let Some(storage) = STORAGE.get() {
         storage.buffer_pool().put_back(pinned, idx);
     }

@@ -4,7 +4,7 @@
 //! BufferPool: holds available Buffers. get() pops, Drop pushes back.
 
 use std::sync::Mutex;
-use crate::types::PinnedBuffer;
+use super::engine::PinnedBuffer;
 
 /// Owned buffer handle. Wraps a &'static PinnedBuffer + registered index.
 /// Holding this = exclusive access to the underlying pinned memory.
