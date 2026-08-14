@@ -69,35 +69,14 @@ TEST_PATTERN=test_lo_set_get_roundtrip ./build.sh test
 
 Benchmark uses per-size server restarts, io-threads 8, taskset pinning, 750 clients, 10s duration per size.
 
-## Architecture
-
-```
-src/
-  lib.rs              — module entry, config, lifecycle
-  types.rs            — PoolBuffer (shared between storage + transport)
-  errors.rs           — centralized error string constants
-  data_type.rs        — LoValue, ObjectId, RDB callbacks
-  commands/mod.rs     — LO.HELLO, LO.GET, LO.SET handlers
-  storage/
-    mod.rs            — Storage trait + NvmeEngine trait
-    pool.rs           — lock-free buffer pool (crossbeam ArrayQueue)
-    fd_pool.rs        — pre-opened fd management
-    uring.rs          — UringNvmeEngine (io_uring + poller thread)
-  transport/mod.rs    — EFA stubs (replaced by libefa-rs crate)
-tests/                — integration tests (valkey-bloom pattern)
-bench.sh              — performance benchmarks
-build.sh              — build + test automation
-STATUS.md             — work tracker (done + remaining)
-```
-
 ## Performance (i8ge.48xlarge, 16 NVMe striped)
 
-| Object Size | Clients | RPS | p50 Latency |
-|-------------|---------|-----|-------------|
-| 4KB | 750 | 150,000 | 2.5 ms |
-| 1MB | 750 | 60,000 | — |
-| 16MB | 750 | 3,900 | — |
-| 50MB | 750 | 1,000 | — |
+| Object Size | Clients | RPS |
+|-------------|---------|-----|
+| 4KB | 750 | 150,000 |
+| 1MB | 750 | 60,000 |
+| 16MB | 750 | 3,900 |
+| 50MB | 750 | 1,000 |
 
 Raw NVMe baseline (fio): 1.4M IOPS at 4KB, 50 GB/s at 1MB+.
 
