@@ -4,7 +4,7 @@
 
 - **One `.so`** — single Valkey module artifact with three internal layers:
   - **Data Type** — Valkey keyspace integration: LoValue struct, commands (LO.HELLO, LO.GET, LO.SET), RDB callbacks, TIERING.REF, BlockClient management
-  - **Storage** — Buffer pool + NVMe I/O: pool_get/put, pin/unpin, io_uring read/write, registered buffers, disk eviction
+  - **Storage** — Buffer pool + NVMe I/O: Buffer ownership (get → use → Drop returns), io_uring read/write, registered buffers, disk eviction
   - **Transport crate** (libefa-rs) — EFA/libfabric lifecycle, multi-device LB, completion handling. Cargo dependency, reusable by any Rust project. **Runtime-agnostic: does not own threads or an async runtime.**
 
 **Runtime ownership:** The module owns a tokio runtime (created at OnLoad, configured via module args: thread count, core pinning). The transport crate exposes `async fn write/read`. The module `.await`s them from tasks spawned on its runtime. Transport's internal CQ polling is opaque to the module — we don't pass it a Handle or spawn its tasks.
@@ -41,11 +41,11 @@ LO.HELLO (per client connection):
   5. Session::new(client_regions)   → create fi_endpoint on each EFA device, insert client AV entries
 
 LO.GET / LO.SET (per operation):
-  6. storage.pin(buf)               → prevent eviction during DMA
-  7. session.write/read(buf, ...)   → non-blocking, completion via callback
+  6. buf = storage.pool_get()      → owned Buffer, exclusive access to pinned memory
+  7. session.write/read(buf, ...)   → Buffer moves into transport (ownership transfer)
   8. On completion callback (fires on transport CQ thread or io_uring poller thread):
-       storage.unpin(buf)
-       storage.pool_put(buf)
+       Buffer returned via callback parameter → caller can use or let Drop
+       Drop fires → Buffer returns to pool automatically
        UnblockClient(bc, private_data)
   9. Reply callback fires on main thread:
        ctx.reply_ok() or ctx.reply_error()
@@ -96,32 +96,30 @@ pub struct ObjectId(pub u64);
 
 Storage operates on **OIDs and file paths**, never on Valkey keys. The command handler resolves key → OID via the data type layer, then calls storage.
 
-Uses `PoolBuffer` from the transport crate as the shared buffer descriptor.
+Buffer ownership is the core principle: holding a `Buffer` = exclusive access to pinned memory. Drop returns it to the pool automatically. No explicit pin/unpin/pool_put.
 
 ```rust
+/// Types:
+///   PinnedBuffer (types.rs) — raw 4KB-aligned Box<[u8]>, registered with io_uring + EFA
+///   Buffer (storage/buffer.rs) — owned handle wrapping &'static PinnedBuffer + idx
+///     - Holding it = exclusive access. Moving it = transferring ownership.
+///     - Drop = automatic return to pool. No explicit put needed.
+///   BufferPool (storage/buffer.rs) — Mutex<Vec<Buffer>>. get() pops, Drop pushes back.
+
 /// Error types for storage operations.
 #[derive(Debug)]
 pub enum StorageError {
     IoError { code: i32 },     // io_uring read/write failed
     PoolExhausted,             // no free buffers available
-    ObjectTooLarge,            // object exceeds pool buffer size - Debatable (see LO.GET/SET handling)
+    ObjectTooLarge,            // object exceeds pool buffer size
 }
 
 trait Storage {
     // ─── Buffer Pool ─────────────────────────────────────────────────────
 
     /// Get a buffer from the pool. Returns None if pool exhausted.
-    /// Returned buffer is a registered slot (valid for io_uring ReadFixed and EFA fi_write).
-    fn pool_get(&self) -> Option<PoolBuffer>;
-
-    /// Return a buffer to the pool.
-    fn pool_put(&self, buf: PoolBuffer);
-
-    /// Pin buffer — prevents eviction/reuse during in-flight DMA or io_uring op.
-    fn pin(&self, buf: &PoolBuffer);
-
-    /// Unpin buffer — allows eviction/reuse.
-    fn unpin(&self, buf: &PoolBuffer);
+    /// Returned Buffer is owned — Drop returns it to the pool automatically.
+    fn pool_get(&self) -> Option<Buffer>;
 
     /// Pool buffer size (all buffers are this fixed size).
     fn pool_buf_size(&self) -> usize;
@@ -129,33 +127,31 @@ trait Storage {
     // ─── Registration ────────────────────────────────────────────────────
 
     /// Register pool buffers with io_uring (IORING_REGISTER_BUFFERS).
-    /// Called once at startup. Pins pages for NVMe DMA.
     fn register_buffers(&self) -> Result<(), StorageError>;
 
-    /// Deregister pool buffers from io_uring. Called at module unload.
+    /// Deregister pool buffers from io_uring.
     fn deregister_buffers(&self) -> Result<(), StorageError>;
 
     // ─── NVMe I/O ───────────────────────────────────────────────────────
 
     /// Read object bytes from NVMe into buf. Async via io_uring ReadFixed.
-    /// object_id maps directly to a file path: {data_dir}/{oid:016x}.dat — no lookup needed.
-    /// Calls on_complete from the io_uring poller thread.
+    /// Takes Buffer by value (ownership transfers to storage during I/O).
+    /// Returns (Buffer, bytes_read) in callback — caller gets buf back.
     fn read_into(
         &self,
         object_id: ObjectId,
-        buf: &mut PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Result<u64, StorageError>) + Send>,  // Ok(bytes_read)
+        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
     );
 
     /// Write buf to NVMe as a new object. Async via io_uring.
-    /// Returns the new ObjectId + crc32c via callback (caller stores these in LoValue).
-    /// Atomicity: O_TMPFILE → write → linkat (file invisible until complete).
+    /// Takes Buffer by value. Returns (Buffer, ObjectId, crc32c) via callback.
     fn write_new(
         &self,
-        buf: &PoolBuffer,
+        buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Result<(ObjectId, u32), StorageError>) + Send>,  // Ok((oid, crc32c))
+        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
     );
 
     /// Delete an object file from NVMe. Called on key deletion or eviction.
@@ -168,99 +164,76 @@ trait Storage {
 ## Transport Crate API (libefa-rs)
 
 ```rust
-/// Shared type: both storage and transport speak this language.
-/// Defined in the transport crate; storage depends on it.
-pub struct PoolBuffer {
-    pub ptr: *mut u8,
-    pub len: usize,
-}
+/// PinnedBuffer (types.rs) — raw kernel-pinned memory. Transport uses this for DMA registration.
+/// Buffer (storage/buffer.rs) — owned handle. Transport receives this for DMA operations.
 
 /// Error types for transport operations.
 #[derive(Debug)]
 pub enum TransportError {
-    DeviceNotFound,            // EFA device not present (AMI issue)
-    RegistrationFailed,        // fi_mr_reg failed (memory alignment, permissions)
-    SessionCreateFailed,       // fi_endpoint or fi_av_insert failed
-    WriteFailed { code: i32 }, // fi_write CQE returned error
-    ReadFailed { code: i32 },  // fi_read CQE returned error
-    RegionOutOfBounds,         // region_idx invalid or offset+len exceeds region
-    Timeout,                   // CQ poll timed out (configurable deadline)
-    SessionClosed,             // operation submitted on a closed/closing session
+    DeviceNotFound,
+    RegistrationFailed,
+    SessionCreateFailed,
+    WriteFailed { code: i32 },
+    ReadFailed { code: i32 },
+    RegionOutOfBounds,
+    Timeout,
+    SessionClosed,
 }
 
-pub struct EfaContext { /* fi_fabric + fi_domain per device, fi_eq, registered MRs */ }
+pub struct EfaContext { /* fi_fabric + fi_domain per device, registered MRs */ }
 
 /// EFA endpoint address — 32 bytes, opaque to callers.
-/// Contains GID (16B) + QPN (2B) + pad (2B) + QKEY (4B).
-/// Obtained via fi_getname(). Exchanged during LO.HELLO so each side can fi_av_insert the peer.
 pub struct EfaAddress(pub [u8; 32]);
 
 impl EfaContext {
-    /// Discover EFA devices, create fabric + domain per device.
-    /// Synchronous — no runtime needed. Fails with DeviceNotFound if no EFA hardware.
+    /// Discover EFA devices. Synchronous — no runtime needed.
     pub fn init() -> Result<Self, TransportError>;
 
-    /// Number of EFA devices available.
     pub fn device_count(&self) -> usize;
-
-    /// Whether EFA hardware is present and initialized.
     pub fn is_available(&self) -> bool;
 
-    /// Register buffers with all EFA domains for zero-cost per-op DMA.
-    /// Buffers must be 4KB-aligned.
-    pub fn register_buffers(&self, bufs: &[PoolBuffer]) -> Result<(), TransportError>;
-
-    /// Deregister previously registered buffers.
+    /// Register buffers for DMA. Takes slice of byte slices (from PinnedBuffer memory).
+    pub fn register_buffers(&self, bufs: &[&[u8]]) -> Result<(), TransportError>;
     pub fn deregister_buffers(&self) -> Result<(), TransportError>;
-
-    /// Shutdown and release all EFA resources.
     pub fn shutdown(self);
 }
 
-/// Client-side memory region descriptor.
-/// Received during LO.HELLO. Represents one contiguous registered region on the client
-/// (typically one per GPU memory pool — 1 to 8 total, NOT per object).
+/// Client-side memory region descriptor. Received during LO.HELLO.
 pub struct ClientRegion {
-    pub rkey: u64,           // remote key (fi_write takes uint64_t key; EFA uses 32-bit, zero-extended)
-    pub remote_addr: u64,    // base virtual address of the region on the client
-    pub len: u64,            // total length of the region
+    pub rkey: u64,
+    pub remote_addr: u64,
+    pub len: u64,
 }
 
-pub struct Session { /* endpoints per EFA device, AV entries, client regions, LB state */ }
+pub struct Session { /* endpoints, AV entries, client regions */ }
 
 impl Session {
-    /// Create a session. Internally creates fi_endpoint on each EFA device,
-    /// inserts peer address into each device's AV (fi_av_insert).
-    /// client_regions are stored for per-op targeting (region_idx → rkey + remote_addr).
     pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress, client_regions: &[ClientRegion]) -> Result<Self, TransportError>;
 
-    /// Server addresses to return in LO.HELLO reply.
     pub fn server_addrs(&self) -> Vec<EfaAddress>;
 
     /// DMA write: server buffer → client region.
-    /// Async — awaits CQ completion. Module spawns this as a task on its tokio runtime.
-    /// Internally load-balances across EFA devices (best-of-two on in-flight).
-    /// region_idx selects which ClientRegion to target (resolves to rkey + base addr internally).
-    pub async fn write(
+    /// Takes Buffer by value (ownership during DMA). Returns Buffer in callback.
+    pub fn write(
         &self,
-        buf: &PoolBuffer,
+        buf: Buffer,
         len: usize,
         region_idx: u32,
         remote_offset: u64,
-    ) -> Result<(), TransportError>;
+        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+    );
 
     /// DMA read: client region → server buffer.
-    /// Async — awaits CQ completion. Module spawns this as a task on its tokio runtime.
-    /// region_idx selects which ClientRegion to read from.
-    pub async fn read(
+    /// Takes Buffer by value. Returns Buffer in callback.
+    pub fn read(
         &self,
-        buf: &mut PoolBuffer,
+        buf: Buffer,
         len: usize,
         region_idx: u32,
         remote_offset: u64,
-    ) -> Result<(), TransportError>;
+        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+    );
 
-    /// Tear down session. In-flight ops receive SessionClosed in their callbacks.
     pub fn close(self);
 }
 ```
@@ -269,20 +242,18 @@ impl Session {
 
 ## Client Unblocking
 
-The module uses `ValkeyModule_BlockClient` with a `reply_callback` function pointer:
+The module uses `ValkeyModule_BlockClient` with `ThreadSafeContext` (valkeymodule-rs does not yet expose reply_callback):
 
 ```rust
 // Main thread:
-bc = ValkeyModule_BlockClient(ctx, Some(reply_fn), None, Some(free_fn), timeout_ms);
+bc = ctx.block_client();
 
 // Any background thread (io_uring poller, EFA CQ thread):
-ValkeyModule_UnblockClient(bc, private_data_ptr);
-
-// Main thread (next event loop tick):
-reply_fn(ctx, private_data) → ctx.reply_ok() or ctx.reply_error(msg)
+let thread_ctx = ThreadSafeContext::with_blocked_client(bc);
+thread_ctx.reply(Ok(ValkeyValue::...));  // unblocks + replies
 ```
 
-No `ThreadSafeContext` needed. The `BlockedClient` raw pointer is `Send` — it passes through async closure chains. The reply always executes on the main thread with a valid `ctx`.
+**Future:** When valkeymodule-rs adds reply_callback support, keyspace writes (LoValue SET) should move to the reply callback (runs on main thread with real ctx). Currently done via ThreadSafeContext lock.
 
 ---
 
@@ -435,7 +406,7 @@ Pros: no ambiguity, no arg-count dispatch. Cons: two commands for the same logic
 | Memory registration | Buffer pool dual-registered with io_uring + EFA once at startup. Same physical pages, no conflicts. Zero per-op registration cost. |
 | rkey model | Client sends 1-8 `ClientRegion` descriptors during LO.HELLO. Per-op specifies `region_idx` + `remote_offset`. |
 | Multi-EFA LB | Internal to `Session`. Best-of-two on in-flight count. Storage/data type unaware. |
-| Buffer ownership | Storage owns + allocates. Transport reads/writes into them. Pin/unpin prevents eviction during DMA. |
+| Buffer ownership | Storage owns PinnedBuffer (Box<[u8]>, 4KB-aligned). Buffer is an owned handle (&'static PinnedBuffer + idx). Holding Buffer = exclusive access. Drop = return to pool. No pin/unpin. |
 | Error handling | Typed errors (`TransportError`, `StorageError`) propagated through callbacks/await to `UnblockClient` → reply callback → client. |
 | Transport API style | `async fn write/read` — module spawns tasks on its runtime. No callback variants needed. |
 | Storage addressing | Storage takes `ObjectId`, not Valkey keys. Key→OID resolution is the data type layer's job (reads LoValue from keyspace). |
