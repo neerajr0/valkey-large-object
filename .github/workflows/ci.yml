@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SERVER_VERSION: unstable
   VALKEY_REPO_URL: https://github.com/valkey-io/valkey.git
   TEST_FRAMEWORK_REPO: https://github.com/valkey-io/valkey-test-framework
   TEST_FRAMEWORK_DIR: tests/build/valkeytestframework
