@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,7 +37,21 @@ jobs:
       - name: Run unit tests
         run: cargo test --features enable-system-alloc
 
+      - name: Get week number
+        id: week
+        run: echo "week=$(date +%V)" >> $GITHUB_OUTPUT
+
+      - name: Cache valkey-server and test framework
+        id: cache-valkey
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/build/binaries
+            tests/build/valkeytestframework
+          key: valkey-unstable-normal-w${{ steps.week.outputs.week }}
+
       - name: Build valkey-server
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
           mkdir -p tests/build/binaries/unstable
           cd tests/build
@@ -45,8 +60,11 @@ jobs:
           git checkout unstable
           make -j
           cp src/valkey-server ../binaries/unstable/
+          cd ../..
+          rm -rf valkey
 
       - name: Set up test framework
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
           git clone ${{ env.TEST_FRAMEWORK_REPO }}
           mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
@@ -92,7 +110,21 @@ jobs:
       - name: Run unit tests
         run: cargo test --features enable-system-alloc
 
+      - name: Get week number
+        id: week
+        run: echo "week=$(date +%V)" >> $GITHUB_OUTPUT
+
+      - name: Cache valkey-server (ASAN) and test framework
+        id: cache-valkey
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/build/binaries
+            tests/build/valkeytestframework
+          key: valkey-unstable-asan-w${{ steps.week.outputs.week }}
+
       - name: Build valkey-server with ASAN
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
           mkdir -p tests/build/binaries/unstable
           cd tests/build
@@ -102,8 +134,11 @@ jobs:
           make distclean
           make -j SANITIZER=address
           cp src/valkey-server ../binaries/unstable/
+          cd ../..
+          rm -rf valkey
 
       - name: Set up test framework
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
           git clone ${{ env.TEST_FRAMEWORK_REPO }}
           mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}

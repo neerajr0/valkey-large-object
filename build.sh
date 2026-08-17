@@ -85,7 +85,15 @@ if [ -z "$SERVER_VERSION" ]; then
     export SERVER_VERSION="unstable"
 fi
 
-BINARY_PATH="tests/build/binaries/$SERVER_VERSION/valkey-server"
+# Use separate binary dir for ASAN so normal and ASAN builds don't collide.
+# GIT_VERSION is used for git checkout, SERVER_VERSION is exported for tests.
+GIT_VERSION="$SERVER_VERSION"
+if [ ! -z "${ASAN_BUILD}" ]; then
+    export SERVER_VERSION="${SERVER_VERSION}-asan"
+fi
+BINARY_DIR="tests/build/binaries/${SERVER_VERSION}"
+
+BINARY_PATH="$BINARY_DIR/valkey-server"
 CACHED_VALKEY_PATH="tests/build/valkey"
 
 # Optional: use an externally built valkey-server binary.
@@ -95,7 +103,7 @@ if [ -n "$VALKEY_SERVER_PATH" ]; then
         exit 1
     fi
     echo "Using external valkey-server binary: $VALKEY_SERVER_PATH"
-    mkdir -p "tests/build/binaries/$SERVER_VERSION"
+    mkdir -p "$BINARY_DIR"
     cp "$VALKEY_SERVER_PATH" "$BINARY_PATH"
 fi
 
@@ -103,19 +111,19 @@ if [ -f "$BINARY_PATH" ] && [ -x "$BINARY_PATH" ]; then
     echo "valkey-server binary '$BINARY_PATH' found."
 else
     echo "valkey-server binary '$BINARY_PATH' not found. Building from source..."
-    mkdir -p "tests/build/binaries/$SERVER_VERSION"
+    mkdir -p "$BINARY_DIR"
     rm -rf $CACHED_VALKEY_PATH
     cd tests/build
     git clone "$REPO_URL"
     cd valkey
-    git checkout "$SERVER_VERSION"
+    git checkout "$GIT_VERSION"
     make distclean
     if [ ! -z "${ASAN_BUILD}" ]; then
         make -j SANITIZER=address
     else
         make -j
     fi
-    cp src/valkey-server ../binaries/$SERVER_VERSION/
+    cp src/valkey-server "$SCRIPT_DIR/$BINARY_DIR/"
     cd $SCRIPT_DIR
     rm -rf $CACHED_VALKEY_PATH
 fi

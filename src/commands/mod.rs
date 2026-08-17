@@ -381,18 +381,22 @@ fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
             len,
             crc,
         } => {
-            // Write LoValue to keyspace
-            let ctx = thread_ctx.lock();
-            let key_str = ctx.create_string(key_name.as_slice());
-            let key = ctx.open_key_writable(&key_str);
-            let lo_value = LoValue {
-                object_id: oid,
-                len,
-                crc32c: crc,
-            };
-            key.set_value(&LO_TYPE, lo_value).unwrap();
-            drop(key);
-            drop(ctx);
+            // Scoped block ensures drop order: key, key_str, ctx.
+            // key_str must be freed (VM_FreeString) while ctx is still alive,
+            // because ctx's autoMemory tracks the string. Without this scope,
+            // explicit drop(ctx) frees the context first, then key_str's Drop
+            // calls VM_FreeString on freed memory (use-after-free).
+            {
+                let ctx = thread_ctx.lock();
+                let key_str = ctx.create_string(key_name.as_slice());
+                let key = ctx.open_key_writable(&key_str);
+                let lo_value = LoValue {
+                    object_id: oid,
+                    len,
+                    crc32c: crc,
+                };
+                key.set_value(&LO_TYPE, lo_value).unwrap();
+            }
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         ReplyData::Err(msg) => {

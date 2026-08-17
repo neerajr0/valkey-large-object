@@ -108,23 +108,21 @@ impl StorageEngine {
         self.delete(object_id);
     }
 
-    /// Open a read fd for an object (O_RDONLY | O_DIRECT).
+    /// Open a read fd for an object. Uses O_DIRECT when direct-io config is enabled.
     fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
         let path = oid.file_path(&self.data_dir);
         let c_path = std::ffi::CString::new(path).ok()?;
-        // SAFETY: c_path is a valid null-terminated C string. O_RDONLY|O_DIRECT are valid flags.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+        let flags = if crate::direct_io() {
+            libc::O_RDONLY | libc::O_DIRECT
+        } else {
+            libc::O_RDONLY
+        };
+        // SAFETY: c_path is a valid null-terminated C string, flags are valid POSIX.
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
             Some(fd)
         } else {
-            // Fallback without O_DIRECT (e.g., tmpfs for testing).
-            // SAFETY: Same as above, just without O_DIRECT.
-            let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-            if fd2 >= 0 {
-                Some(fd2)
-            } else {
-                None
-            }
+            None
         }
     }
 }
@@ -215,12 +213,17 @@ impl Storage for StorageEngine {
         let final_path = oid.file_path(&self.data_dir);
         let tmp_path = format!("{}.tmp", final_path);
 
-        // Open tmp file for O_DIRECT write.
+        // Open tmp file for write. Uses O_DIRECT when direct-io config is enabled.
+        let write_flags = if crate::direct_io() {
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT
+        } else {
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
+        };
         // SAFETY: CString is valid, flags are standard POSIX, mode 0o644 is safe.
         let fd = unsafe {
             libc::open(
                 std::ffi::CString::new(tmp_path.as_str()).unwrap().as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT,
+                write_flags,
                 0o644,
             )
         };
