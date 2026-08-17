@@ -12,15 +12,19 @@ General Functional Completeness in ValkeyLargeObjModule:
 - Handle case when the NVMe exceeds memory usage limit - max-bytes enforcement
 - Handle case when the number of EFA sessions exceeds limit (add a configurable limit)
 - Congestion Control/Rate limiting based on number of inflight requests
+- FD pool size config and also implementing an LFU on the FD pool
 - Ensure the ObjectID has a uniqueness guarantee - use node id + monotonic counter
 - Request State and transition machninery across EFA and TCP cases
 - Support multiple buffer sizes in the BufferPool layer.
-- Module Threads Core Pinning
 - Per Client disconnect handling - EFA session tear down
 - Shutdown handling - cleanup of buffer pools, fds and also dir/files in the NVMe, cancel inflight ops, etc.
 - Module Metrics for Requests, BufferPool, NVMe, Objects, etc.
+- Emit KeySpace Events from main thread callbacks
 - Review thread boundaries and locking of every data structure for safety and concurrency
 - Elimate as much as Rust `unsafe` declared code as possible
+- Finalize command customer experience and implement arg parsing
+- Finalize on metric names, key space event names, config names, errors
+- Module Threads Core Pinning
 - Adding unit testing on every interface
 - I have already added support for sanity integ tests using valkey-test-framework. We need to complete this.
 - CI Setup for full test run - build, unit test, integ test
