@@ -3,12 +3,12 @@
 //! Buffer pool: fixed-size, 4KB-aligned, dual-registered (io_uring + EFA).
 //! io_uring: ReadFixed/WriteFixed with registered buffers.
 
+use std::alloc::Layout;
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
-use std::alloc::Layout;
 
-use crate::data_type::ObjectId;
 use super::buffer::{Buffer, BufferPool};
+use crate::data_type::ObjectId;
 
 use super::fd_pool::FdPool;
 use super::uring::{IoRequest, UringNvmeEngine};
@@ -36,9 +36,15 @@ impl PinnedBuffer {
         Self { mem }
     }
 
-    pub fn as_mut_ptr(&self) -> *mut u8 { self.mem.as_ptr() as *mut u8 }
-    pub fn len(&self) -> usize { self.mem.len() }
-    pub fn as_slice(&self) -> &[u8] { &self.mem }
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mem.as_ptr() as *mut u8
+    }
+    pub fn len(&self) -> usize {
+        self.mem.len()
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mem
+    }
 }
 
 // ─── StorageEngine ───────────────────────────────────────────────────────────
@@ -58,7 +64,6 @@ pub struct StorageEngine {
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
 }
-
 
 impl StorageEngine {
     pub fn new(buf_size: usize, buf_count: usize, data_dir: &str) -> Self {
@@ -112,7 +117,11 @@ impl StorageEngine {
             // Fallback without O_DIRECT (e.g., tmpfs for testing).
             // SAFETY: Same as above, just without O_DIRECT.
             let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-            if fd2 >= 0 { Some(fd2) } else { None }
+            if fd2 >= 0 {
+                Some(fd2)
+            } else {
+                None
+            }
         }
     }
 }
@@ -138,7 +147,9 @@ impl Storage for StorageEngine {
             .collect();
 
         let engine: Box<dyn NvmeEngine> = Box::new(UringNvmeEngine::new(iovecs));
-        self.uring.set(engine).map_err(|_| StorageError::IoError { code: -1 })?;
+        self.uring
+            .set(engine)
+            .map_err(|_| StorageError::IoError { code: -1 })?;
         Ok(())
     }
 
@@ -164,10 +175,13 @@ impl Storage for StorageEngine {
                         fd
                     }
                     None => {
-                        on_complete(buf, Err(StorageError::IoError {
-                            // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                            code: unsafe { *libc::__errno_location() },
-                        }));
+                        on_complete(
+                            buf,
+                            Err(StorageError::IoError {
+                                // SAFETY: __errno_location returns a valid pointer to thread-local errno.
+                                code: unsafe { *libc::__errno_location() },
+                            }),
+                        );
                         return;
                     }
                 }
@@ -213,10 +227,13 @@ impl Storage for StorageEngine {
             )
         };
         if fd < 0 {
-            on_complete(buf, Err(StorageError::IoError {
-                // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                code: unsafe { *libc::__errno_location() },
-            }));
+            on_complete(
+                buf,
+                Err(StorageError::IoError {
+                    // SAFETY: __errno_location returns a valid pointer to thread-local errno.
+                    code: unsafe { *libc::__errno_location() },
+                }),
+            );
             return;
         }
 

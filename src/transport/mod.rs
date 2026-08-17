@@ -21,9 +21,9 @@ pub struct EfaAddress(pub [u8; 32]);
 /// Received during LO.HELLO. One per GPU memory pool (1-8 total, NOT per object).
 #[derive(Debug, Clone)]
 pub struct ClientRegion {
-    pub rkey: u64,          // remote key (fi_write takes uint64_t key)
-    pub remote_addr: u64,   // base virtual address of the region on the client
-    pub len: u64,           // total length of the region
+    pub rkey: u64,        // remote key (fi_write takes uint64_t key)
+    pub remote_addr: u64, // base virtual address of the region on the client
+    pub len: u64,         // total length of the region
 }
 
 // ─── Error Types ─────────────────────────────────────────────────────────────

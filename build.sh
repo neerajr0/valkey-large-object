@@ -1,13 +1,14 @@
 #!/usr/bin/env sh
 
-# Build valkey-largeobj module and run integration tests.
-# Follows the same pattern as valkey-bloom.
+# Build valkey-largeobj module and run tests.
 #
 # Usage:
-#   ./build.sh              # build + test
-#   ./build.sh build        # build only
-#   ./build.sh test         # test only (assumes already built)
-#   ./build.sh clean        # remove build artifacts
+#   ./build.sh                # fmt + build + unit tests + integration tests
+#   ./build.sh build          # fmt + build + unit tests (no valkey-server needed)
+#   ./build.sh unit-test      # unit tests only (assumes already built)
+#   ./build.sh integ-test     # integration tests only (assumes already built)
+#   ./build.sh test           # unit tests + integration tests (assumes already built)
+#   ./build.sh clean          # remove build artifacts
 #
 # Environment variables:
 #   SERVER_VERSION        valkey branch/tag to build (default: unstable)
@@ -36,16 +37,41 @@ if [ "$1" = "clean" ]; then
     exit 0
 fi
 
+# ─── Unit Tests Only ──────────────────────────────────────────────────────────
+
+if [ "$1" = "unit-test" ]; then
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    exit 0
+fi
+
 # ─── Build Module ─────────────────────────────────────────────────────────────
 
-if [ "$1" != "test" ]; then
+if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
+    echo "Running cargo fmt check..."
+    cargo fmt --check
+    echo ""
+
     echo "Running cargo build release..."
     cargo build --release
     echo "Module built: $MODULE_PATH"
+    echo ""
+
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    echo ""
 fi
 
 if [ "$1" = "build" ]; then
     exit 0
+fi
+
+# ─── Run unit tests if "test" command ─────────────────────────────────────────
+
+if [ "$1" = "test" ]; then
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    echo ""
 fi
 
 # ─── Valkey Server Binary ─────────────────────────────────────────────────────
@@ -135,4 +161,4 @@ else
 fi
 
 echo ""
-echo "Build and tests succeeded."
+echo "All tests passed."

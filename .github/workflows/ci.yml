@@ -1,0 +1,152 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  VALKEY_REPO_URL: https://github.com/valkey-io/valkey.git
+  TEST_FRAMEWORK_REPO: https://github.com/valkey-io/valkey-test-framework
+  TEST_FRAMEWORK_DIR: tests/build/valkeytestframework
+
+jobs:
+  # ─── Format + Clippy ──────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - name: cargo fmt check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --profile release --all-targets -- -D warnings
+
+  # ─── Build + Unit Tests + Integration Tests ───────────────────────────────
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        server_version: ['unstable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev build-essential
+
+      - name: Set server version
+        run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test --features enable-system-alloc
+
+      - name: Build valkey-server
+        run: |
+          mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
+          cd tests/build
+          git clone "${{ env.VALKEY_REPO_URL }}"
+          cd valkey
+          git checkout ${{ matrix.server_version }}
+          make -j
+          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+
+      - name: Set up test framework
+        run: |
+          git clone ${{ env.TEST_FRAMEWORK_REPO }}
+          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
+          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          rm -rf valkey-test-framework
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set module path
+        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+
+      - name: Run integration tests
+        run: python -m pytest --cache-clear -v "tests/"
+
+  # ─── ASAN Build ───────────────────────────────────────────────────────────
+  asan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        server_version: ['unstable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev build-essential
+
+      - name: Set server version
+        run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test --features enable-system-alloc
+
+      - name: Build valkey-server with ASAN
+        run: |
+          mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
+          cd tests/build
+          git clone "${{ env.VALKEY_REPO_URL }}"
+          cd valkey
+          git checkout ${{ matrix.server_version }}
+          make distclean
+          make -j SANITIZER=address
+          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+
+      - name: Set up test framework
+        run: |
+          git clone ${{ env.TEST_FRAMEWORK_REPO }}
+          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
+          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          rm -rf valkey-test-framework
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set module path
+        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+
+      - name: Run integration tests with ASAN
+        run: |
+          python -m pytest --capture=sys --cache-clear -v "tests/" 2>&1 | tee test_output.tmp
+          if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
+            echo "::error::Memory leaks detected by AddressSanitizer"
+            grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp
+            rm test_output.tmp
+            exit 1
+          fi
+          rm test_output.tmp
