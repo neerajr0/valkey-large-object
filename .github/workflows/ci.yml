@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
@@ -11,30 +12,9 @@ env:
   TEST_FRAMEWORK_DIR: tests/build/valkeytestframework
 
 jobs:
-  # ─── Format + Clippy ──────────────────────────────────────────────────────
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
-
-      - name: cargo fmt check
-        run: cargo fmt --check
-
-      - name: cargo clippy
-        run: cargo clippy --profile release --all-targets -- -D warnings
-
-  # ─── Build + Unit Tests + Integration Tests ───────────────────────────────
+  # ─── Lint + Build + Unit Tests + Integration Tests ────────────────────────
   build-and-test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        server_version: ['unstable']
     steps:
       - uses: actions/checkout@v4
 
@@ -43,8 +23,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev build-essential
 
-      - name: Set server version
-        run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
+      - name: cargo fmt check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --profile release --all-targets -- -D warnings
 
       - name: Release build
         run: cargo build --release
@@ -54,13 +37,13 @@ jobs:
 
       - name: Build valkey-server
         run: |
-          mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
+          mkdir -p tests/build/binaries/unstable
           cd tests/build
           git clone "${{ env.VALKEY_REPO_URL }}"
           cd valkey
-          git checkout ${{ matrix.server_version }}
+          git checkout unstable
           make -j
-          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+          cp src/valkey-server ../binaries/unstable/
 
       - name: Set up test framework
         run: |
@@ -85,13 +68,9 @@ jobs:
       - name: Run integration tests
         run: python -m pytest --cache-clear -v "tests/"
 
-  # ─── ASAN Build ───────────────────────────────────────────────────────────
+  # ─── Lint + Build + ASAN Integration Tests ────────────────────────────────
   asan:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        server_version: ['unstable']
     steps:
       - uses: actions/checkout@v4
 
@@ -100,8 +79,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev build-essential
 
-      - name: Set server version
-        run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
+      - name: cargo fmt check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --profile release --all-targets -- -D warnings
 
       - name: Release build
         run: cargo build --release
@@ -111,14 +93,14 @@ jobs:
 
       - name: Build valkey-server with ASAN
         run: |
-          mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
+          mkdir -p tests/build/binaries/unstable
           cd tests/build
           git clone "${{ env.VALKEY_REPO_URL }}"
           cd valkey
-          git checkout ${{ matrix.server_version }}
+          git checkout unstable
           make distclean
           make -j SANITIZER=address
-          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+          cp src/valkey-server ../binaries/unstable/
 
       - name: Set up test framework
         run: |
