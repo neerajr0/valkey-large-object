@@ -115,7 +115,7 @@ use valkey_module::configuration::ConfigurationContext;
 use valkey_module::configuration::ConfigurationValue;
 use valkey_module::ValkeyError;
 
-fn validate_pool_buf_size<G, T: ConfigurationValue<i64>>(
+fn validate_pool_buf_size<T: ConfigurationValue<i64>>(
     config_ctx: &ConfigurationContext,
     _name: &str,
     val: &'static T,
@@ -124,7 +124,7 @@ fn validate_pool_buf_size<G, T: ConfigurationValue<i64>>(
     if v < 4096 {
         return Err(ValkeyError::Str("pool-buf-size must be at least 4096"));
     }
-    if v as usize % 4096 != 0 {
+    if !(v as usize).is_multiple_of(4096) {
         return Err(ValkeyError::Str("pool-buf-size must be 4KB aligned"));
     }
     Ok(())
@@ -202,7 +202,7 @@ valkey_module! {
     configurations: [
         i64: [
             ["pool-buf-size", &*CFG_POOL_BUF_SIZE, 4_194_304, 4096, 1_073_741_824,
-             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<ValkeyString, AtomicI64>))],
+             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<AtomicI64>))],
             ["pool-buf-count", &*CFG_POOL_BUF_COUNT, 512, 1, 65536,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,

@@ -42,6 +42,9 @@ impl PinnedBuffer {
     pub fn len(&self) -> usize {
         self.mem.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.mem.is_empty()
+    }
     pub fn as_slice(&self) -> &[u8] {
         &self.mem
     }
@@ -163,7 +166,7 @@ impl Storage for StorageEngine {
         object_id: ObjectId,
         buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
+        on_complete: super::ReadCallback,
     ) {
         // Get fd from pool (or open if miss).
         let fd = match self.fd_pool.get(object_id) {
@@ -207,12 +210,7 @@ impl Storage for StorageEngine {
         engine.submit(req);
     }
 
-    fn write_new(
-        &self,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
-    ) {
+    fn write_new(&self, buf: Buffer, len: u64, on_complete: super::WriteCallback) {
         let oid = ObjectId::next();
         let final_path = oid.file_path(&self.data_dir);
         let tmp_path = format!("{}.tmp", final_path);

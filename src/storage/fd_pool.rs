@@ -13,6 +13,12 @@ pub struct FdPool {
     fds: RwLock<HashMap<u64, RawFd>>,
 }
 
+impl Default for FdPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FdPool {
     pub fn new() -> Self {
         Self {

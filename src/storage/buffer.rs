@@ -25,6 +25,9 @@ impl Buffer {
     pub fn len(&self) -> usize {
         self.pinned.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.pinned.len() == 0
+    }
     pub fn idx(&self) -> u16 {
         self.idx
     }
@@ -43,6 +46,12 @@ impl Drop for Buffer {
 /// get() pops one out. Drop pushes it back.
 pub struct BufferPool {
     pool: Mutex<Vec<Buffer>>,
+}
+
+impl Default for BufferPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BufferPool {

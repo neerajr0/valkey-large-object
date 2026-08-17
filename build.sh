@@ -52,6 +52,10 @@ if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
     cargo fmt --check
     echo ""
 
+    echo "Running cargo clippy..."
+    cargo clippy --profile release --all-targets -- -D warnings
+    echo ""
+
     echo "Running cargo build release..."
     cargo build --release
     echo "Module built: $MODULE_PATH"

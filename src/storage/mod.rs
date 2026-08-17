@@ -12,6 +12,14 @@ pub mod engine;
 pub mod fd_pool;
 pub mod uring;
 
+// ─── Callback Type Aliases ────────────────────────────────────────────────────
+
+/// Callback for read completion: (buffer returned, bytes_read or error).
+pub type ReadCallback = Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>;
+
+/// Callback for write completion: (buffer returned, (ObjectId, crc32c) or error).
+pub type WriteCallback = Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>;
+
 // ─── Error Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -66,22 +74,11 @@ pub trait Storage: Send + Sync {
     /// Read object from NVMe into buf. Async via io_uring ReadFixed.
     /// Takes Buffer by value (ownership transfers to storage during I/O).
     /// Returns (Buffer, bytes_read) in callback — caller gets buf back.
-    fn read_into(
-        &self,
-        object_id: ObjectId,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
-    );
+    fn read_into(&self, object_id: ObjectId, buf: Buffer, len: u64, on_complete: ReadCallback);
 
     /// Write buf to NVMe as a new object. Async via io_uring.
     /// Takes Buffer by value. Returns (Buffer, ObjectId, crc32c) via callback.
-    fn write_new(
-        &self,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
-    );
+    fn write_new(&self, buf: Buffer, len: u64, on_complete: WriteCallback);
 
     /// Delete an object file from NVMe. Called on key deletion or eviction.
     fn delete(&self, object_id: ObjectId);
