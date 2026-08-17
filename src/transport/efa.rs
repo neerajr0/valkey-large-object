@@ -172,7 +172,7 @@ impl EfaEndpoint {
 
             let mut info: *mut ffi::fi_info = ptr::null_mut();
             let ret = ffi::fi_getinfo(
-                fi_version(1, 14),
+                fi_version(1, 18),
                 ptr::null(),
                 ptr::null(),
                 0,
