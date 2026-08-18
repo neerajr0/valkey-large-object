@@ -91,10 +91,18 @@ lazy_static::lazy_static! {
 // ─── Global Runtime ──────────────────────────────────────────────────────────
 
 /// Tokio runtime — owned by the module, handle passed to transport crate.
-static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+/// Stored in Mutex<Option<>> so deinitialize() can take ownership and drop it,
+/// which shuts down worker threads and allows the process to exit cleanly.
+static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
-pub fn runtime_handle() -> &'static tokio::runtime::Handle {
-    RUNTIME.get().expect("runtime not initialized").handle()
+pub fn runtime_handle() -> tokio::runtime::Handle {
+    RUNTIME
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("runtime not initialized")
+        .handle()
+        .clone()
 }
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
@@ -171,7 +179,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    RUNTIME.set(rt).ok();
+    *RUNTIME.lock().unwrap() = Some(rt);
 
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();
@@ -202,6 +210,10 @@ fn deinitialize(_ctx: &Context) -> Status {
     transport::shutdown();
     storage::deregister_buffers();
     storage::shutdown();
+    // Shutdown tokio runtime — drops worker threads so process can exit cleanly.
+    if let Some(rt) = RUNTIME.lock().unwrap().take() {
+        rt.shutdown_background();
+    }
     Status::Ok
 }
 
