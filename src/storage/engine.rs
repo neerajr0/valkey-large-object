@@ -108,6 +108,14 @@ impl StorageEngine {
         self.delete(object_id);
     }
 
+    /// Signal the io_uring poller thread to exit. Non-blocking.
+    /// The poller drains pending ops then terminates, allowing process exit.
+    pub fn signal_shutdown(&self) {
+        if let Some(engine) = self.uring.get() {
+            engine.signal_shutdown();
+        }
+    }
+
     /// Open a read fd for an object. Uses O_DIRECT when direct-io config is enabled.
     fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
         let path = oid.file_path(&self.data_dir);

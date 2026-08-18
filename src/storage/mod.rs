@@ -45,6 +45,9 @@ impl std::fmt::Display for StorageError {
 /// Implemented by UringNvmeEngine (production) and SyncNvmeEngine (tests).
 pub trait NvmeEngine: Send + Sync {
     fn submit(&self, req: uring::IoRequest);
+    /// Signal the engine to stop accepting work and exit its poller loop.
+    /// Does not block — the poller thread exits asynchronously.
+    fn signal_shutdown(&self);
 }
 
 // ─── Storage Trait (from interface doc) ──────────────────────────────────────
@@ -115,7 +118,12 @@ pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
 /// Shutdown: drain in-flight ops, close fds, clean up files.
 /// Called from module deinit. TODO: implement when shutdown path is built.
 pub fn shutdown() {
-    // Future: UringNvmeEngine::shutdown() drains pending ops.
+    // Signal the io_uring poller thread to drain pending ops and exit.
+    // The poller checks the shutdown AtomicBool on each 100ms tick and exits
+    // when set + no pending ops remain. This allows the process to terminate.
+    if let Some(storage) = STORAGE.get() {
+        storage.signal_shutdown();
+    }
     // Future: FdPool closes all open fds.
     // Future: Orphan reconciliation (delete .dat files with no keyspace entry).
 }

@@ -73,6 +73,9 @@ impl NvmeEngine for UringNvmeEngine {
     fn submit(&self, req: IoRequest) {
         self.tx.send(req).ok();
     }
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 impl UringNvmeEngine {
