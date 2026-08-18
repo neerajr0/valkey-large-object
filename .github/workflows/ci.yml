@@ -25,6 +25,13 @@ jobs:
           # System deps (AL2023)
           sudo yum install -y clang clang-devel gcc make
 
+      - name: Install Rust
+        run: |
+          if ! command -v cargo &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
       - name: cargo fmt check
         run: cargo fmt --check
 
@@ -92,6 +99,13 @@ jobs:
         run: |
           # System deps (AL2023)
           sudo yum install -y clang clang-devel gcc make
+
+      - name: Install Rust
+        run: |
+          if ! command -v cargo &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: cargo fmt check
         run: cargo fmt --check
