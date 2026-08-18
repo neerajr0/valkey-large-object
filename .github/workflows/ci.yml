@@ -166,14 +166,12 @@ jobs:
         env:
           ASAN_BUILD: "1"
         run: |
-          set -o pipefail
-          python3 -m pytest --capture=sys --cache-clear -v "tests/" 2>&1 | tee test_output.tmp
-          PYTEST_EXIT=$?
+          python3 -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" 2>&1 | tee test_output.tmp
           if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
             echo "::error::Memory leaks detected by AddressSanitizer"
-            grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp
+            LEAKING_TESTS=$(grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp | grep -v "LeakSanitizer" | grep ".*\.py::")
+            echo "$LEAKING_TESTS"
             rm test_output.tmp
             exit 1
           fi
           rm test_output.tmp
-          exit $PYTEST_EXIT

@@ -210,9 +210,9 @@ fn deinitialize(_ctx: &Context) -> Status {
     transport::shutdown();
     storage::deregister_buffers();
     storage::shutdown();
-    // Shutdown tokio runtime — drops worker threads so process can exit cleanly.
+    // Shutdown tokio runtime — blocks until worker threads exit so process can terminate.
     if let Some(rt) = RUNTIME.lock().unwrap().take() {
-        rt.shutdown_background();
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
     }
     Status::Ok
 }
