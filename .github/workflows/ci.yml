@@ -14,16 +14,26 @@ env:
   TEST_FRAMEWORK_DIR: tests/build/valkeytestframework
 
 jobs:
-  # ─── Lint + Build + Unit Tests + Integration Tests ────────────────────────
-  build-and-test:
+  test:
     runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: build-and-test
+            asan: false
+            cache_key_suffix: normal
+          - name: asan
+            asan: true
+            cache_key_suffix: asan
+    name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
-          # System deps (AL2023)
           sudo yum install -y clang clang-devel gcc make git python3 python3-pip
+          ${{ matrix.asan && 'sudo yum install -y libasan' || '' }}
 
       - name: Install Rust
         run: |
@@ -55,7 +65,7 @@ jobs:
           path: |
             tests/build/binaries
             tests/build/valkeytestframework
-          key: valkey-unstable-arm64-normal-w${{ steps.week.outputs.week }}
+          key: valkey-unstable-arm64-${{ matrix.cache_key_suffix }}-w${{ steps.week.outputs.week }}
 
       - name: Build valkey-server
         if: steps.cache-valkey.outputs.cache-hit != 'true'
@@ -65,7 +75,7 @@ jobs:
           git clone "${{ env.VALKEY_REPO_URL }}"
           cd valkey
           git checkout unstable
-          make -j
+          ${{ matrix.asan && 'make distclean && make -j SANITIZER=address' || 'make -j' }}
           cp src/valkey-server ../binaries/unstable/
           cd ../..
           rm -rf valkey
@@ -87,82 +97,11 @@ jobs:
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
 
       - name: Run integration tests
+        if: ${{ !matrix.asan }}
         run: python3 -m pytest --cache-clear -v "tests/"
 
-  # ─── Lint + Build + ASAN Integration Tests ────────────────────────────────
-  asan:
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          # System deps (AL2023)
-          sudo yum install -y clang clang-devel gcc make git python3 python3-pip libasan
-
-      - name: Install Rust
-        run: |
-          if ! command -v cargo &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          fi
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: cargo fmt check
-        run: cargo fmt --check
-
-      - name: cargo clippy
-        run: cargo clippy --profile release --all-targets -- -D warnings
-
-      - name: Release build
-        run: cargo build --release
-
-      - name: Run unit tests
-        run: cargo test --features enable-system-alloc
-
-      - name: Get week number
-        id: week
-        run: echo "week=$(date +%V)" >> $GITHUB_OUTPUT
-
-      - name: Cache valkey-server (ASAN) and test framework
-        id: cache-valkey
-        uses: actions/cache@v4
-        with:
-          path: |
-            tests/build/binaries
-            tests/build/valkeytestframework
-          key: valkey-unstable-arm64-asan-w${{ steps.week.outputs.week }}
-
-      - name: Build valkey-server with ASAN
-        if: steps.cache-valkey.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p tests/build/binaries/unstable
-          cd tests/build
-          git clone "${{ env.VALKEY_REPO_URL }}"
-          cd valkey
-          git checkout unstable
-          make distclean
-          make -j SANITIZER=address
-          cp src/valkey-server ../binaries/unstable/
-          cd ../..
-          rm -rf valkey
-
-      - name: Set up test framework
-        if: steps.cache-valkey.outputs.cache-hit != 'true'
-        run: |
-          git clone ${{ env.TEST_FRAMEWORK_REPO }}
-          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
-          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
-          rm -rf valkey-test-framework
-
-      - name: Install Python dependencies
-        run: |
-          python3 -m pip install --upgrade pip
-          pip3 install -r requirements.txt
-
-      - name: Set module path
-        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
-
-      - name: Run integration tests with ASAN
+      - name: Run integration tests (ASAN)
+        if: ${{ matrix.asan }}
         env:
           ASAN_BUILD: "1"
         run: |
