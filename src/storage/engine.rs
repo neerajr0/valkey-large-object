@@ -120,11 +120,10 @@ impl StorageEngine {
     fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
         let path = oid.file_path(&self.data_dir);
         let c_path = std::ffi::CString::new(path).ok()?;
-        let flags = if crate::direct_io() {
-            libc::O_RDONLY | libc::O_DIRECT
-        } else {
-            libc::O_RDONLY
-        };
+        let mut flags = libc::O_RDONLY;
+        if crate::direct_io() {
+            flags |= libc::O_DIRECT;
+        }
         // SAFETY: c_path is a valid null-terminated C string, flags are valid POSIX.
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
@@ -222,11 +221,10 @@ impl Storage for StorageEngine {
         let tmp_path = format!("{}.tmp", final_path);
 
         // Open tmp file for write. Uses O_DIRECT when direct-io config is enabled.
-        let write_flags = if crate::direct_io() {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT
-        } else {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
-        };
+        let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+        if crate::direct_io() {
+            write_flags |= libc::O_DIRECT;
+        }
         // SAFETY: CString is valid, flags are standard POSIX, mode 0o644 is safe.
         let fd = unsafe {
             libc::open(
