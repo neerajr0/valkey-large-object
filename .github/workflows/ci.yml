@@ -16,7 +16,7 @@ env:
 jobs:
   # ─── Lint + Build + Unit Tests + Integration Tests ────────────────────────
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
@@ -89,7 +89,7 @@ jobs:
 
   # ─── Lint + Build + ASAN Integration Tests ────────────────────────────────
   asan:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
