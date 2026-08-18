@@ -23,7 +23,7 @@ jobs:
       - name: Install system dependencies
         run: |
           # System deps (AL2023)
-          sudo yum install -y clang clang-devel gcc make
+          sudo yum install -y clang clang-devel gcc make git
 
       - name: Install Rust
         run: |
@@ -98,7 +98,7 @@ jobs:
       - name: Install system dependencies
         run: |
           # System deps (AL2023)
-          sudo yum install -y clang clang-devel gcc make
+          sudo yum install -y clang clang-devel gcc make git
 
       - name: Install Rust
         run: |
