@@ -22,8 +22,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential
+          # System deps (AL2023)
+          sudo yum install -y clang clang-devel gcc make
 
       - name: cargo fmt check
         run: cargo fmt --check
@@ -71,11 +71,6 @@ jobs:
           mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
           rm -rf valkey-test-framework
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -95,8 +90,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential
+          # System deps (AL2023)
+          sudo yum install -y clang clang-devel gcc make
 
       - name: cargo fmt check
         run: cargo fmt --check
@@ -144,11 +139,6 @@ jobs:
           mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
           mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
           rm -rf valkey-test-framework
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
 
       - name: Install Python dependencies
         run: |
