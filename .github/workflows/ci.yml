@@ -165,5 +165,17 @@ jobs:
       - name: Run integration tests with ASAN
         env:
           ASAN_BUILD: "1"
-          ASAN_OPTIONS: "detect_leaks=0"
-        run: python3 -m pytest --cache-clear -v "tests/" -m "not skip_for_asan" 
+        run: |
+          python3 -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" > test_output.tmp 2>&1 || true
+          cat test_output.tmp
+          if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
+            echo "::error::Memory leaks detected by AddressSanitizer"
+            grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp | grep ".*\.py::"
+            rm -f test_output.tmp
+            exit 1
+          fi
+          if grep -q "FAILED\|ERROR" test_output.tmp; then
+            rm -f test_output.tmp
+            exit 1
+          fi
+          rm -f test_output.tmp
