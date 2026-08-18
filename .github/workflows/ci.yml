@@ -23,7 +23,7 @@ jobs:
       - name: Install system dependencies
         run: |
           # System deps (AL2023)
-          sudo yum install -y clang clang-devel gcc make git
+          sudo yum install -y clang clang-devel gcc make git python3 python3-pip
 
       - name: Install Rust
         run: |
@@ -80,14 +80,14 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
 
       - name: Run integration tests
-        run: python -m pytest --cache-clear -v "tests/"
+        run: python3 -m pytest --cache-clear -v "tests/"
 
   # ─── Lint + Build + ASAN Integration Tests ────────────────────────────────
   asan:
@@ -98,7 +98,7 @@ jobs:
       - name: Install system dependencies
         run: |
           # System deps (AL2023)
-          sudo yum install -y clang clang-devel gcc make git
+          sudo yum install -y clang clang-devel gcc make git python3 python3-pip
 
       - name: Install Rust
         run: |
@@ -156,8 +156,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
@@ -166,7 +166,7 @@ jobs:
         env:
           ASAN_BUILD: "1"
         run: |
-          python -m pytest --capture=sys --cache-clear -v "tests/" 2>&1 | tee test_output.tmp
+          python3 -m pytest --capture=sys --cache-clear -v "tests/" 2>&1 | tee test_output.tmp
           if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
             echo "::error::Memory leaks detected by AddressSanitizer"
             grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp
