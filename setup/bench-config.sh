@@ -7,8 +7,10 @@
 # --- paths ---
 : "${PORT:=6399}"
 : "${DATA_DIR:=/mnt/bigobj-data}"        # must match setup-storage.sh MOUNT_POINT
-: "${LOGFILE:=/tmp/bigobj.log}"
-: "${PIDFILE:=/tmp/bigobj.pid}"
+# Log/pid in $HOME so a normal user can always write them (a shared /tmp path can
+# be left root-owned by an earlier sudo run → "Can't open the log file").
+: "${LOGFILE:=${HOME:-/tmp}/bigobj.log}"
+: "${PIDFILE:=${HOME:-/tmp}/bigobj.pid}"
 # LVM striped volume + mount opts (created by setup-storage.sh; used by bench-reset.sh).
 : "${LV:=/dev/bigobj_vg/bigobj_lv}"
 : "${MOUNT_OPTS:=noatime,discard,inode64}"
