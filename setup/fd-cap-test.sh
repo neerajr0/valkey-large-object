@@ -89,8 +89,12 @@ echo "memory / fd overhead (post-run; pinned slab should track ~FD_CAP, not DBSI
 # close their fds). Skips gracefully without root.
 if [ "${DROP_CACHES:-1}" = "1" ]; then
   sync 2>/dev/null || true
-  sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null \
-    || echo "  (drop_caches skipped — needs root; SUnreclaim still includes reclaimable inode cache)"
+  # echo 3 = drop pagecache + reclaimable dentries/inodes. Must be 3 (not 1): the
+  # ~1 inode/written-file is *reclaimable* and would otherwise swamp the ~FD_CAP
+  # inodes our open fds *pin* (non-reclaimable). After this, xfs_inode/SUnreclaim
+  # should track ~FD_CAP, not object_count.
+  sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null \
+    || echo "  (drop_caches skipped — needs root; slab still includes reclaimable inode cache)"
 fi
 mem_fd_snapshot "$PID"
 echo "  expect ~$FD_CAP pinned fds => ~$((FD_CAP * 3 / 2 / 1024)) MB pinned kernel mem (~1.5KB/fd),"
