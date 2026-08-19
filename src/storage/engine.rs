@@ -173,28 +173,26 @@ impl Storage for StorageEngine {
         len: u64,
         on_complete: super::ReadCallback,
     ) {
-        // Get fd from pool (or open if miss).
-        let fd = match self.fd_pool.get(object_id) {
-            Some(fd) => fd,
-            None => {
-                match self.open_read_fd(object_id) {
-                    Some(fd) => {
-                        self.fd_pool.insert(object_id, fd);
-                        fd
-                    }
-                    None => {
-                        on_complete(
-                            buf,
-                            Err(StorageError::IoError {
-                                // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                                code: unsafe { *libc::__errno_location() },
-                            }),
-                        );
-                        return;
-                    }
+        // Acquire an fd guard from the LFU pool (open + insert on miss). The guard
+        // holds an in-flight reference on the fd so a concurrent evict/delete can't
+        // close it out from under this read.
+        let guard = match self.fd_pool.acquire(object_id) {
+            Some(g) => g,
+            None => match self.open_read_fd(object_id) {
+                Some(fd) => self.fd_pool.insert(object_id, fd),
+                None => {
+                    on_complete(
+                        buf,
+                        Err(StorageError::IoError {
+                            // SAFETY: __errno_location returns a valid pointer to thread-local errno.
+                            code: unsafe { *libc::__errno_location() },
+                        }),
+                    );
+                    return;
                 }
-            }
+            },
         };
+        let fd = guard.fd();
 
         // Engine must be initialized (set once at module load via register_buffers).
         let engine = match self.uring.get() {
@@ -205,11 +203,18 @@ impl Storage for StorageEngine {
             }
         };
 
+        // Move the guard into the completion closure so the fd stays open for the
+        // whole read; it is released (in-flight refcount decremented) once the read
+        // completes on the poller thread. This is the in-flight reference count in
+        // action, and the extension point for read coalescing.
         let req = IoRequest::Read {
             fd,
             buf,
             len,
-            on_complete,
+            on_complete: Box::new(move |buf, result| {
+                on_complete(buf, result);
+                drop(guard);
+            }),
         };
 
         engine.submit(req);
@@ -276,6 +281,9 @@ impl Storage for StorageEngine {
                     Ok(()) => {
                         // Atomic rename: tmp → final.
                         if std::fs::rename(&tmp_path_for_cb, &final_path_for_cb).is_ok() {
+                            // The fd pool is populated lazily on the read path; we
+                            // deliberately do not warm it from the write path (that's
+                            // speculative work for an object that may never be read).
                             on_complete(buf, Ok((oid, crc)));
                         } else {
                             let _ = std::fs::remove_file(&tmp_path_for_cb);
@@ -294,7 +302,8 @@ impl Storage for StorageEngine {
     }
 
     fn delete(&self, object_id: ObjectId) {
-        // Close fd first (fd pool), then unlink file.
+        // Drop the fd from the pool (an in-flight read keeps it open until it
+        // completes), then unlink. Unlinking an open file is fine on Linux.
         self.fd_pool.remove(object_id);
         let path = object_id.file_path(&self.data_dir);
         let _ = std::fs::remove_file(&path);
