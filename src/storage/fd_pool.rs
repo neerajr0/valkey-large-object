@@ -30,7 +30,7 @@ use crate::data_type::ObjectId;
 /// Cap on the number of *cached* fds. Keep it under `ulimit -n` with headroom for
 /// Valkey's own fds. Soft bound: in-flight fds (evicted or deleted mid-read) stay
 /// open until the read completes, so the live fd count can briefly exceed this.
-pub const DEFAULT_CAPACITY: usize = 16384;
+pub const DEFAULT_CAPACITY: usize = 100_000;
 
 /// LFU eviction sample size (similar to Valkey's `maxmemory-samples`).
 const EVICT_SAMPLE_SIZE: usize = 8;
