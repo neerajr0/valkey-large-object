@@ -25,15 +25,26 @@ bc_echo "stopping existing server (if any) ..."
 $CLI SHUTDOWN NOSAVE 2>/dev/null || true
 sleep 1
 
-# Raise the fd soft limit for THIS shell; the server inherits it.
-if ! ulimit -n "$FD_LIMIT" 2>/dev/null; then
-  hard="$(ulimit -Hn)"
-  echo "[bench] ERROR: can't raise 'ulimit -n' to $FD_LIMIT (hard limit=$hard)." >&2
-  echo "[bench]        The fd-pool cap is $FD_CAP, so you need well above that." >&2
-  echo "[bench]        Re-run under sudo, or: sudo prlimit --nofile=$FD_LIMIT --pid \$\$" >&2
+# Raise the fd soft limit for THIS shell; the server inherits it. Cap the request
+# at the hard limit (raising the hard limit needs root) — we only need well above
+# the fd-pool cap, not the full FD_LIMIT. Error only if even the hard limit is too
+# low for the pool + client sockets.
+HARD="$(ulimit -Hn)"
+NEED=$(( FD_CAP + CLIENTS + WRITE_CLIENTS + 2048 ))   # pool + bench sockets + margin
+WANT="$FD_LIMIT"
+[ "$HARD" != "unlimited" ] && [ "$WANT" -gt "$HARD" ] && WANT="$HARD"
+if ! ulimit -n "$WANT" 2>/dev/null; then
+  echo "[bench] ERROR: can't set 'ulimit -n' to $WANT (hard limit=$HARD)." >&2
+  echo "[bench]        Re-run under sudo, or raise it: sudo prlimit --nofile=$NEED --pid \$\$" >&2
   exit 1
 fi
-bc_echo "ulimit -n = $(ulimit -n)  (fd-pool cap = $FD_CAP)"
+CUR="$(ulimit -n)"
+if [ "$CUR" != "unlimited" ] && [ "$CUR" -lt "$NEED" ]; then
+  echo "[bench] ERROR: ulimit -n=$CUR is below what the test needs (~$NEED = cap $FD_CAP + sockets + margin)." >&2
+  echo "[bench]        Raise the hard limit (sudo prlimit --nofile=$NEED --pid \$\$) or run under sudo, then re-run." >&2
+  exit 1
+fi
+bc_echo "ulimit -n = $CUR  (fd-pool cap = $FD_CAP, need ~$NEED)"
 
 bc_echo "starting: obj-size=$OBJ_SIZE pool-buf-count=$POOL_BUF_COUNT io-threads=$IO_THREADS cpus=$SERVER_CPUS"
 taskset -c "$SERVER_CPUS" "$VALKEY_SERVER" --port "$PORT" --daemonize yes \
