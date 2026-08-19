@@ -1,11 +1,16 @@
-//! EFA-aware E2E test client for ValkeyLargeObj.
+//! EFA-aware E2E test client for ValkeyLargeObj (Multi-Device).
 //!
-//! Validates the full integrated pipeline:
-//!   Client EFA buffer → fi_read (hardware RDMA) → Server pool buf → io_uring → NVMe  (LO.SET)
-//!   NVMe → io_uring → Server pool buf → fi_write (hardware RDMA) → Client EFA buffer (LO.GET)
+//! Validates the full integrated pipeline with Option 2 (per-request rkey):
+//!   Client EFA buffer → fi_read (hardware RDMA) → Server pool buf → io_uring → NVMe  (DMA.SET)
+//!   NVMe → io_uring → Server pool buf → fi_write (hardware RDMA) → Client EFA buffer (DMA.GET)
 //!
-//! Prints every command sent over TCP and provides byte-level attribution showing
-//! that object data travels exclusively over EFA, not TCP.
+//! Protocol:
+//!   DMA.HELLO <client_efa_addr>
+//!     → returns array of ALL server EFA addresses (one per device)
+//!   DMA.GET <key> <rkey> <remote_addr> <len>
+//!     → server fi_writes into client buffer, replies with :bytes_written
+//!   DMA.SET <key> <rkey> <remote_addr> <len>
+//!     → server fi_reads from client buffer, writes to NVMe, replies +OK
 //!
 //! Usage:
 //!   efa-e2e-client --server <valkey_server_private_ip> [--iterations 10] [--size 2097152]
@@ -17,7 +22,6 @@ use clap::Parser;
 use eyre::{eyre, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use fabric::{run_cq_progress, EfaEndpoint};
 use resp::RespConnection;
@@ -27,7 +31,7 @@ const PATTERN_SET: u8 = 0xDD;
 const PATTERN_CLR: u8 = 0x00;
 
 #[derive(Parser, Debug)]
-#[command(name = "efa-e2e-client", about = "EFA-aware E2E test client for ValkeyLargeObj")]
+#[command(name = "efa-e2e-client", about = "EFA E2E test client for ValkeyLargeObj (multi-device)")]
 struct Args {
     /// Valkey server private IP address
     #[arg(long)]
@@ -37,7 +41,7 @@ struct Args {
     #[arg(long, default_value = "6379")]
     port: u16,
 
-    /// Object size in bytes for LO.SET / LO.GET
+    /// Object size in bytes for DMA.SET / DMA.GET
     #[arg(long, default_value = "2097152")]
     size: usize,
 
@@ -52,7 +56,7 @@ fn main() -> Result<()> {
     let iterations = args.iterations;
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║          EFA E2E Client — ValkeyLargeObj                    ║");
+    println!("║      EFA E2E Client — ValkeyLargeObj (Multi-Device)         ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Server:     {}:{}", args.server, args.port);
@@ -65,7 +69,7 @@ fn main() -> Result<()> {
     let mut ep = EfaEndpoint::new()?;
     let local_addr = ep.get_local_addr()?;
     let local_addr_hex: String = local_addr.iter().map(|b| format!("{:02x}", b)).collect();
-    println!("  EFA address: {} ({} bytes)", &local_addr_hex[..32], local_addr.len());
+    println!("  EFA address: {} ({} bytes)", &local_addr_hex[..32.min(local_addr_hex.len())], local_addr.len());
     println!("  Provider:    efa (API version 1.18, hardware RDMA auto-enabled)");
 
     // ─── Step 2: Register buffer ─────────────────────────────────────────
@@ -100,64 +104,64 @@ fn main() -> Result<()> {
         return Err(eyre!("PING failed: {}", reply.trim()));
     }
 
-    // ─── Step 5: LO.HELLO ────────────────────────────────────────────────
-    println!("\n── Step 5: LO.HELLO (establish RDMA session) ──");
-    let rkey_str = rkey.to_string();
-    let remote_addr_str = remote_addr.to_string();
-    let buf_size_str = DEFAULT_BUF_SIZE.to_string();
-    let hello_args: Vec<&str> = vec![
-        "LO.HELLO",
-        &local_addr_hex,
-        "1",
-        &rkey_str,
-        &remote_addr_str,
-        &buf_size_str,
-    ];
+    // ─── Step 5: DMA.HELLO (Option 2: client_efa_addr only) ──────────────
+    println!("\n── Step 5: DMA.HELLO (establish RDMA session, multi-device) ──");
+    let hello_args: Vec<&str> = vec!["DMA.HELLO", &local_addr_hex];
     let (reply, _) = conn.command(&hello_args)?;
 
     if reply.starts_with('-') {
         stop_flag.store(true, Ordering::Relaxed);
         progress_thread.join().unwrap();
-        return Err(eyre!("LO.HELLO failed: {}", reply.trim()));
+        return Err(eyre!("DMA.HELLO failed: {}", reply.trim()));
     }
 
-    let server_addr_hex = RespConnection::parse_array_first_bulk(&reply)?;
-    println!("  Session established. Server EFA: {}...", &server_addr_hex[..32]);
+    // Parse ALL server EFA addresses from the array reply
+    let server_addrs = parse_resp_array_bulks(&reply)?;
+    println!("  Session established. Server returned {} EFA address(es):", server_addrs.len());
+    for (i, addr_hex) in server_addrs.iter().enumerate() {
+        println!("    Device {}: {}...", i, &addr_hex[..32.min(addr_hex.len())]);
+    }
 
-    // Insert server into AV for bidirectional protocol
-    let server_addr_bytes = hex_decode(&server_addr_hex)?;
-    let _server_fi_addr = ep.insert_peer(&server_addr_bytes)?;
-    println!("  Server inserted into local AV");
+    // Insert ALL server addresses into local AV
+    for addr_hex in &server_addrs {
+        let server_addr_bytes = hex_decode(addr_hex)?;
+        let _fi_addr = ep.insert_peer(&server_addr_bytes)?;
+    }
+    println!("  All {} server address(es) inserted into local AV", server_addrs.len());
 
-    // ─── Step 6: Warmup LO.SET (absorbs handshake) ───────────────────────
+    // ─── Step 6: Warmup DMA.SET (absorbs handshake) ──────────────────────
     println!("\n── Step 6: Warmup (absorbs EFA handshake) ──");
     buf[..obj_size].fill(PATTERN_SET);
+    let rkey_str = rkey.to_string();
+    let remote_addr_str = remote_addr.to_string();
     let size_str = obj_size.to_string();
-    let (reply, warmup_ms) = conn.command(&["LO.SET", "efa_warmup", &size_str, "0", "0"])?;
+
+    let (reply, warmup_ms) = conn.command(&[
+        "DMA.SET", "efa_warmup", &rkey_str, &remote_addr_str, &size_str,
+    ])?;
     if reply.starts_with('-') {
         stop_flag.store(true, Ordering::Relaxed);
         progress_thread.join().unwrap();
-        return Err(eyre!("Warmup LO.SET failed: {}", reply.trim()));
+        return Err(eyre!("Warmup DMA.SET failed: {}", reply.trim()));
     }
     println!("  Handshake + first transfer: {:.2} ms", warmup_ms);
 
-    // Reset TCP counters after warmup so steady-state numbers are clean
+    // Reset TCP counters after warmup
     let tcp_sent_before_bench = conn.tcp_bytes_sent;
     let tcp_recv_before_bench = conn.tcp_bytes_received;
 
-    // ─── Step 7: Steady-state LO.SET ─────────────────────────────────────
-    println!("\n── Step 7: Steady-state LO.SET ({} x {} bytes) ──", iterations, obj_size);
+    // ─── Step 7: Steady-state DMA.SET ────────────────────────────────────
+    println!("\n── Step 7: Steady-state DMA.SET ({} x {} bytes) ──", iterations, obj_size);
     buf[..obj_size].fill(PATTERN_SET);
 
     let mut set_times: Vec<f64> = Vec::new();
     for i in 0..iterations {
         let key = format!("efa_bench_{}", i);
-        // Print first iteration to show the command format
         let (reply, ms) = if i == 0 {
             println!("  Example command (first of {}):", iterations);
-            conn.command(&["LO.SET", &key, &size_str, "0", "0"])?
+            conn.command(&["DMA.SET", &key, &rkey_str, &remote_addr_str, &size_str])?
         } else {
-            conn.command_silent(&["LO.SET", &key, &size_str, "0", "0"])?
+            conn.command_silent(&["DMA.SET", &key, &rkey_str, &remote_addr_str, &size_str])?
         };
         if reply.starts_with('-') {
             println!("  ERROR on iter {}: {}", i, reply.trim());
@@ -174,21 +178,22 @@ fn main() -> Result<()> {
         println!("  min={:.2} ms  avg={:.2} ms  max={:.2} ms  throughput={:.2} GB/s", min, avg, max, tput);
     }
 
-    // ─── Step 8: Steady-state LO.GET ─────────────────────────────────────
-    println!("\n── Step 8: Steady-state LO.GET ({} x {} bytes) ──", iterations, obj_size);
+    // ─── Step 8: Steady-state DMA.GET ────────────────────────────────────
+    println!("\n── Step 8: Steady-state DMA.GET ({} x {} bytes) ──", iterations, obj_size);
+    // Use an offset into the buffer for GET so we can verify data correctness
     let get_offset: usize = obj_size;
-    let get_offset_str = get_offset.to_string();
+    let get_remote_addr = remote_addr + get_offset as u64;
+    let get_remote_addr_str = get_remote_addr.to_string();
 
     let mut get_times: Vec<f64> = Vec::new();
     for i in 0..iterations {
         buf[get_offset..get_offset + obj_size].fill(PATTERN_CLR);
         let key = format!("efa_bench_{}", i);
-        // Print first iteration to show the command format
         let (reply, ms) = if i == 0 {
             println!("  Example command (first of {}):", iterations);
-            conn.command(&["LO.GET", &key, "0", &get_offset_str])?
+            conn.command(&["DMA.GET", &key, &rkey_str, &get_remote_addr_str, &size_str])?
         } else {
-            conn.command_silent(&["LO.GET", &key, "0", &get_offset_str])?
+            conn.command_silent(&["DMA.GET", &key, &rkey_str, &get_remote_addr_str, &size_str])?
         };
         if reply.starts_with('-') {
             println!("  ERROR on iter {}: {}", i, reply.trim());
@@ -231,8 +236,8 @@ fn main() -> Result<()> {
     // ─── Data Path Attribution ───────────────────────────────────────────
     let tcp_sent_bench = conn.tcp_bytes_sent - tcp_sent_before_bench;
     let tcp_recv_bench = conn.tcp_bytes_received - tcp_recv_before_bench;
-    let efa_read_bytes = iterations as u64 * obj_size as u64;  // LO.SET: server fi_read
-    let efa_write_bytes = iterations as u64 * obj_size as u64; // LO.GET: server fi_write
+    let efa_read_bytes = iterations as u64 * obj_size as u64;  // DMA.SET: server fi_read
+    let efa_write_bytes = iterations as u64 * obj_size as u64; // DMA.GET: server fi_write
     let total_efa = efa_read_bytes + efa_write_bytes;
     let total_tcp = tcp_sent_bench + tcp_recv_bench;
     let efa_pct = if total_efa + total_tcp > 0 {
@@ -252,8 +257,8 @@ fn main() -> Result<()> {
     println!("║    Total:    {:>10} bytes                                 ║", total_tcp);
     println!("║                                                              ║");
     println!("║  EFA (object data, hardware RDMA):                           ║");
-    println!("║    fi_read:  {:>10} bytes  ({} x LO.SET)              ║", efa_read_bytes, iterations);
-    println!("║    fi_write: {:>10} bytes  ({} x LO.GET)              ║", efa_write_bytes, iterations);
+    println!("║    fi_read:  {:>10} bytes  ({} x DMA.SET)             ║", efa_read_bytes, iterations);
+    println!("║    fi_write: {:>10} bytes  ({} x DMA.GET)             ║", efa_write_bytes, iterations);
     println!("║    Total:    {:>10} bytes                                 ║", total_efa);
     println!("║                                                              ║");
     println!("║  Object data over TCP:  0 bytes                              ║");
@@ -269,18 +274,45 @@ fn main() -> Result<()> {
     if !set_times.is_empty() {
         let avg = set_times.iter().sum::<f64>() / set_times.len() as f64;
         let tput = (obj_size as f64 / 1e9) / (avg / 1000.0);
-        println!("║  LO.SET:  {:.2} ms avg, {:.2} GB/s  (fi_read → NVMe)          ║", avg, tput);
+        println!("║  DMA.SET: {:.2} ms avg, {:.2} GB/s  (fi_read → NVMe)        ║", avg, tput);
     }
     if !get_times.is_empty() {
         let avg = get_times.iter().sum::<f64>() / get_times.len() as f64;
         let tput = (obj_size as f64 / 1e9) / (avg / 1000.0);
-        println!("║  LO.GET:  {:.2} ms avg, {:.2} GB/s  (NVMe → fi_write)         ║", avg, tput);
+        println!("║  DMA.GET: {:.2} ms avg, {:.2} GB/s  (NVMe → fi_write)       ║", avg, tput);
     }
     println!("║  Warmup:  {:.2} ms (includes EFA handshake, one-time)       ║", warmup_ms);
     println!("║  Verify:  {}                                               ║", if verified { "PASS" } else { "FAIL" });
+    println!("║  Server EFA devices: {}                                     ║", server_addrs.len());
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     Ok(())
+}
+
+/// Parse all bulk strings from a RESP array reply.
+fn parse_resp_array_bulks(reply: &str) -> Result<Vec<String>> {
+    let lines: Vec<&str> = reply.lines().collect();
+    if lines.is_empty() || !lines[0].starts_with('*') {
+        return Err(eyre!("Expected RESP array, got: {:?}", reply));
+    }
+    let count: usize = lines[0][1..].trim().parse()?;
+    let mut results = Vec::with_capacity(count);
+    let mut i = 1;
+    while i < lines.len() && results.len() < count {
+        if lines[i].starts_with('$') {
+            let len: usize = lines[i][1..].trim().parse()?;
+            if i + 1 < lines.len() {
+                let data = &lines[i + 1][..len.min(lines[i + 1].len())];
+                results.push(data.to_string());
+                i += 2;
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(results)
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {

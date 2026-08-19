@@ -14,7 +14,6 @@ libc = "0.2"
 crc32c = "0.6"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 lazy_static = "1"
 
 [build-dependencies]

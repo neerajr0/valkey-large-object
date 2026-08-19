@@ -148,43 +148,20 @@ impl EfaEndpoint {
     /// Create a new EFA endpoint with RMA capability.
     /// Returns Err if no EFA device is found (graceful fallback to TCP-only mode).
     pub fn new() -> Result<Self, TransportError> {
+        let infos = Self::discover_devices()?;
+        if infos.is_empty() {
+            return Err(TransportError::DeviceNotFound);
+        }
+        Self::from_info(infos[0])
+    }
+
+    /// Create an EFA endpoint from a specific fi_info node (for multi-device).
+    /// Takes ownership of the fi_info pointer — will be freed on drop.
+    pub fn from_info(info: *mut ffi::fi_info) -> Result<Self, TransportError> {
+        if info.is_null() {
+            return Err(TransportError::DeviceNotFound);
+        }
         unsafe {
-            // fi_allocinfo() equivalent: fi_dupinfo(NULL)
-            let hints: *mut ffi::fi_info = ffi::fi_dupinfo(ptr::null());
-            if hints.is_null() {
-                return Err(TransportError::DeviceNotFound);
-            }
-
-            (*hints).caps = (ffi::FI_MSG | ffi::FI_RMA) as u64;
-            (*hints).ep_attr.as_mut().unwrap().type_ = ffi::fi_ep_type_FI_EP_RDM;
-
-            // Use libc strdup so fi_freeinfo can safely free() the string
-            let prov = b"efa\0";
-            (*hints).fabric_attr.as_mut().unwrap().prov_name =
-                libc::strdup(prov.as_ptr() as *const libc::c_char);
-
-            // MR modes required by EFA
-            (*hints).domain_attr.as_mut().unwrap().mr_mode = (ffi::FI_MR_LOCAL
-                | ffi::FI_MR_VIRT_ADDR
-                | ffi::FI_MR_ALLOCATED
-                | ffi::FI_MR_PROV_KEY)
-                as i32;
-
-            let mut info: *mut ffi::fi_info = ptr::null_mut();
-            let ret = ffi::fi_getinfo(
-                fi_version(1, 18),
-                ptr::null(),
-                ptr::null(),
-                0,
-                hints,
-                &mut info,
-            );
-            ffi::fi_freeinfo(hints);
-
-            if ret != 0 || info.is_null() {
-                return Err(TransportError::DeviceNotFound);
-            }
-
             // fi_fabric
             let mut fabric: *mut ffi::fid_fabric = ptr::null_mut();
             let ret = ffi::fi_fabric((*info).fabric_attr, &mut fabric, ptr::null_mut());
@@ -265,6 +242,90 @@ impl EfaEndpoint {
                 cq,
                 ep,
             })
+        }
+    }
+
+    /// Discover all available EFA devices by walking the fi_info linked list.
+    /// Returns a Vec of fi_info pointers — each represents a distinct EFA device.
+    /// Filters to unique domain names (each physical EFA device has a different domain).
+    /// The caller must use fi_dupinfo() before passing to from_info() if they want
+    /// to keep the original list alive, OR take individual nodes and null out ->next.
+    ///
+    /// Returns owned fi_info pointers (each is a fi_dupinfo'd copy).
+    pub fn discover_devices() -> Result<Vec<*mut ffi::fi_info>, TransportError> {
+        unsafe {
+            let hints: *mut ffi::fi_info = ffi::fi_dupinfo(ptr::null());
+            if hints.is_null() {
+                return Err(TransportError::DeviceNotFound);
+            }
+
+            (*hints).caps = (ffi::FI_MSG | ffi::FI_RMA) as u64;
+            (*hints).ep_attr.as_mut().unwrap().type_ = ffi::fi_ep_type_FI_EP_RDM;
+
+            let prov = b"efa\0";
+            (*hints).fabric_attr.as_mut().unwrap().prov_name =
+                libc::strdup(prov.as_ptr() as *const libc::c_char);
+
+            (*hints).domain_attr.as_mut().unwrap().mr_mode = (ffi::FI_MR_LOCAL
+                | ffi::FI_MR_VIRT_ADDR
+                | ffi::FI_MR_ALLOCATED
+                | ffi::FI_MR_PROV_KEY)
+                as i32;
+
+            let mut info: *mut ffi::fi_info = ptr::null_mut();
+            let ret = ffi::fi_getinfo(
+                fi_version(1, 18),
+                ptr::null(),
+                ptr::null(),
+                0,
+                hints,
+                &mut info,
+            );
+            ffi::fi_freeinfo(hints);
+
+            if ret != 0 || info.is_null() {
+                return Err(TransportError::DeviceNotFound);
+            }
+
+            // Walk the linked list and collect unique devices by domain name.
+            // Each physical EFA device has a unique domain_attr->name (e.g. "efa_0", "efa_1").
+            let mut seen_domains: Vec<String> = Vec::new();
+            let mut devices: Vec<*mut ffi::fi_info> = Vec::new();
+            let mut cur = info;
+
+            while !cur.is_null() {
+                let domain_name = if !(*cur).domain_attr.is_null()
+                    && !(*(*cur).domain_attr).name.is_null()
+                {
+                    std::ffi::CStr::from_ptr((*(*cur).domain_attr).name)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    format!("unknown_{}", devices.len())
+                };
+
+                if !seen_domains.contains(&domain_name) {
+                    seen_domains.push(domain_name);
+                    // Duplicate this node so we own it independently
+                    let dup = ffi::fi_dupinfo(cur);
+                    if !dup.is_null() {
+                        // Ensure the dup's ->next is null (it's a standalone node)
+                        (*dup).next = ptr::null_mut();
+                        devices.push(dup);
+                    }
+                }
+
+                cur = (*cur).next;
+            }
+
+            // Free the original linked list
+            ffi::fi_freeinfo(info);
+
+            if devices.is_empty() {
+                Err(TransportError::DeviceNotFound)
+            } else {
+                Ok(devices)
+            }
         }
     }
 
