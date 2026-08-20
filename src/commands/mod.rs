@@ -416,6 +416,7 @@ fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
             };
             key.set_value(&LO_TYPE, lo_value).unwrap();
             drop(key);
+            drop(key_str);
             drop(ctx);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
