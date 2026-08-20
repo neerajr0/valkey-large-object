@@ -26,7 +26,7 @@ use std::sync::Arc;
 use fabric::{run_cq_progress, EfaEndpoint};
 use resp::RespConnection;
 
-const DEFAULT_BUF_SIZE: usize = 4 * 1024 * 1024; // 4MB registered buffer
+const DEFAULT_BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB registered buffer (2x for SET + GET regions)
 const PATTERN_SET: u8 = 0xDD;
 const PATTERN_CLR: u8 = 0x00;
 
@@ -74,12 +74,14 @@ fn main() -> Result<()> {
 
     // ─── Step 2: Register buffer ─────────────────────────────────────────
     println!("\n── Step 2: Register memory buffer ──");
-    let mut buf = vec![0u8; DEFAULT_BUF_SIZE].into_boxed_slice();
+    // Allocate 2x obj_size: first half for SET data, second half for GET destination
+    let buf_size = obj_size * 2;
+    let mut buf = vec![0u8; buf_size].into_boxed_slice();
     let mr = ep.register_remote(&mut buf)?;
     let rkey = mr.rkey();
     let remote_addr = buf.as_ptr() as u64;
     println!("  Address:  {:#x}", remote_addr);
-    println!("  Size:     {} bytes ({} MB)", DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE / 1048576);
+    println!("  Size:     {} bytes ({} MB)", buf_size, buf_size / 1048576);
     println!("  rkey:     {}", rkey);
 
     // ─── Step 3: CQ progress thread ─────────────────────────────────────

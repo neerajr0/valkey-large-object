@@ -5,7 +5,10 @@ fn main() {
     // Try to find libfabric via pkg-config. If it fails (e.g. dev desktop without
     // libfabric installed), we still let the build succeed — the transport layer
     // will gracefully report EFA as unavailable at runtime.
-    let lib = match pkg_config::Config::new().atleast_version("1.0").probe("libfabric") {
+    let lib = match pkg_config::Config::new()
+        .atleast_version("1.0")
+        .probe("libfabric")
+    {
         Ok(lib) => lib,
         Err(_) => {
             // Check the EFA installer path as fallback.
@@ -21,10 +24,15 @@ fn main() {
                 };
                 // SAFETY: build scripts are single-threaded.
                 unsafe { env::set_var("PKG_CONFIG_PATH", &new_path) };
-                match pkg_config::Config::new().atleast_version("1.0").probe("libfabric") {
+                match pkg_config::Config::new()
+                    .atleast_version("1.0")
+                    .probe("libfabric")
+                {
                     Ok(lib) => lib,
                     Err(_) => {
-                        println!("cargo:warning=libfabric not found — EFA transport will be unavailable");
+                        println!(
+                            "cargo:warning=libfabric not found — EFA transport will be unavailable"
+                        );
                         println!("cargo:rustc-cfg=no_efa");
                         return;
                     }

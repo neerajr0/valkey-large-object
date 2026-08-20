@@ -206,7 +206,9 @@ impl EfaEndpoint {
             check_ret(ret, "fi_endpoint").map_err(|_| TransportError::DeviceNotFound)?;
 
             // fi_ep_bind(av)
-            let bind_fn = (*(*ep).fid.ops).bind.ok_or(TransportError::DeviceNotFound)?;
+            let bind_fn = (*(*ep).fid.ops)
+                .bind
+                .ok_or(TransportError::DeviceNotFound)?;
             let ret = bind_fn(
                 &mut (*ep).fid as *mut ffi::fid,
                 &mut (*av).fid as *mut ffi::fid,
@@ -272,6 +274,12 @@ impl EfaEndpoint {
                 | ffi::FI_MR_PROV_KEY)
                 as i32;
 
+            // Request FI_DELIVERY_COMPLETE: CQ completion guarantees data is visible
+            // at the remote end, not merely that the local buffer can be reused.
+            // This is critical for correctness — the client must see the written data
+            // before we report success on DMA.GET / DMA.SET.
+            (*hints).tx_attr.as_mut().unwrap().op_flags = ffi::FI_DELIVERY_COMPLETE as u64;
+
             let mut info: *mut ffi::fi_info = ptr::null_mut();
             let ret = ffi::fi_getinfo(
                 fi_version(1, 18),
@@ -294,15 +302,14 @@ impl EfaEndpoint {
             let mut cur = info;
 
             while !cur.is_null() {
-                let domain_name = if !(*cur).domain_attr.is_null()
-                    && !(*(*cur).domain_attr).name.is_null()
-                {
-                    std::ffi::CStr::from_ptr((*(*cur).domain_attr).name)
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    format!("unknown_{}", devices.len())
-                };
+                let domain_name =
+                    if !(*cur).domain_attr.is_null() && !(*(*cur).domain_attr).name.is_null() {
+                        std::ffi::CStr::from_ptr((*(*cur).domain_attr).name)
+                            .to_string_lossy()
+                            .to_string()
+                    } else {
+                        format!("unknown_{}", devices.len())
+                    };
 
                 if !seen_domains.contains(&domain_name) {
                     seen_domains.push(domain_name);
@@ -382,6 +389,18 @@ impl EfaEndpoint {
         }
     }
 
+    /// Remove a peer's fi_addr from the AV, freeing the slot.
+    /// Called during session disconnect cleanup.
+    pub fn remove_peer(&self, fi_addr: u64) {
+        unsafe {
+            if let Some(remove_fn) = (*(*self.av).ops).remove {
+                // fi_av_remove returns 0 on success; we ignore errors since this
+                // is best-effort cleanup.
+                let _ = remove_fn(self.av, &fi_addr as *const u64 as *mut u64, 1, 0);
+            }
+        }
+    }
+
     /// Register a buffer for local access (FI_READ | FI_WRITE).
     /// Used for server-side pool buffers that serve as source/dest for fi_write/fi_read.
     pub fn register_local_buffer(
@@ -423,25 +442,15 @@ impl EfaEndpoint {
         remote_addr: u64,
         rkey: u64,
     ) -> Result<(), TransportError> {
-        unsafe {
-            let write_fn = (*(*self.ep).rma)
-                .write
-                .ok_or(TransportError::WriteFailed { code: -1 })?;
-
-            let mut ctx: u64 = 0;
-            let ret = write_fn(
-                self.ep,
-                local_buf as *const libc::c_void,
-                len,
-                local_desc,
-                peer,
-                remote_addr,
-                rkey,
-                &mut ctx as *mut u64 as *mut libc::c_void,
-            );
-            check_ssize(ret, "fi_write")
-                .map_err(|_| TransportError::WriteFailed { code: ret as i32 })?;
-        }
+        self.post_write(
+            peer,
+            local_buf,
+            len,
+            local_desc,
+            remote_addr,
+            rkey,
+            std::ptr::null_mut(),
+        )?;
         self.wait_cq()
             .map_err(|_| TransportError::WriteFailed { code: -2 })?;
         Ok(())
@@ -458,12 +467,72 @@ impl EfaEndpoint {
         remote_addr: u64,
         rkey: u64,
     ) -> Result<(), TransportError> {
+        self.post_read(
+            peer,
+            local_buf,
+            len,
+            local_desc,
+            remote_addr,
+            rkey,
+            std::ptr::null_mut(),
+        )?;
+        self.wait_cq()
+            .map_err(|_| TransportError::ReadFailed { code: -2 })?;
+        Ok(())
+    }
+
+    // ─── Non-blocking post methods (for batched CQ polling) ──────────────────
+
+    /// Post an fi_write without waiting for completion.
+    /// The `context` pointer is returned in the CQ entry on completion.
+    pub fn post_write(
+        &self,
+        peer: u64,
+        local_buf: *const u8,
+        len: usize,
+        local_desc: *mut libc::c_void,
+        remote_addr: u64,
+        rkey: u64,
+        context: *mut libc::c_void,
+    ) -> Result<(), TransportError> {
+        unsafe {
+            let write_fn = (*(*self.ep).rma)
+                .write
+                .ok_or(TransportError::WriteFailed { code: -1 })?;
+
+            let ret = write_fn(
+                self.ep,
+                local_buf as *const libc::c_void,
+                len,
+                local_desc,
+                peer,
+                remote_addr,
+                rkey,
+                context,
+            );
+            check_ssize(ret, "fi_write")
+                .map_err(|_| TransportError::WriteFailed { code: ret as i32 })?;
+        }
+        Ok(())
+    }
+
+    /// Post an fi_read without waiting for completion.
+    /// The `context` pointer is returned in the CQ entry on completion.
+    pub fn post_read(
+        &self,
+        peer: u64,
+        local_buf: *mut u8,
+        len: usize,
+        local_desc: *mut libc::c_void,
+        remote_addr: u64,
+        rkey: u64,
+        context: *mut libc::c_void,
+    ) -> Result<(), TransportError> {
         unsafe {
             let read_fn = (*(*self.ep).rma)
                 .read
                 .ok_or(TransportError::ReadFailed { code: -1 })?;
 
-            let mut ctx: u64 = 0;
             let ret = read_fn(
                 self.ep,
                 local_buf as *mut libc::c_void,
@@ -472,14 +541,57 @@ impl EfaEndpoint {
                 peer,
                 remote_addr,
                 rkey,
-                &mut ctx as *mut u64 as *mut libc::c_void,
+                context,
             );
             check_ssize(ret, "fi_read")
                 .map_err(|_| TransportError::ReadFailed { code: ret as i32 })?;
         }
-        self.wait_cq()
-            .map_err(|_| TransportError::ReadFailed { code: -2 })?;
         Ok(())
+    }
+
+    /// Poll the CQ for up to `max_entries` completions (non-blocking).
+    /// Returns the number of completions reaped. Each completed entry's `op_context`
+    /// field contains the context pointer passed to post_write/post_read.
+    ///
+    /// Returns (count, Vec<*mut c_void>) — the context pointers of completed ops.
+    /// On CQ error, returns Err with the failing context (if identifiable).
+    pub fn poll_cq(&self, max_entries: usize) -> Result<Vec<*mut libc::c_void>, TransportError> {
+        unsafe {
+            let cq_read_fn = match (*(*self.cq).ops).read {
+                Some(f) => f,
+                None => return Err(TransportError::Unavailable),
+            };
+
+            // Stack-allocate space for up to max_entries (capped at 32 for stack safety).
+            let batch = max_entries.min(32);
+            let mut entries: Vec<ffi::fi_cq_entry> = vec![std::mem::zeroed(); batch];
+
+            let ret = cq_read_fn(self.cq, entries.as_mut_ptr() as *mut libc::c_void, batch);
+
+            if ret > 0 {
+                let count = ret as usize;
+                let contexts: Vec<*mut libc::c_void> =
+                    entries[..count].iter().map(|e| e.op_context).collect();
+                Ok(contexts)
+            } else if ret == 0 || ret == -(ffi::FI_EAGAIN as isize) {
+                // No completions available yet
+                Ok(vec![])
+            } else if ret == -(ffi::FI_EAVAIL as isize) {
+                // Error available on the CQ — read and report it
+                if let Some(cq_readerr_fn) = (*(*self.cq).ops).readerr {
+                    let mut err_entry: ffi::fi_cq_err_entry = std::mem::zeroed();
+                    cq_readerr_fn(self.cq, &mut err_entry, 0);
+                    // Return the error context so caller can identify which op failed
+                    Err(TransportError::WriteFailed {
+                        code: -(err_entry.err as i32),
+                    })
+                } else {
+                    Err(TransportError::WriteFailed { code: ret as i32 })
+                }
+            } else {
+                Err(TransportError::WriteFailed { code: ret as i32 })
+            }
+        }
     }
 
     /// Get a CQ handle for running progress in a background thread.

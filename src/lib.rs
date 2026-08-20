@@ -169,15 +169,27 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     let device_count = transport::worker_pool()
         .map(|p| p.device_count())
         .unwrap_or(0);
+    let discovered_devices = transport::worker_pool()
+        .map(|p| p.discovered_device_count())
+        .unwrap_or(0);
 
     ctx.log_notice(&format!(
-        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB efa_devices={} workers={}",
+        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB efa_devices={} workers={} ({})",
         dir,
         pool_buf_count(),
         pool_buf_size(),
         (pool_buf_count() * pool_buf_size()) as f64 / (1024.0 * 1024.0),
+        discovered_devices,
         device_count,
-        device_count,
+        if discovered_devices < device_count {
+            format!(
+                "{} physical + {} CQ-isolation endpoints",
+                discovered_devices,
+                device_count - discovered_devices
+            )
+        } else {
+            format!("{} physical devices", discovered_devices)
+        },
     ));
 
     Status::Ok
