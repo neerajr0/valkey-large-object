@@ -6,8 +6,10 @@
 //! - RDB callbacks (save/load references) (TODO)
 //! - TIERING.REF replication (TODO)
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
+//! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
 
@@ -56,14 +58,98 @@ pub struct LoValue {
     pub crc32c: u32,         // integrity checksum (verified on replication pull)
 }
 
+// ─── LoValue Helper Methods ──────────────────────────────────────────────────
+
+impl LoValue {
+    /// Reports memory usage: in-memory struct size + on-disk object size.
+    /// Used by `MEMORY USAGE <key>`.
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<LoValue>() + self.len as usize
+    }
+
+    /// Reports free effort proportional to file size (1 per MB, minimum 1).
+    /// Valkey uses this to decide sync vs async free (lazy-free threshold ~64).
+    pub fn free_effort(&self) -> usize {
+        (self.len / (1024 * 1024)) as usize + 1
+    }
+
+    /// Deep-copy: allocates a new OID and copies the NVMe file.
+    /// Returns None if the file copy fails (e.g., source file missing).
+    pub fn create_copy(&self, data_dir: &str) -> Option<LoValue> {
+        let new_oid = ObjectId::next();
+        let src_path = self.object_id.file_path(data_dir);
+        let dst_path = new_oid.file_path(data_dir);
+
+        match std::fs::copy(&src_path, &dst_path) {
+            Ok(_) => Some(LoValue {
+                object_id: new_oid,
+                len: self.len,
+                crc32c: self.crc32c,
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
+// ─── Callbacks ───────────────────────────────────────────────────────────────
+
 /// Free callback — triggered by native Valkey DEL.
 /// Deletes the NVMe file for this object.
+///
+/// TODO: If GC (Issue #27 https://github.com/KarthikSubbarao/ValkeyLargeObj/issues/27)
+/// adopts a queue-based approach where all NVMe file
+/// deletions happen on a background thread, replace `storage::delete(oid)` here
+/// with a push to the GC deletion queue. lo_free would then become O(1) and
+/// free_effort would always return a minimal value.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     // SAFETY: value is a valid LoValue pointer that we previously returned from
     // rdb_load or set_value. We take ownership back and drop it after deleting the file.
     let lo = Box::from_raw(value as *mut LoValue);
     // Delete NVMe file via storage layer.
     crate::storage::delete(lo.object_id);
+}
+
+/// MEMORY USAGE callback.
+/// Reports struct overhead + full on-disk object size for capacity planning.
+unsafe extern "C" fn lo_mem_usage(value: *const std::ffi::c_void) -> usize {
+    let val = &*(value as *const LoValue);
+    val.memory_usage()
+}
+
+/// FREE EFFORT callback.
+/// Returns effort proportional to file size so Valkey can decide between
+/// synchronous DEL (main thread) and async UNLINK (background thread).
+unsafe extern "C" fn lo_free_effort(
+    _key: *mut raw::RedisModuleString,
+    value: *const std::ffi::c_void,
+) -> usize {
+    let val = &*(value as *const LoValue);
+    val.free_effort()
+}
+
+/// COPY callback.
+/// Deep-copies the NVMe file with a fresh OID. Returns null on failure.
+unsafe extern "C" fn lo_copy(
+    _from_key: *mut raw::RedisModuleString,
+    _to_key: *mut raw::RedisModuleString,
+    value: *const std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let src = &*(value as *const LoValue);
+    match src.create_copy(&crate::data_dir()) {
+        Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// DEBUG DIGEST callback.
+/// Feeds object_id, len, and crc32c into the digest for integrity verification.
+unsafe extern "C" fn lo_digest(md: *mut raw::RedisModuleDigest, value: *mut std::ffi::c_void) {
+    let mut dig = Digest::new(md);
+    let val = &*(value as *const LoValue);
+    dig.add_long_long(val.object_id.0 as i64);
+    dig.add_long_long(val.len as i64);
+    dig.add_long_long(val.crc32c as i64);
+    dig.end_sequence();
 }
 
 // ─── Type Registration ───────────────────────────────────────────────────────
@@ -77,15 +163,15 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
         rdb_save: None,    // TODO
         aof_rewrite: None, // TODO
         free: Some(lo_free),
-        mem_usage: None, // TODO
-        digest: None,    // TODO
-        aux_load: None,  // TODO
-        aux_save: None,  // TODO
+        mem_usage: Some(lo_mem_usage),
+        digest: Some(lo_digest),
+        aux_load: None, // TODO
+        aux_save: None, // TODO
         aux_save2: None,
         aux_save_triggers: 0,
-        free_effort: None, // TODO
+        free_effort: Some(lo_free_effort),
         unlink: None,
-        copy: None,   // TODO
+        copy: Some(lo_copy),
         defrag: None, // TODO
         mem_usage2: None,
         free_effort2: None,
@@ -99,6 +185,7 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_oid_monotonic() {
@@ -132,5 +219,152 @@ mod tests {
             "OID {} should be >= 1000000 after init_counter",
             oid.0
         );
+    }
+
+    // ─── memory_usage tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_memory_usage() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 4_194_304, // 4MB
+            crc32c: 0,
+        };
+        assert_eq!(
+            val.memory_usage(),
+            std::mem::size_of::<LoValue>() + 4_194_304
+        );
+    }
+
+    #[test]
+    fn test_memory_usage_zero() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 0,
+            crc32c: 0,
+        };
+        assert_eq!(val.memory_usage(), std::mem::size_of::<LoValue>());
+    }
+
+    // ─── free_effort tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_free_effort_small() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 512,
+            crc32c: 0,
+        };
+        assert_eq!(val.free_effort(), 1); // minimum
+    }
+
+    #[test]
+    fn test_free_effort_large() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 100 * 1024 * 1024, // 100MB
+            crc32c: 0,
+        };
+        assert_eq!(val.free_effort(), 101);
+    }
+
+    #[test]
+    fn test_free_effort_boundary() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 1024 * 1024 - 1, // 1MB - 1 byte
+            crc32c: 0,
+        };
+        assert_eq!(val.free_effort(), 1); // just below 1MB → 0 + 1
+    }
+
+    #[test]
+    fn test_free_effort_exactly_one_mb() {
+        let val = LoValue {
+            object_id: ObjectId(1),
+            len: 1024 * 1024, // exactly 1MB
+            crc32c: 0,
+        };
+        assert_eq!(val.free_effort(), 2); // 1 + 1
+    }
+
+    // ─── create_copy tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_copy_success() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_success");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let oid = ObjectId::next();
+        let src_path = oid.file_path(tmp.to_str().unwrap());
+        // Create source file with known content.
+        let content = b"hello large object world";
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        f.write_all(content).unwrap();
+
+        let val = LoValue {
+            object_id: oid,
+            len: content.len() as u64,
+            crc32c: 0xDEAD,
+        };
+
+        let copy = val.create_copy(tmp.to_str().unwrap()).unwrap();
+
+        // New OID must differ.
+        assert_ne!(copy.object_id, val.object_id);
+        // Metadata preserved.
+        assert_eq!(copy.len, val.len);
+        assert_eq!(copy.crc32c, val.crc32c);
+        // New file exists with same content.
+        let dst_path = copy.object_id.file_path(tmp.to_str().unwrap());
+        let read_back = std::fs::read(&dst_path).unwrap();
+        assert_eq!(read_back, content);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&dst_path);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_copy_missing_source() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_missing");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let val = LoValue {
+            object_id: ObjectId(0xDEADBEEF),
+            len: 1024,
+            crc32c: 0,
+        };
+
+        let result = val.create_copy(tmp.to_str().unwrap());
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_copy_different_oid() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_diff_oid");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let oid = ObjectId::next();
+        let src_path = oid.file_path(tmp.to_str().unwrap());
+        std::fs::write(&src_path, b"data").unwrap();
+
+        let val = LoValue {
+            object_id: oid,
+            len: 4,
+            crc32c: 0,
+        };
+
+        let copy = val.create_copy(tmp.to_str().unwrap()).unwrap();
+        assert_ne!(copy.object_id, val.object_id);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&src_path);
+        let dst_path = copy.object_id.file_path(tmp.to_str().unwrap());
+        let _ = std::fs::remove_file(&dst_path);
+        let _ = std::fs::remove_dir(&tmp);
     }
 }
