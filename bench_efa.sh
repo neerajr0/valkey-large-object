@@ -79,15 +79,15 @@ run_mode() {
     rm -rf "$DATA_DIR"
     mkdir -p "$DATA_DIR"
 
-    # Write config file (correct way to pass module args)
-    cat > /tmp/lo_bench_${MODE}.conf << EOF
-port $PORT
+    # Write config file (module_args_as_configuration uses bare key-value pairs)
+    cat > /tmp/lo_bench_${MODE}.conf <<- CONF
+port ${PORT}
 loglevel warning
 save ""
 appendonly no
 io-threads 4
-loadmodule $MODULE --pool-mode $MODE --pool-buf-size $BUF_SIZE --pool-buf-count $BUFPOOL_COUNT --data-dir $DATA_DIR --direct-io yes
-EOF
+loadmodule ${MODULE} data-dir ${DATA_DIR} pool-mode ${MODE} pool-buf-size ${BUF_SIZE} pool-buf-count ${BUFPOOL_COUNT} direct-io yes
+CONF
 
     # Start server
     $SERVER /tmp/lo_bench_${MODE}.conf > /tmp/valkey_bench_${MODE}.log 2>&1 &
