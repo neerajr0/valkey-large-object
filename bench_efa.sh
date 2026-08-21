@@ -73,10 +73,13 @@ import socket, os, time
 s = socket.socket(); s.connect(('127.0.0.1', $PORT))
 s.setsockopt(6, 1, 1)
 payload = os.urandom($BUF_SIZE)
+len_str = b'$BUF_SIZE'
 start = time.monotonic()
 for i in range($NUM_KEYS):
     key = f'k:{i:012d}'.encode()
-    cmd = f'*3\r\n\$6\r\nLO.SET\r\n\${len(key)}\r\n'.encode() + key + b'\r\n'
+    # LO.SET key len payload = 4 RESP elements
+    cmd = f'*4\r\n\$6\r\nLO.SET\r\n\${len(key)}\r\n'.encode() + key + b'\r\n'
+    cmd += f'\${len(len_str)}\r\n'.encode() + len_str + b'\r\n'
     cmd += f'\${len(payload)}\r\n'.encode() + payload + b'\r\n'
     s.sendall(cmd)
     s.recv(1024)
