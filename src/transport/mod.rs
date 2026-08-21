@@ -337,9 +337,9 @@ impl EfaContext {
 
             // Create fabric
             let mut fabric: *mut ffi::fid_fabric = ptr::null_mut();
-            // fi_fabric takes fi_fabric_attr which is the first field of fi_info
+            // shim_fi_fabric takes fi_info* and extracts info->fabric_attr internally
             let ret = ffi::fi_fabric(
-                info as *mut std::os::raw::c_void, // fabric_attr is first field
+                info as *mut std::os::raw::c_void,
                 &mut fabric,
                 ptr::null_mut(),
             );

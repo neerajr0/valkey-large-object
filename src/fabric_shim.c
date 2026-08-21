@@ -49,10 +49,10 @@ void shim_fi_freeinfo(struct fi_info *info) {
     fi_freeinfo(info);
 }
 
-/* fi_fabric */
-int shim_fi_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
+/* fi_fabric — takes fi_info and extracts fabric_attr internally */
+int shim_fi_fabric(struct fi_info *info, struct fid_fabric **fabric,
                    void *context) {
-    return fi_fabric(attr, fabric, context);
+    return fi_fabric(info->fabric_attr, fabric, context);
 }
 
 /* fi_domain */
