@@ -55,6 +55,10 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_DATA_DIR: Mutex<String> = Mutex::new(String::new());
 
+    /// Pool mode: "bufpool" (default, fixed-size buffer classes) or "arena" (talc sub-allocation).
+    /// Immutable after load.
+    static ref CFG_POOL_MODE: Mutex<String> = Mutex::new(String::from("bufpool"));
+
     /// Buffer pool slot size in bytes. Must be 4KB-aligned. Immutable after load.
     /// Default: 4MB (suitable for KV cache chunks).
     static ref CFG_POOL_BUF_SIZE: AtomicI64 = AtomicI64::new(4 * 1024 * 1024);
@@ -101,6 +105,10 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
 
 pub fn data_dir() -> String {
     CFG_DATA_DIR.lock().unwrap().clone()
+}
+
+pub fn pool_mode() -> String {
+    CFG_POOL_MODE.lock().unwrap().clone()
 }
 
 pub fn pool_buf_size() -> usize {
@@ -230,6 +238,7 @@ valkey_module! {
         ],
         string: [
             ["data-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["pool-mode", &*CFG_POOL_MODE, "bufpool", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],

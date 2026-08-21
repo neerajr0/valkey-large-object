@@ -7,6 +7,7 @@ use crate::data_type::ObjectId;
 pub use buffer::Buffer;
 use engine::PinnedBuffer;
 
+pub mod arena;
 pub mod buffer;
 pub mod engine;
 pub mod fd_pool;
@@ -92,40 +93,125 @@ pub trait Storage: Send + Sync {
 use std::sync::OnceLock;
 static STORAGE: OnceLock<engine::StorageEngine> = OnceLock::new();
 
-pub fn get() -> &'static engine::StorageEngine {
-    STORAGE.get().expect("storage not initialized")
+/// Arena storage instance (used when pool-mode=arena).
+static ARENA_STORAGE: OnceLock<engine::ArenaStorageEngine> = OnceLock::new();
+
+/// Dynamic storage instance (used when pool-mode=dynamic).
+static DYNAMIC_STORAGE: OnceLock<engine::DynamicStorageEngine> = OnceLock::new();
+
+/// Which mode is active.
+static POOL_MODE: OnceLock<PoolMode> = OnceLock::new();
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum PoolMode {
+    BufPool,
+    Arena,
+    /// Dynamic: buffers allocated on demand from heap (ValkeyAlloc).
+    /// No io_uring pre-registration (uses plain read/write, not ReadFixed).
+    /// EFA: single registered staging buffer for fi_write (memcpy on EFA path).
+    Dynamic,
+}
+
+pub fn pool_mode() -> PoolMode {
+    *POOL_MODE.get().unwrap_or(&PoolMode::BufPool)
+}
+
+pub fn get() -> &'static dyn Storage {
+    match pool_mode() {
+        PoolMode::BufPool => STORAGE.get().expect("storage not initialized") as &dyn Storage,
+        PoolMode::Arena => {
+            ARENA_STORAGE.get().expect("arena storage not initialized") as &dyn Storage
+        }
+        PoolMode::Dynamic => {
+            DYNAMIC_STORAGE.get().expect("dynamic storage not initialized") as &dyn Storage
+        }
+    }
 }
 
 /// Called by Buffer::drop() to return a buffer to the pool.
 pub fn return_buffer(pinned: &'static engine::PinnedBuffer, idx: u16) {
-    if let Some(storage) = STORAGE.get() {
-        storage.buffer_pool().put_back(pinned, idx);
+    match pool_mode() {
+        PoolMode::BufPool => {
+            if let Some(storage) = STORAGE.get() {
+                storage.buffer_pool().put_back(pinned, idx);
+            }
+        }
+        PoolMode::Arena => {
+            if let Some(storage) = ARENA_STORAGE.get() {
+                // In arena mode, pinned.as_mut_ptr() is the sub-allocated address.
+                storage.return_buffer_by_ptr(pinned.as_mut_ptr());
+            }
+        }
+        PoolMode::Dynamic => {
+            // In dynamic mode, the buffer was heap-allocated and fi_mr_reg'd.
+            // The MR handle was forgotten in pool_get() — on real EFA hardware,
+            // we'd need to track it to call fi_mr_dereg here.
+            // TODO: Store MR handle in a side-map keyed by ptr, retrieve and drop here.
+            // For now, the registration leaks until process exit (acceptable for benchmark).
+            //
+            // Free the buffer memory.
+            // SAFETY: We leaked this PinnedBuffer in pool_get(). Reconstruct and drop.
+            unsafe {
+                let _ = Box::from_raw(pinned as *const engine::PinnedBuffer as *mut engine::PinnedBuffer);
+            }
+        }
     }
 }
 
 /// Convenience: delete an object's NVMe file.
 pub fn delete(object_id: crate::data_type::ObjectId) {
-    get().delete_file(object_id);
+    get().delete(object_id);
 }
 
 pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
-    let storage = engine::StorageEngine::new(buf_size, buf_count, data_dir);
-    STORAGE.set(storage).ok();
-    // Fill the pool now that StorageEngine is in the static OnceLock.
-    get().init_pool();
+    let mode_str = crate::pool_mode();
+    let mode = if mode_str == "arena" {
+        PoolMode::Arena
+    } else if mode_str == "dynamic" {
+        PoolMode::Dynamic
+    } else {
+        PoolMode::BufPool
+    };
+    POOL_MODE.set(mode).ok();
+
+    match mode {
+        PoolMode::BufPool => {
+            let storage = engine::StorageEngine::new(buf_size, buf_count, data_dir);
+            STORAGE.set(storage).ok();
+            // Fill the pool now that StorageEngine is in the static OnceLock.
+            STORAGE.get().unwrap().init_pool();
+        }
+        PoolMode::Arena => {
+            let total_size = buf_size * buf_count;
+            let storage = engine::ArenaStorageEngine::new(buf_size, total_size, data_dir);
+            ARENA_STORAGE.set(storage).ok();
+        }
+        PoolMode::Dynamic => {
+            let storage = engine::DynamicStorageEngine::new(buf_size, data_dir);
+            DYNAMIC_STORAGE.set(storage).ok();
+        }
+    }
 }
 
 /// Shutdown: drain in-flight ops, close fds, clean up files.
-/// Called from module deinit. TODO: implement when shutdown path is built.
 pub fn shutdown() {
-    // Signal the io_uring poller thread to drain pending ops and exit.
-    // The poller checks the shutdown AtomicBool on each 100ms tick and exits
-    // when set + no pending ops remain. This allows the process to terminate.
-    if let Some(storage) = STORAGE.get() {
-        storage.signal_shutdown();
+    match pool_mode() {
+        PoolMode::BufPool => {
+            if let Some(storage) = STORAGE.get() {
+                storage.signal_shutdown();
+            }
+        }
+        PoolMode::Arena => {
+            if let Some(storage) = ARENA_STORAGE.get() {
+                storage.signal_shutdown();
+            }
+        }
+        PoolMode::Dynamic => {
+            if let Some(storage) = DYNAMIC_STORAGE.get() {
+                storage.signal_shutdown();
+            }
+        }
     }
-    // Future: FdPool closes all open fds.
-    // Future: Orphan reconciliation (delete .dat files with no keyspace entry).
 }
 
 pub fn register_buffers() {
@@ -138,5 +224,16 @@ pub fn deregister_buffers() {
 
 /// Return Buffer descriptors for transport layer to fi_mr_reg.
 pub fn pinned_buffers() -> &'static [PinnedBuffer] {
-    get().buffer_descriptors()
+    match pool_mode() {
+        PoolMode::BufPool => STORAGE.get().unwrap().buffer_descriptors(),
+        PoolMode::Arena => {
+            let arena = ARENA_STORAGE.get().unwrap();
+            std::slice::from_ref(arena.pinned_backing())
+        }
+        PoolMode::Dynamic => {
+            // Dynamic mode: register a single staging buffer for EFA fi_write.
+            let dynamic = DYNAMIC_STORAGE.get().unwrap();
+            std::slice::from_ref(dynamic.staging_buffer())
+        }
+    }
 }

@@ -17,7 +17,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, Storage};
+use crate::storage;
 use crate::transport::{self, ClientRegion, EfaAddress, Session};
 
 // ─── Per-Client Session Store ────────────────────────────────────────────────
