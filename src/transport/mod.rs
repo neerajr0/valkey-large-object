@@ -79,12 +79,12 @@ mod ffi {
     pub const FI_SUCCESS: c_int = 0;
 
     // Real libfabric FFI — only linked when feature "efa" is enabled.
-    // On EFA machines: cargo build --features efa (links -lfabric).
+    // On EFA machines: cargo build --features efa (links -lfabric_shim).
+    // The shim wraps libfabric's static inline functions into real symbols.
     #[cfg(feature = "efa")]
-    #[link(name = "fabric")]
     extern "C" {
         // Discovery
-        pub fn fi_getinfo(
+        pub fn shim_fi_getinfo(
             version: u32,
             node: *const c_char,
             service: *const c_char,
@@ -93,16 +93,16 @@ mod ffi {
             info: *mut *mut fi_info,
         ) -> c_int;
 
-        pub fn fi_freeinfo(info: *mut fi_info);
+        pub fn shim_fi_freeinfo(info: *mut fi_info);
 
         // Fabric + Domain
-        pub fn fi_fabric(
+        pub fn shim_fi_fabric(
             attr: *mut c_void, // fi_fabric_attr*
             fabric: *mut *mut fid_fabric,
             context: *mut c_void,
         ) -> c_int;
 
-        pub fn fi_domain(
+        pub fn shim_fi_domain(
             fabric: *mut fid_fabric,
             info: *mut fi_info,
             domain: *mut *mut fid_domain,
@@ -110,7 +110,7 @@ mod ffi {
         ) -> c_int;
 
         // Memory Registration
-        pub fn fi_mr_reg(
+        pub fn shim_fi_mr_reg(
             domain: *mut fid_domain,
             buf: *const c_void,
             len: usize,
@@ -122,24 +122,50 @@ mod ffi {
             context: *mut c_void,
         ) -> c_int;
 
-        pub fn fi_mr_desc(mr: *mut fid_mr) -> *mut c_void;
-        pub fn fi_mr_key(mr: *mut fid_mr) -> u64;
+        pub fn shim_fi_mr_desc(mr: *mut fid_mr) -> *mut c_void;
+        pub fn shim_fi_mr_key(mr: *mut fid_mr) -> u64;
 
-        pub fn fi_close(fid: *mut c_void) -> c_int;
+        pub fn shim_fi_close(fid: *mut c_void) -> c_int;
 
         // fi_version
-        pub fn fi_version() -> u32;
+        pub fn shim_fi_version() -> u32;
     }
+
+    // Wrapper aliases so the rest of the code doesn't change
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_getinfo(version: u32, node: *const c_char, service: *const c_char,
+                             flags: u64, hints: *const fi_info, info: *mut *mut fi_info) -> c_int {
+        shim_fi_getinfo(version, node, service, flags, hints, info)
+    }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_freeinfo(info: *mut fi_info) { shim_fi_freeinfo(info) }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_fabric(attr: *mut c_void, fabric: *mut *mut fid_fabric, context: *mut c_void) -> c_int {
+        shim_fi_fabric(attr, fabric, context)
+    }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_domain(fabric: *mut fid_fabric, info: *mut fi_info, domain: *mut *mut fid_domain, context: *mut c_void) -> c_int {
+        shim_fi_domain(fabric, info, domain, context)
+    }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_mr_reg(domain: *mut fid_domain, buf: *const c_void, len: usize, access: u64,
+                            offset: u64, requested_key: u64, flags: u64, mr: *mut *mut fid_mr, context: *mut c_void) -> c_int {
+        shim_fi_mr_reg(domain, buf, len, access, offset, requested_key, flags, mr, context)
+    }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_mr_desc(mr: *mut fid_mr) -> *mut c_void { shim_fi_mr_desc(mr) }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_mr_key(mr: *mut fid_mr) -> u64 { shim_fi_mr_key(mr) }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_close(fid: *mut c_void) -> c_int { shim_fi_close(fid) }
+    #[cfg(feature = "efa")]
+    pub unsafe fn fi_version() -> u32 { shim_fi_version() }
 
     /// fi_mr_dereg is fi_close on the MR's fid.
     #[cfg(feature = "efa")]
     pub unsafe fn fi_mr_dereg(mr: *mut fid_mr) -> c_int {
         fi_close(mr)
     }
-
-    // Stub implementations when EFA feature is disabled (no libfabric linkage).
-    #[cfg(not(feature = "efa"))]
-    pub unsafe fn fi_mr_dereg(_mr: *mut fid_mr) -> c_int { 0 }
 }
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
