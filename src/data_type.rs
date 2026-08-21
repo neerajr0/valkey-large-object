@@ -69,6 +69,11 @@ impl LoValue {
 
     /// Reports free effort proportional to file size (1 per MB, minimum 1).
     /// Valkey uses this to decide sync vs async free (lazy-free threshold ~64).
+    ///
+    /// This models NVMe free cost (unlink(2) syscall), not DRAM free cost.
+    /// Memory overhead per object is negligible (only metadata stored in DRAM).
+    /// TODO: When dual DRAM/NVMe caching is supported, revisit to account for
+    /// both tiers (e.g., sum NVMe unlink effort + DRAM cache eviction effort).
     pub fn free_effort(&self) -> usize {
         (self.len / (1024 * 1024)) as usize + 1
     }
