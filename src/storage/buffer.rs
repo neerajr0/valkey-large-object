@@ -45,7 +45,7 @@ impl Drop for Buffer {
 /// The buffer pool. Holds available Buffers in a Vec behind a Mutex.
 /// get() pops one out. Drop pushes it back.
 pub struct BufferPool {
-    pool: Mutex<Vec<Buffer>>,
+    pub(crate) pool: Mutex<Vec<Buffer>>,
 }
 
 impl Default for BufferPool {

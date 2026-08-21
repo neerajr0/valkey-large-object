@@ -160,26 +160,18 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     let storage = storage::get();
-    let buf = storage
-        .pool_get()
-        .ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
 
     let blocked_client = ctx.block_client();
 
-    // NVMe read — buf moved in, comes back in callback.
-    storage.read_into(
+    // Coalesced NVMe read — buffer acquisition is internal to storage.
+    // Leader: acquires buf, submits io_uring read.
+    // Waiter: no buf, callback stored, memcpy at completion.
+    let _ = storage.read_into_coalesced(
         object_id,
-        buf,
         obj_len,
-        Box::new(move |buf, read_result| {
-            match read_result {
-                Err(e) => {
-                    unblock_client(
-                        blocked_client,
-                        ReplyData::Err(format!("{}: {}", errors::ERR_NVME_READ, e)),
-                    );
-                }
-                Ok(bytes_read) => {
+        Box::new(move |opt_buf, read_result| {
+            match (opt_buf, read_result) {
+                (Some(buf), Ok(bytes_read)) => {
                     if let Some((region_idx, remote_offset)) = efa_args {
                         // EFA: RDMA write buf → client GPU.
                         // session_arc was cloned before entering this callback — no lock needed.
@@ -220,6 +212,20 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             unblock_client(blocked_client, ReplyData::GetOkTcp { data });
                         }
                     }
+                }
+                (_, Err(e)) => {
+                    // Error: leader NVMe read failed, or pool exhausted at fan-out.
+                    unblock_client(
+                        blocked_client,
+                        ReplyData::Err(format!("{}: {}", errors::ERR_NVME_READ, e)),
+                    );
+                }
+                (None, Ok(_)) => {
+                    // Defensive: shouldn't happen (success always provides a buffer).
+                    unblock_client(
+                        blocked_client,
+                        ReplyData::Err("internal: coalescing returned no buffer".to_string()),
+                    );
                 }
             }
         }),

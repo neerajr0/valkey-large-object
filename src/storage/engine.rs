@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use super::buffer::{Buffer, BufferPool};
 use crate::data_type::ObjectId;
 
+use super::coalescing::{CoalesceResult, CoalescedReadCallback, CoalescingMap};
 use super::fd_pool::FdPool;
 use super::uring::{IoRequest, UringNvmeEngine};
 use super::{NvmeEngine, Storage, StorageError};
@@ -66,6 +67,8 @@ pub struct StorageEngine {
     uring: OnceLock<Box<dyn NvmeEngine>>,
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
+    /// Per-key read coalescing map. Deduplicates concurrent NVMe reads for the same OID.
+    coalescing: CoalescingMap,
 }
 
 impl StorageEngine {
@@ -84,6 +87,7 @@ impl StorageEngine {
             pinned_buffers,
             uring: OnceLock::new(),
             fd_pool: FdPool::new(),
+            coalescing: CoalescingMap::new(),
         }
     }
 
@@ -130,6 +134,68 @@ impl StorageEngine {
             Some(fd)
         } else {
             None
+        }
+    }
+
+    /// Coalesced read: deduplicates concurrent NVMe reads for the same ObjectId.
+    ///
+    /// - First request for an OID becomes the leader: acquires a buffer, submits io_uring read.
+    /// - Subsequent requests for the same OID (while leader is in-flight): become waiters,
+    ///   no buffer acquired, callback stored. At leader completion, data is memcpy'd to
+    ///   a just-in-time acquired buffer per waiter.
+    ///
+    /// The command handler calls this instead of pool_get() + read_into() directly.
+    /// Buffer acquisition is internal — callers never call pool_get() for reads.
+    pub fn read_into_coalesced(
+        &'static self,
+        object_id: ObjectId,
+        len: u64,
+        cb: CoalescedReadCallback,
+    ) -> Result<(), StorageError> {
+        match self.coalescing.try_join_or_lead(object_id, cb) {
+            CoalesceResult::Waiter => Ok(()), // callback registered, no I/O needed
+            CoalesceResult::Leader(leader_cb) => {
+                // Leader: acquire buffer and submit NVMe read.
+                let buf = match self.pool_get() {
+                    Some(b) => b,
+                    None => {
+                        // Can't even start the read — remove the map entry and fail.
+                        // No waiters can exist yet in practice (we just inserted the
+                        // entry on this single-threaded main thread), but drain safely.
+                        let dropped = self.coalescing.remove_without_complete(object_id);
+                        if dropped > 0 {
+                            // Shouldn't happen (main thread is single-threaded), but be safe.
+                            eprintln!(
+                                "largeobj: coalescing leader pool_get failed, dropped {} waiters for oid={}",
+                                dropped, object_id.0
+                            );
+                        }
+                        leader_cb(None, Err(StorageError::PoolExhausted));
+                        return Ok(()); // Error delivered via callback, not Result
+                    }
+                };
+
+                // Wrap the io_uring completion to fan out to waiters, then fire leader cb.
+                let io_cb: super::ReadCallback = Box::new(move |buf, result| {
+                    // Fan out to waiters (memcpy from leader buf into each waiter's buf).
+                    self.coalescing
+                        .complete(object_id, &buf, &result, &self.pool);
+
+                    // Fire leader's own callback.
+                    match result {
+                        Ok(bytes_read) => leader_cb(Some(buf), Ok(bytes_read)),
+                        Err(e) => {
+                            // Leader also gets the error. Drop buf (returns to pool).
+                            drop(buf);
+                            leader_cb(None, Err(e));
+                        }
+                    }
+                });
+
+                // Submit the actual io_uring read (existing path).
+                self.read_into(object_id, buf, len, io_cb);
+                Ok(())
+            }
         }
     }
 }

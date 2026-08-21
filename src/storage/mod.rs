@@ -5,9 +5,11 @@
 
 use crate::data_type::ObjectId;
 pub use buffer::Buffer;
+pub use coalescing::{CoalesceResult, CoalescedReadCallback, CoalescingMap};
 use engine::PinnedBuffer;
 
 pub mod buffer;
+pub mod coalescing;
 pub mod engine;
 pub mod fd_pool;
 pub mod uring;
