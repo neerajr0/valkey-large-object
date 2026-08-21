@@ -81,6 +81,7 @@ mod ffi {
     // Real libfabric FFI — only linked when feature "efa" is enabled.
     // On EFA machines: cargo build --features efa (links -lfabric).
     #[cfg(feature = "efa")]
+    #[link(name = "fabric")]
     extern "C" {
         // Discovery
         pub fn fi_getinfo(
