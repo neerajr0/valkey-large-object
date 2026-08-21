@@ -7,11 +7,6 @@
 #
 # Run on EFA machine: ec2-user@16.147.230.226
 # Usage: ./bench_efa.sh [buf_size_kb] [num_keys] [clients]
-#
-# Requires:
-#   - ../valkey/src/valkey-server
-#   - ../valkey/src/valkey-benchmark
-#   - ./target/release/libvalkey_largeobj.so
 
 set -e
 
@@ -24,10 +19,9 @@ PORT=6399
 DATA_DIR="/tmp/lo-bench-data"
 SERVER="../valkey/src/valkey-server"
 BENCH="../valkey/src/valkey-benchmark"
-MODULE="./target/release/libvalkey_largeobj.so"
+MODULE="$(pwd)/target/release/libvalkey_largeobj.so"
 
 BUFPOOL_COUNT=128
-ARENA_TOTAL=$((BUFPOOL_COUNT * BUF_SIZE))
 
 echo "=== EFA Registration Benchmark ==="
 echo "Buffer size: ${BUF_SIZE_KB}KB | Keys: ${NUM_KEYS} | Clients: ${CLIENTS} | Duration: ${DURATION}s"
@@ -42,23 +36,22 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null
         wait "$SERVER_PID" 2>/dev/null || true
     fi
-    rm -rf "$DATA_DIR"
+    rm -rf "$DATA_DIR" /tmp/lo_bench_*.conf
 }
 trap cleanup EXIT
 
-# Populate keys via raw Python RESP (no pip needed).
+# Populate keys via pipelined Python RESP (no pip needed)
 populate() {
     local N=$1
     echo "  Populating $N keys (${BUF_SIZE_KB}KB each)..."
     python3 - "$PORT" "$N" "$BUF_SIZE" << 'PYEOF'
 import socket, sys, os
 port, n, size = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-payload = b"X" * size  # Deterministic fill
+payload = b"X" * size
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect(("127.0.0.1", port))
 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-# Pipeline in batches of 100
 batch = 100
 for start in range(0, n, batch):
     end = min(start + batch, n)
@@ -68,16 +61,14 @@ for start in range(0, n, batch):
         buf += f"*3\r\n$6\r\nLO.SET\r\n${len(key)}\r\n".encode() + key + b"\r\n"
         buf += f"${len(payload)}\r\n".encode() + payload + b"\r\n"
     sock.sendall(buf)
-    # Read responses
+    # Drain responses
+    remaining = end - start
     resp = b""
-    expected = end - start
-    count = 0
-    while count < expected:
+    while resp.count(b"\r\n") < remaining:
         resp += sock.recv(65536)
-        count = resp.count(b"\r\n")  # Each response has at least one \r\n
 
 sock.close()
-print(f"  Populated {n} keys")
+print(f"  Done: {n} keys populated")
 PYEOF
 }
 
@@ -88,27 +79,23 @@ run_mode() {
     rm -rf "$DATA_DIR"
     mkdir -p "$DATA_DIR"
 
+    # Write config file (correct way to pass module args)
+    cat > /tmp/lo_bench_${MODE}.conf << EOF
+port $PORT
+loglevel warning
+save ""
+appendonly no
+io-threads 4
+loadmodule $MODULE --pool-mode $MODE --pool-buf-size $BUF_SIZE --pool-buf-count $BUFPOOL_COUNT --data-dir $DATA_DIR --direct-io yes
+EOF
+
     # Start server
-    $SERVER \
-        --port $PORT \
-        --daemonize no \
-        --loglevel warning \
-        --save "" \
-        --appendonly no \
-        --io-threads 4 \
-        --loadmodule "$MODULE" \
-        --pool-mode "$MODE" \
-        --pool-buf-size "$BUF_SIZE" \
-        --pool-buf-count "$BUFPOOL_COUNT" \
-        --arena-total-size "$ARENA_TOTAL" \
-        --data-dir "$DATA_DIR" \
-        --direct-io yes \
-        > /tmp/valkey_bench_${MODE}.log 2>&1 &
+    $SERVER /tmp/lo_bench_${MODE}.conf > /tmp/valkey_bench_${MODE}.log 2>&1 &
     SERVER_PID=$!
     sleep 2
 
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "  ERROR: Server failed to start. Check /tmp/valkey_bench_${MODE}.log"
+        echo "  ERROR: Server failed to start. Log:"
         tail -10 /tmp/valkey_bench_${MODE}.log
         SERVER_PID=""
         return 1
@@ -129,10 +116,9 @@ run_mode() {
         -- LO.GET "key:__rand_int__" \
         > /tmp/bench_${MODE}.csv 2>/dev/null
 
-    # Extract rps from CSV output
-    GET_RPS=$(grep -i "lo.get\|\"LO" /tmp/bench_${MODE}.csv | head -1 | cut -d',' -f2 | tr -d '"' || echo "0")
-    if [ -z "$GET_RPS" ] || [ "$GET_RPS" = "0" ]; then
-        # Try alternate CSV format
+    # Extract rps
+    GET_RPS=$(grep -i "lo.get\|\"LO" /tmp/bench_${MODE}.csv 2>/dev/null | head -1 | cut -d',' -f2 | tr -d '"' || true)
+    if [ -z "$GET_RPS" ]; then
         GET_RPS=$(tail -1 /tmp/bench_${MODE}.csv | cut -d',' -f2 | tr -d '"')
     fi
     echo "  LO.GET: ${GET_RPS} rps"
