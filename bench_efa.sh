@@ -142,6 +142,7 @@ echo "mode,lo_get_rps" > /tmp/efa_results.csv
 run_mode "bufpool"
 run_mode "arena"
 run_mode "dynamic"
+run_mode "dynamic-noefa"
 
 echo ""
 echo ""

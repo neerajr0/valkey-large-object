@@ -617,21 +617,15 @@ impl Storage for DynamicStorageEngine {
         let pinned = Box::leak(Box::new(PinnedBuffer::new(self.buf_size)));
 
         // EFA registration: fi_mr_reg on this buffer so fi_write can use it directly.
-        // This is the REAL per-request registration cost. On EFA hardware, fi_mr_reg
-        // pins pages (get_user_pages) + programs NIC MR table (~1-5ms total).
-        // The RegisteredMr handle is stored alongside the buffer — dropping it
-        // calls fi_mr_dereg when the buffer is returned.
-        //
-        // NOTE: On non-EFA machines (feature "efa" disabled), this is a no-op.
-        let _mr = crate::transport::register_single_buffer(
-            pinned.as_mut_ptr(),
-            pinned.len(),
-        );
-        // TODO: Store the MR handle so it lives as long as the buffer.
-        // For now we leak it (registration stays active until process exit).
-        // Proper fix: attach MR to Buffer or store in a side map.
-        if let Ok(mr) = _mr {
-            std::mem::forget(mr); // Keep registered until buffer is freed
+        // Skip in DynamicNoEfa mode to isolate alloc cost from registration cost.
+        if super::pool_mode() != super::PoolMode::DynamicNoEfa {
+            let _mr = crate::transport::register_single_buffer(
+                pinned.as_mut_ptr(),
+                pinned.len(),
+            );
+            if let Ok(mr) = _mr {
+                std::mem::forget(mr);
+            }
         }
 
         // idx=u16::MAX signals "dynamic" — no io_uring registered index.

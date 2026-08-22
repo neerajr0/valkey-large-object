@@ -110,6 +110,8 @@ pub enum PoolMode {
     /// No io_uring pre-registration (uses plain read/write, not ReadFixed).
     /// EFA: single registered staging buffer for fi_write (memcpy on EFA path).
     Dynamic,
+    /// Dynamic without EFA registration — isolates alloc cost from fi_mr_reg cost.
+    DynamicNoEfa,
 }
 
 pub fn pool_mode() -> PoolMode {
@@ -122,7 +124,7 @@ pub fn get() -> &'static dyn Storage {
         PoolMode::Arena => {
             ARENA_STORAGE.get().expect("arena storage not initialized") as &dyn Storage
         }
-        PoolMode::Dynamic => {
+        PoolMode::Dynamic | PoolMode::DynamicNoEfa => {
             DYNAMIC_STORAGE.get().expect("dynamic storage not initialized") as &dyn Storage
         }
     }
@@ -142,7 +144,7 @@ pub fn return_buffer(pinned: &'static engine::PinnedBuffer, idx: u16) {
                 storage.return_buffer_by_ptr(pinned.as_mut_ptr());
             }
         }
-        PoolMode::Dynamic => {
+        PoolMode::Dynamic | PoolMode::DynamicNoEfa => {
             // In dynamic mode, the buffer was heap-allocated and fi_mr_reg'd.
             // The MR handle was forgotten in pool_get() — on real EFA hardware,
             // we'd need to track it to call fi_mr_dereg here.
@@ -169,6 +171,8 @@ pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
         PoolMode::Arena
     } else if mode_str == "dynamic" {
         PoolMode::Dynamic
+    } else if mode_str == "dynamic-noefa" {
+        PoolMode::DynamicNoEfa
     } else {
         PoolMode::BufPool
     };
@@ -186,7 +190,7 @@ pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
             let storage = engine::ArenaStorageEngine::new(buf_size, total_size, data_dir);
             ARENA_STORAGE.set(storage).ok();
         }
-        PoolMode::Dynamic => {
+        PoolMode::Dynamic | PoolMode::DynamicNoEfa => {
             let storage = engine::DynamicStorageEngine::new(buf_size, data_dir);
             DYNAMIC_STORAGE.set(storage).ok();
         }
@@ -206,7 +210,7 @@ pub fn shutdown() {
                 storage.signal_shutdown();
             }
         }
-        PoolMode::Dynamic => {
+        PoolMode::Dynamic | PoolMode::DynamicNoEfa => {
             if let Some(storage) = DYNAMIC_STORAGE.get() {
                 storage.signal_shutdown();
             }
@@ -234,6 +238,10 @@ pub fn pinned_buffers() -> &'static [PinnedBuffer] {
             // Dynamic mode: register a single staging buffer for EFA fi_write.
             let dynamic = DYNAMIC_STORAGE.get().unwrap();
             std::slice::from_ref(dynamic.staging_buffer())
+        }
+        PoolMode::DynamicNoEfa => {
+            // No EFA registration at all — return empty slice.
+            &[]
         }
     }
 }
