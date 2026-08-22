@@ -109,7 +109,7 @@ run_mode() {
             pool-buf-size $BUF_SIZE \
             pool-buf-count $BUFPOOL_COUNT \
             bench-mode yes \
-            direct-io no \
+            direct-io yes \
         --save "" \
         --appendonly no \
         --io-threads $IO_THREADS
