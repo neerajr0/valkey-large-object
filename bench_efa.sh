@@ -22,11 +22,11 @@ VALKEY_CLI="../valkey/src/valkey-cli"
 VALKEY_BENCH="../valkey/src/valkey-benchmark"
 
 # Benchmark params (matched to bench.sh)
-BUF_SIZE=4096
-BUFPOOL_COUNT=4096
-CLIENTS=750
+BUF_SIZE=1048576
+BUFPOOL_COUNT=512
+CLIENTS=200
 DURATION=10
-NUM_KEYS=500
+NUM_KEYS=200
 IO_THREADS=8
 
 # CPU pinning — i8ge has 192 CPUs (aarch64)
@@ -41,7 +41,7 @@ echo "=============================================="
 echo "DATA_DIR:       $DATA_DIR"
 echo "PORT:           $PORT"
 echo "MODULE_SO:      $MODULE_SO"
-echo "BUF_SIZE:       $BUF_SIZE (4KB)"
+echo "BUF_SIZE:       $BUF_SIZE (1MB)"
 echo "BUFPOOL_COUNT:  $BUFPOOL_COUNT"
 echo "CLIENTS:        $CLIENTS"
 echo "DURATION:       ${DURATION}s"
@@ -67,7 +67,7 @@ trap cleanup EXIT
 
 # Populate keys via raw RESP (no pip)
 populate() {
-    echo "  Populating $NUM_KEYS keys (4KB each)..."
+    echo "  Populating $NUM_KEYS keys (1MB each)..."
     python3 -c "
 import socket, os, time
 s = socket.socket(); s.connect(('127.0.0.1', $PORT))
