@@ -23,7 +23,7 @@ VALKEY_BENCH="../valkey/src/valkey-benchmark"
 
 # Benchmark params (matched to bench.sh)
 BUF_SIZE=4096
-BUFPOOL_COUNT=128
+BUFPOOL_COUNT=4096
 CLIENTS=750
 DURATION=10
 NUM_KEYS=500
