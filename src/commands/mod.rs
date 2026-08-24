@@ -169,7 +169,8 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let _ = storage.read_into_coalesced(
         object_id,
         obj_len,
-        Box::new(move |opt_buf, read_result| {
+        Box::new(move |result| {
+            let (opt_buf, read_result) = result;
             match (opt_buf, read_result) {
                 (Some(buf), Ok(bytes_read)) => {
                     if let Some((region_idx, remote_offset)) = efa_args {

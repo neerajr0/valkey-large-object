@@ -5,7 +5,9 @@
 
 use crate::data_type::ObjectId;
 pub use buffer::Buffer;
-pub use coalescing::{CoalesceResult, CoalescedReadCallback, CoalescingMap};
+pub use coalescing::{
+    CoalesceResult, CoalescingMap, ReadCoalesceResult, ReadCoalescingMap, WaiterCallback,
+};
 use engine::PinnedBuffer;
 
 pub mod buffer;
