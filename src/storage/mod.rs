@@ -1,7 +1,7 @@
 //! Storage Layer — buffer pool + NVMe I/O.
 //!
-//! Operates on OIDs and file paths, NEVER on Valkey keys.
-//! Command handler resolves key → OID via data type layer, then calls storage.
+//! Operates on object_ids and file paths, NEVER on Valkey keys.
+//! Command handler resolves key → object_id via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
 pub use buffer::Buffer;

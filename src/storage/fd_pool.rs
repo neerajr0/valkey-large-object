@@ -26,16 +26,16 @@ impl FdPool {
         }
     }
 
-    pub fn get(&self, oid: ObjectId) -> Option<RawFd> {
-        self.fds.read().unwrap().get(&oid.0).copied()
+    pub fn get(&self, object_id: ObjectId) -> Option<RawFd> {
+        self.fds.read().unwrap().get(&object_id.0).copied()
     }
 
-    pub fn insert(&self, oid: ObjectId, fd: RawFd) {
-        self.fds.write().unwrap().insert(oid.0, fd);
+    pub fn insert(&self, object_id: ObjectId, fd: RawFd) {
+        self.fds.write().unwrap().insert(object_id.0, fd);
     }
 
-    pub fn remove(&self, oid: ObjectId) {
-        if let Some(fd) = self.fds.write().unwrap().remove(&oid.0) {
+    pub fn remove(&self, object_id: ObjectId) {
+        if let Some(fd) = self.fds.write().unwrap().remove(&object_id.0) {
             // SAFETY: fd is a valid file descriptor opened by us via libc::open.
             // We own it exclusively (removed from map) and close exactly once.
             unsafe { libc::close(fd) };
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn test_fd_pool_insert_get_remove() {
         let pool = FdPool::new();
-        let oid = ObjectId(42);
+        let object_id = ObjectId(42);
 
         // Open a real temp file to get a valid fd.
         let tmp = std::ffi::CString::new("/tmp/fdpool_test_XXXXXX").unwrap();
@@ -73,12 +73,12 @@ mod tests {
         assert!(fd >= 0, "mkstemp failed");
 
         // Insert and retrieve.
-        pool.insert(oid, fd);
-        assert_eq!(pool.get(oid), Some(fd));
+        pool.insert(object_id, fd);
+        assert_eq!(pool.get(object_id), Some(fd));
 
         // Remove closes the fd.
-        pool.remove(oid);
-        assert_eq!(pool.get(oid), None);
+        pool.remove(object_id);
+        assert_eq!(pool.get(object_id), None);
 
         // Verify fd is actually closed: fcntl should fail with EBADF.
         // SAFETY: fcntl on a closed fd returns -1 (does not crash).

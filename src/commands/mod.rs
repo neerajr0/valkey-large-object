@@ -37,7 +37,7 @@ enum ReplyData {
     },
     SetOk {
         key_name: Vec<u8>,
-        oid: ObjectId,
+        object_id: ObjectId,
         len: u64,
         crc: u32,
     },
@@ -304,9 +304,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                                 obj_len,
                                 Box::new(move |_buf, write_result| {
                                     let reply = match write_result {
-                                        Ok((oid, crc)) => ReplyData::SetOk {
+                                        Ok((object_id, crc)) => ReplyData::SetOk {
                                             key_name: key_for_reply,
-                                            oid,
+                                            object_id,
                                             len: obj_len,
                                             crc,
                                         },
@@ -352,9 +352,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             obj_len,
             Box::new(move |_buf, write_result| {
                 let reply = match write_result {
-                    Ok((oid, crc)) => ReplyData::SetOk {
+                    Ok((object_id, crc)) => ReplyData::SetOk {
                         key_name: key_for_reply,
-                        oid,
+                        object_id,
                         len: obj_len,
                         crc,
                     },
@@ -383,7 +383,7 @@ fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
         }
         ReplyData::SetOk {
             key_name,
-            oid,
+            object_id,
             len,
             crc,
         } => {
@@ -397,7 +397,7 @@ fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
                 let key_str = ctx.create_string(key_name.as_slice());
                 let key = ctx.open_key_writable(&key_str);
                 let lo_value = LoValue {
-                    object_id: oid,
+                    object_id,
                     len,
                     crc32c: crc,
                 };

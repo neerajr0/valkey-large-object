@@ -51,7 +51,7 @@ struct CoalescedRead {
 // ─── CoalescingMap ───────────────────────────────────────────────────────────
 
 /// The coalescing map. Keyed by ObjectId.
-/// An entry exists IFF a read for that OID is currently in-flight.
+/// An entry exists IFF a read for that object_id is currently in-flight.
 ///
 /// Accessed from:
 ///   - Main thread: try_join_or_lead() at command dispatch time.
@@ -77,17 +77,17 @@ impl CoalescingMap {
 
     /// Try to join an existing in-flight read, or become the leader.
     ///
-    /// - If OID is already in the map: registers `cb` as a waiter, returns `Waiter`.
-    /// - If OID is not in the map: inserts a new entry (empty waiter list),
+    /// - If object_id is already in the map: registers `cb` as a waiter, returns `Waiter`.
+    /// - If object_id is not in the map: inserts a new entry (empty waiter list),
     ///   returns `Leader(cb)` so the caller can use it in the io_uring completion path.
-    pub fn try_join_or_lead(&self, oid: ObjectId, cb: CoalescedReadCallback) -> CoalesceResult {
+    pub fn try_join_or_lead(&self, object_id: ObjectId, cb: CoalescedReadCallback) -> CoalesceResult {
         let mut map = self.map.lock().unwrap();
-        if let Some(entry) = map.get_mut(&oid) {
+        if let Some(entry) = map.get_mut(&object_id) {
             entry.waiters.push(cb);
             CoalesceResult::Waiter
         } else {
             map.insert(
-                oid,
+                object_id,
                 CoalescedRead {
                     waiters: Vec::new(),
                 },
@@ -98,24 +98,24 @@ impl CoalescingMap {
 
     /// Called when the leader's NVMe read completes (success or failure).
     ///
-    /// Drains all waiters for this OID:
+    /// Drains all waiters for this object_id:
     ///   - On success: acquires a buffer per waiter, memcpy from leader_buf, fires cb(Some(buf), Ok(n)).
     ///   - On leader failure: fires cb(None, Err(e)) for each waiter.
     ///   - On pool exhaustion during fan-out: fires cb(None, Err(PoolExhausted)) for that waiter.
     ///
-    /// Removes the OID from the map after draining.
+    /// Removes the object_id from the map after draining.
     ///
     /// Returns the number of waiters served (for future metrics).
     pub fn complete(
         &self,
-        oid: ObjectId,
+        object_id: ObjectId,
         leader_buf: &Buffer,
         result: &Result<u64, StorageError>,
         pool: &BufferPool,
     ) -> usize {
         let waiters = {
             let mut map = self.map.lock().unwrap();
-            match map.remove(&oid) {
+            match map.remove(&object_id) {
                 Some(entry) => entry.waiters,
                 None => return 0,
             }
@@ -161,23 +161,23 @@ impl CoalescingMap {
         waiter_count
     }
 
-    /// Check if an OID currently has an in-flight read (for testing/metrics).
+    /// Check if an object_id currently has an in-flight read (for testing/metrics).
     #[cfg(test)]
-    pub fn is_inflight(&self, oid: ObjectId) -> bool {
-        self.map.lock().unwrap().contains_key(&oid)
+    pub fn is_inflight(&self, object_id: ObjectId) -> bool {
+        self.map.lock().unwrap().contains_key(&object_id)
     }
 
     /// Remove an entry without completing it (used when leader fails to acquire a buffer).
     /// Returns the number of waiters that were dropped.
-    pub fn remove_without_complete(&self, oid: ObjectId) -> usize {
+    pub fn remove_without_complete(&self, object_id: ObjectId) -> usize {
         let mut map = self.map.lock().unwrap();
-        match map.remove(&oid) {
+        match map.remove(&object_id) {
             Some(entry) => entry.waiters.len(),
             None => 0,
         }
     }
 
-    /// Number of OIDs currently in-flight (for metrics).
+    /// Number of object_ids currently in-flight (for metrics).
     #[allow(dead_code)]
     pub fn inflight_count(&self) -> usize {
         self.map.lock().unwrap().len()
@@ -216,60 +216,60 @@ mod tests {
     #[test]
     fn test_leader_when_no_inflight() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(1);
+        let object_id = ObjectId(1);
 
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        let result = map.try_join_or_lead(oid, cb);
+        let result = map.try_join_or_lead(object_id, cb);
 
         assert!(matches!(result, CoalesceResult::Leader(_)));
-        assert!(map.is_inflight(oid));
+        assert!(map.is_inflight(object_id));
     }
 
     #[test]
     fn test_waiter_when_inflight_exists() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(2);
+        let object_id = ObjectId(2);
 
         // First call: becomes leader.
         let cb1: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        let result1 = map.try_join_or_lead(oid, cb1);
+        let result1 = map.try_join_or_lead(object_id, cb1);
         assert!(matches!(result1, CoalesceResult::Leader(_)));
 
         // Second call: becomes waiter.
         let cb2: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        let result2 = map.try_join_or_lead(oid, cb2);
+        let result2 = map.try_join_or_lead(object_id, cb2);
         assert!(matches!(result2, CoalesceResult::Waiter));
     }
 
     #[test]
     fn test_multiple_waiters() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(3);
+        let object_id = ObjectId(3);
 
         // Leader
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid, cb);
+        map.try_join_or_lead(object_id, cb);
 
         // 10 waiters
         for _ in 0..10 {
             let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-            let result = map.try_join_or_lead(oid, cb);
+            let result = map.try_join_or_lead(object_id, cb);
             assert!(matches!(result, CoalesceResult::Waiter));
         }
 
         // Verify map has the entry
-        assert!(map.is_inflight(oid));
+        assert!(map.is_inflight(object_id));
     }
 
     #[test]
     fn test_complete_fires_all_waiters() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(4);
+        let object_id = ObjectId(4);
         let pool = make_pool(10, 4096);
 
         // Leader
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid, cb);
+        map.try_join_or_lead(object_id, cb);
 
         // 3 waiters with counters
         let counter = Arc::new(AtomicUsize::new(0));
@@ -283,7 +283,7 @@ mod tests {
                 // Forget buffer to avoid Drop calling into uninitialized STORAGE.
                 std::mem::forget(buf);
             });
-            map.try_join_or_lead(oid, cb);
+            map.try_join_or_lead(object_id, cb);
         }
 
         // Simulate leader completion: create a "leader buffer" with known data.
@@ -294,11 +294,11 @@ mod tests {
         }
         let leader_buf = Buffer::from_pinned(leader_pinned, 99);
 
-        let served = map.complete(oid, &leader_buf, &Ok(100), pool);
+        let served = map.complete(object_id, &leader_buf, &Ok(100), pool);
 
         assert_eq!(served, 3);
         assert_eq!(counter.load(Ordering::Relaxed), 3);
-        assert!(!map.is_inflight(oid));
+        assert!(!map.is_inflight(object_id));
 
         // Forget leader buf to avoid Drop into uninitialized STORAGE.
         std::mem::forget(leader_buf);
@@ -307,12 +307,12 @@ mod tests {
     #[test]
     fn test_complete_on_error_propagates() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(5);
+        let object_id = ObjectId(5);
         let pool = make_pool(5, 4096);
 
         // Leader
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid, cb);
+        map.try_join_or_lead(object_id, cb);
 
         // 2 waiters
         let error_count = Arc::new(AtomicUsize::new(0));
@@ -323,7 +323,7 @@ mod tests {
                 assert!(result.is_err(), "waiter should receive Err");
                 c.fetch_add(1, Ordering::Relaxed);
             });
-            map.try_join_or_lead(oid, cb);
+            map.try_join_or_lead(object_id, cb);
         }
 
         // Leader failed
@@ -331,7 +331,7 @@ mod tests {
         let leader_buf = Buffer::from_pinned(leader_pinned, 99);
 
         let served = map.complete(
-            oid,
+            object_id,
             &leader_buf,
             &Err(StorageError::IoError { code: -5 }),
             pool,
@@ -339,55 +339,55 @@ mod tests {
 
         assert_eq!(served, 2);
         assert_eq!(error_count.load(Ordering::Relaxed), 2);
-        assert!(!map.is_inflight(oid));
+        assert!(!map.is_inflight(object_id));
 
         std::mem::forget(leader_buf);
     }
 
     #[test]
-    fn test_different_oids_independent() {
+    fn test_different_object_ids_independent() {
         let map = CoalescingMap::new();
-        let oid1 = ObjectId(10);
-        let oid2 = ObjectId(20);
+        let object_id1 = ObjectId(10);
+        let object_id2 = ObjectId(20);
 
-        // Leader for oid1
+        // Leader for object_id1
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid1, cb);
+        map.try_join_or_lead(object_id1, cb);
 
-        // Leader for oid2
+        // Leader for object_id2
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid2, cb);
+        map.try_join_or_lead(object_id2, cb);
 
-        // Waiter joins oid1
+        // Waiter joins object_id1
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        let result = map.try_join_or_lead(oid1, cb);
+        let result = map.try_join_or_lead(object_id1, cb);
         assert!(matches!(result, CoalesceResult::Waiter));
 
-        // oid2 still independent
-        assert!(map.is_inflight(oid1));
-        assert!(map.is_inflight(oid2));
+        // object_id2 still independent
+        assert!(map.is_inflight(object_id1));
+        assert!(map.is_inflight(object_id2));
     }
 
     #[test]
     fn test_map_empty_after_complete() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(30);
+        let object_id = ObjectId(30);
         let pool = make_pool(5, 4096);
 
         // Leader, no waiters
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid, cb);
-        assert!(map.is_inflight(oid));
+        map.try_join_or_lead(object_id, cb);
+        assert!(map.is_inflight(object_id));
 
         let leader_pinned = Box::leak(Box::new(PinnedBuffer::new(4096)));
         let leader_buf = Buffer::from_pinned(leader_pinned, 99);
 
-        map.complete(oid, &leader_buf, &Ok(4096), pool);
-        assert!(!map.is_inflight(oid));
+        map.complete(object_id, &leader_buf, &Ok(4096), pool);
+        assert!(!map.is_inflight(object_id));
 
-        // New read for same OID becomes leader again.
+        // New read for same object_id becomes leader again.
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        let result = map.try_join_or_lead(oid, cb);
+        let result = map.try_join_or_lead(object_id, cb);
         assert!(matches!(result, CoalesceResult::Leader(_)));
 
         std::mem::forget(leader_buf);
@@ -396,13 +396,13 @@ mod tests {
     #[test]
     fn test_pool_exhaustion_at_fanout() {
         let map = CoalescingMap::new();
-        let oid = ObjectId(40);
+        let object_id = ObjectId(40);
         // Pool with only 1 buffer — won't have any left for waiters after leader takes it.
         let pool = make_pool(0, 4096); // empty pool!
 
         // Leader
         let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-        map.try_join_or_lead(oid, cb);
+        map.try_join_or_lead(object_id, cb);
 
         // 2 waiters — will get PoolExhausted
         let exhausted_count = Arc::new(AtomicUsize::new(0));
@@ -417,13 +417,13 @@ mod tests {
                     _ => panic!("expected PoolExhausted"),
                 }
             });
-            map.try_join_or_lead(oid, cb);
+            map.try_join_or_lead(object_id, cb);
         }
 
         let leader_pinned = Box::leak(Box::new(PinnedBuffer::new(4096)));
         let leader_buf = Buffer::from_pinned(leader_pinned, 99);
 
-        let served = map.complete(oid, &leader_buf, &Ok(4096), pool);
+        let served = map.complete(object_id, &leader_buf, &Ok(4096), pool);
         assert_eq!(served, 2);
         assert_eq!(exhausted_count.load(Ordering::Relaxed), 2);
 
@@ -435,7 +435,7 @@ mod tests {
         use std::thread;
 
         let map = Arc::new(CoalescingMap::new());
-        let oid = ObjectId(50);
+        let object_id = ObjectId(50);
         let leader_count = Arc::new(AtomicUsize::new(0));
         let waiter_count = Arc::new(AtomicUsize::new(0));
 
@@ -446,7 +446,7 @@ mod tests {
             let wc = waiter_count.clone();
             handles.push(thread::spawn(move || {
                 let cb: CoalescedReadCallback = Box::new(|_buf, _result| {});
-                match m.try_join_or_lead(oid, cb) {
+                match m.try_join_or_lead(object_id, cb) {
                     CoalesceResult::Leader(_) => {
                         lc.fetch_add(1, Ordering::Relaxed);
                     }

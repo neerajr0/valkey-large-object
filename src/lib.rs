@@ -19,7 +19,7 @@
 //   2. storage::init(buf_size, buf_count, data_dir)
 //                              — allocate pool buffers, create StorageEngine.
 //                              — scan data_dir for existing .dat files to
-//                                recover OID counter (avoids OID collision).
+//                                recover object_id counter (avoids object_id collision).
 //   3. storage::register_buffers()
 //                              — IORING_REGISTER_BUFFERS pins pool pages for
 //                                ReadFixed/WriteFixed zero-copy I/O.

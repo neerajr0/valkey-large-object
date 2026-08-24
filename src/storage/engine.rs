@@ -67,7 +67,7 @@ pub struct StorageEngine {
     uring: OnceLock<Box<dyn NvmeEngine>>,
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
-    /// Per-key read coalescing map. Deduplicates concurrent NVMe reads for the same OID.
+    /// Per-key read coalescing map. Deduplicates concurrent NVMe reads for the same object_id.
     coalescing: CoalescingMap,
 }
 
@@ -121,8 +121,8 @@ impl StorageEngine {
     }
 
     /// Open a read fd for an object. Uses O_DIRECT when direct-io config is enabled.
-    fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
-        let path = oid.file_path(&self.data_dir);
+    fn open_read_fd(&self, object_id: ObjectId) -> Option<RawFd> {
+        let path = object_id.file_path(&self.data_dir);
         let c_path = std::ffi::CString::new(path).ok()?;
         let mut flags = libc::O_RDONLY;
         if crate::direct_io() {
@@ -139,8 +139,8 @@ impl StorageEngine {
 
     /// Coalesced read: deduplicates concurrent NVMe reads for the same ObjectId.
     ///
-    /// - First request for an OID becomes the leader: acquires a buffer, submits io_uring read.
-    /// - Subsequent requests for the same OID (while leader is in-flight): become waiters,
+    /// - First request for an object_id becomes the leader: acquires a buffer, submits io_uring read.
+    /// - Subsequent requests for the same object_id (while leader is in-flight): become waiters,
     ///   no buffer acquired, callback stored. At leader completion, data is memcpy'd to
     ///   a just-in-time acquired buffer per waiter.
     ///
@@ -166,7 +166,7 @@ impl StorageEngine {
                         if dropped > 0 {
                             // Shouldn't happen (main thread is single-threaded), but be safe.
                             eprintln!(
-                                "largeobj: coalescing leader pool_get failed, dropped {} waiters for oid={}",
+                                "largeobj: coalescing leader pool_get failed, dropped {} waiters for object_id={}",
                                 dropped, object_id.0
                             );
                         }
@@ -282,8 +282,8 @@ impl Storage for StorageEngine {
     }
 
     fn write_new(&self, buf: Buffer, len: u64, on_complete: super::WriteCallback) {
-        let oid = ObjectId::next();
-        let final_path = oid.file_path(&self.data_dir);
+        let object_id = ObjectId::next();
+        let final_path = object_id.file_path(&self.data_dir);
         let tmp_path = format!("{}.tmp", final_path);
 
         // Open tmp file for write. Uses O_DIRECT when direct-io config is enabled.
@@ -342,7 +342,7 @@ impl Storage for StorageEngine {
                     Ok(()) => {
                         // Atomic rename: tmp → final.
                         if std::fs::rename(&tmp_path_for_cb, &final_path_for_cb).is_ok() {
-                            on_complete(buf, Ok((oid, crc)));
+                            on_complete(buf, Ok((object_id, crc)));
                         } else {
                             let _ = std::fs::remove_file(&tmp_path_for_cb);
                             on_complete(buf, Err(StorageError::IoError { code: -1 }));
