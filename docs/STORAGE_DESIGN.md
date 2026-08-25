@@ -162,7 +162,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 **How we fix it — segment-level rotation:**
 1. Monitor per-segment: `largest_free_block / total_free_bytes`. If ratio < 50% → fragmented.
 2. Mark segment as DRAINING (no new allocs from it).
-3. Passively wait for evictions/deletions to empty it, OR actively evacuate remaining objects to other segments (memcpy + update HashMap offsets).
+3. Passively wait for evictions (valkey core driven, ie, object free) / deletions to empty it, OR actively evacuate remaining objects to other segments (memcpy + update HashMap offsets).
 4. Once empty: `fi_mr_dereg` + `munmap`. Replace with fresh segment.
 
 **Mitigation — size-banded segments:**
@@ -224,7 +224,7 @@ DEL key:
   7. Untrack buffer / delete object
 ```
 
-**Key property:** Data exists ONLY in DRAM. Eviction = data loss = equivalent to DEL. Only Valkey's maxmemory eviction policy triggers this.
+**Key property:** Data exists ONLY in DRAM. Eviction on the DRAM layer = data loss = equivalent to DEL. Only Valkey's maxmemory eviction policy triggers this.
 
 ### 5.2 DRAM + NVMe Mode
 
@@ -311,7 +311,7 @@ LO.SET key 10GB [rkey remote_addr len] (EFA path):
   5. Fence: wait for ALL writes to complete before ACKing to client.
 ```
 
-Pipeline depth (buffers in flight simultaneously) is bounded by available pool buffers and NVMe queue depth. Typical: 4–16 buffers in flight.
+Pipeline depth (buffers in flight simultaneously) is bounded by available pool buffers and NVMe queue depth.
 
 ### 6.3 Parallel Read (LO.GET via EFA)
 
@@ -490,49 +490,50 @@ ObjectContext exists in two layers with different lifetimes. Same struct, same B
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get(42) → RawFd → /data/lo-data/000000000000002a.dat
-       len=50MB,
-       crc32c=0xAB12}          object_contexts[42] → ObjectContext {
-                                                       buffers: [
-                                                         Buffer{seg=0, offset=0x0000, len=8MB},
-                                                         Buffer{seg=0, offset=0x80_0000, len=8MB},
-                                                         Buffer{seg=1, offset=0x0000, len=8MB},
-                                                         ...7 chunks...
-                                                       ],
-                                                       total_len: 50MB
-                                                     }
-                                                            │
-                               ┌────────────────────────────┘
-                               ▼
-                  ┌─────────────────────────────────────────────────────────┐
-                  │ Segment 0 (16GB contiguous, io_uring buf_index=0)        │
-                  │ [8MB][8MB][...hundreds of objects sub-allocated by talc]  │
-                  └─────────────────────────────────────────────────────────┘
-                  ┌─────────────────────────────────────────────────────────┐
-                  │ Segment 1 (16GB contiguous, io_uring buf_index=1)        │
-                  │ [8MB][...more objects...]                                │
-                  └─────────────────────────────────────────────────────────┘
+  └─ LoValue {oid=42,         fd_pool.get(42) → RawFd → /data/lo-data/000000000000002a.dat (50MB)
+       len=50MB,                                                ▲
+       crc32c=0xAB12}                                           │  N buffers : 1 file
+                                                                │  (parallel ReadFixed/WriteFixed
+                               object_contexts[42] → ObjectContext    at different file offsets)
+                                 buffers: [                     │
+                                   buf[0] {seg=0, off=0x0000, 8MB}  ──→ file offset 0MB
+                                   buf[1] {seg=0, off=0x80_0000, 8MB} → file offset 8MB
+                                   buf[2] {seg=1, off=0x0000, 8MB}  ──→ file offset 16MB
+                                   buf[3] {seg=0, off=0x100_0000, 8MB} → file offset 24MB
+                                   buf[4] {seg=1, off=0x80_0000, 8MB} → file offset 32MB
+                                   buf[5] {seg=0, off=0x180_0000, 8MB} → file offset 40MB
+                                   buf[6] {seg=1, off=0x100_0000, 2MB} → file offset 48MB
+                                 ]
+                                 total_len: 50MB
+                                                     │
+                    ┌────────────────────────────────┘
+                    ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │ Segment 0 (16GB contiguous, io_uring buf_index=0)        │
+  │ [...buf[0]...][...buf[1]...][...buf[3]...][...buf[5]...] │
+  └─────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────┐
+  │ Segment 1 (16GB contiguous, io_uring buf_index=1)        │
+  │ [...buf[2]...][...buf[4]...][...buf[6]...]               │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 8. Expanding and Shrinking
+## 8. Expanding and Shrinking of Segments
 
 ### 8.1 When to Expand
 
 | Trigger | Action |
 |---------|--------|
 | Allocation fails (no contiguous space in any segment) | Add segment immediately |
-| Utilization > 80% sustained | Add segment proactively |
-| New LO keys being SET faster than evictions | Add segment to reduce eviction rate |
+| Segment Memory Utilization > 80% sustained | Add segment proactively |
 
 ### 8.2 When to Shrink
 
 | Trigger | Action |
 |---------|--------|
-| Valkey `used_memory` approaching `maxmemory` | Shrink to give memory back |
-| Module's DRAM usage disproportionately high vs other data | Shrink |
-| Sustained low utilization (<30% for >5 minutes) | Shrink to reduce waste |
+| Valkey `used_memory` approaching `maxmemory` | Shrink to give memory back. There are caveats explained in sections below |
 
 ### 8.3 How Expansion Works
 
@@ -541,13 +542,13 @@ key "obj-A"
 3. Add to allocator: `talc.claim(Span::new(base, base + size))`
 4. New allocations can immediately use the new segment
 
-Cost: ~2-10ms for the unregister/re-register cycle. In-flight ReadFixed/WriteFixed ops already submitted are unaffected (kernel has their pages pinned). New submissions wait briefly.
+Cost: ~2-10ms (Need to validate through tests) for the unregister/re-register cycle. In-flight ReadFixed/WriteFixed ops already submitted are unaffected (kernel has their pages pinned). New submissions wait briefly.
 
 ### 8.4 How Shrinking Works
 
 **DRAM+NVMe mode:**
 ```
-1. Pick segment with lowest utilization
+1. Pick segment with lowest utilization (live bytes allocated / segment capacity)
 2. Mark segment DRAINING (no new allocations from it)
 3. Wait for in-flight I/O targeting this segment to complete
 4. Evict cached objects in this segment (data safe on NVMe)
@@ -559,7 +560,7 @@ Eviction is cheap — objects survive on NVMe. Next GET is a cache miss.
 
 **DRAM-only mode:**
 ```
-1. Pick segment with lowest utilization
+1. Pick segment with lowest utilization (live bytes allocated / segment capacity)
 2. Mark segment DRAINING
 3. Wait for in-flight I/O to complete
 4. Evacuate remaining live objects:
@@ -580,3 +581,4 @@ Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment 
 5. For Approach B: does `fi_mr_reg` on overcommitted mmap pin all pages immediately? If yes, virtual overcommit trick doesn't save physical memory. Test on i8ge.
 6. Shrink trigger: how does the module learn about Valkey memory pressure? `VM_GetServerInfo` polling? A callback from Valkey? Memory hooks?
 7. Should we expose pool/arena stats via `LO.INFO` for observability?
+8. Should we use a Scale Out and Scale In to handle overly fragmented Segments? We will need a live transition. IMO, it might be over-engineering and we need tests to see how common fragmentation is in talc. free operations on talc already work to mitigate fragmentation
