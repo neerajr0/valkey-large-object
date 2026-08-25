@@ -454,6 +454,66 @@ Valkey's RESP command dispatch accumulates the full payload in `client->querybuf
 
 **Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
 
+### 6.9 Streaming I/O: Degraded Mode Under DRAM Pressure
+
+When the IoPool has insufficient DRAM to hold the full object's N chunks simultaneously, the module degrades gracefully rather than rejecting the request outright.
+
+**Problem:** A 20GB LO.SET normally requires multiple buffers in flight for parallel NVMe writes (§6.3). If only 1GB of buffer space is available, the full pipeline cannot be filled. Without streaming support, the request is rejected.
+
+**Solution:** Streaming mode — incrementally read into available buffers and write to NVMe in a loop until the entire object is transferred.
+
+**Streaming SET (EFA → NVMe):**
+```
+StreamingWrite state:
+  oid, fd, total_len, bytes_written, crc_hasher, client_crc,
+  client_efa_addr, client_rkey, dest_fi_addr, buffers[]
+
+Loop (runs on tokio task):
+  1. fi_read(client_addr + bytes_written, buffer[i], chunk_size)
+  2. crc_hasher.update(buffer[i][..chunk_len])
+  3. WriteFixed(fd, offset=bytes_written, buffer[i], chunk_len)
+  4. Wait for WriteFixed CQE
+  5. bytes_written += chunk_len
+  6. Reuse buffer[i] for next iteration
+  7. If bytes_written == total_len → finalize
+  8. Else → loop
+
+Finalize:
+  - Verify crc_hasher.finalize() == client_crc
+  - If mismatch: unlink file, unblock client with ERR
+  - If match: create LoValue in keyspace, unblock client with OK
+```
+
+**Streaming GET (NVMe → EFA):**
+```
+Same pattern in reverse:
+  1. ReadFixed(fd, offset, buffer[i], chunk_size)
+  2. fi_write(buffer[i], chunk_size, dest, remote_addr + offset, rkey)
+  3. Reuse buffer[i] for next chunk
+  4. Repeat until entire object sent
+```
+
+**Minimum buffer requirement:**
+- 1 buffer: fully serial (fi_read/write → NVMe write/read → repeat). Functional but no overlap.
+- 2 buffers: double-buffering (overlap NVMe I/O with EFA transfer). ~70-80% of full pipeline throughput.
+- Below minimum (`lo-streaming-min-buffers`, default: 2): reject with `ERR insufficient buffer capacity`.
+
+**Concurrency cap:** At most `lo-max-streaming-ops` (default: 2) concurrent streaming operations. Prevents cascading — if the pool is under severe pressure, accepting unlimited slow streaming work makes it worse.
+
+**Data correctness:**
+- CRC32c computed incrementally during the streaming loop, verified at end
+- LoValue is created ONLY after all chunks written AND CRC verified
+- On client disconnect mid-stream: unlink partial file, no LoValue created
+- On server crash mid-stream: orphan file with no matching LoValue → reconciliation deletes it
+- Invariant: `LoValue exists ⟺ NVMe file is complete AND CRC-verified`
+
+**Threading:** The streaming loop runs on the tokio runtime (EFA transport thread pool). Main thread involvement: command handler creates StreamingWrite state + blocks client (start), unblocks client on completion (end). Buffer alloc on main thread at start, free on main thread at finalize.
+
+**When to stream vs reject:**
+- `pool_alloc(pipeline_depth)` → got N buffers → proceed with full pipeline (§6.3/§6.4)
+- Got fewer than pipeline_depth but ≥ `lo-streaming-min-buffers` → streaming mode
+- Got < `lo-streaming-min-buffers` → reject with ERR
+
 ---
 
 ## 7. Data Type Struct and Object References
