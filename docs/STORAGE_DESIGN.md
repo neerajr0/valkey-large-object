@@ -106,7 +106,7 @@ Class 3: 8MB buffers  × 250    (serves 1-8MB objects)
 - Fixed capacity per class decided at startup
 - Cannot handle objects larger than largest class (reject with ERR)
 
-### 4.2 Approach B: Arena with Slab Allocator (talc)
+### 4.2 Approach B: Arena with Slab Allocator (talc) [Recommended]
 
 Allocate one or more large contiguous memory segments at startup. Register each segment with EFA. Sub-allocate exact-sized slots from the segments using a general-purpose allocator (talc).
 
@@ -183,12 +183,33 @@ Route small objects (≤1MB) to "small segments" and large objects (>1MB) to "la
 | Code complexity | ~100 lines | ~315 lines |
 | Best for | Simplicity, predictable latency | Memory efficiency, varied object sizes |
 
-### 4.5 Common Requirements (both approaches)
+### 4.5 Decision: Approach B (Separate Segments Per Layer)
+
+We use Approach B (talc arena). Object sizes are unknown at design time — talc provides exact-fit allocation regardless of what sizes production traffic produces.
+
+**Two separate talc instances, each with their own segments:**
+
+```
+IoPool:      Segment(s) (e.g., 2GB)   — own Mutex<Talc>, high churn, short-lived ObjectContexts
+DRAMCache:   Segment(s) (e.g., 16GB)  — own Mutex<Talc>, low churn, long-lived ObjectContexts
+
+io_uring registration: [iovec{IoPool_seg, 2GB}, iovec{DRAMCache_seg, 16GB}] — 2 entries
+```
+
+**Why separate segments per layer:**
+- Prevents lifetime-mixing fragmentation: IoPool high-churn alloc/free cycles cannot create holes between long-lived DRAMCache objects
+- Each layer's talc instance only sees objects of similar lifetime — fragmentation is self-healing (IoPool: FIFO churn reclaims space naturally; DRAMCache: infrequent evictions don't leave Swiss-cheese)
+- Independent sizing: IoPool sized for max concurrent I/O, DRAMCache sized for working set
+- Independent scaling: expand/shrink one layer without affecting the other
+
+### 4.6 Common Requirements
 
 **O_DIRECT alignment (NVMe mode only — does not apply to DRAM-only mode):**
 O_DIRECT bypasses the kernel page cache for direct NVMe I/O. It imposes two constraints:
 1. **Buffer address** must be 4KB-aligned (filesystem block size). Handled by `PinnedBuffer::new()` via `Layout::from_size_align(size, 4096)`.
 2. **Write length** must be a multiple of 512 bytes (logical sector size). Objects not naturally aligned are padded on disk: `ceil(len / 512) * 512`. Up to 511 bytes waste on disk. Reads return only `len` bytes (stored in LoValue metadata).
+
+**Both read and write paths must round up the I/O length.** The kernel rejects non-aligned lengths with `EINVAL`. The module handles this explicitly — O_DIRECT does not auto-pad. Current code (`uring.rs`) uses `align_up()` which rounds to 4096 — over-aligned but correct. Read path applies this; write path currently does not (BUG — masked because benchmark object sizes are naturally aligned). Must be fixed.
 
 EFA `fi_write` has no alignment constraint — sends exact `len`.
 
@@ -201,7 +222,7 @@ Objects exceeding the largest supported size are rejected at `LO.SET` with `ERR 
 
 ## 5. Operating Modes
 
-Both approaches follow the same command-level flow. "Alloc" and "free" refer to whichever mechanism was chosen (Approach A: pop/push from free list; Approach B: talc.alloc/free from preallocated arena). In both cases the resulting pointer is pre-registered with io_uring and EFA.
+Both approaches follow the same command-level flow. "Alloc" and "free" refer to `talc.alloc`/`talc.free` from the shared segment pool. The resulting memory is pre-registered with io_uring and EFA.
 
 ### 5.1 DRAM-Only Mode
 
@@ -224,7 +245,7 @@ DEL key:
   7. Untrack buffer / delete object
 ```
 
-**Key property:** Data exists ONLY in DRAM. Eviction on the DRAM layer = data loss = equivalent to DEL. Only Valkey's maxmemory eviction policy triggers this.
+**Key property:** Data exists ONLY in DRAM. Eviction on the DRAMCache layer = data loss = equivalent to DEL. Only Valkey's maxmemory eviction policy triggers this.
 
 ### 5.2 DRAM + NVMe Mode
 
@@ -232,29 +253,29 @@ All objects persist on NVMe (write-through). DRAM is a read cache — hot object
 
 ```
 LO.SET key len <payload> [rkey remote_addr]:
-  1. If key has existing DRAM cache entry: free that buffer (invalidate stale data)
+  1. If key has existing DRAMCache entry: free that buffer (invalidate stale data)
   2. Alloc buffer (registered memory)
   3a. TCP: copy payload into buffer
   3b. EFA: fi_read from client GPU into buffer (zero-copy)
   4. io_uring WriteFixed to NVMe (O_DIRECT, 512-byte aligned length)
-  5. Free buffer (no DRAM caching on write path)
+  5. Free buffer (no DRAMCache caching on write path)
   6. Track file in key/object: key → NVMe location only
 
-LO.GET key [rkey remote_addr len] — DRAM hit:
-  7. Lookup in HashMap → buffer is cached in DRAM
+LO.GET key [rkey remote_addr len] — DRAMCache hit:
+  7. Lookup in HashMap → buffer is cached in DRAMCache
   8a. TCP: reply from buffer
   8b. EFA: fi_write from buffer (zero-copy)
 
-LO.GET key [rkey remote_addr len] — DRAM miss:
+LO.GET key [rkey remote_addr len] — DRAMCache miss:
   9. Alloc buffer (registered memory)
   10. io_uring ReadFixed from NVMe into buffer (O_DIRECT)
   11a. TCP: reply from buffer
   11b. EFA: fi_write from buffer (zero-copy)
-  12. Promote to DRAM cache (based on access frequency / policy) + Track DRAM buffer in key/object
+  12. Promote to DRAMCache (based on access frequency / policy) + Track buffer in ObjectContext
 
-Eviction (DRAM pressure):
+Eviction (DRAMCache pressure):
   13. Free buffer. Data safe on NVMe.
-  14. Remove DRAM cache pointer from HashMap (keep NVMe reference)
+  14. Remove DRAMCache pointer from HashMap (keep NVMe reference)
 
 DEL key:
   15. Free buffer (if cached in DRAM)
@@ -263,9 +284,9 @@ DEL key:
 ```
 
 **Key properties:**
-- SET always invalidates any stale DRAM entry then writes to NVMe. No caching on write path.
-- DRAM cache is populated only on the GET path (promotion). Admission policy is a single decision point at step 12.
-- DRAM cache is expendable. Eviction is cheap (data persists on NVMe). Cache miss costs one NVMe read (~15μs on i8ge).
+- SET always invalidates any stale DRAMCache entry then writes to NVMe. No caching on write path.
+- DRAMCache is populated only on the GET path (promotion). Admission policy is a single decision point at step 12.
+- DRAMCache is expendable. Eviction is cheap (data persists on NVMe). Cache miss costs one NVMe read (~15μs on i8ge).
 
 ---
 
@@ -294,7 +315,34 @@ Object "key123" (10GB):
 - Simpler fd management, RDB serialization, and error handling.
 - mdraid0 stripes across all drives regardless of file count.
 
-### 6.2 Parallel Write (LO.SET via EFA)
+### 6.2 Buffer Size Translation (Client Args → Server Chunks)
+
+The server decides chunk size — the client never specifies or sees it.
+
+**Server config:** `lo-buffer-size` (e.g., 8MB). This determines the allocation unit for all I/O operations.
+
+**LO.SET translation:**
+```
+Client sends:  LO.SET key 50MB <payload or rkey+addr+len>
+Server sees:   total_len=50MB, chunk_size=8MB → N=7 chunks
+Server does:   alloc 7 buffers from shared segments
+               partition incoming data into 8MB pieces
+               submit 7 parallel WriteFixed SQEs to NVMe
+```
+
+**LO.GET translation:**
+```
+Client sends:  LO.GET key [rkey addr 50MB]
+Server sees:   LoValue.len=50MB, chunk_size=8MB → N=7 chunks
+Server does:   alloc 4-8 buffers (pipeline depth)
+               submit ReadFixed SQEs at file offsets 0, 8MB, 16MB, ...
+               TCP: write each chunk to reply buffer sequentially (client sees one bulk string)
+               EFA: fi_write each chunk to client at addr + i*chunk_size
+```
+
+**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / lo-buffer-size)` internal operations. The last operation uses `len = total_len % lo-buffer-size` (partial chunk). O_DIRECT write path pads the final write to 512-byte boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
+
+### 6.3 Parallel Write (LO.SET via EFA)
 
 For EFA, the module pulls data from client GPU memory in chunks using fi_read:
 
@@ -313,7 +361,7 @@ LO.SET key 10GB [rkey remote_addr len] (EFA path):
 
 Pipeline depth (buffers in flight simultaneously) is bounded by available pool buffers and NVMe queue depth.
 
-### 6.3 Parallel Read (LO.GET via EFA)
+### 6.4 Parallel Read (LO.GET via EFA)
 
 Module reads from NVMe in parallel chunks and writes to client GPU:
 
@@ -335,7 +383,7 @@ LO.GET key [rkey remote_addr len] (EFA path, cache miss):
 
 **Pipeline overlap:** Read and send happen concurrently. While buffer 0 is being sent to client, buffers 1-3 are being filled from NVMe. This keeps both NVMe bandwidth and network bandwidth saturated.
 
-### 6.4 Chunk Size Selection
+### 6.5 Chunk Size Selection
 
 | Chunk size | Buffers for 10GB | SQE count | Tradeoff |
 |---|---|---|---|
@@ -345,17 +393,17 @@ LO.GET key [rkey remote_addr len] (EFA path, cache miss):
 
 With pipelining (4–8 buffers in flight), only 4–8 buffers are checked out at once regardless of object size. Total SQE count determines total I/O time; pipeline depth determines pool pressure.
 
-**Recommended:** chunk_size = buffer size from pool (Approach A class or Approach B alloc). No special "large object" buffer — reuse the same pool. The chunking is purely an I/O scheduling pattern, not a storage decision.
+**Recommended:** chunk_size = `lo-buffer-size` config value. No special "large object" buffer — reuse the same shared segment allocator. The chunking is purely an I/O scheduling pattern, not a storage decision.
 
-### 6.5 DRAM Cache for Large Objects
+### 6.6 DRAMCache for Large Objects
 
-Large objects (>256MB) are **never promoted to DRAM cache**:
+Large objects (>256MB) are **never promoted to DRAMCache**:
 - Cost/benefit is poor (256MB DRAM for one key vs serving hundreds of smaller hot objects)
 - Promotion threshold is configurable: `dram-cache-max-object-size` (default: 256MB)
 - Objects above this threshold always read from NVMe via the parallel pipeline
-- Objects below this threshold can be promoted to DRAM on repeated access (Section 5.2 step 12)
+- Objects below this threshold can be promoted to DRAMCache on repeated access (Section 5.2 step 12)
 
-### 6.6 EFA Transport for Large Objects
+### 6.7 EFA Transport for Large Objects
 
 Two cases for how EFA handles large objects:
 
@@ -395,7 +443,7 @@ Server internally:
 
 **v1 decision:** Reject over TCP for large objects. Accept over EFA using Case 2 (server-side split) to meet the product requirement. Case 1 deferred to v2 if multi-GPU clients need explicit region control.
 
-### 6.7 TCP Path: Large Object Rejection
+### 6.8 TCP Path: Large Object Rejection
 
 Valkey's RESP command dispatch accumulates the full payload in `client->querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental streaming API for either direction.
 
@@ -426,8 +474,9 @@ pub struct LoValue {
 
 Only durable, object-intrinsic data. No runtime state (fd, DRAM cache location, flags). Runtime references are in module-internal structures:
 - **FdPool:** `HashMap<ObjectId, RawFd>` — rebuilt on load, not serialized
-- **DRAM Cache:** `HashMap<ObjectId, ObjectContext>` — populated on GET hits, evicted independently
-- **IoPool inflight:** transient `ObjectContext` per in-flight request, dropped on completion
+- **DRAMCache:** `HashMap<ObjectId, ObjectContext>` — buffers in DRAMCache segments, populated on GET hits, evicted independently
+- **IoPool inflight:** transient `ObjectContext` per in-flight request — buffers in IoPool segments, dropped on completion
+- **Allocators:** `Mutex<Talc>` per layer — `dram_talc` for DRAMCache, `io_talc` for IoPool (§4.5)
 
 ### 7.2 ObjectContext (Per-Object Runtime State)
 
@@ -451,11 +500,11 @@ Stored in: `HashMap<ObjectId, ObjectContext>`
 
 - **Small object (1MB):** `buffers = [Buffer{seg=0, offset=0x5000, len=1MB}]`
 - **Large object (50MB):** `buffers = [Buffer{seg=0, ...}, Buffer{seg=1, ...}, ...]` — chunks may span multiple segments
-- **Not cached (cold on NVMe):** No entry in HashMap. LO.GET allocates transient buffers from io layer pool, reads from NVMe, serves, then either promotes (inserts ObjectContext) or frees.
+- **Not cached (cold on NVMe):** No entry in HashMap. LO.GET allocates transient buffers via IoPool, reads from NVMe, serves, then either promotes to DRAMCache (inserts ObjectContext) or frees.
 
 Used by both:
-- **DRAM cache layer:** Serving hits directly from buffers
-- **I/O layer:** Parallel ReadFixed/WriteFixed and EFA fi_write across all chunks
+- **DRAMCache:** Serving hits directly from buffers
+- **IoPool:** Parallel ReadFixed/WriteFixed and EFA fi_write across all chunks
 
 ### 7.3 NVMe File Reference
 
@@ -469,22 +518,25 @@ Each object is one file: `/data/lo-data/{oid:016x}.dat`
 
 ### 7.4 ObjectContext Lifetimes
 
-ObjectContext exists in two layers with different lifetimes. Same struct, same Buffer type, different ownership semantics.
+ObjectContext exists in two layers with different lifetimes. Same struct, same Buffer type, but allocated from **separate talc instances in separate segments** (§4.5).
 
-**DRAM Cache Layer (long-lived):**
+**DRAMCache (long-lived):**
 - ObjectContext created on cache promotion (LO.GET hit policy admits it)
+- Buffers allocated from DRAMCache segment(s) via `dram_talc.lock().alloc()`
 - Held in `HashMap<ObjectId, ObjectContext>` for the object's entire cached lifetime
 - Buffers remain allocated and serve repeated LO.GET hits directly
-- On DRAM cache eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → all its Buffers freed back to allocator
-- Object survives on NVMe. Next GET is a cache miss.
+- On DRAMCache eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → `dram_talc.lock().free()` for each buffer
+- Object survives on NVMe. Next GET is a cache miss (IoPool serves it).
 
-**NVMe I/O Pool Layer (short-lived):**
+**IoPool (short-lived):**
 - ObjectContext created per in-flight I/O request (or coalesced group of requests for same object)
-- Buffers allocated transiently for NVMe ReadFixed/WriteFixed + client transfer
-- On request completion: ObjectContext dropped → all its Buffers freed back to allocator
-- If promotion policy says yes: ObjectContext ownership transfers to DRAM Cache layer instead of being dropped
+- Buffers allocated from IoPool segment(s) via `io_talc.lock().alloc()`
+- On request completion: ObjectContext dropped → `io_talc.lock().free()` for each buffer
+- If promotion policy says yes: data copied from IoPool buffer into a fresh DRAMCache allocation, then IoPool buffer freed. (Cannot transfer ownership across segments — different talc instances.)
 
 ### 7.5 Relationship Diagram
+
+Example: 50MB object cached in DRAMCache (long-lived). IoPool would look the same structurally but with shorter-lived ObjectContexts in IoPool segments.
 
 ```
 Valkey keyspace                Module internals
@@ -508,19 +560,21 @@ key "obj-A"
                                                      │
                     ┌────────────────────────────────┘
                     ▼
-  ┌─────────────────────────────────────────────────────────┐
-  │ Segment 0 (16GB contiguous, io_uring buf_index=0)        │
-  │ [...buf[0]...][...buf[1]...][...buf[3]...][...buf[5]...] │
-  └─────────────────────────────────────────────────────────┘
-  ┌─────────────────────────────────────────────────────────┐
-  │ Segment 1 (16GB contiguous, io_uring buf_index=1)        │
-  │ [...buf[2]...][...buf[4]...][...buf[6]...]               │
-  └─────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────────┐
+  │ DRAMCache Segment 0 (16GB, io_uring buf_index=0, dram_talc) │
+  │ [...buf[0]...][...buf[1]...][...buf[3]...][...buf[5]...]    │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────────┐
+  │ DRAMCache Segment 1 (16GB, io_uring buf_index=1, dram_talc) │
+  │ [...buf[2]...][...buf[4]...][...buf[6]...]                  │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 8. Expanding and Shrinking of Segments
+
+Expanding and shrinking applies only to **DRAMCache segments**. IoPool segments are fixed at startup (sized for max concurrent I/O) and never resized — if IoPool is exhausted, the module back-pressures new requests until buffers are freed.
 
 ### 8.1 When to Expand
 
@@ -551,12 +605,12 @@ Cost: ~2-10ms (Need to validate through tests) for the unregister/re-register cy
 1. Pick segment with lowest utilization (live bytes allocated / segment capacity)
 2. Mark segment DRAINING (no new allocations from it)
 3. Wait for in-flight I/O targeting this segment to complete
-4. Evict cached objects in this segment (data safe on NVMe)
+4. Evict DRAMCache objects in this segment (data safe on NVMe)
    - Drop their ObjectContexts → Buffers logically freed
 5. IORING_UNREGISTER_BUFFERS → remove segment from iovec array → IORING_REGISTER_BUFFERS
 6. Release segment memory to OS
 ```
-Eviction is cheap — objects survive on NVMe. Next GET is a cache miss.
+Eviction is cheap — objects survive on NVMe. Next GET is a DRAMCache miss.
 
 **DRAM-only mode:**
 ```
@@ -574,11 +628,9 @@ Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment 
 
 ## 9. Open Questions
 
-1. What size classes for Approach A? Need LMCache team input on their chunk sizes.
-2. For Approach A: what free:cached ratio is safe? (reserve 20% for I/O, allow 80% for caching?)
-3. For Approach B: segment size? 4GB (granular shrink) vs 16GB (fewer segments, less overhead)?
-4. For Approach B: does `talc.claim()` support adding spans after initial creation? Must verify API.
-5. For Approach B: does `fi_mr_reg` on overcommitted mmap pin all pages immediately? If yes, virtual overcommit trick doesn't save physical memory. Test on i8ge.
-6. Shrink trigger: how does the module learn about Valkey memory pressure? `VM_GetServerInfo` polling? A callback from Valkey? Memory hooks?
-7. Should we expose pool/arena stats via `LO.INFO` for observability?
-8. Should we use a Scale Out and Scale In to handle overly fragmented Segments? We will need a live transition. IMO, it might be over-engineering and we need tests to see how common fragmentation is in talc. free operations on talc already work to mitigate fragmentation
+1. Segment size? 4GB (granular shrink) vs 16GB (fewer segments, less overhead)?
+2. Does `talc.claim()` support adding spans after initial creation? Must verify API.
+3. Does `fi_mr_reg` on overcommitted mmap pin all pages immediately? If yes, virtual overcommit trick doesn't save physical memory. Test on i8ge.
+4. Shrink trigger: how does the module learn about Valkey memory pressure? `VM_GetServerInfo` polling? A callback from Valkey? Memory hooks?
+5. Should we expose pool/arena stats via `LO.INFO` for observability?
+6. Should we use a Scale Out and Scale In to handle overly fragmented Segments? We will need a live transition. IMO, it might be over-engineering and we need tests to see how common fragmentation is in talc. free operations on talc already work to mitigate fragmentation
