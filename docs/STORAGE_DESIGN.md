@@ -1,6 +1,6 @@
 # Storage Design
 
-**Date:** 2026-08-21  **Status:** Draft  **Author:** karsubba
+**Date:** 2026-08-21  **Status:** Draft  **Author:** @KarthikSubbarao
 
 ---
 
@@ -21,7 +21,7 @@ Two operating modes:
 These two constraints drive every design decision:
 
 **1. EFA registration (fi_mr_reg):**
-Any buffer used as source for `fi_write` must be pre-registered with the NIC. Registration pins physical pages and programs the NIC's translation table. Cost: ~1-5ms per call. Must be done at startup or on rare resize events — never on the data path.
+Any buffer used as source for `fi_write` must be pre-registered with the NIC. Registration pins physical pages and programs the NIC's translation table. Cost: ~300-500μs per call (measured ~333μs on i8ge EFA, not size-proportional). Must be done at startup or on rare resize events — never on the data path. Per-request registration destroys throughput by 45x (measured: 138K rps pre-registered vs 3K rps per-request at 4KB).
 
 **2. io_uring registration (IORING_REGISTER_BUFFERS):**
 Any buffer used for `ReadFixed`/`WriteFixed` must be pre-registered with the kernel's io_uring ring. Enables kernel-bypass I/O (no per-op address translation). Cost: one-time at startup. Kernel overhead scales with buffer count — keep ≤1000 per registration.
@@ -183,10 +183,16 @@ Route small objects (≤1MB) to "small segments" and large objects (>1MB) to "la
 | Code complexity | ~100 lines | ~315 lines |
 | Best for | Simplicity, predictable latency | Memory efficiency, varied object sizes |
 
-### 4.5 Common Behaviors (both approaches)
+### 4.5 Common Requirements (both approaches)
 
-**NVMe write alignment:**
-O_DIRECT requires write length to be a multiple of 512 bytes (sector size). Objects not naturally aligned are padded on disk: `ceil(len / 512) * 512`. Up to 511 bytes waste on disk for small odd-sized objects. Reads return only `len` bytes (stored in LoValue metadata). EFA `fi_write` has no alignment constraint — sends exact `len`.
+**O_DIRECT alignment (NVMe mode only — does not apply to DRAM-only mode):**
+O_DIRECT bypasses the kernel page cache for direct NVMe I/O. It imposes two constraints:
+1. **Buffer address** must be 4KB-aligned (filesystem block size). Handled by `PinnedBuffer::new()` via `Layout::from_size_align(size, 4096)`.
+2. **Write length** must be a multiple of 512 bytes (logical sector size). Objects not naturally aligned are padded on disk: `ceil(len / 512) * 512`. Up to 511 bytes waste on disk. Reads return only `len` bytes (stored in LoValue metadata).
+
+EFA `fi_write` has no alignment constraint — sends exact `len`.
+
+Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
 Objects exceeding the largest supported size are rejected at `LO.SET` with `ERR object exceeds max buffer size`. No multi-buffer stitching, no fallback path. Client (LMCache) already chunks by layer/block and can chunk smaller. Module advertises max size via config.
@@ -195,213 +201,377 @@ Objects exceeding the largest supported size are rejected at `LO.SET` with `ERR 
 
 ## 5. Operating Modes
 
+Both approaches follow the same command-level flow. "Alloc" and "free" refer to whichever mechanism was chosen (Approach A: pop/push from free list; Approach B: talc.alloc/free from preallocated arena). In both cases the resulting pointer is pre-registered with io_uring and EFA.
+
 ### 5.1 DRAM-Only Mode
 
 All objects live exclusively in DRAM. No NVMe storage. Fastest possible reads. Capacity limited by available DRAM.
 
-**With Approach A:**
 ```
-LO.SET key len <payload>:
-  1. Pop buffer from smallest fitting class free list
-  2. Copy payload into buffer
-  3. Store (class_idx, buf_idx, len) in HashMap
+LO.SET key len <payload> [rkey remote_addr]:
+  1. Alloc buffer (registered memory)
+  2a. TCP: copy payload into buffer
+  2b. EFA: fi_read from client GPU into buffer (zero-copy)
+  3. Track buffer: key → buffer location + len
 
 LO.GET key [rkey remote_addr len]:
   4. Lookup in HashMap → buffer pointer
   5a. TCP: reply from buffer
-  5b. EFA: fi_write from buffer (zero-copy, buffer is registered)
+  5b. EFA: fi_write from buffer to client GPU (zero-copy)
 
 DEL key:
-  6. Push buffer back to class free list
-  7. Remove from HashMap
-```
-
-**With Approach B:**
-```
-LO.SET key len <payload>:
-  1. arena.alloc(len, align=4096) → (segment_idx, offset)
-  2. Copy payload into arena slot
-  3. Store CachedObject{segment_idx, offset, len} in HashMap
-
-LO.GET key [rkey remote_addr len]:
-  4. Lookup in HashMap → derive pointer from segment base + offset
-  5a. TCP: reply from arena slot
-  5b. EFA: fi_write(arena_ptr, len, segment.rkey) — zero-copy
-
-DEL key:
-  6. arena.free(ptr, layout)
-  7. Remove from HashMap
+  6. Free buffer (return to pool / arena)
+  7. Untrack buffer / delete object
 ```
 
 **Key property:** Data exists ONLY in DRAM. Eviction = data loss = equivalent to DEL. Only Valkey's maxmemory eviction policy triggers this.
 
 ### 5.2 DRAM + NVMe Mode
 
-All objects persist on NVMe (write-through). DRAM is a read cache — hot objects promoted on access.
+All objects persist on NVMe (write-through). DRAM is a read cache — hot objects promoted on GET only.
 
-**With Approach A:**
 ```
-LO.SET key len <payload>:
-  1. Pop buffer from class free list (this is IoPool — registered with io_uring + EFA)
-  2. Copy payload into buffer
-  3. io_uring WriteFixed to NVMe
-  4. Decision: keep buffer as cache (promotion) OR return to free list
-     - If cache: buffer stays held, tracked in HashMap as cached
-     - If not: return buffer to free list after write completes
+LO.SET key len <payload> [rkey remote_addr]:
+  1. If key has existing DRAM cache entry: free that buffer (invalidate stale data)
+  2. Alloc buffer (registered memory)
+  3a. TCP: copy payload into buffer
+  3b. EFA: fi_read from client GPU into buffer (zero-copy)
+  4. io_uring WriteFixed to NVMe (O_DIRECT, 512-byte aligned length)
+  5. Free buffer (no DRAM caching on write path)
+  6. Track file in key/object: key → NVMe location only
 
-LO.GET key (DRAM hit):
-  5. Lookup in HashMap → buffer is cached
-  6a. TCP: reply from buffer
-  6b. EFA: fi_write from buffer (zero-copy)
+LO.GET key [rkey remote_addr len] — DRAM hit:
+  7. Lookup in HashMap → buffer is cached in DRAM
+  8a. TCP: reply from buffer
+  8b. EFA: fi_write from buffer (zero-copy)
 
-LO.GET key (DRAM miss):
-  7. Pop buffer from class free list
-  8. io_uring ReadFixed from NVMe into buffer
-  9. Reply (TCP direct or EFA fi_write — zero-copy either way)
-  10. Keep buffer as cache (promotion). Store in HashMap.
+LO.GET key [rkey remote_addr len] — DRAM miss:
+  9. Alloc buffer (registered memory)
+  10. io_uring ReadFixed from NVMe into buffer (O_DIRECT)
+  11a. TCP: reply from buffer
+  11b. EFA: fi_write from buffer (zero-copy)
+  12. Promote to DRAM cache (based on access frequency / policy) + Track DRAM buffer in key/object
 
-Eviction (under memory pressure):
-  11. Pick victim (LRU/LFU)
-  12. Push buffer back to free list. Data safe on NVMe.
-  13. Remove from HashMap cache entry (keep NVMe reference)
-```
+Eviction (DRAM pressure):
+  13. Free buffer. Data safe on NVMe.
+  14. Remove DRAM cache pointer from HashMap (keep NVMe reference)
 
-**With Approach B:**
-```
-LO.SET key len <payload>:
-  1. arena.alloc(len, align=4096) → (segment_idx, offset)
-  2. Copy payload into arena slot
-  3. io_uring WriteFixed to NVMe (buf_index=segment_idx, offset=obj_offset)
-  4. Object lives in arena (cached) AND on NVMe (persisted)
-
-LO.GET key (DRAM hit — in arena):
-  6. Lookup in HashMap → CachedObject in arena
-  7a. TCP: reply from arena slot
-  7b. EFA: fi_write from arena slot (zero-copy, segment is EFA-registered)
-
-LO.GET key (DRAM miss):
-  8. arena.alloc(len) → new slot in arena
-  9. io_uring ReadFixed from NVMe directly into arena slot (buf_index=segment_idx, offset=slot_offset)
-  10. Reply (TCP from arena slot, or fi_write from arena slot for EFA) — zero-copy
-  11. Object is now cached in arena. Store in HashMap.
-
-Eviction:
-  12. arena.free(slot). Data safe on NVMe.
-  13. Remove cache entry from HashMap.
+DEL key:
+  15. Free buffer (if cached in DRAM)
+  16. Delete NVMe file
+  17. Remove from HashMap
 ```
 
-**Key property:** DRAM cache is expendable. Eviction is cheap (data persists on NVMe). Cache miss costs one NVMe read (~15μs).
+**Key properties:**
+- SET always invalidates any stale DRAM entry then writes to NVMe. No caching on write path.
+- DRAM cache is populated only on the GET path (promotion). Admission policy is a single decision point at step 12.
+- DRAM cache is expendable. Eviction is cheap (data persists on NVMe). Cache miss costs one NVMe read (~15μs on i8ge).
 
 ---
 
-## 6. Expanding and Shrinking
+## 6. Large Object I/O: Multi-Buffer Parallel
 
-### 6.1 When to Expand
+Objects can be much larger than a single I/O buffer (e.g., 10GB object with 64MB buffers). The module handles this by streaming through multiple buffers in parallel — never allocating the full object in DRAM at once.
+
+**Transport-dependent behavior:**
+- **TCP:** Valkey's command dispatch accumulates the full payload in `querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental/streaming API. **TCP rejects objects above a configurable max size** (e.g., 256MB). Multi-buffer parallel I/O applies only to EFA.
+- **EFA:** The module controls chunk size via fi_read/fi_write. Multi-buffer parallel I/O is the primary large object path.
+
+### 6.1 NVMe Representation: Single File Per Object
+
+Each object is one contiguous file on NVMe regardless of size:
+
+```
+Object "key123" (10GB):
+  NVMe: /data/lo-data/00000042.dat   (10GB file, XFS extent-allocated)
+  LoValue: {oid=42, size=10GB, fd_idx=7}
+```
+
+**Why single file, not multiple:**
+- io_uring parallelizes via offset within one fd — no need for multiple files
+- NVMe controller sees LBAs, not files. Same parallelism either way.
+- Atomicity: single unlink = atomic delete. No partial-object cleanup.
+- Simpler fd management, RDB serialization, and error handling.
+- mdraid0 stripes across all drives regardless of file count.
+
+### 6.2 Parallel Write (LO.SET via EFA)
+
+For EFA, the module pulls data from client GPU memory in chunks using fi_read:
+
+```
+LO.SET key 10GB [rkey remote_addr len] (EFA path):
+  1. Create/open NVMe file, fallocate(10GB)
+  2. fi_read chunk from client GPU into registered buffer
+  3. Submit N WriteFixed SQEs in parallel:
+     SQE[0]: WriteFixed(fd, offset=0,             buf_idx=0, len=chunk_size)
+     SQE[1]: WriteFixed(fd, offset=chunk_size,    buf_idx=1, len=chunk_size)
+     SQE[2]: WriteFixed(fd, offset=2*chunk_size,  buf_idx=2, len=chunk_size)
+     ...
+  4. Reap CQEs. As each completes, return buffer to pool, fi_read next chunk.
+  5. Fence: wait for ALL writes to complete before ACKing to client.
+```
+
+Pipeline depth (buffers in flight simultaneously) is bounded by available pool buffers and NVMe queue depth. Typical: 4–16 buffers in flight.
+
+### 6.3 Parallel Read (LO.GET via EFA)
+
+Module reads from NVMe in parallel chunks and writes to client GPU:
+
+```
+LO.GET key [rkey remote_addr len] (EFA path, cache miss):
+  1. Lookup LoValue → fd, size
+  2. Checkout N buffers from pool (e.g., 4 × chunk_size)
+  3. Submit N ReadFixed SQEs in parallel:
+     SQE[0]: ReadFixed(fd, offset=0,             buf_idx=0, len=chunk_size)
+     SQE[1]: ReadFixed(fd, offset=chunk_size,    buf_idx=1, len=chunk_size)
+     SQE[2]: ReadFixed(fd, offset=2*chunk_size,  buf_idx=2, len=chunk_size)
+     SQE[3]: ReadFixed(fd, offset=3*chunk_size,  buf_idx=3, len=chunk_size)
+  4. As each CQE completes:
+     a. fi_write chunk to client GPU (at sequential offset within client's region)
+     b. Return buffer to pool
+     c. Submit next ReadFixed SQE for the next file offset
+  5. Repeat until entire object transferred.
+```
+
+**Pipeline overlap:** Read and send happen concurrently. While buffer 0 is being sent to client, buffers 1-3 are being filled from NVMe. This keeps both NVMe bandwidth and network bandwidth saturated.
+
+### 6.4 Chunk Size Selection
+
+| Chunk size | Buffers for 10GB | SQE count | Tradeoff |
+|---|---|---|---|
+| 4MB | 2500 (sequential) | 2500 | Minimal pool usage, high SQE overhead |
+| 64MB | 160 (sequential) | 160 | Good balance |
+| 256MB | 40 (sequential) | 40 | Fewer SQEs, larger pool reservation |
+
+With pipelining (4–8 buffers in flight), only 4–8 buffers are checked out at once regardless of object size. Total SQE count determines total I/O time; pipeline depth determines pool pressure.
+
+**Recommended:** chunk_size = buffer size from pool (Approach A class or Approach B alloc). No special "large object" buffer — reuse the same pool. The chunking is purely an I/O scheduling pattern, not a storage decision.
+
+### 6.5 DRAM Cache for Large Objects
+
+Large objects (>256MB) are **never promoted to DRAM cache**:
+- Cost/benefit is poor (256MB DRAM for one key vs serving hundreds of smaller hot objects)
+- Promotion threshold is configurable: `dram-cache-max-object-size` (default: 256MB)
+- Objects above this threshold always read from NVMe via the parallel pipeline
+- Objects below this threshold can be promoted to DRAM on repeated access (Section 5.2 step 12)
+
+### 6.6 EFA Transport for Large Objects
+
+Two cases for how EFA handles large objects:
+
+**Case 1: Client provides multiple address/len pairs in the command**
+
+The command itself includes multiple regions. Server performs parallel fi_read/fi_write across all of them simultaneously:
+
+```
+LO.SET key <total_len> <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+```
+
+- Client has multiple GPU memory registrations (e.g., multi-GPU, or multiple buffers on one GPU)
+- Server fi_reads/fi_writes in parallel across all provided regions
+- Each region maps to one or more NVMe chunks
+- Client controls the parallelism and memory layout explicitly
+
+**Case 2: Client provides a single large address/len that exceeds comfortable buffer size**
+
+The client provides one region larger than the server's buffer size. Two sub-options:
+
+- **Reject:** Return ERR if `len > max_efa_transfer_size`. Simple, forces client to use Case 1.
+- **Accept and split (preferred — product requirement):** Server internally splits the single large region into chunk-sized fi_write/fi_read calls at sequential offsets within the client's region:
+
+```
+Client provides: rkey=R, remote_addr=A, len=10GB
+Server internally:
+  fi_write(buf[0], chunk_size, dest, A + 0*chunk_size, R, ...)
+  fi_write(buf[1], chunk_size, dest, A + 1*chunk_size, R, ...)
+  fi_write(buf[2], chunk_size, dest, A + 2*chunk_size, R, ...)
+  ...
+```
+
+- Transparent to client — single registration, single addr, server handles the chunking
+- Server pipelines: NVMe ReadFixed fills buffer[i], fi_write sends it, buffer returned to pool
+- No API change from the small-object case — same command syntax, server detects large size and splits
+
+**v1 decision:** Reject over TCP for large objects. Accept over EFA using Case 2 (server-side split) to meet the product requirement. Case 1 deferred to v2 if multi-GPU clients need explicit region control.
+
+### 6.7 TCP Path: Large Object Rejection
+
+Valkey's RESP command dispatch accumulates the full payload in `client->querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental streaming API for either direction.
+
+**Consequence:** A 10GB LO.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
+
+**v1 behavior:**
+- `LO.SET` over TCP: reject with `ERR object exceeds max TCP size` if payload > `lo-max-tcp-object-size` (configurable, default 256MB)
+- `LO.GET` over TCP: reject with same error if stored object size > threshold
+- EFA clients are not subject to this limit — they use multi-buffer parallel I/O (Cases 1/2 above)
+
+**Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
+
+---
+
+## 7. Data Type Struct and Object References
+
+### 7.1 LoValue (Per-Key Metadata)
+
+Stored in Valkey's keyspace via the module data type. One per LO key. ~20 bytes. Serialized to RDB.
+
+```rust
+pub struct LoValue {
+    pub object_id: ObjectId,  // Monotonic per-node OID (used as NVMe filename)
+    pub len: u64,             // Object size in bytes (exact)
+    pub crc32c: u32,          // Integrity checksum (verified on replication pull)
+}
+```
+
+Only durable, object-intrinsic data. No runtime state (fd, DRAM cache location, flags). Runtime references are in module-internal structures:
+- **FdPool:** `HashMap<ObjectId, RawFd>` — rebuilt on load, not serialized
+- **DRAM Cache:** `HashMap<ObjectId, ObjectContext>` — populated on GET hits, evicted independently
+- **IoPool inflight:** transient `ObjectContext` per in-flight request, dropped on completion
+
+### 7.2 ObjectContext (Per-Object Runtime State)
+
+Module-internal runtime companion to LoValue. Tracks the object's live buffer locations and access metadata. Not serialized — rebuilt on load, evicted independently of commands.
+
+```rust
+struct Buffer {
+    segment_idx: u8,       // Which pinned segment this slice lives in
+    offset: u64,           // Byte offset within that segment
+    len: u32,              // This chunk's size
+}
+// Always within a registered segment → ReadFixed + EFA fi_write capable
+
+struct ObjectContext {
+    buffers: Vec<Buffer>,  // Ordered chunks. 1 for small objects, N for large.
+    total_len: u64,        // Sum of all buffer lens = object size
+}
+```
+
+Stored in: `HashMap<ObjectId, ObjectContext>`
+
+- **Small object (1MB):** `buffers = [Buffer{seg=0, offset=0x5000, len=1MB}]`
+- **Large object (50MB):** `buffers = [Buffer{seg=0, ...}, Buffer{seg=1, ...}, ...]` — chunks may span multiple segments
+- **Not cached (cold on NVMe):** No entry in HashMap. LO.GET allocates transient buffers from io layer pool, reads from NVMe, serves, then either promotes (inserts ObjectContext) or frees.
+
+Used by both:
+- **DRAM cache layer:** Serving hits directly from buffers
+- **I/O layer:** Parallel ReadFixed/WriteFixed and EFA fi_write across all chunks
+
+### 7.3 NVMe File Reference
+
+Each object is one file: `/data/lo-data/{oid:016x}.dat`
+
+- fd opened at LO.SET, held in FdPool (`HashMap<ObjectId, RawFd>`)
+- Lookup: `fd_pool.get(object_id)` → RawFd for io_uring submission
+- File size = `ceil(len / 512) * 512` (O_DIRECT 512-byte write alignment padding)
+- Actual object length stored in `LoValue.len` (not derived from file size)
+- On DEL: `fd_pool.remove(oid)` closes fd, then `unlink()` deletes file
+
+### 7.4 ObjectContext Lifetimes
+
+ObjectContext exists in two layers with different lifetimes. Same struct, same Buffer type, different ownership semantics.
+
+**DRAM Cache Layer (long-lived):**
+- ObjectContext created on cache promotion (LO.GET hit policy admits it)
+- Held in `HashMap<ObjectId, ObjectContext>` for the object's entire cached lifetime
+- Buffers remain allocated and serve repeated LO.GET hits directly
+- On DRAM cache eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → all its Buffers freed back to allocator
+- Object survives on NVMe. Next GET is a cache miss.
+
+**NVMe I/O Pool Layer (short-lived):**
+- ObjectContext created per in-flight I/O request (or coalesced group of requests for same object)
+- Buffers allocated transiently for NVMe ReadFixed/WriteFixed + client transfer
+- On request completion: ObjectContext dropped → all its Buffers freed back to allocator
+- If promotion policy says yes: ObjectContext ownership transfers to DRAM Cache layer instead of being dropped
+
+### 7.5 Relationship Diagram
+
+```
+Valkey keyspace                Module internals
+──────────────                 ────────────────
+key "obj-A"
+  └─ LoValue {oid=42,         fd_pool.get(42) → RawFd → /data/lo-data/000000000000002a.dat
+       len=50MB,
+       crc32c=0xAB12}          object_contexts[42] → ObjectContext {
+                                                       buffers: [
+                                                         Buffer{seg=0, offset=0x0000, len=8MB},
+                                                         Buffer{seg=0, offset=0x80_0000, len=8MB},
+                                                         Buffer{seg=1, offset=0x0000, len=8MB},
+                                                         ...7 chunks...
+                                                       ],
+                                                       total_len: 50MB
+                                                     }
+                                                            │
+                               ┌────────────────────────────┘
+                               ▼
+                  ┌─────────────────────────────────────────────────────────┐
+                  │ Segment 0 (16GB contiguous, io_uring buf_index=0)        │
+                  │ [8MB][8MB][...hundreds of objects sub-allocated by talc]  │
+                  └─────────────────────────────────────────────────────────┘
+                  ┌─────────────────────────────────────────────────────────┐
+                  │ Segment 1 (16GB contiguous, io_uring buf_index=1)        │
+                  │ [8MB][...more objects...]                                │
+                  └─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 8. Expanding and Shrinking
+
+### 8.1 When to Expand
 
 | Trigger | Action |
 |---------|--------|
-| Allocation fails (pool/arena full) | Add capacity immediately |
-| Utilization > 80% sustained | Add capacity proactively |
-| New LO keys being SET faster than evictions | Add capacity to reduce eviction rate |
+| Allocation fails (no contiguous space in any segment) | Add segment immediately |
+| Utilization > 80% sustained | Add segment proactively |
+| New LO keys being SET faster than evictions | Add segment to reduce eviction rate |
 
-### 6.2 When to Shrink
+### 8.2 When to Shrink
 
 | Trigger | Action |
 |---------|--------|
 | Valkey `used_memory` approaching `maxmemory` | Shrink to give memory back |
-| Module's DRAM usage disproportionately high vs Valkey's other data | Shrink |
+| Module's DRAM usage disproportionately high vs other data | Shrink |
 | Sustained low utilization (<30% for >5 minutes) | Shrink to reduce waste |
 
-### 6.3 How Expansion Works
+### 8.3 How Expansion Works
 
-**Approach A:**
-- Allocate new buffers from ValkeyAlloc (zmalloc)
-- New buffers are **unregistered** (elastic tier — cannot use ReadFixed or fi_write directly)
-- Serve NVMe I/O via plain io_uring read/write (slower but functional)
-- For EFA: memcpy from elastic buffer to a registered (pinned tier) buffer, then fi_write
-- Cost: one allocation per buffer. No disruption to existing operations.
+1. Allocate new segment (contiguous region, e.g., 16GB)
+2. Register with io_uring: `IORING_UNREGISTER_BUFFERS` → append new iovec → `IORING_REGISTER_BUFFERS`
+3. Add to allocator: `talc.claim(Span::new(base, base + size))`
+4. New allocations can immediately use the new segment
 
-**Approach B:**
-- `mmap` a new segment (e.g., 16GB)
-- `fi_mr_reg(new_segment)` → new rkey (~2-5ms)
-- `talc.claim(Span::new(base, base + size))` — adds segment to allocator
-- New allocations can immediately use the new segment
-- Cost: ~5ms for registration. No disruption.
+Cost: ~2-10ms for the unregister/re-register cycle. In-flight ReadFixed/WriteFixed ops already submitted are unaffected (kernel has their pages pinned). New submissions wait briefly.
 
-### 6.4 How Shrinking Works
+### 8.4 How Shrinking Works
 
-**Approach A:**
-
+**DRAM+NVMe mode:**
 ```
-DRAM+NVMe mode:
-  1. Evict cached objects (LFU/LRU) — data safe on NVMe
-  2. Return freed buffers to ValkeyAlloc
-  3. Pinned tier (registered) is NEVER shrunk — deregister is too expensive and stalls I/O
-  4. Elastic tier (unregistered) buffers freed immediately
-
-DRAM-only mode:
-  1. Can only free UNUSED buffers (not holding live objects)
-  2. Live objects ARE the data — freeing them = data loss
-  3. Valkey's maxmemory eviction must delete LO keys first
-  4. After key deletion → buffer returns to free list → can be freed to ValkeyAlloc
+1. Pick segment with lowest utilization
+2. Mark segment DRAINING (no new allocations from it)
+3. Wait for in-flight I/O targeting this segment to complete
+4. Evict cached objects in this segment (data safe on NVMe)
+   - Drop their ObjectContexts → Buffers logically freed
+5. IORING_UNREGISTER_BUFFERS → remove segment from iovec array → IORING_REGISTER_BUFFERS
+6. Release segment memory to OS
 ```
+Eviction is cheap — objects survive on NVMe. Next GET is a cache miss.
 
-**Approach B:**
-
+**DRAM-only mode:**
 ```
-DRAM+NVMe mode:
-  1. Pick segment with lowest utilization
-  2. Mark segment DRAINING (no new allocations from it)
-  3. Wait for in-flight I/O targeting this segment to complete (~2-5ms)
-  4. Evacuate remaining live objects:
-     - For each live object: alloc in another segment, memcpy, update HashMap
-  5. fi_mr_dereg(segment) — releases NIC resources
-  6. munmap(segment) — releases physical memory to OS
-  Evacuation cost: proportional to live data. 5% utilized 16GB segment = ~800MB copy = ~80ms.
-
-DRAM-only mode:
-  1. Same as above, but evacuation is MANDATORY (cannot evict — data only exists here)
-  2. Shrinking only reduces total segment count, never destroys data
-  3. Must have enough capacity in remaining segments to hold evacuated objects
-  4. If remaining segments too full to absorb: cannot shrink (reject the shrink request)
+1. Pick segment with lowest utilization
+2. Mark segment DRAINING
+3. Wait for in-flight I/O to complete
+4. Evacuate remaining live objects:
+   - For each live object: alloc in another segment, memcpy, update ObjectContext
+5. IORING_UNREGISTER → remove → IORING_REGISTER
+6. Release segment memory to OS
 ```
+Evacuation is mandatory — data only exists in DRAM. Cannot shrink if remaining segments are too full to absorb evacuated objects (reject the shrink request).
 
-### 6.5 IoPool Resizing (DRAM+NVMe, both approaches)
+Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment = ~800MB copy = ~80ms.
 
-The IoPool has two tiers:
-
-```
-IoPool
-├─ Pinned tier (registered at startup, io_uring + EFA)
-│   - Fixed count, NEVER shrunk
-│   - Enables ReadFixed / fi_write source
-│   - Sized for steady-state concurrent I/O (e.g., 128 buffers)
-│
-└─ Elastic tier (unregistered, heap-allocated via ValkeyAlloc)
-    - Grows on demand when pinned tier exhausted
-    - Shrinks under memory pressure (freed back to ValkeyAlloc)
-    - Uses plain io_uring read/write (not ReadFixed — works but no kernel shortcut)
-    - EFA: must memcpy to pinned tier buffer first, then fi_write
-```
-
-**Why two tiers:** The pinned tier gives maximum I/O performance. The elastic tier handles bursts without rejecting requests. Under sustained pressure, elastic buffers are freed first (cheapest to reclaim — no deregistration needed).
-
----
-
-## 7. Recommendation
-
-| Mode | Recommended approach | Why |
-|------|---------------------|-----|
-| **DRAM-only** | Approach B (arena) | Memory efficiency is the only metric. No NVMe, so ReadFixed doesn't matter. 50% waste from Approach A is unacceptable when DRAM IS the storage. |
-| **DRAM+NVMe, EFA-heavy** | Approach A (fixed classes) | Zero-copy on every path. ReadFixed for NVMe. Fragmentation-free. EFA fi_write from same buffer that did the NVMe read. |
-| **DRAM+NVMe, TCP-heavy** | Either (Approach A simpler) | TCP replies don't need registration. Approach A still wins on NVMe read throughput (ReadFixed). |
-| **Hybrid deployment** | Approach A for IoPool + Approach B for DRAM cache | Best of both: ReadFixed NVMe I/O + memory-efficient DRAM cache. One memcpy on promotion (IoPool → arena). |
-
-**Migration path:** Start with Approach A (simpler, zero-copy everywhere, works today). Move to Approach B for DRAM-only mode when memory efficiency becomes critical. The command interface is identical — the change is internal to the storage layer.
-
----
-
-## 8. Open Questions
+## 9. Open Questions
 
 1. What size classes for Approach A? Need LMCache team input on their chunk sizes.
 2. For Approach A: what free:cached ratio is safe? (reserve 20% for I/O, allow 80% for caching?)
