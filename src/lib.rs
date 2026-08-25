@@ -126,13 +126,19 @@ pub fn transport_threads() -> usize {
 
 /// Resolve the effective fd-pool capacity.
 ///
-/// If `fd-pool-size` is configured (> 0) that value wins. Otherwise (0 = auto) we
-/// size the pool from the process's `RLIMIT_NOFILE` soft limit — the real ceiling on
-/// how many fds this instance can hold open — reserving headroom for Valkey's own
-/// fds (client connections, listeners, AOF/RDB, cluster bus, io_uring rings). We give
-/// the pool ~75% of the soft limit and clamp to a floor so tiny ulimits still cache.
-/// Falls back to [`storage::fd_pool::DEFAULT_CAPACITY`] if the limit can't be queried
-/// or is unbounded.
+/// If `fd-pool-size` is configured (> 0) that value wins. Otherwise (0 = auto) we size
+/// the pool from what the *core* says is available, so the read-fd cache can never push
+/// total open fds past `RLIMIT_NOFILE`:
+///
+///   free   = nofile_soft − maxclients − CONFIG_FDSET_INCR
+///   pool   = 75% of free   (the remaining 25% covers the module's own transient fds:
+///                           LO.SET write fds, io_uring rings, EFA transport)
+///
+/// `maxclients` is read live from the core (INFO `clients`); Valkey has already
+/// reconciled it against the OS limit in `adjustOpenFilesLimit()` and reserves
+/// `CONFIG_FDSET_INCR` (32 + 96) more for its event loop. Reserving that budget means
+/// the pool only claims fds Valkey's own clients/internals won't. Falls back to
+/// [`storage::fd_pool::DEFAULT_CAPACITY`] if the OS limit can't be read or is unbounded.
 pub fn fd_pool_capacity() -> usize {
     use crate::storage::fd_pool::DEFAULT_CAPACITY;
 
@@ -141,27 +147,60 @@ pub fn fd_pool_capacity() -> usize {
         return configured as usize;
     }
 
-    // Reserve a fixed slice of fds for everything in the process that isn't the pool.
-    const RESERVED_FOR_VALKEY: u64 = 4096;
     const FLOOR: u64 = 1024;
+    // Valkey keeps CONFIG_FDSET_INCR (CONFIG_MIN_RESERVED_FDS 32 + 96) fds beyond
+    // maxclients for its event loop; mirror that reservation here.
+    const VALKEY_FDSET_INCR: u64 = 128;
+    // Valkey's default maxclients — used only if the live value can't be read, so we
+    // still reserve a client budget rather than risk EMFILE.
+    const DEFAULT_MAXCLIENTS: u64 = 10_000;
 
-    // SAFETY: getrlimit writes into `rl` (fully initialized below) and RLIMIT_NOFILE
-    // is a valid resource id; returns 0 on success.
-    let mut rl = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
+    let soft = match nofile_soft_limit() {
+        Some(n) => n,
+        None => return DEFAULT_CAPACITY, // unreadable or unlimited → conservative fallback
     };
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
-    if rc != 0 || rl.rlim_cur == libc::RLIM_INFINITY {
-        return DEFAULT_CAPACITY;
-    }
 
-    let soft = rl.rlim_cur;
-    // 75% of the soft limit, then subtract headroom, then clamp up to the floor.
-    let usable = (soft / 4 * 3)
-        .saturating_sub(RESERVED_FOR_VALKEY)
-        .max(FLOOR);
+    // Reserve the fds the core has already carved out for client connections + its own
+    // event loop; the pool may use only what's left.
+    let reserved = valkey_maxclients()
+        .unwrap_or(DEFAULT_MAXCLIENTS)
+        .saturating_add(VALKEY_FDSET_INCR);
+    let free = soft.saturating_sub(reserved);
+
+    // 75% of the remaining fds, floored so tiny limits still cache something.
+    let usable = (free / 4 * 3).max(FLOOR);
     usable as usize
+}
+
+/// Live `maxclients` from the core (INFO `clients` section). Valkey has already
+/// clamped this against `RLIMIT_NOFILE` in `adjustOpenFilesLimit()`, so it is the
+/// authoritative count of fds reserved for client connections. `None` if the field
+/// can't be read. Safe crate wrapper — no `unsafe` in our code.
+fn valkey_maxclients() -> Option<u64> {
+    valkey_module::ServerInfo::new("clients").field_unsigned("maxclients")
+}
+
+/// Read the open-file soft limit (`RLIMIT_NOFILE`) from `/proc/self/limits`.
+///
+/// Pure safe std I/O — no `libc`/`unsafe`. The module is Linux-only (io_uring), so
+/// `/proc/self/limits` is always available. Returns `None` if the file can't be read,
+/// the line is missing, or the limit is `unlimited`.
+fn nofile_soft_limit() -> Option<u64> {
+    // Format (whitespace-padded columns):
+    //   Limit             Soft Limit   Hard Limit   Units
+    //   Max open files    1024         1048576      files
+    let contents = std::fs::read_to_string("/proc/self/limits").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            // Soft limit is the first token after the label.
+            let soft = rest.split_whitespace().next()?;
+            if soft == "unlimited" {
+                return None;
+            }
+            return soft.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 pub fn bench_mode() -> bool {
