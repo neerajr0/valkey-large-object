@@ -52,20 +52,25 @@ ReadFixed:  buf_index=1, offset=0x5000, len=4MB
 
 ## 3. Object Size Distribution
 
-Modern hybrid-attention models produce diverse object types per prefix:
+Object sizes are **unknown at design time**. The module stores opaque blobs from clients (LMCache, vLLM, custom inference frameworks). Sizes depend on model architecture, page size, attention type, and layer grouping — none of which we control.
 
-| Object type | Size per chunk | Growth |
+**Known lower bound:** ~15KB (compressed attention blocks, small metadata).
+**Known upper bound:** Unbounded in theory. KDA checkpoints ~150MB, full KV cache for long contexts can reach GBs. The module handles large objects via multi-buffer parallel I/O (§6).
+
+Example ranges observed in hybrid-attention models:
+
+| Object type | Typical size | Notes |
 |---|---|---|
-| HCA compressed blocks (128x) | 15–50 KB | Linear with sequence, tiny |
-| FP4 indexer state | 10–50 KB | Small metadata |
-| CSA compressed KV (4x) | 0.5–1 MB | Linear ÷ 4 |
-| Sliding window KV | 0.5–2 MB | Fixed (window size) |
-| KDA recurrent state | 2–8 MB | Fixed (model dims) |
-| Full-attention KV blocks | 0.5–4 MB | Linear with sequence |
+| Compressed attention blocks | 15–50 KB | Small, numerous |
+| Metadata / indexer state | 10–50 KB | Small |
+| Compressed KV (4x) | 0.5–1 MB | Common |
+| Sliding window KV | 0.5–2 MB | Fixed per model |
+| KDA recurrent state / checkpoints | 2–150 MB | Hot, good DRAMCache candidates |
+| Full-attention KV blocks | 0.5 MB – multi-GB | Linear with context length |
 
-**Range: 15KB to 8MB per stored object. 500x variance.**
+**Variance: 1000x+ across object types.**
 
-The client (LMCache) stores each chunk as a separate key. Our module sees individual opaque blobs at varying sizes.
+The client stores each chunk as a separate key. Our module sees individual opaque blobs at varying sizes.
 
 ---
 
@@ -159,14 +164,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 **What talc cannot do:**
 - Compaction (moving live objects to consolidate free space). Would invalidate all pointers/offsets.
 
-**How we fix it — segment-level rotation:**
-1. Monitor per-segment: `largest_free_block / total_free_bytes`. If ratio < 50% → fragmented.
-2. Mark segment as DRAINING (no new allocs from it).
-3. Passively wait for evictions (valkey core driven, ie, object free) / deletions to empty it, OR actively evacuate remaining objects to other segments (memcpy + update HashMap offsets).
-4. Once empty: `fi_mr_dereg` + `munmap`. Replace with fresh segment.
-
-**Mitigation — size-banded segments:**
-Route small objects (≤1MB) to "small segments" and large objects (>1MB) to "large segments." Similar sizes in the same segment minimize fragmentation (same pattern jemalloc uses internally with arenas).
+**Mitigation strategy:** Open question. Separate segments per layer (§4.5) prevents the worst case (short-lived IoPool churn fragmenting long-lived DRAMCache). Within each layer, coalescing may be sufficient — needs production data to determine if active mitigation is required. See §9 Open Questions. Other mitigations include (1) banding into segments based on value size (2) scaling out and scaling in to delete fragmented segments.
 
 ### 4.4 Comparison
 
@@ -178,8 +176,8 @@ Route small objects (≤1MB) to "small segments" and large objects (>1MB) to "la
 | EFA zero-copy on hit | Yes | Yes |
 | Promotion zero-copy (NVMe → cache) | Yes (keep buffer) | Yes (ReadFixed into arena slot directly) |
 | Alloc speed | O(1) guaranteed | O(1) amortized, O(n) worst |
-| Fragmentation | Impossible | Possible (segment rotation fixes) |
-| Defrag mechanism | N/A | Segment drain + evacuation |
+| Fragmentation | Impossible | Possible (coalescing + separate segments mitigate) |
+| Defrag mechanism | N/A | Open question (§9) |
 | Code complexity | ~100 lines | ~315 lines |
 | Best for | Simplicity, predictable latency | Memory efficiency, varied object sizes |
 
