@@ -41,20 +41,14 @@ impl ArenaPool {
         assert!(buf_size >= 4096 && buf_size % 4096 == 0);
         assert!(total_size >= buf_size);
 
-        // mmap a contiguous region, 4KB-aligned by default.
-        // SAFETY: Standard mmap call with MAP_PRIVATE|MAP_ANONYMOUS.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED, "mmap failed for arena");
-        let base = base as *mut u8;
+        // Allocate via ValkeyAlloc (global allocator) so used_memory tracks it.
+        // ValkeyAlloc → zmalloc → jemalloc → mmap internally for large allocs.
+        // Returns contiguous, page-aligned memory for sizes > ~2MB.
+        let layout = Layout::from_size_align(total_size, 4096)
+            .expect("invalid arena layout");
+        // SAFETY: layout is valid (total_size > 0, alignment is power of 2).
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null(), "ValkeyAlloc failed for arena segment");
 
         // Create the talc span and allocator.
         // SAFETY: base is valid mmap'd memory of total_size bytes.
@@ -131,9 +125,10 @@ impl ArenaPool {
 
 impl Drop for ArenaPool {
     fn drop(&mut self) {
-        // SAFETY: Unmapping the memory we mmap'd. All allocations should be freed by now.
+        // SAFETY: Deallocating memory we allocated via std::alloc::alloc_zeroed.
+        let layout = Layout::from_size_align(self.total_size, 4096).unwrap();
         unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.total_size);
+            std::alloc::dealloc(self.base, layout);
         }
     }
 }

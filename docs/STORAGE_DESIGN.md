@@ -574,6 +574,8 @@ key "obj-A"
 
 Expanding and shrinking applies only to **DRAMCache segments**. IoPool segments are fixed at startup (sized for max concurrent I/O) and never resized — if IoPool is exhausted, the module back-pressures new requests until buffers are freed.
 
+This will be solved using a cron job from the Module that monitors memory usage using existing Module APIs.
+
 ### 8.1 When to Expand
 
 | Trigger | Action |
@@ -629,6 +631,5 @@ Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment 
 1. Segment size? 4GB (granular shrink) vs 16GB (fewer segments, less overhead)?
 2. Does `talc.claim()` support adding spans after initial creation? Must verify API.
 3. Does `fi_mr_reg` on overcommitted mmap pin all pages immediately? If yes, virtual overcommit trick doesn't save physical memory. Test on i8ge.
-4. Shrink trigger: how does the module learn about Valkey memory pressure? `VM_GetServerInfo` polling? A callback from Valkey? Memory hooks?
-5. Should we expose pool/arena stats via `LO.INFO` for observability?
-6. Should we use a Scale Out and Scale In to handle overly fragmented Segments? We will need a live transition. IMO, it might be over-engineering and we need tests to see how common fragmentation is in talc. free operations on talc already work to mitigate fragmentation
+4. Should we support streaming over EFA when we are short on DRAM and have capacity on NVMe? e.g. large object SET command (over 20 GB) could utilize 1GB of a DRAM buffer if that is all we have, provided we incrementally read into this buffer and write to NVMe until entire object is read into DRAM and written to NVMe. The other option is to reject the request unless we have an overall space in DRAM for the write/read operation. To support streaming, e.g. SET, we need to maintain an Object State and a background loop task does the above until completion using offsets, chunking (already planned / discussed in doc), and CRC validation. We can also have a min number of required buffers and reject requests when we are under this. 
+5. Should we use a Scale Out and Scale In to handle overly fragmented Segments? We will need a live transition. IMO, it might be over-engineering and we need tests to see how common fragmentation is in talc. free operations on talc already work to mitigate fragmentation
