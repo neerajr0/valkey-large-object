@@ -12,6 +12,7 @@ use crate::data_type::ObjectId;
 
 use super::coalescing::{CoalesceResult, ReadCoalesceResult, ReadCoalescingMap, WaiterCallback};
 use super::fd_pool::FdPool;
+use super::shared_buffer::SharedBuffer;
 use super::uring::{IoRequest, UringNvmeEngine};
 use super::{NvmeEngine, Storage, StorageError};
 
@@ -140,17 +141,13 @@ impl StorageEngine {
 
     /// Coalesced read: deduplicates concurrent NVMe reads for the same ObjectId.
     ///
-    /// - First request for an object_id becomes the leader: acquires a buffer, submits io_uring read.
-    /// - Subsequent requests for the same object_id (while leader is in-flight): become waiters,
-    ///   no buffer acquired, callback stored. At leader completion, data is memcpy'd to
-    ///   a just-in-time acquired buffer per waiter.
+    /// - First request becomes the leader: acquires a buffer, submits io_uring read.
+    /// - Subsequent requests for the same object_id: become waiters, no I/O needed.
+    /// - At completion: leader buffer wrapped in Arc (SharedBuffer), cloned to all consumers.
     ///
-    /// The command handler calls this instead of pool_get() + read_into() directly.
-    /// Buffer acquisition is internal — callers never call pool_get() for reads.
-    ///
-    /// The coalescing map is generic — the read-specific completion logic (buffer acquire +
-    /// memcpy from leader buffer) is defined here as a closure passed to `complete()`,
-    /// keeping the coalescing infrastructure reusable for other operations.
+    /// No per-waiter buffer allocation. No memcpy. One buffer serves all N requests.
+    /// Buffer returns to pool when the last consumer (fi_write CQE or TCP reply) drops
+    /// its SharedBuffer clone.
     pub fn read_into_coalesced(
         &'static self,
         object_id: ObjectId,
@@ -158,82 +155,48 @@ impl StorageEngine {
         cb: WaiterCallback<ReadCoalesceResult>,
     ) -> Result<(), StorageError> {
         match self.coalescing.try_join_or_lead(object_id, cb) {
-            CoalesceResult::Waiter => Ok(()), // callback registered, no I/O needed
+            CoalesceResult::Waiter => Ok(()), // callback stored, no I/O needed
             CoalesceResult::Leader(leader_cb) => {
                 // Leader: acquire buffer and submit NVMe read.
                 let buf = match self.pool_get() {
                     Some(b) => b,
                     None => {
-                        // Can't even start the read — remove the map entry and notify waiters.
-                        // No waiters can exist yet in practice (we just inserted the
-                        // entry on this single-threaded main thread), but drain safely.
-                        let dropped = self.coalescing.remove_and_notify(object_id, || {
-                            (None, Err(StorageError::PoolExhausted))
-                        });
-                        if dropped > 0 {
-                            eprintln!(
-                                "largeobj: coalescing leader pool_get failed, notified {} waiters for object_id={}",
-                                dropped, object_id.0
-                            );
-                        }
-                        leader_cb((None, Err(StorageError::PoolExhausted)));
-                        return Ok(()); // Error delivered via callback, not Result
+                        // Can't start the read — notify any waiters and fire leader cb.
+                        self.coalescing
+                            .remove_and_notify(object_id, || Err(StorageError::PoolExhausted));
+                        valkey_module::logging::log_warning(format!(
+                            "largeobj: coalescing leader pool_get failed for object_id={}",
+                            object_id.0
+                        ));
+                        leader_cb(Err(StorageError::PoolExhausted));
+                        return Ok(()); // Error delivered via callback
                     }
                 };
 
-                // Wrap the io_uring completion to fan out to waiters, then fire leader cb.
+                // io_uring completion: wrap buffer in SharedBuffer (Arc), fan out to all.
                 let io_cb: super::ReadCallback = Box::new(move |buf, result| {
-                    // Fan out to waiters via the generic complete() interface.
-                    // The read-specific logic (buffer acquire + memcpy) is defined
-                    // here as the completion closure — not inside the coalescing map.
-                    match &result {
-                        Ok(bytes_read) => {
-                            let len = *bytes_read as usize;
-                            let src_ptr = buf.ptr();
-                            self.coalescing.complete(object_id, || {
-                                // Per-waiter: acquire buffer, memcpy leader data.
-                                match self.pool.get() {
-                                    Some(waiter_buf) => {
-                                        // SAFETY: Both pointers are valid pool buffers with
-                                        // capacity >= len. leader_buf was just filled by NVMe
-                                        // DMA (L1/L2 hot). waiter_buf is a distinct pool slot
-                                        // (no aliasing). len <= pool_buf_size.
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                src_ptr,
-                                                waiter_buf.ptr(),
-                                                len,
-                                            );
-                                        }
-                                        (Some(waiter_buf), Ok(*bytes_read))
-                                    }
-                                    None => {
-                                        // Pool exhausted at fan-out time.
-                                        (None, Err(StorageError::PoolExhausted))
-                                    }
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            // Leader NVMe read failed — propagate error to all waiters.
-                            self.coalescing.complete(object_id, || {
-                                (None, Err(StorageError::IoError { code: -1 }))
-                            });
-                        }
-                    }
-
-                    // Fire leader's own callback.
                     match result {
-                        Ok(bytes_read) => leader_cb((Some(buf), Ok(bytes_read))),
+                        Ok(bytes_read) => {
+                            // Wrap in SharedBuffer — one Arc, N consumers, zero-copy.
+                            let shared = SharedBuffer::new(buf, bytes_read);
+
+                            // Fan out to waiters: each gets an Arc clone.
+                            self.coalescing.complete(object_id, || Ok(shared.clone()));
+
+                            // Fire leader's own callback.
+                            leader_cb(Ok(shared));
+                        }
                         Err(e) => {
-                            // Leader also gets the error. Drop buf (returns to pool).
+                            // Leader NVMe read failed — return buffer to pool, propagate error.
                             drop(buf);
-                            leader_cb((None, Err(e)));
+                            self.coalescing
+                                .complete(object_id, || Err(StorageError::IoError { code: -1 }));
+                            leader_cb(Err(e));
                         }
                     }
                 });
 
-                // Submit the actual io_uring read (existing path).
+                // Submit io_uring read (existing path).
                 self.read_into(object_id, buf, len, io_cb);
                 Ok(())
             }

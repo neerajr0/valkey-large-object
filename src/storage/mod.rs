@@ -9,11 +9,13 @@ pub use coalescing::{
     CoalesceResult, CoalescingMap, ReadCoalesceResult, ReadCoalescingMap, WaiterCallback,
 };
 use engine::PinnedBuffer;
+pub use shared_buffer::SharedBuffer;
 
 pub mod buffer;
 pub mod coalescing;
 pub mod engine;
 pub mod fd_pool;
+pub mod shared_buffer;
 pub mod uring;
 
 // ─── Callback Type Aliases ────────────────────────────────────────────────────

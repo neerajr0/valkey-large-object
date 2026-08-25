@@ -189,14 +189,17 @@ where
 // ─── Type Aliases for Read Coalescing ────────────────────────────────────────
 
 use crate::data_type::ObjectId;
-use crate::storage::Buffer;
+use crate::storage::shared_buffer::SharedBuffer;
 use crate::storage::StorageError;
 
-/// The result type passed to each waiter in the read coalescing path.
-/// `(Option<Buffer>, Result<u64, StorageError>)`:
-///   - `(Some(buf), Ok(bytes_read))` on success — buf contains object data.
-///   - `(None, Err(e))` on failure — leader read failed or pool exhausted at fan-out.
-pub type ReadCoalesceResult = (Option<Buffer>, Result<u64, StorageError>);
+/// The result type passed to each consumer (leader + waiters) in the read coalescing path.
+///
+/// - `Ok(SharedBuffer)` on success — shared read-only access to the leader's buffer.
+///   All consumers receive an Arc clone (zero-copy). Buffer returns to pool when last clone drops.
+/// - `Err(StorageError)` on failure — leader NVMe read failed or leader couldn't acquire a buffer.
+///
+/// No `Option` needed: success always provides a buffer, failure never does.
+pub type ReadCoalesceResult = Result<SharedBuffer, StorageError>;
 
 /// Convenience type alias: a CoalescingMap specialized for NVMe read deduplication.
 pub type ReadCoalescingMap = CoalescingMap<ObjectId, ReadCoalesceResult>;
@@ -206,7 +209,7 @@ pub type ReadCoalescingMap = CoalescingMap<ObjectId, ReadCoalesceResult>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::buffer::BufferPool;
+    use crate::storage::buffer::{Buffer, BufferPool};
     use crate::storage::engine::PinnedBuffer;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -283,9 +286,11 @@ mod tests {
 
     #[test]
     fn test_complete_fires_all_waiters() {
+        use crate::storage::shared_buffer::SharedBuffer;
+
         let map: CoalescingMap<ObjectId, ReadCoalesceResult> = CoalescingMap::new();
         let object_id = ObjectId(4);
-        let pool = make_pool(10, 4096);
+        let pool = make_pool(1, 4096);
 
         // Leader
         let cb: WaiterCallback<ReadCoalesceResult> = Box::new(|_result| {});
@@ -296,44 +301,32 @@ mod tests {
         for _ in 0..3 {
             let c = counter.clone();
             let cb: WaiterCallback<ReadCoalesceResult> = Box::new(move |result| {
-                let (buf, read_result) = result;
-                assert!(buf.is_some(), "waiter should receive a buffer");
-                assert!(read_result.is_ok(), "waiter should receive Ok");
-                assert_eq!(read_result.unwrap(), 100);
+                assert!(result.is_ok(), "waiter should receive Ok(SharedBuffer)");
+                let shared = result.unwrap();
+                assert_eq!(shared.data_len(), 100);
+                assert_eq!(shared.as_slice()[0], 0xAB);
                 c.fetch_add(1, Ordering::Relaxed);
-                // Forget buffer to avoid Drop calling into uninitialized STORAGE.
-                std::mem::forget(buf);
+                // Prevent Drop from calling into uninitialized global STORAGE.
+                std::mem::forget(shared);
             });
             map.try_join_or_lead(object_id, cb);
         }
 
-        // Simulate leader completion: create a "leader buffer" with known data.
-        let leader_pinned = Box::leak(Box::new(PinnedBuffer::new(4096)));
-        // Write a pattern into leader buf.
+        // Simulate leader completion: create SharedBuffer from a pool buffer.
+        let buf = pool.get().unwrap();
         unsafe {
-            std::ptr::write_bytes(leader_pinned.as_mut_ptr(), 0xAB, 100);
+            std::ptr::write_bytes(buf.ptr(), 0xAB, 100);
         }
-        let leader_buf_ptr = leader_pinned.as_mut_ptr();
-        let bytes_read: u64 = 100;
+        let shared = SharedBuffer::new(buf, 100);
 
-        // Complete with a closure that does the read-specific work (buffer acquire + memcpy).
-        let served = map.complete(object_id, || match pool.get() {
-            Some(waiter_buf) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        leader_buf_ptr,
-                        waiter_buf.ptr(),
-                        bytes_read as usize,
-                    );
-                }
-                (Some(waiter_buf), Ok(bytes_read))
-            }
-            None => (None, Err(StorageError::PoolExhausted)),
-        });
+        // Complete: each waiter receives an Arc clone of the shared buffer (refcount bump, no copy).
+        let served = map.complete(object_id, || Ok(shared.clone()));
 
         assert_eq!(served, 3);
         assert_eq!(counter.load(Ordering::Relaxed), 3);
         assert!(!map.is_inflight(object_id));
+
+        std::mem::forget(shared);
     }
 
     #[test]
@@ -350,18 +343,14 @@ mod tests {
         for _ in 0..2 {
             let c = error_count.clone();
             let cb: WaiterCallback<ReadCoalesceResult> = Box::new(move |result| {
-                let (buf, read_result) = result;
-                assert!(buf.is_none(), "waiter should NOT receive a buffer on error");
-                assert!(read_result.is_err(), "waiter should receive Err");
+                assert!(result.is_err(), "waiter should receive Err");
                 c.fetch_add(1, Ordering::Relaxed);
             });
             map.try_join_or_lead(object_id, cb);
         }
 
         // Leader failed — complete with error propagation closure.
-        let served = map.complete(object_id, || {
-            (None, Err(StorageError::IoError { code: -5 }))
-        });
+        let served = map.complete(object_id, || Err(StorageError::IoError { code: -5 }));
 
         assert_eq!(served, 2);
         assert_eq!(error_count.load(Ordering::Relaxed), 2);
@@ -402,7 +391,7 @@ mod tests {
         map.try_join_or_lead(object_id, cb);
         assert!(map.is_inflight(object_id));
 
-        map.complete(object_id, || (None, Ok(4096)));
+        map.complete(object_id, || Err(StorageError::PoolExhausted));
         assert!(!map.is_inflight(object_id));
 
         // New operation for same key becomes leader again.
@@ -412,46 +401,52 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_exhaustion_at_fanout() {
+    fn test_no_pool_exhaustion_at_fanout() {
+        // With shared buffer (Arc), fan-out never needs per-waiter buffer allocation.
+        // Even with only 1 pool buffer, all waiters succeed as long as the leader's
+        // read completed — they each get an Arc clone (refcount bump, no allocation).
+        use crate::storage::shared_buffer::SharedBuffer;
+
         let map: CoalescingMap<ObjectId, ReadCoalesceResult> = CoalescingMap::new();
         let object_id = ObjectId(40);
-        // Pool with 0 buffers — simulates exhaustion at fan-out.
-        let pool = make_pool(0, 4096);
+        let pool = make_pool(1, 4096); // Only 1 buffer — just enough for leader.
 
         // Leader
         let cb: WaiterCallback<ReadCoalesceResult> = Box::new(|_result| {});
         map.try_join_or_lead(object_id, cb);
 
-        // 2 waiters — will get PoolExhausted
-        let exhausted_count = Arc::new(AtomicUsize::new(0));
-        for _ in 0..2 {
-            let c = exhausted_count.clone();
+        // 100 waiters — all succeed because no per-waiter buffer is needed.
+        let success_count = Arc::new(AtomicUsize::new(0));
+        for _ in 0..100 {
+            let c = success_count.clone();
             let cb: WaiterCallback<ReadCoalesceResult> = Box::new(move |result| {
-                let (buf, read_result) = result;
-                assert!(buf.is_none());
-                match read_result {
-                    Err(StorageError::PoolExhausted) => {
-                        c.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => panic!("expected PoolExhausted"),
-                }
+                assert!(
+                    result.is_ok(),
+                    "all waiters should succeed with shared buffer"
+                );
+                let shared = result.unwrap();
+                assert_eq!(shared.data_len(), 4096);
+                c.fetch_add(1, Ordering::Relaxed);
+                std::mem::forget(shared);
             });
             map.try_join_or_lead(object_id, cb);
         }
 
-        // Complete with read-specific closure (pool.get fails → PoolExhausted).
-        let served = map.complete(object_id, || {
-            match pool.get() {
-                Some(waiter_buf) => {
-                    std::mem::forget(waiter_buf);
-                    (None, Ok(4096)) // won't reach here
-                }
-                None => (None, Err(StorageError::PoolExhausted)),
-            }
-        });
+        // Simulate leader completion: create SharedBuffer from the single pool buffer.
+        let buf = pool.get().unwrap();
+        unsafe {
+            std::ptr::write_bytes(buf.ptr(), 0xFF, 4096);
+        }
+        let shared = SharedBuffer::new(buf, 4096);
 
-        assert_eq!(served, 2);
-        assert_eq!(exhausted_count.load(Ordering::Relaxed), 2);
+        // Each waiter receives an Arc clone (refcount bump, no buffer allocation).
+        let served = map.complete(object_id, || Ok(shared.clone()));
+
+        assert_eq!(served, 100);
+        assert_eq!(success_count.load(Ordering::Relaxed), 100);
+        assert!(!map.is_inflight(object_id));
+
+        std::mem::forget(shared);
     }
 
     #[test]

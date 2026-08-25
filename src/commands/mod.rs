@@ -165,26 +165,26 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Coalesced NVMe read — buffer acquisition is internal to storage.
     // Leader: acquires buf, submits io_uring read.
-    // Waiter: no buf, callback stored, memcpy at completion.
+    // Waiter: no buf, callback stored. At completion all get SharedBuffer (Arc clone).
     let _ = storage.read_into_coalesced(
         object_id,
         obj_len,
         Box::new(move |result| {
-            let (opt_buf, read_result) = result;
-            match (opt_buf, read_result) {
-                (Some(buf), Ok(bytes_read)) => {
+            match result {
+                Ok(shared_buf) => {
                     if let Some((region_idx, remote_offset)) = efa_args {
-                        // EFA: RDMA write buf → client GPU.
+                        // EFA: RDMA write shared_buf → client GPU.
                         // session_arc was cloned before entering this callback — no lock needed.
                         if let Some(session) = session_arc {
-                            session.write(
-                                buf,
-                                bytes_read as usize,
+                            session.write_shared(
+                                shared_buf,
                                 region_idx,
                                 remote_offset,
-                                Box::new(move |_buf, write_result| {
+                                Box::new(move |write_result| {
                                     let reply = match write_result {
-                                        Ok(()) => ReplyData::GetOk { bytes_read },
+                                        Ok(()) => ReplyData::GetOk {
+                                            bytes_read: obj_len,
+                                        },
                                         Err(e) => ReplyData::Err(format!(
                                             "{}: {}",
                                             errors::ERR_EFA_WRITE,
@@ -201,31 +201,28 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             );
                         }
                     } else {
-                        // TCP: copy bytes from buf, release buf, reply with data
-                        // In bench-mode: reply with size only (skips TCP output buffer copy)
+                        // TCP: copy bytes from shared buffer, reply with data.
+                        // The Module reply API copies into the output buffer anyway —
+                        // no extra per-waiter buffer needed.
                         if crate::bench_mode() {
-                            unblock_client(blocked_client, ReplyData::GetOk { bytes_read });
+                            unblock_client(
+                                blocked_client,
+                                ReplyData::GetOk {
+                                    bytes_read: shared_buf.data_len(),
+                                },
+                            );
                         } else {
-                            // SAFETY: buf.ptr() is valid pool memory, bytes_read <= buf.len.
-                            let data = unsafe {
-                                std::slice::from_raw_parts(buf.ptr(), bytes_read as usize).to_vec()
-                            };
+                            let data = shared_buf.as_slice().to_vec();
                             unblock_client(blocked_client, ReplyData::GetOkTcp { data });
                         }
+                        // shared_buf drops here — if last ref, buffer returns to pool.
                     }
                 }
-                (_, Err(e)) => {
-                    // Error: leader NVMe read failed, or pool exhausted at fan-out.
+                Err(e) => {
+                    // Error: leader NVMe read failed or pool exhausted.
                     unblock_client(
                         blocked_client,
                         ReplyData::Err(format!("{}: {}", errors::ERR_NVME_READ, e)),
-                    );
-                }
-                (None, Ok(_)) => {
-                    // Defensive: shouldn't happen (success always provides a buffer).
-                    unblock_client(
-                        blocked_client,
-                        ReplyData::Err("internal: coalescing returned no buffer".to_string()),
                     );
                 }
             }

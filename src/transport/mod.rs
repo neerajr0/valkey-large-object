@@ -7,6 +7,7 @@
 
 use std::sync::OnceLock;
 
+use crate::storage::shared_buffer::SharedBuffer;
 use crate::storage::Buffer;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
@@ -75,6 +76,7 @@ impl EfaContext {
         //   1. fi_getinfo with hints (provider="efa", ep_type=FI_EP_RDM, caps=FI_RMA)
         //   2. fi_fabric() per returned info
         //   3. fi_domain() per fabric
+        // To be implemented when transport module (libefa-rs) is integrated.
         //
         // For now, return Unavailable (no EFA on dev desktop).
         Ok(Self {
@@ -98,6 +100,7 @@ impl EfaContext {
         }
         // TODO: fi_mr_reg each buffer across all domains.
         // Store MR descriptors for per-op fi_write/fi_read.
+        // To be implemented when transport module (libefa-rs) is integrated.
         Ok(())
     }
 
@@ -106,11 +109,13 @@ impl EfaContext {
             return Ok(());
         }
         // TODO: fi_mr_dereg all registered MRs.
+        // To be implemented when transport module (libefa-rs) is integrated.
         Ok(())
     }
 
     pub fn shutdown(self) {
         // TODO: fi_close domains, fi_close fabrics.
+        // To be implemented when transport module (libefa-rs) is integrated.
     }
 }
 
@@ -130,12 +135,14 @@ impl Session {
         client_regions: Vec<ClientRegion>,
     ) -> Result<Self, TransportError> {
         // TODO: fi_endpoint creation, fi_av_insert(peer_addr)
+        // To be implemented when transport module (libefa-rs) is integrated.
         Ok(Self { client_regions })
     }
 
     /// Server EFA addresses to return in LO.HELLO reply.
     pub fn server_addrs(&self) -> Vec<EfaAddress> {
         // TODO: fi_getname() on each endpoint
+        // To be implemented when transport module (libefa-rs) is integrated.
         vec![]
     }
 
@@ -155,6 +162,7 @@ impl Session {
             return;
         }
         // TODO: Post fi_writemsg, CQ poller fires on_complete.
+        // To be implemented when transport module (libefa-rs) is integrated.
         on_complete(buf, Ok(()));
     }
 
@@ -173,13 +181,43 @@ impl Session {
             return;
         }
         // TODO: Post fi_readmsg, CQ poller fires on_complete.
+        // To be implemented when transport module (libefa-rs) is integrated.
         on_complete(buf, Ok(()));
+    }
+
+    /// DMA write from a shared (Arc) buffer to a client region.
+    ///
+    /// The SharedBuffer clone keeps the underlying pinned memory alive until the
+    /// fi_write completes (CQE received). On completion, the clone drops — if it's
+    /// the last reference, the buffer returns to pool.
+    ///
+    /// Multiple concurrent write_shared() calls from the same SharedBuffer are safe:
+    /// the local buffer is read-only during fi_write (libfabric guarantee for RMA writes).
+    pub fn write_shared(
+        &self,
+        buf: SharedBuffer,
+        region_idx: u32,
+        _remote_offset: u64,
+        on_complete: Box<dyn FnOnce(Result<(), TransportError>) + Send>,
+    ) {
+        if region_idx as usize >= self.client_regions.len() {
+            on_complete(Err(TransportError::RegionOutOfBounds));
+            return;
+        }
+        // TODO: Post fi_writemsg using buf.ptr() as local source, buf.idx() for local_desc.
+        // The CQ poller closure captures `buf` (SharedBuffer clone) — it drops when the
+        // CQE fires, decrementing the Arc refcount. When refcount hits 0, the underlying
+        // Buffer returns to pool.
+        // To be implemented when transport module (libefa-rs) is integrated.
+        let _ = buf; // Consumed — held alive by the CQ poller closure in production.
+        on_complete(Ok(()));
     }
 
     /// Tear down session. In-flight ops receive SessionClosed.
     pub fn close(self) {
         // TODO: fi_close endpoints, remove AV entries.
         // Signal in-flight ops with SessionClosed error.
+        // To be implemented when transport module (libefa-rs) is integrated.
     }
 }
 
@@ -219,4 +257,5 @@ pub fn deregister_buffers() {
 pub fn shutdown() {
     // EfaContext::shutdown() consumes self — can't call on static ref.
     // TODO: Use Option<EfaContext> or OnceLock::take() when stabilized.
+    // To be implemented when transport module (libefa-rs) is integrated.
 }
