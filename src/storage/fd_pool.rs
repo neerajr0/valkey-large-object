@@ -27,9 +27,17 @@ use indexmap::IndexMap;
 
 use crate::data_type::ObjectId;
 
-/// Cap on the number of *cached* fds. Keep it under `ulimit -n` with headroom for
-/// Valkey's own fds. Soft bound: in-flight fds (evicted or deleted mid-read) stay
-/// open until the read completes, so the live fd count can briefly exceed this.
+/// Fallback cap on the number of *cached* fds.
+///
+/// The real cap is normally derived at load from the process `RLIMIT_NOFILE` soft
+/// limit (see `crate::fd_pool_capacity`), which is the actual ceiling on open fds.
+/// This constant is only used when that query fails or the limit is unbounded
+/// (`RLIM_INFINITY`). 100k is a deliberately conservative floor: it sits well under
+/// the ulimits we run with (production NVMe instance stores raise `nofile` to ~1M),
+/// while still caching enough fds to keep the read path warm.
+///
+/// Soft bound: in-flight fds (evicted or deleted mid-read) stay open until the read
+/// completes, so the live fd count can briefly exceed the cap.
 pub const DEFAULT_CAPACITY: usize = 100_000;
 
 /// LFU eviction sample size (similar to Valkey's `maxmemory-samples`).
@@ -155,15 +163,11 @@ impl FdPool {
         self.inner.write().unwrap().map.swap_remove(&object_id.0);
     }
 
-    /// Current number of cached fds.
-    #[allow(dead_code)] // forward-looking: INFO largeobj stats
-    pub fn len(&self) -> usize {
+    /// Current number of cached fds. Test-only for now; promote to a public accessor
+    /// when INFO largeobj stats actually need it.
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.inner.read().unwrap().map.len()
-    }
-
-    #[allow(dead_code)] // forward-looking: INFO largeobj stats
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Evict one entry via sampled (approximate) LFU. Caller holds the write lock.
@@ -223,26 +227,42 @@ mod tests {
     use super::*;
     use crate::data_type::ObjectId;
 
+    /// Open a throwaway read fd (real, valid, cheap to close). `/dev/null` gives us as
+    /// many distinct fds as we need without touching the filesystem under test.
+    fn open_null() -> RawFd {
+        let path = std::ffi::CString::new("/dev/null").unwrap();
+        // SAFETY: constant valid C path, O_RDONLY is a valid flag.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "open /dev/null failed");
+        fd
+    }
+
     #[test]
     fn test_fd_pool_insert_acquire_remove() {
         let pool = FdPool::new();
         let oid = ObjectId(42);
 
-        // Open a real temp file to get a valid fd.
-        let tmp = std::ffi::CString::new("/tmp/fdpool_test_XXXXXX").unwrap();
-        let mut buf = tmp.into_bytes_with_nul();
-        // SAFETY: mkstemp takes a mutable C string template, returns a valid fd.
-        let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
-        assert!(fd >= 0, "mkstemp failed");
+        // Use a pipe so closure can be verified race-free: the read end reports EOF
+        // only once every write-end fd is closed. That depends on the pipe's open
+        // file description, not the fd *number*, so it is immune to fd-number reuse
+        // by other tests running on parallel threads.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe() fills a 2-element array with valid fds when it returns 0.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe failed");
+        let (read_end, write_end) = (fds[0], fds[1]);
+        // Non-blocking read end so the EOF check can't hang if the close didn't happen.
+        // SAFETY: read_end is a valid fd; setting O_NONBLOCK on it is sound.
+        unsafe { libc::fcntl(read_end, libc::F_SETFL, libc::O_NONBLOCK) };
 
         // Insert returns a guard for immediate use; the cached fd is retrievable.
-        let guard = pool.insert(oid, fd);
-        assert_eq!(guard.fd(), fd);
+        let guard = pool.insert(oid, write_end);
+        assert_eq!(guard.fd(), write_end);
         assert_eq!(pool.len(), 1);
 
         // A subsequent acquire hits the cache and returns the same fd.
         let hit = pool.acquire(oid).expect("cached fd");
-        assert_eq!(hit.fd(), fd);
+        assert_eq!(hit.fd(), write_end);
 
         // Drop all outstanding guards so remove can close the fd (no in-flight ref).
         drop(guard);
@@ -252,14 +272,82 @@ mod tests {
         pool.remove(oid);
         assert!(pool.acquire(oid).is_none());
 
-        // Verify fd is actually closed: fcntl should fail with EBADF.
-        // SAFETY: fcntl on a closed fd returns -1 (does not crash).
-        let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(ret, -1, "fd should be closed after remove");
+        // The only write end is now closed, so the read end must observe EOF (read
+        // returns 0). Had the pool failed to close it, read would return -1/EAGAIN.
+        let mut byte = 0u8;
+        // SAFETY: read_end is a valid fd; reading one byte into a local is sound.
+        let n = unsafe { libc::read(read_end, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+        assert_eq!(
+            n, 0,
+            "write end should be closed after remove (expected EOF)"
+        );
 
-        // Clean up the temp file.
-        let path = std::ffi::CStr::from_bytes_with_nul(&buf).unwrap();
-        // SAFETY: path is a valid C string from mkstemp.
-        unsafe { libc::unlink(path.as_ptr()) };
+        // SAFETY: read_end is still open and owned by this test.
+        unsafe { libc::close(read_end) };
+    }
+
+    #[test]
+    fn test_eviction_bounds_capacity() {
+        // With all guards dropped, every entry is idle, so inserting past capacity
+        // always finds a victim and the cached count never exceeds the cap.
+        let pool = FdPool::with_capacity(4);
+        for i in 0..20u64 {
+            drop(pool.insert(ObjectId(i), open_null()));
+            assert!(pool.len() <= 4, "cached fds exceeded capacity at i={}", i);
+        }
+        assert_eq!(pool.len(), 4);
+    }
+
+    #[test]
+    fn test_inflight_fd_is_never_evicted() {
+        let pool = FdPool::with_capacity(2);
+
+        // A is held (in flight): its guard keeps a strong ref alive.
+        let a = pool.insert(ObjectId(1), open_null());
+        // B is idle.
+        drop(pool.insert(ObjectId(2), open_null()));
+
+        // Inserting C is at capacity → eviction must skip the in-flight A and drop B.
+        drop(pool.insert(ObjectId(3), open_null()));
+
+        assert!(
+            pool.acquire(ObjectId(1)).is_some(),
+            "in-flight A was evicted"
+        );
+        assert!(
+            pool.acquire(ObjectId(2)).is_none(),
+            "idle B should be evicted"
+        );
+        assert!(
+            pool.acquire(ObjectId(3)).is_some(),
+            "freshly inserted C missing"
+        );
+
+        drop(a);
+    }
+
+    #[test]
+    fn test_lfu_evicts_least_frequently_used() {
+        let pool = FdPool::with_capacity(2);
+
+        // Two idle entries; warm up A so it has a higher access frequency than B.
+        drop(pool.insert(ObjectId(1), open_null()));
+        drop(pool.insert(ObjectId(2), open_null()));
+        for _ in 0..10 {
+            drop(pool.acquire(ObjectId(1)));
+        }
+
+        // Inserting C evicts the coldest sampled idle entry — that's B, not A.
+        drop(pool.insert(ObjectId(3), open_null()));
+
+        assert!(pool.acquire(ObjectId(1)).is_some(), "hot A should survive");
+        assert!(
+            pool.acquire(ObjectId(2)).is_none(),
+            "cold B should be evicted"
+        );
+        assert!(
+            pool.acquire(ObjectId(3)).is_some(),
+            "new C should be present"
+        );
     }
 }

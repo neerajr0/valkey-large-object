@@ -40,6 +40,7 @@ valkey-server --port 7380 \
 | `bench-mode` | no | When yes, LO.GET returns integer size instead of bulk data. |
 | `max-bytes` | 0 (unlimited) | Max NVMe bytes (eviction not implemented yet). |
 | `transport-threads` | 2 | Threads for EFA transport runtime. |
+| `fd-pool-size` | 0 (auto) | Max cached read fds. `0` derives the cap from the process `RLIMIT_NOFILE` soft limit, reserving headroom for Valkey's own fds; set a positive value to pin it. |
 
 ## Test
 

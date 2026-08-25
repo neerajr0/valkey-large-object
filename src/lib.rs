@@ -16,7 +16,7 @@
 // all steps complete:
 //
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
-//   2. storage::init(buf_size, buf_count, data_dir)
+//   2. storage::init(buf_size, buf_count, fd_pool_capacity, data_dir)
 //                              — allocate pool buffers, create StorageEngine.
 //                              — scan data_dir for existing .dat files to
 //                                recover OID counter (avoids OID collision).
@@ -69,6 +69,11 @@ lazy_static::lazy_static! {
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
 
+    /// Max number of read fds the fd-pool caches. Immutable after load.
+    /// 0 = auto: derive from the process RLIMIT_NOFILE soft limit at load (see
+    /// `fd_pool_capacity`). Set a positive value to pin the cap explicitly.
+    static ref CFG_FD_POOL_SIZE: AtomicI64 = AtomicI64::new(0);
+
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
@@ -117,6 +122,46 @@ pub fn max_bytes() -> u64 {
 
 pub fn transport_threads() -> usize {
     CFG_TRANSPORT_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Resolve the effective fd-pool capacity.
+///
+/// If `fd-pool-size` is configured (> 0) that value wins. Otherwise (0 = auto) we
+/// size the pool from the process's `RLIMIT_NOFILE` soft limit — the real ceiling on
+/// how many fds this instance can hold open — reserving headroom for Valkey's own
+/// fds (client connections, listeners, AOF/RDB, cluster bus, io_uring rings). We give
+/// the pool ~75% of the soft limit and clamp to a floor so tiny ulimits still cache.
+/// Falls back to [`storage::fd_pool::DEFAULT_CAPACITY`] if the limit can't be queried
+/// or is unbounded.
+pub fn fd_pool_capacity() -> usize {
+    use crate::storage::fd_pool::DEFAULT_CAPACITY;
+
+    let configured = CFG_FD_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    if configured > 0 {
+        return configured as usize;
+    }
+
+    // Reserve a fixed slice of fds for everything in the process that isn't the pool.
+    const RESERVED_FOR_VALKEY: u64 = 4096;
+    const FLOOR: u64 = 1024;
+
+    // SAFETY: getrlimit writes into `rl` (fully initialized below) and RLIMIT_NOFILE
+    // is a valid resource id; returns 0 on success.
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc != 0 || rl.rlim_cur == libc::RLIM_INFINITY {
+        return DEFAULT_CAPACITY;
+    }
+
+    let soft = rl.rlim_cur;
+    // 75% of the soft limit, then subtract headroom, then clamp up to the floor.
+    let usable = (soft / 4 * 3)
+        .saturating_sub(RESERVED_FOR_VALKEY)
+        .max(FLOOR);
+    usable as usize
 }
 
 pub fn bench_mode() -> bool {
@@ -177,7 +222,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     transport::init();
 
     // Step 2+3: Storage allocates buffer pool + register with io_uring.
-    storage::init(pool_buf_size(), pool_buf_count(), &dir);
+    let fd_cap = fd_pool_capacity();
+    storage::init(pool_buf_size(), pool_buf_count(), fd_cap, &dir);
     storage::register_buffers();
 
     // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
@@ -186,12 +232,13 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     transport::register_buffers(&slices);
 
     ctx.log_notice(&format!(
-        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",
+        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={} fd_pool_capacity={}",
         dir,
         pool_buf_count(),
         pool_buf_size(),
         (pool_buf_count() * pool_buf_size()) as f64 / (1024.0 * 1024.0),
         transport_threads(),
+        fd_cap,
     ));
 
     Status::Ok
@@ -226,6 +273,8 @@ valkey_module! {
             ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
             ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
+             ConfigurationFlags::IMMUTABLE, None, None],
+            ["fd-pool-size", &*CFG_FD_POOL_SIZE, 0, 0, i64::MAX,
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [

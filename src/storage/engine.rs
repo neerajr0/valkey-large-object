@@ -69,7 +69,7 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub fn new(buf_size: usize, buf_count: usize, data_dir: &str) -> Self {
+    pub fn new(buf_size: usize, buf_count: usize, fd_pool_capacity: usize, data_dir: &str) -> Self {
         let mut pinned_buffers = Vec::with_capacity(buf_count);
 
         for _i in 0..buf_count {
@@ -83,7 +83,7 @@ impl StorageEngine {
             pool: BufferPool::new(),
             pinned_buffers,
             uring: OnceLock::new(),
-            fd_pool: FdPool::new(),
+            fd_pool: FdPool::with_capacity(fd_pool_capacity),
         }
     }
 
@@ -117,9 +117,10 @@ impl StorageEngine {
     }
 
     /// Open a read fd for an object. Uses O_DIRECT when direct-io config is enabled.
-    fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
+    /// On failure returns the OS error code (errno) so the caller can surface it.
+    fn open_read_fd(&self, oid: ObjectId) -> Result<RawFd, i32> {
         let path = oid.file_path(&self.data_dir);
-        let c_path = std::ffi::CString::new(path).ok()?;
+        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
         let mut flags = libc::O_RDONLY;
         if crate::direct_io() {
             flags |= libc::O_DIRECT;
@@ -127,9 +128,11 @@ impl StorageEngine {
         // SAFETY: c_path is a valid null-terminated C string, flags are valid POSIX.
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
-            Some(fd)
+            Ok(fd)
         } else {
-            None
+            // Capture errno via the safe wrapper immediately, before any other libc
+            // call on this thread can clobber it.
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
         }
     }
 }
@@ -179,15 +182,9 @@ impl Storage for StorageEngine {
         let guard = match self.fd_pool.acquire(object_id) {
             Some(g) => g,
             None => match self.open_read_fd(object_id) {
-                Some(fd) => self.fd_pool.insert(object_id, fd),
-                None => {
-                    on_complete(
-                        buf,
-                        Err(StorageError::IoError {
-                            // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                            code: unsafe { *libc::__errno_location() },
-                        }),
-                    );
+                Ok(fd) => self.fd_pool.insert(object_id, fd),
+                Err(code) => {
+                    on_complete(buf, Err(StorageError::IoError { code }));
                     return;
                 }
             },
@@ -239,13 +236,9 @@ impl Storage for StorageEngine {
             )
         };
         if fd < 0 {
-            on_complete(
-                buf,
-                Err(StorageError::IoError {
-                    // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                    code: unsafe { *libc::__errno_location() },
-                }),
-            );
+            // Capture errno via the safe wrapper before any other libc call clobbers it.
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            on_complete(buf, Err(StorageError::IoError { code }));
             return;
         }
 

@@ -108,8 +108,8 @@ pub fn delete(object_id: crate::data_type::ObjectId) {
     get().delete_file(object_id);
 }
 
-pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
-    let storage = engine::StorageEngine::new(buf_size, buf_count, data_dir);
+pub fn init(buf_size: usize, buf_count: usize, fd_pool_capacity: usize, data_dir: &str) {
+    let storage = engine::StorageEngine::new(buf_size, buf_count, fd_pool_capacity, data_dir);
     STORAGE.set(storage).ok();
     // Fill the pool now that StorageEngine is in the static OnceLock.
     get().init_pool();
