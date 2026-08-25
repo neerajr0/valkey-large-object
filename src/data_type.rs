@@ -87,6 +87,19 @@ impl LoValue {
 
     /// Deep-copy: allocates a new OID and copies the NVMe file.
     /// Returns None if the file copy fails (e.g., source file missing).
+    ///
+    /// Thread-safety note: This runs on the main thread (COPY command handler).
+    /// The source file is safe to read because:
+    /// - All commands (read/copy/delete) execute on the main thread.
+    /// - The core guarantees a key exists when COPY is dispatched — a DEL after
+    ///   COPY is sequenced by the event loop, so the source file cannot vanish
+    ///   mid-copy.
+    ///
+    /// Future consideration: when read coalescing / refcounting is added, a
+    /// background eviction (io-poller thread) could race with this copy. In
+    /// this case ackground eviction must synchronize with the main
+    /// thread (e.g., via ThreadSafeContext notification) before unlinking any
+    /// file that is still referenced by a live key.
     pub fn create_copy(&self, data_dir: &str) -> Option<LoValue> {
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(data_dir);
