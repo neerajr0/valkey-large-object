@@ -67,15 +67,22 @@ impl LoValue {
         std::mem::size_of::<LoValue>() + self.len as usize
     }
 
-    /// Reports free effort proportional to file size (1 per MB, minimum 1).
-    /// Valkey uses this to decide sync vs async free (lazy-free threshold ~64).
+    /// Returns 0 to signal Valkey to ALWAYS free asynchronously (BIO thread).
     ///
-    /// This models NVMe free cost (unlink(2) syscall), not DRAM free cost.
-    /// Memory overhead per object is negligible (only metadata stored in DRAM).
-    /// TODO: When dual DRAM/NVMe caching is supported, revisit to account for
-    /// both tiers (e.g., sum NVMe unlink effort + DRAM cache eviction effort).
+    /// Per the Module API contract: returning 0 causes lazyfreeGetFreeEffort()
+    /// to map to ULONG_MAX, which always exceeds LAZYFREE_THRESHOLD (64),
+    /// guaranteeing async free.
+    ///
+    /// Rationale for always-async:
+    /// 1. Our free callback performs unlink(2) on the NVMe file — a blocking
+    ///    I/O syscall that should never execute on the main event-loop thread.
+    /// 2. The actual LoValue struct is trivial (24 bytes of metadata). The
+    ///    "effort" is the file deletion, which is O(1) regardless of file size
+    ///    on modern filesystems (XFS/ext4 reclaim blocks lazily).
+    /// 3. Thread safety is maintained: storage::delete() is a plain
+    ///    remove_file() syscall with no shared mutable state.
     pub fn free_effort(&self) -> usize {
-        (self.len / (1024 * 1024)) as usize + 1
+        0
     }
 
     /// Deep-copy: allocates a new OID and copies the NVMe file.
@@ -122,8 +129,9 @@ unsafe extern "C" fn lo_mem_usage(value: *const std::ffi::c_void) -> usize {
 }
 
 /// FREE EFFORT callback.
-/// Returns effort proportional to file size so Valkey can decide between
-/// synchronous DEL (main thread) and async UNLINK (background thread).
+/// Always returns 0 to force asynchronous free via BIO thread.
+/// This keeps unlink(2) off the main event-loop thread.
+/// See LoValue::free_effort() for full rationale.
 unsafe extern "C" fn lo_free_effort(
     _key: *mut raw::RedisModuleString,
     value: *const std::ffi::c_void,
@@ -254,43 +262,28 @@ mod tests {
     // ─── free_effort tests ───────────────────────────────────────────────
 
     #[test]
-    fn test_free_effort_small() {
-        let val = LoValue {
+    fn test_free_effort_always_zero() {
+        // free_effort always returns 0 (async free) regardless of object size.
+        let small = LoValue {
             object_id: ObjectId(1),
             len: 512,
             crc32c: 0,
         };
-        assert_eq!(val.free_effort(), 1); // minimum
-    }
+        assert_eq!(small.free_effort(), 0);
 
-    #[test]
-    fn test_free_effort_large() {
-        let val = LoValue {
-            object_id: ObjectId(1),
-            len: 100 * 1024 * 1024, // 100MB
+        let large = LoValue {
+            object_id: ObjectId(2),
+            len: 100 * 1024 * 1024,
             crc32c: 0,
         };
-        assert_eq!(val.free_effort(), 101);
-    }
+        assert_eq!(large.free_effort(), 0);
 
-    #[test]
-    fn test_free_effort_boundary() {
-        let val = LoValue {
-            object_id: ObjectId(1),
-            len: 1024 * 1024 - 1, // 1MB - 1 byte
+        let zero = LoValue {
+            object_id: ObjectId(3),
+            len: 0,
             crc32c: 0,
         };
-        assert_eq!(val.free_effort(), 1); // just below 1MB → 0 + 1
-    }
-
-    #[test]
-    fn test_free_effort_exactly_one_mb() {
-        let val = LoValue {
-            object_id: ObjectId(1),
-            len: 1024 * 1024, // exactly 1MB
-            crc32c: 0,
-        };
-        assert_eq!(val.free_effort(), 2); // 1 + 1
+        assert_eq!(zero.free_effort(), 0);
     }
 
     // ─── create_copy tests ───────────────────────────────────────────────
