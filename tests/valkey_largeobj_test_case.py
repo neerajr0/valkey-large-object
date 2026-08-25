@@ -1,4 +1,5 @@
 import os
+import time
 import pytest
 from valkeytestframework.valkey_test_case import ValkeyTestCase
 from valkey import ResponseError
@@ -46,3 +47,21 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
                 f"Actual error '{str(e)}' != expected '{expected_err_reply}'"
             )
             return str(e)
+
+    def _wait_for_lazyfree_done(self, client, timeout_sec=5):
+        """Poll INFO stats until lazyfree_pending_objects reaches 0.
+
+        Module free_effort returns 0 (always async), so DEL schedules file
+        deletion on the BIO thread. This helper waits for that to complete
+        before asserting on filesystem state.
+        """
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            info = client.info('stats')
+            pending = info.get('lazyfree_pending_objects', 0)
+            if pending == 0:
+                return
+            time.sleep(0.01)
+        raise AssertionError(
+            f"lazyfree_pending_objects did not reach 0 within {timeout_sec}s"
+        )
