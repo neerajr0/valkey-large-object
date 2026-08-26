@@ -405,7 +405,35 @@ Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the 
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL: `fd_pool.remove(oid)` closes fd, then `unlink()` deletes file
 
-### 6.4 ObjectContext Lifetimes
+### 6.4 FdPool (File Descriptor Management)
+
+Manages open NVMe file descriptors with LFRU eviction and a configurable cap.
+
+```rust
+struct FdEntry {
+    fd: RawFd,
+    refcount: AtomicU32,     // In-flight I/Os using this fd
+    access_count: AtomicU64, // LFRU scoring (frequency)
+    last_access: AtomicU64,  // LFRU scoring (recency)
+}
+
+struct FdPool {
+    entries: RwLock<HashMap<ObjectId, Arc<FdEntry>>>,
+    max_open: usize,         // Cap — evict when exceeded (configurable)
+}
+```
+
+**Why capped:** OS file descriptor limits and kernel inode cache pressure. With millions of objects on NVMe, keeping all fds open wastes kernel resources. LFRU eviction closes cold fds; hot fds stay open.
+
+**Operations:**
+- **GET/SET:** `fd_pool.get_or_open(oid)` → returns `Arc<FdEntry>` (refcount incremented). Caller holds Arc for duration of I/O. Drop decrements refcount.
+- **Eviction (cap hit):** Find lowest-scored entry with `refcount == 0`. Close fd, remove from HashMap. If all candidates have refcount > 0 (in-flight), open beyond cap temporarily.
+- **DEL/free callback:** Remove entry from HashMap. If refcount > 0, fd stays open until last I/O completes (Arc drop triggers close). If refcount == 0, close immediately.
+- **Reopen:** If a GET arrives for an object whose fd was evicted from pool, reopen from path `/data/lo-data/{oid:016x}.dat`.
+
+**Why Arc<FdEntry>:** I/O operations hold a clone of the Arc. HashMap removal (on DEL or eviction) drops one ref. In-flight I/Os still hold valid refs — no dangling pointer, no use-after-close.
+
+### 6.5 ObjectContext Lifetimes
 
 ObjectContext exists in two layers with different lifetimes. Same struct, same Buffer type, but allocated from **separate talc instances in separate segments** (§4.5).
 
@@ -423,7 +451,7 @@ ObjectContext exists in two layers with different lifetimes. Same struct, same B
 - On request completion: StreamingContext dropped → `nvme_pool_talc.lock().free()` for each buffer
 - If promotion policy says yes: separate ReadFixed directly into DRAMPool buffers (§7.3.4). No memcpy from NVMePool. NVMePool buffers freed independently after serving the current request.
 
-### 6.5 Relationship Diagram
+### 6.6 Relationship Diagram
 
 Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the same structurally but with short-lived StreamingContexts in NVMePool segments.
 
@@ -853,7 +881,105 @@ Evacuation is mandatory — data only exists in DRAM. Cannot shrink if remaining
 
 Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment = ~800MB copy = ~80ms.
 
-## 9. Open Questions
+## 9. Concurrency, Refcounting, and Lifecycle
+
+This section describes how shared state is protected, which structures are refcounted, and how the free callback coordinates with in-flight operations.
+
+### 9.1 Refcounting Summary
+
+| Component | Mechanism | Who holds refs | Drop-to-0 action |
+|---|---|---|---|
+| ObjectContext (DRAMPool) | `Arc<ObjectContext>` | DRAMPool HashMap (1), each in-flight GET reader (1 each) | `Drop` impl: `dram_pool_talc.lock().free()` for each buffer, decrement segment refcounts |
+| StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | Leader task only (coalesced waiters wait on notification, don't hold the context) | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
+| Buffer | **Not refcounted** — owned exclusively by parent context | ObjectContext or StreamingContext (never shared independently) | Freed when parent drops: `talc.free(ptr, layout)` + segment refcount decrement |
+| FdEntry | `Arc<FdEntry>` | FdPool HashMap (1), each in-flight I/O op (1 each) | `Drop` impl: `close(fd)` |
+| DRAMSegment | `AtomicU32` refcount | Each live ObjectContext buffer in this segment (+1 per alloc, -1 per free) | If draining: safe to IORING_UNREGISTER + dealloc |
+| NVMeSegment | `AtomicU32` refcount | Each live StreamingContext buffer in this segment (+1 per alloc, -1 per free) | If draining: safe to IORING_UNREGISTER + dealloc |
+
+### 9.2 Threading Model: Which Thread Does What
+
+**Rule:** Main thread serves directly only when no NVMe I/O and no EFA transport is needed. All other paths spawn a tokio task and block the client.
+
+**TCP paths:**
+
+| Path | Threads | Why |
+|---|---|---|
+| GET → DRAMPool hit | Main thread only | Data already in DRAM. RwLock read + reply inline. Zero I/O. |
+| GET → DRAMPool miss (Tiered mode) | Main → tokio task | Needs NVMePool buffer alloc + NVMe ReadFixed. BlockedClient until read completes. |
+| SET (Tiered mode) | Main → tokio task | Needs NVMePool buffer alloc + NVMe WriteFixed. BlockedClient until write + CRC verified. |
+| SET (DRAM-only mode) | Main thread only | DRAMPool alloc + memcpy from querybuf. Synchronous. No NVMe, no tokio. |
+
+Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a non-existent key returns key-not-found, not a cache miss.
+
+**EFA paths:**
+
+| Path | Threads | Why |
+|---|---|---|
+| All EFA commands (GET and SET, both modes) | Main → tokio task | EFA transport (fi_read/fi_write) is async. Always BlockedClient + tokio task. |
+
+**Summary:** Main thread handles only the synchronous fast paths (DRAM hit over TCP, DRAM-only SET over TCP). Everything involving NVMe I/O or EFA transport goes through tokio.
+
+### 9.3 Global State and Lock Table
+
+| Global | Type | Lock | Threads that access |
+|---|---|---|---|
+| DRAMPool object map | `HashMap<ObjectId, Arc<ObjectContext>>` | `RwLock` | Main (read on GET hit, remove on free callback), tokio (read for coalesce check, write for promotion insert + Filling state update) |
+| DRAMPool allocator | `Mutex<Talc>` (dram_pool_talc) | Mutex | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc) |
+| NVMePool allocator | `Mutex<Talc>` (nvme_pool_talc) | Mutex | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
+| FdPool | `HashMap<ObjectId, Arc<FdEntry>>` | `RwLock` | Main (remove on DEL/free callback), tokio (get_or_open on SET/GET miss) |
+| Segment metadata | `Vec<Segment>` (per pool) | Read-only after init (no lock needed) | All threads (read segment base/size/buf_index). Draining flag is AtomicBool. |
+
+**Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
+
+**Why Mutex for talc:** Allocator operations modify internal free-list state — no concurrent access possible. Hold time ~10-50ns. Negligible contention.
+
+**Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call talc.free if last ref).
+
+### 9.4 Free Callback Lifecycle
+
+When Valkey DELs or evicts a key (`free_effort=1`, sync on main thread):
+
+The Valkey module data type struct (LoValue) is deleted immediately within the free callback scope — it is removed from the keyspace and freed. After this returns, no new command can find or access this key. The actual resource cleanup (buffers, fd, NVMe file) happens lazily via Arc drop:
+
+```
+free_callback(LoValue) — main thread:
+  0. LoValue struct freed (Valkey module data type container) — key no longer visible to new requests
+
+  1. DRAMPool HashMap: remove Arc<ObjectContext> for this oid
+     → If this was the last Arc (no in-flight readers): Drop runs immediately
+       → talc.free each buffer, decrement segment refcounts
+     → If in-flight readers hold clones: Drop deferred until last reader finishes
+       → No blocking. Main thread continues. Last reader's drop triggers cleanup on their thread.
+
+  2. FdPool: remove Arc<FdEntry> for this oid
+     → Same pattern: if refcount > 0 (in-flight I/O), fd stays open until last I/O drops its Arc
+     → close(fd) runs from whichever thread drops the last Arc
+
+  3. NVMe file: dispatch unlink to io-poller (submit unlink SQE)
+     → Or inline unlink(path) if acceptable (~1μs)
+```
+
+**Invariant:** The free callback never blocks waiting for in-flight operations. LoValue is deleted immediately (new requests get key-not-found). Internal resources (buffers, fd, file) are cleaned up lazily — HashMap removals prevent new refs, Arc handles the rest. The main thread is never stalled.
+
+### 9.5 Segment Draining Lifecycle
+
+When shrinking DRAMPool under memory pressure (§8.4):
+
+```
+1. segment.draining.store(true) — no new allocs from this segment
+2. Batch-evict ObjectContexts whose buffers are in this segment:
+   - Remove Arc from HashMap (1000 per command invocation)
+   - Each removal may or may not trigger Drop (depends on in-flight readers)
+3. Monitor segment.refcount — when it hits 0, all buffers have been freed
+4. IORING_UNREGISTER → remove from iovec array → IORING_REGISTER
+5. dealloc(segment) — returns memory to Valkey (used_memory decreases)
+```
+
+Between steps 2 and 3: in-flight readers may still be serving from buffers in the draining segment. This is safe — the buffers are valid until freed. The segment is not released until refcount == 0.
+
+---
+
+## 10. Open Questions
 
 1. Segment size? 4GB (granular shrink) vs 16GB (fewer segments, less overhead)? Config knob — needs production data.
 2. Should we use Scale Out and Scale In to handle overly fragmented segments? Requires live transition (drain + evacuate). May be over-engineering — talc free-coalescing may be sufficient. Needs tests to determine fragmentation rate in practice.
