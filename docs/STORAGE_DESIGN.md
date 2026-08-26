@@ -1,6 +1,6 @@
 # Storage Design
 
-**Date:** 2026-08-21  **Status:** Draft  **Author:** @KarthikSubbarao
+**Date:** 2026-08-21  **Status:** In-Review  **Author:** @KarthikSubbarao
 
 ---
 
@@ -145,7 +145,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 - io_uring `ReadFixed`/`WriteFixed` via segment-as-buffer (same NVMe throughput as Approach A)
 - EFA zero-copy on DRAM hit (fi_write from any offset within registered segment)
 - NVMe read can land directly in arena slot (ReadFixed with offset) — zero-copy promotion possible
-- Industry precedent (Mooncake, NVIDIA DOCA, SPDK)
+- Industry precedent for the pattern (pre-registered large memory regions with sub-allocation to avoid per-request registration cost): Mooncake, NVIDIA DOCA, SPDK
 
 **Cons:**
 - Fragmentation possible after many alloc/free cycles with varied sizes
