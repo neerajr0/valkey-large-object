@@ -10,6 +10,7 @@ pub mod dram_pool;
 pub mod fd_pool;
 pub mod nvme_pool;
 pub mod segment;
+pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
@@ -69,7 +70,7 @@ pub fn init(nvme_segment_size: usize, dram_segment_size: usize, _data_dir: &str)
     NVME_POOL.set(nvme_pool).ok();
 
     // DRAMPool: 1 segment initially. buf_index starts after NVMePool segments.
-    let nvme_seg_count = get_nvme_pool().segments.len() as u16;
+    let nvme_seg_count = get_nvme_pool().segments().len() as u16;
     let dram_pool = DRAMPool::new(1, dram_segment_size, nvme_seg_count);
     DRAM_POOL.set(dram_pool).ok();
 
@@ -97,10 +98,10 @@ pub fn shutdown() {
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
-    for seg in &get_nvme_pool().segments {
+    for seg in get_nvme_pool().segments() {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
     }
-    for seg in &get_dram_pool().segments {
+    for seg in get_dram_pool().segments() {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
     }
     slices

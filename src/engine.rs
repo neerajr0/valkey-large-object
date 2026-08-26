@@ -19,7 +19,7 @@ use valkey_module::{enum_configuration, ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, uring, ObjectContext, SegmentBuffer};
+use crate::storage::{self, uring, ObjectContext};
 use crate::transport::Session;
 
 // ─── Operating Mode ──────────────────────────────────────────────────────────
@@ -129,6 +129,10 @@ fn execute_get_tiered(
         }
     };
 
+    // StreamingContext owns the NVMePool buffer for this GET operation.
+    // Single buffer today; multi-batch streaming adds more buffers here.
+    let stream_ctx = storage::StreamingContext::new_for_get(vec![seg_buf], obj_len);
+
     // Get fd from FdPool (cached) or open fresh.
     let fd_pool = storage::get_fd_pool();
     let fd = match fd_pool.get(object_id) {
@@ -143,7 +147,7 @@ fn execute_get_tiered(
             }
             let new_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
             if new_fd < 0 {
-                nvme_pool.free(&seg_buf);
+                nvme_pool.free(&stream_ctx.buffers[0]);
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
@@ -155,8 +159,8 @@ fn execute_get_tiered(
         }
     };
 
-    let buf_ptr_usize = nvme_pool.buffer_ptr(&seg_buf) as usize;
-    let buf_index = nvme_pool.segments[seg_buf.segment_idx as usize].buf_index;
+    let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
+    let buf_index = nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].buf_index;
 
     // Spawn tokio task for NVMe read + serve + optional promotion.
     crate::runtime_handle().spawn(async move {
@@ -212,10 +216,10 @@ fn execute_get_tiered(
                 promote_to_dram(object_id, obj_len);
 
                 // Free NVMePool buffer (served, promotion uses separate ReadFixed).
-                storage::get_nvme_pool().free(&seg_buf);
+                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             }
             Ok(Err(e)) => {
-                storage::get_nvme_pool().free(&seg_buf);
+                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::String(format!(
                     "{}: {}",
                     errors::ERR_NVME_READ,
@@ -223,7 +227,7 @@ fn execute_get_tiered(
                 ))));
             }
             Err(_) => {
-                storage::get_nvme_pool().free(&seg_buf);
+                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
             }
         }
@@ -391,7 +395,11 @@ fn execute_set_tiered(
         }
     };
 
-    let buf_ptr = nvme_pool.buffer_ptr(&seg_buf);
+    // StreamingContext owns the NVMePool buffer for this SET operation.
+    // Single buffer today; multi-batch streaming adds more buffers here.
+    let stream_ctx = storage::StreamingContext::new_for_set(vec![seg_buf], obj_len);
+
+    let buf_ptr = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]);
     let buf_ptr_usize = buf_ptr as usize;
 
     match data_source {
@@ -399,7 +407,10 @@ fn execute_set_tiered(
             // TCP: memcpy into NVMePool buffer, then write to NVMe.
             let copy_len = data.len().min(obj_len as usize);
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
-            do_tiered_nvme_write(buf_ptr_usize, obj_len, seg_buf, blocked_client, key_name);
+            crate::runtime_handle().spawn(async move {
+                do_tiered_nvme_write(buf_ptr_usize, obj_len, stream_ctx, blocked_client, key_name)
+                    .await;
+            });
         }
         DataSource::Efa {
             session,
@@ -425,13 +436,14 @@ fn execute_set_tiered(
                         do_tiered_nvme_write(
                             buf_ptr_usize,
                             obj_len,
-                            seg_buf,
+                            stream_ctx,
                             blocked_client,
                             key_name,
-                        );
+                        )
+                        .await;
                     }
                     _ => {
-                        storage::get_nvme_pool().free(&seg_buf);
+                        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                         let thread_ctx =
                             valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
@@ -443,10 +455,11 @@ fn execute_set_tiered(
 }
 
 /// Shared Tiered NVMe write: CRC → open tmp → WriteFixed → rename → create LoValue.
-fn do_tiered_nvme_write(
+/// Must be called from within a tokio task (awaits io_uring write).
+async fn do_tiered_nvme_write(
     buf_ptr_usize: usize,
     obj_len: u64,
-    seg_buf: SegmentBuffer,
+    stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     key_name: Vec<u8>,
 ) {
@@ -464,71 +477,69 @@ fn do_tiered_nvme_write(
     }
     let fd = unsafe { libc::open(c_tmp.as_ptr(), write_flags, 0o644) };
     if fd < 0 {
-        storage::get_nvme_pool().free(&seg_buf);
+        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
     }
 
     let nvme_pool = storage::get_nvme_pool();
-    let buf_index = nvme_pool.segments[seg_buf.segment_idx as usize].buf_index;
+    let buf_index = nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].buf_index;
 
-    crate::runtime_handle().spawn(async move {
-        let buf_ptr_local = buf_ptr_usize as *const u8;
-        let write_result = uring::submit_write(fd, buf_index, buf_ptr_local, 0, obj_len).await;
-        unsafe { libc::close(fd) };
+    let buf_ptr_local = buf_ptr_usize as *const u8;
+    let write_result = uring::submit_write(fd, buf_index, buf_ptr_local, 0, obj_len).await;
+    unsafe { libc::close(fd) };
 
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
-        match write_result {
-            Ok(Ok(())) => {
-                if std::fs::rename(&tmp_path, &file_path).is_ok() {
-                    // Cache the fd in FdPool for future reads.
-                    let c_file = std::ffi::CString::new(file_path.as_str()).unwrap();
-                    let mut read_flags = libc::O_RDONLY;
-                    if crate::direct_io() {
-                        read_flags |= libc::O_DIRECT;
-                    }
-                    let read_fd = unsafe { libc::open(c_file.as_ptr(), read_flags) };
-                    if read_fd >= 0 {
-                        storage::get_fd_pool().insert(oid, read_fd);
-                    }
-
-                    {
-                        let ctx = thread_ctx.lock();
-                        let key_str = ctx.create_string(key_name);
-                        let key = ctx.open_key_writable(&key_str);
-                        let lo_value = LoValue {
-                            object_id: oid,
-                            len: obj_len,
-                            crc32c: crc,
-                        };
-                        key.set_value(&LO_TYPE, lo_value).unwrap();
-                    }
-                    storage::get_nvme_pool().free(&seg_buf);
-                    thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-                } else {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    storage::get_nvme_pool().free(&seg_buf);
-                    thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+    match write_result {
+        Ok(Ok(())) => {
+            if std::fs::rename(&tmp_path, &file_path).is_ok() {
+                // Cache the fd in FdPool for future reads.
+                let c_file = std::ffi::CString::new(file_path.as_str()).unwrap();
+                let mut read_flags = libc::O_RDONLY;
+                if crate::direct_io() {
+                    read_flags |= libc::O_DIRECT;
                 }
-            }
-            Ok(Err(e)) => {
+                let read_fd = unsafe { libc::open(c_file.as_ptr(), read_flags) };
+                if read_fd >= 0 {
+                    storage::get_fd_pool().insert(oid, read_fd);
+                }
+
+                {
+                    let ctx = thread_ctx.lock();
+                    let key_str = ctx.create_string(key_name);
+                    let key = ctx.open_key_writable(&key_str);
+                    let lo_value = LoValue {
+                        object_id: oid,
+                        len: obj_len,
+                        crc32c: crc,
+                    };
+                    key.set_value(&LO_TYPE, lo_value).unwrap();
+                }
+                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+                thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+            } else {
                 let _ = std::fs::remove_file(&tmp_path);
-                storage::get_nvme_pool().free(&seg_buf);
-                thread_ctx.reply(Err(ValkeyError::String(format!(
-                    "{}: {}",
-                    errors::ERR_NVME_WRITE,
-                    e
-                ))));
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                storage::get_nvme_pool().free(&seg_buf);
+                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
             }
         }
-    });
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+            thread_ctx.reply(Err(ValkeyError::String(format!(
+                "{}: {}",
+                errors::ERR_NVME_WRITE,
+                e
+            ))));
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+        }
+    }
 }
 
 // ─── Promotion (Tiered mode: NVMe → DRAMPool) ───────────────────────────────
@@ -557,7 +568,7 @@ fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
     };
 
     let buf_ptr = dram_pool.buffer_ptr(&seg_buf) as usize;
-    let buf_index = dram_pool.segments[seg_buf.segment_idx as usize].buf_index;
+    let buf_index = dram_pool.segments()[seg_buf.segment_idx as usize].buf_index;
 
     // Insert as Filling (visible but not yet servable).
     let obj_ctx = Arc::new(ObjectContext::new_filling(

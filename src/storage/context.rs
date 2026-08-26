@@ -107,32 +107,27 @@ pub struct StreamingContext {
     pub total_len: u64,
     /// Progress cursor: bytes completed so far.
     pub bytes_completed: u64,
-    /// Rolling CRC32c hasher for SET verification. None for GET.
-    pub crc_state: u32,
-    /// Whether CRC is being tracked (SET = true, GET = false).
-    pub track_crc: bool,
+    // TODO: CRC32c verification is a local variable in the tokio SET task,
+    // not on this struct. When implementing SET streaming, track crc as
+    // `let mut crc: u32 = 0` in the task and compare against client-provided value.
 }
 
 impl StreamingContext {
-    /// Create a new StreamingContext for a SET operation (CRC tracked).
+    /// Create a new StreamingContext for a SET operation.
     pub fn new_for_set(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
         Self {
             buffers,
             total_len,
             bytes_completed: 0,
-            crc_state: 0,
-            track_crc: true,
         }
     }
 
-    /// Create a new StreamingContext for a GET operation (no CRC).
+    /// Create a new StreamingContext for a GET operation.
     pub fn new_for_get(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
         Self {
             buffers,
             total_len,
             bytes_completed: 0,
-            crc_state: 0,
-            track_crc: false,
         }
     }
 
