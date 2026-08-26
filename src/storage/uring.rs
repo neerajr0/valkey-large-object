@@ -1,64 +1,83 @@
-//! io_uring Engine — registered buffers, ReadFixed/WriteFixed, CQ poller thread.
+//! io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
 //!
 //! Architecture:
-//!   Main thread: submit(IoRequest) via channel → returns immediately
+//!   Caller: submit(IoRequest) via channel → returns immediately
 //!   Poller thread: owns io_uring ring, submits ReadFixed/WriteFixed, polls CQ,
 //!                  fires completion callback from CQ thread.
 //!
-//! Key optimization: buffers are registered with IORING_REGISTER_BUFFERS at startup.
-//! Reads use ReadFixed opcode — pages pinned ONCE, eliminates per-read gup_fast_fallback.
+//! Segments are registered with IORING_REGISTER_BUFFERS at startup.
+//! ReadFixed/WriteFixed use buf_index (segment index) + offset within segment.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::storage::{NvmeEngine, StorageError};
+use super::StorageError;
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
-/// Completion callback type — fired from the CQ poller thread.
-use super::buffer::Buffer;
+/// Completion callback: (result or error). Caller retains buffer ownership.
+pub type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
+pub type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
 
-pub type ReadCallback = Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>;
-pub type WriteCallback = Box<dyn FnOnce(Buffer, Result<(), StorageError>) + Send>;
-
+/// I/O request — references a position within a registered segment.
 pub enum IoRequest {
     Read {
         fd: RawFd,
-        buf: Buffer, // owned buffer — travels through io_uring pipeline
+        /// io_uring buf_index (segment's position in the registered iovec array).
+        buf_index: u16,
+        /// Pointer to the buffer within the segment (absolute address).
+        buf_ptr: *mut u8,
+        /// Offset within the NVMe file to read from.
+        file_offset: u64,
+        /// Number of bytes to read (will be aligned up to 4096 for O_DIRECT).
         len: u64,
         on_complete: ReadCallback,
     },
     Write {
         fd: RawFd,
-        buf: Buffer,
+        buf_index: u16,
+        buf_ptr: *const u8,
+        file_offset: u64,
         len: u64,
         on_complete: WriteCallback,
     },
 }
 
-// SAFETY: IoRequest contains raw pointers (as usize) and boxed closures.
-// The pointers refer to pool-allocated buffers that are stable for module lifetime.
-// The closures are Send. The enum is only sent across a bounded channel to the
-// poller thread which is the sole consumer.
+// SAFETY: IoRequest contains raw pointers referring to segment-allocated memory
+// that is stable for module lifetime. Closures are Send. Only sent across a
+// bounded channel to the single poller thread.
 unsafe impl Send for IoRequest {}
 
 // ─── Pending Operation Tracking ──────────────────────────────────────────────
 
 enum PendingOp {
-    Read {
-        buf: Buffer,
-        on_complete: ReadCallback,
-    },
-    Write {
-        buf: Buffer,
-        on_complete: WriteCallback,
-        len: u64,
-    },
+    Read { on_complete: ReadCallback },
+    Write { on_complete: WriteCallback, len: u64 },
+}
+
+// ─── Global Engine ───────────────────────────────────────────────────────────
+
+static ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
+
+pub fn set_engine(engine: UringNvmeEngine) {
+    ENGINE.set(engine).ok();
+}
+
+pub fn submit(req: IoRequest) {
+    if let Some(engine) = ENGINE.get() {
+        engine.tx.send(req).ok();
+    }
+}
+
+pub fn shutdown() {
+    if let Some(engine) = ENGINE.get() {
+        engine.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
@@ -66,21 +85,12 @@ enum PendingOp {
 pub struct UringNvmeEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
-    poller: Option<thread::JoinHandle<()>>,
-}
-
-impl NvmeEngine for UringNvmeEngine {
-    fn submit(&self, req: IoRequest) {
-        self.tx.send(req).ok();
-    }
-    fn signal_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
+    _poller: Option<thread::JoinHandle<()>>,
 }
 
 impl UringNvmeEngine {
     /// Create engine and spawn CQ poller thread.
-    /// `iovecs` are the pool buffers to register with the kernel.
+    /// `iovecs` are the registered segments (combined DRAMPool + NVMePool).
     pub fn new(iovecs: Vec<libc::iovec>) -> Self {
         let (tx, rx) = bounded::<IoRequest>(4096);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -95,8 +105,6 @@ impl UringNvmeEngine {
         let poller = thread::Builder::new()
             .name("lo-uring-poller".into())
             .spawn(move || {
-                // SAFETY: Reconstruct iovecs inside the poller thread from (usize, usize) pairs.
-                // The underlying memory is pool-allocated and stable for module lifetime.
                 let iovecs: Vec<libc::iovec> = buf_info
                     .iter()
                     .map(|&(ptr, len)| libc::iovec {
@@ -111,35 +119,22 @@ impl UringNvmeEngine {
         Self {
             tx,
             shutdown,
-            poller: Some(poller),
-        }
-    }
-
-    /// Shutdown the engine. Drains pending ops then exits.
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.poller.take() {
-            handle.join().ok();
+            _poller: Some(poller),
         }
     }
 
     /// The CQ poller loop — owns the io_uring ring.
     fn poller_loop(rx: Receiver<IoRequest>, shutdown: Arc<AtomicBool>, iovecs: Vec<libc::iovec>) {
-        // Initialize io_uring.
         let mut ring = match io_uring::IoUring::new(256) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("largeobj: io_uring init failed: {}", e);
-                // Fallback: drain requests with errors.
                 Self::error_drain_loop(rx, shutdown);
                 return;
             }
         };
 
-        // Register buffers — pins pages for ReadFixed/WriteFixed.
         let use_fixed = if !iovecs.is_empty() {
-            // SAFETY: iovecs point to pool-allocated, page-aligned memory that is stable
-            // for the module's lifetime. The kernel pins these pages for zero-copy I/O.
             unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok()
         } else {
             false
@@ -168,7 +163,9 @@ impl UringNvmeEngine {
                         let (sqe, op) = match req {
                             IoRequest::Read {
                                 fd,
-                                buf,
+                                buf_index,
+                                buf_ptr,
+                                file_offset,
                                 len,
                                 on_complete,
                             } => {
@@ -176,67 +173,60 @@ impl UringNvmeEngine {
                                 let sqe = if use_fixed {
                                     io_uring::opcode::ReadFixed::new(
                                         io_uring::types::Fd(fd),
-                                        buf.ptr(),
+                                        buf_ptr,
                                         read_len,
-                                        buf.idx(),
+                                        buf_index,
                                     )
-                                    .offset(0)
+                                    .offset(file_offset)
                                     .build()
                                     .user_data(token)
                                 } else {
                                     io_uring::opcode::Read::new(
                                         io_uring::types::Fd(fd),
-                                        buf.ptr(),
+                                        buf_ptr,
                                         read_len,
                                     )
-                                    .offset(0)
+                                    .offset(file_offset)
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Read { buf, on_complete })
+                                (sqe, PendingOp::Read { on_complete })
                             }
                             IoRequest::Write {
                                 fd,
-                                buf,
+                                buf_index,
+                                buf_ptr,
+                                file_offset,
                                 len,
                                 on_complete,
                             } => {
-                                let write_len = len as u32;
+                                let write_len = Self::align_up(len) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::WriteFixed::new(
                                         io_uring::types::Fd(fd),
-                                        buf.ptr() as *const u8,
+                                        buf_ptr,
                                         write_len,
-                                        buf.idx(),
+                                        buf_index,
                                     )
-                                    .offset(0)
+                                    .offset(file_offset)
                                     .build()
                                     .user_data(token)
                                 } else {
                                     io_uring::opcode::Write::new(
                                         io_uring::types::Fd(fd),
-                                        buf.ptr() as *const u8,
+                                        buf_ptr,
                                         write_len,
                                     )
-                                    .offset(0)
+                                    .offset(file_offset)
                                     .build()
                                     .user_data(token)
                                 };
-                                (
-                                    sqe,
-                                    PendingOp::Write {
-                                        buf,
-                                        on_complete,
-                                        len,
-                                    },
-                                )
+                                (sqe, PendingOp::Write { on_complete, len })
                             }
                         };
 
                         pending.insert(token, op);
 
-                        // SAFETY: The SQE references stable pool memory. ring.submission()
-                        // is only accessed from this single poller thread (no races).
                         unsafe {
                             if ring.submission().is_full() {
                                 ring.submit().ok();
@@ -249,13 +239,12 @@ impl UringNvmeEngine {
                 }
             }
 
-            // Phase 2: Submit + wait for at least 1 completion.
+            // Phase 2: Submit + wait.
             if !pending.is_empty() {
                 ring.submit_and_wait(1).ok();
             } else if shutdown.load(Ordering::Relaxed) {
                 break;
             } else {
-                // No pending work — brief sleep to avoid busy-spin.
                 thread::sleep(std::time::Duration::from_micros(50));
                 continue;
             }
@@ -269,25 +258,20 @@ impl UringNvmeEngine {
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
                     match op {
-                        PendingOp::Read { buf, on_complete } => {
+                        PendingOp::Read { on_complete } => {
                             if result >= 0 {
-                                on_complete(buf, Ok(result as u64));
+                                on_complete(Ok(result as u64));
                             } else {
-                                on_complete(buf, Err(StorageError::IoError { code: -result }));
+                                on_complete(Err(StorageError::IoError { code: -result }));
                             }
                         }
-                        PendingOp::Write {
-                            buf,
-                            on_complete,
-                            len,
-                        } => {
+                        PendingOp::Write { on_complete, len } => {
                             if result >= 0 && result as u64 >= len {
-                                on_complete(buf, Ok(()));
+                                on_complete(Ok(()));
                             } else if result < 0 {
-                                on_complete(buf, Err(StorageError::IoError { code: -result }));
+                                on_complete(Err(StorageError::IoError { code: -result }));
                             } else {
-                                // Short write.
-                                on_complete(buf, Err(StorageError::IoError { code: -1 }));
+                                on_complete(Err(StorageError::IoError { code: -1 }));
                             }
                         }
                     }
@@ -300,15 +284,11 @@ impl UringNvmeEngine {
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(req) => match req {
-                    IoRequest::Read {
-                        buf, on_complete, ..
-                    } => {
-                        on_complete(buf, Err(StorageError::IoError { code: -1 }));
+                    IoRequest::Read { on_complete, .. } => {
+                        on_complete(Err(StorageError::IoError { code: -1 }));
                     }
-                    IoRequest::Write {
-                        buf, on_complete, ..
-                    } => {
-                        on_complete(buf, Err(StorageError::IoError { code: -1 }));
+                    IoRequest::Write { on_complete, .. } => {
+                        on_complete(Err(StorageError::IoError { code: -1 }));
                     }
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {

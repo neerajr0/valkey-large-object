@@ -176,21 +176,24 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();
 
-    // Step 2+3: Storage allocates buffer pool + register with io_uring.
-    storage::init(pool_buf_size(), pool_buf_count(), &dir);
+    // Step 2: Initialize DRAMPool + NVMePool.
+    let nvme_segment_size = pool_buf_size() * pool_buf_count(); // e.g., 4MB * 512 = 2GB
+    let dram_segment_size = nvme_segment_size; // Same size for now — configurable later.
+    storage::init(nvme_segment_size, dram_segment_size, &dir);
+
+    // Step 3: Register all segments with io_uring.
     storage::register_buffers();
 
-    // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
-    let pinned = storage::pinned_buffers();
-    let slices: Vec<&[u8]> = pinned.iter().map(|pb| pb.as_slice()).collect();
-    transport::register_buffers(&slices);
+    // Step 4: Transport::register_buffers() — fi_mr_reg per segment.
+    let slices = storage::all_segment_slices();
+    let slice_refs: Vec<&[u8]> = slices.iter().map(|s| *s).collect();
+    transport::register_buffers(&slice_refs);
 
     ctx.log_notice(&format!(
-        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",
+        "largeobj: initialized data_dir={} nvme_pool={}MB dram_pool={}MB transport_threads={}",
         dir,
-        pool_buf_count(),
-        pool_buf_size(),
-        (pool_buf_count() * pool_buf_size()) as f64 / (1024.0 * 1024.0),
+        nvme_segment_size / (1024 * 1024),
+        dram_segment_size / (1024 * 1024),
         transport_threads(),
     ));
 
@@ -200,7 +203,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 fn deinitialize(_ctx: &Context) -> Status {
     transport::deregister_buffers();
     transport::shutdown();
-    storage::deregister_buffers();
     storage::shutdown();
     Status::Ok
 }

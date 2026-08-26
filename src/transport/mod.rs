@@ -7,7 +7,8 @@
 
 use std::sync::OnceLock;
 
-use crate::storage::Buffer;
+// Buffer type removed — transport will use SegmentBuffer or raw ptr in future.
+// EFA session read/write methods are stubs until transport integration.
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
 
@@ -142,34 +143,34 @@ impl Session {
     /// Takes Buffer ownership during DMA. Returns it in callback.
     pub fn write(
         &self,
-        buf: Buffer,
+        buf_ptr: *mut u8,
         _len: usize,
         _rkey: u64,
         _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
     ) {
         // TODO:
         //   1. Pick device (least-loaded)
         //   2. fi_write(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
         //   3. CQ poller fires on_complete with Buffer returned
-        on_complete(buf, Ok(()));
+        on_complete(buf_ptr, Ok(()));
     }
 
     /// DMA read: pull client memory at (rkey, remote_addr) → server buffer.
     /// Non-blocking. Takes Buffer ownership. Returns it in callback.
     pub fn read(
         &self,
-        buf: Buffer,
+        buf_ptr: *mut u8,
         _len: usize,
         _rkey: u64,
         _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
     ) {
         // TODO:
         //   1. Pick device (least-loaded)
         //   2. fi_read(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
         //   3. CQ poller fires on_complete with Buffer returned
-        on_complete(buf, Ok(()));
+        on_complete(buf_ptr, Ok(()));
     }
 
     /// Tear down session. In-flight ops receive SessionClosed.

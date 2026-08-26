@@ -57,13 +57,13 @@ pub struct LoValue {
 }
 
 /// Free callback — triggered by native Valkey DEL.
-/// Deletes the NVMe file for this object.
+/// Deletes the NVMe file and removes DRAMPool cache entry.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
-    // SAFETY: value is a valid LoValue pointer that we previously returned from
-    // rdb_load or set_value. We take ownership back and drop it after deleting the file.
     let lo = Box::from_raw(value as *mut LoValue);
-    // Delete NVMe file via storage layer.
-    crate::storage::delete(lo.object_id);
+    // Remove from DRAMPool (if cached). Arc<ObjectContext> Drop frees buffers.
+    crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    // Delete NVMe file.
+    crate::storage::delete_file(lo.object_id);
 }
 
 // ─── Type Registration ───────────────────────────────────────────────────────

@@ -1,24 +1,21 @@
-//! Storage Layer — buffer pool + NVMe I/O.
+//! Storage Layer — DRAMPool + NVMePool + io_uring I/O.
 //!
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
-pub use buffer::Buffer;
-use engine::PinnedBuffer;
 
-pub mod buffer;
-pub mod engine;
+pub mod context;
+pub mod dram_pool;
 pub mod fd_pool;
+pub mod nvme_pool;
+pub mod segment;
 pub mod uring;
 
-// ─── Callback Type Aliases ────────────────────────────────────────────────────
-
-/// Callback for read completion: (buffer returned, bytes_read or error).
-pub type ReadCallback = Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>;
-
-/// Callback for write completion: (buffer returned, (ObjectId, crc32c) or error).
-pub type WriteCallback = Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>;
+// Re-exports for convenience.
+pub use context::{ObjectContext, ObjectState, SegmentBuffer, StreamingContext};
+pub use dram_pool::DRAMPool;
+pub use nvme_pool::NVMePool;
 
 // ─── Error Types ─────────────────────────────────────────────────────────────
 
@@ -34,109 +31,74 @@ impl std::fmt::Display for StorageError {
         match self {
             Self::IoError { code } => write!(f, "I/O error (code {})", code),
             Self::PoolExhausted => write!(f, "buffer pool exhausted"),
-            Self::ObjectTooLarge => write!(f, "object exceeds buffer size"),
+            Self::ObjectTooLarge => write!(f, "object exceeds max size"),
         }
     }
 }
 
-// ─── NvmeEngine Trait ────────────────────────────────────────────────────────
-
-/// NvmeEngine trait — abstraction over the io_uring submission path.
-/// Implemented by UringNvmeEngine (production) and SyncNvmeEngine (tests).
-pub trait NvmeEngine: Send + Sync {
-    fn submit(&self, req: uring::IoRequest);
-    /// Signal the engine to stop accepting work and exit its poller loop.
-    /// Does not block — the poller thread exits asynchronously.
-    fn signal_shutdown(&self);
-}
-
-// ─── Storage Trait (from interface doc) ──────────────────────────────────────
-
-/// Storage trait — buffer pool + NVMe I/O.
-/// All methods operate on ObjectId, never on Valkey keys.
-pub trait Storage: Send + Sync {
-    // ─── Buffer Pool ─────────────────────────────────────────────────────
-
-    /// Get a buffer from the pool. Returns None if pool exhausted.
-    /// The returned Buffer is owned — Drop returns it to the pool automatically.
-    fn pool_get(&self) -> Option<Buffer>;
-
-    /// Pool buffer size (all buffers are this fixed size).
-    fn pool_buf_size(&self) -> usize;
-
-    // ─── Registration ────────────────────────────────────────────────────
-
-    /// Register pool buffers with io_uring (IORING_REGISTER_BUFFERS).
-    fn register_buffers(&self) -> Result<(), StorageError>;
-
-    /// Deregister pool buffers from io_uring.
-    fn deregister_buffers(&self) -> Result<(), StorageError>;
-
-    // ─── NVMe I/O ───────────────────────────────────────────────────────
-
-    /// Read object from NVMe into buf. Async via io_uring ReadFixed.
-    /// Takes Buffer by value (ownership transfers to storage during I/O).
-    /// Returns (Buffer, bytes_read) in callback — caller gets buf back.
-    fn read_into(&self, object_id: ObjectId, buf: Buffer, len: u64, on_complete: ReadCallback);
-
-    /// Write buf to NVMe as a new object. Async via io_uring.
-    /// Takes Buffer by value. Returns (Buffer, ObjectId, crc32c) via callback.
-    fn write_new(&self, buf: Buffer, len: u64, on_complete: WriteCallback);
-
-    /// Delete an object file from NVMe. Called on key deletion or eviction.
-    fn delete(&self, object_id: ObjectId);
-}
-
-// ─── Global Storage Instance ─────────────────────────────────────────────────
+// ─── Global Pool Instances ───────────────────────────────────────────────────
 
 use std::sync::OnceLock;
-static STORAGE: OnceLock<engine::StorageEngine> = OnceLock::new();
 
-pub fn get() -> &'static engine::StorageEngine {
-    STORAGE.get().expect("storage not initialized")
+static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
+static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
+
+pub fn get_dram_pool() -> &'static DRAMPool {
+    DRAM_POOL.get().expect("DRAMPool not initialized")
 }
 
-/// Called by Buffer::drop() to return a buffer to the pool.
-pub fn return_buffer(pinned: &'static engine::PinnedBuffer, idx: u16) {
-    if let Some(storage) = STORAGE.get() {
-        storage.buffer_pool().put_back(pinned, idx);
-    }
+pub fn get_nvme_pool() -> &'static NVMePool {
+    NVME_POOL.get().expect("NVMePool not initialized")
 }
 
-/// Convenience: delete an object's NVMe file.
-pub fn delete(object_id: crate::data_type::ObjectId) {
-    get().delete_file(object_id);
+// ─── Initialization ──────────────────────────────────────────────────────────
+
+/// Initialize both pools. Called at module startup.
+/// `nvme_segment_size`: total NVMePool segment size (buf_count * buf_size).
+/// `dram_segment_size`: total DRAMPool segment size (configurable, larger).
+/// `data_dir`: NVMe file storage directory.
+pub fn init(nvme_segment_size: usize, dram_segment_size: usize, _data_dir: &str) {
+    // NVMePool: 1 segment, fixed at startup. buf_index starts at 0.
+    let nvme_pool = NVMePool::new(1, nvme_segment_size, 0);
+    NVME_POOL.set(nvme_pool).ok();
+
+    // DRAMPool: 1 segment initially. buf_index starts after NVMePool segments.
+    let nvme_seg_count = get_nvme_pool().segments.len() as u16;
+    let dram_pool = DRAMPool::new(1, dram_segment_size, nvme_seg_count);
+    DRAM_POOL.set(dram_pool).ok();
 }
 
-pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
-    let storage = engine::StorageEngine::new(buf_size, buf_count, data_dir);
-    STORAGE.set(storage).ok();
-    // Fill the pool now that StorageEngine is in the static OnceLock.
-    get().init_pool();
-}
-
-/// Shutdown: drain in-flight ops, close fds, clean up files.
-/// Called from module deinit. TODO: implement when shutdown path is built.
-pub fn shutdown() {
-    // Signal the io_uring poller thread to drain pending ops and exit.
-    // The poller checks the shutdown AtomicBool on each 100ms tick and exits
-    // when set + no pending ops remain. This allows the process to terminate.
-    if let Some(storage) = STORAGE.get() {
-        storage.signal_shutdown();
-    }
-    // Future: FdPool closes all open fds.
-    // Future: Orphan reconciliation (delete .dat files with no keyspace entry).
-}
-
+/// Register ALL segments (both pools) with io_uring as one combined iovec array.
+/// Must be called after init().
 pub fn register_buffers() {
-    let _ = get().register_buffers();
+    let mut iovecs = get_nvme_pool().iovecs();
+    iovecs.extend(get_dram_pool().iovecs());
+
+    // Create io_uring engine with combined iovecs.
+    let engine = uring::UringNvmeEngine::new(iovecs);
+    uring::set_engine(engine);
 }
 
-pub fn deregister_buffers() {
-    let _ = get().deregister_buffers();
+/// Shutdown: signal io_uring poller to exit.
+pub fn shutdown() {
+    uring::shutdown();
 }
 
-/// Return Buffer descriptors for transport layer to fi_mr_reg.
-pub fn pinned_buffers() -> &'static [PinnedBuffer] {
-    get().buffer_descriptors()
+/// Get combined iovecs for transport registration (fi_mr_reg per segment).
+pub fn all_segment_slices() -> Vec<&'static [u8]> {
+    let mut slices = Vec::new();
+    for seg in &get_nvme_pool().segments {
+        slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
+    }
+    for seg in &get_dram_pool().segments {
+        slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
+    }
+    slices
+}
+
+/// Delete an object's NVMe file. Called from free callback.
+pub fn delete_file(object_id: ObjectId) {
+    let dir = crate::data_dir();
+    let path = object_id.file_path(&dir);
+    let _ = std::fs::remove_file(&path);
 }
