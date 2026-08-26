@@ -30,6 +30,26 @@ impl FdPool {
         self.fds.read().unwrap().get(&oid.0).copied()
     }
 
+    /// Get cached fd or open the file and cache it.
+    /// direct-io is IMMUTABLE so fds opened here remain valid for the module's lifetime.
+    pub fn get_or_open(&self, oid: ObjectId, dir: &str) -> Option<RawFd> {
+        if let Some(fd) = self.get(oid) {
+            return Some(fd);
+        }
+        let path = oid.file_path(dir);
+        let c_path = std::ffi::CString::new(path).unwrap();
+        let mut flags = libc::O_RDONLY;
+        if crate::direct_io() {
+            flags |= libc::O_DIRECT;
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return None;
+        }
+        self.insert(oid, fd);
+        Some(fd)
+    }
+
     pub fn insert(&self, oid: ObjectId, fd: RawFd) {
         self.fds.write().unwrap().insert(oid.0, fd);
     }

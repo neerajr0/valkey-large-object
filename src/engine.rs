@@ -135,27 +135,13 @@ fn execute_get_tiered(
 
     // Get fd from FdPool (cached) or open fresh.
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get(object_id) {
-        Some(cached_fd) => cached_fd,
+    let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
+        Some(fd) => fd,
         None => {
-            let dir = crate::data_dir();
-            let path = object_id.file_path(&dir);
-            let c_path = std::ffi::CString::new(path).unwrap();
-            let mut flags = libc::O_RDONLY;
-            if crate::direct_io() {
-                flags |= libc::O_DIRECT;
-            }
-            let new_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-            if new_fd < 0 {
-                nvme_pool.free(&stream_ctx.buffers[0]);
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
-                return;
-            }
-            // Cache the fd for future reads.
-            fd_pool.insert(object_id, new_fd);
-            new_fd
+            nvme_pool.free(&stream_ctx.buffers[0]);
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+            return;
         }
     };
 
@@ -597,25 +583,13 @@ fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
 
     // Get fd from FdPool (cached) or open fresh for promotion read.
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get(object_id) {
-        Some(cached_fd) => cached_fd,
+    let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
+        Some(fd) => fd,
         None => {
-            let dir = crate::data_dir();
-            let path = object_id.file_path(&dir);
-            let c_path = std::ffi::CString::new(path).unwrap();
-            let mut flags = libc::O_RDONLY;
-            if crate::direct_io() {
-                flags |= libc::O_DIRECT;
-            }
-            let new_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-            if new_fd < 0 {
-                // Failed to open — remove the Filling entry and free buffer.
-                dram_pool.remove_object(&object_id);
-                dram_pool.free(&seg_buf);
-                return;
-            }
-            fd_pool.insert(object_id, new_fd);
-            new_fd
+            // Failed to open — remove the Filling entry and free buffer.
+            dram_pool.remove_object(&object_id);
+            dram_pool.free(&seg_buf);
+            return;
         }
     };
 
