@@ -56,8 +56,13 @@ unsafe impl Send for IoRequest {}
 // ─── Pending Operation Tracking ──────────────────────────────────────────────
 
 enum PendingOp {
-    Read { on_complete: ReadCallback },
-    Write { on_complete: WriteCallback, len: u64 },
+    Read {
+        on_complete: ReadCallback,
+    },
+    Write {
+        on_complete: WriteCallback,
+        len: u64,
+    },
 }
 
 // ─── Global Engine ───────────────────────────────────────────────────────────

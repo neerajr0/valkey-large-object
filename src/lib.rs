@@ -16,8 +16,8 @@
 // all steps complete:
 //
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
-//   2. storage::init(buf_size, buf_count, data_dir)
-//                              — allocate pool buffers, create StorageEngine.
+//   2. storage::init(nvme_size, dram_size, data_dir)
+//                              — allocate pool segments, create DRAMPool + NVMePool.
 //                              — scan data_dir for existing .dat files to
 //                                recover OID counter (avoids OID collision).
 //   3. storage::register_buffers()
@@ -40,11 +40,13 @@ use tokio::runtime::Runtime;
 
 pub mod commands;
 pub mod data_type;
+pub mod engine;
 pub mod errors;
 pub mod storage;
 pub mod transport;
 
 use crate::data_type::LO_TYPE;
+use crate::engine::OperatingMode;
 
 pub const MODULE_NAME: &str = "largeobj";
 pub const MODULE_VERSION: i32 = 1;
@@ -55,13 +57,16 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_DATA_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Buffer pool slot size in bytes. Must be 4KB-aligned. Immutable after load.
-    /// Default: 4MB (suitable for KV cache chunks).
-    static ref CFG_POOL_BUF_SIZE: AtomicI64 = AtomicI64::new(4 * 1024 * 1024);
+    /// NVMe pool size in bytes. This is the total segment memory for NVMe I/O buffers.
+    /// Used in Tiered mode for read/write staging. Default: 512MB.
+    /// Immutable after load. Supports memory notation via module args (e.g., "512mb").
+    static ref CFG_NVME_POOL_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
 
-    /// Number of buffer pool slots. Immutable after load.
-    /// Default: 512 (512 * 4MB = 2GB pool).
-    static ref CFG_POOL_BUF_COUNT: AtomicI64 = AtomicI64::new(512);
+    /// DRAM pool size in bytes. This is the total segment memory for the DRAM cache.
+    /// Used in both modes: DRAM-only stores objects here permanently,
+    /// Tiered mode uses it as a promotion cache. Default: 512MB.
+    /// Immutable after load. Supports memory notation via module args (e.g., "2gb").
+    static ref CFG_DRAM_POOL_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
 
     /// Maximum total bytes on NVMe. 0 = unlimited. Supports memory notation (e.g. "10gb").
     static ref CFG_MAX_BYTES: AtomicI64 = AtomicI64::new(0);
@@ -77,15 +82,18 @@ lazy_static::lazy_static! {
     ///
     /// WHY: Large objects (4KB-50MB) would thrash the page cache if buffered. O_DIRECT ensures
     /// NVMe reads/writes go straight to/from our pre-aligned pool buffers without kernel copies.
-    /// Our PinnedBuffer allocations are 4KB-aligned, satisfying O_DIRECT alignment requirements.
     ///
     /// WHEN TO DISABLE: Set to "no" when O_DIRECT writes fail with EINVAL on the target
-    /// environment. Known case: ASAN builds with GCC standalone toolchains where the sanitizer's
-    /// allocator interacts differently with io_uring O_DIRECT buffer alignment validation.
-    /// Not needed on production (XFS/NVMe instance store) or standard CI (ubuntu-latest).
+    /// environment. Known case: ASAN builds where the sanitizer's allocator interacts
+    /// differently with io_uring O_DIRECT buffer alignment validation.
     ///
     /// DEFAULT: yes (production path — always use O_DIRECT on XFS/NVMe instance store).
     static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
+
+    /// Operating mode. Immutable after module load.
+    /// - Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
+    /// - DramOnly (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Tiered);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -103,12 +111,12 @@ pub fn data_dir() -> String {
     CFG_DATA_DIR.lock().unwrap().clone()
 }
 
-pub fn pool_buf_size() -> usize {
-    CFG_POOL_BUF_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn nvme_pool_size() -> usize {
+    CFG_NVME_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn pool_buf_count() -> usize {
-    CFG_POOL_BUF_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn dram_pool_size() -> usize {
+    CFG_DRAM_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_bytes() -> u64 {
@@ -127,25 +135,8 @@ pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// ─── Config Validators ───────────────────────────────────────────────────────
-
-use valkey_module::configuration::ConfigurationContext;
-use valkey_module::configuration::ConfigurationValue;
-use valkey_module::ValkeyError;
-
-fn validate_pool_buf_size<T: ConfigurationValue<i64>>(
-    config_ctx: &ConfigurationContext,
-    _name: &str,
-    val: &'static T,
-) -> Result<(), ValkeyError> {
-    let v = val.get(config_ctx);
-    if v < 4096 {
-        return Err(ValkeyError::Str("pool-buf-size must be at least 4096"));
-    }
-    if !(v as usize).is_multiple_of(4096) {
-        return Err(ValkeyError::Str("pool-buf-size must be 4KB aligned"));
-    }
-    Ok(())
+pub fn operating_mode() -> OperatingMode {
+    *CFG_OPERATING_MODE.lock().unwrap()
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -176,24 +167,26 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();
 
-    // Step 2: Initialize DRAMPool + NVMePool.
-    let nvme_segment_size = pool_buf_size() * pool_buf_count(); // e.g., 4MB * 512 = 2GB
-    let dram_segment_size = nvme_segment_size; // Same size for now — configurable later.
-    storage::init(nvme_segment_size, dram_segment_size, &dir);
+    // Step 2: Initialize DRAMPool + NVMePool with configured sizes.
+    let mode = operating_mode();
+    let nvme_size = nvme_pool_size();
+    let dram_size = dram_pool_size();
+    storage::init(nvme_size, dram_size, &dir);
 
     // Step 3: Register all segments with io_uring.
     storage::register_buffers();
 
     // Step 4: Transport::register_buffers() — fi_mr_reg per segment.
     let slices = storage::all_segment_slices();
-    let slice_refs: Vec<&[u8]> = slices.iter().map(|s| *s).collect();
+    let slice_refs: Vec<&[u8]> = slices.to_vec();
     transport::register_buffers(&slice_refs);
 
     ctx.log_notice(&format!(
-        "largeobj: initialized data_dir={} nvme_pool={}MB dram_pool={}MB transport_threads={}",
+        "largeobj: initialized mode={:?} data_dir={} nvme_pool={}MB dram_pool={}MB transport_threads={}",
+        mode,
         dir,
-        nvme_segment_size / (1024 * 1024),
-        dram_segment_size / (1024 * 1024),
+        nvme_size / (1024 * 1024),
+        dram_size / (1024 * 1024),
         transport_threads(),
     ));
 
@@ -221,10 +214,10 @@ valkey_module! {
     ],
     configurations: [
         i64: [
-            ["pool-buf-size", &*CFG_POOL_BUF_SIZE, 4_194_304, 4096, 1_073_741_824,
-             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<AtomicI64>))],
-            ["pool-buf-count", &*CFG_POOL_BUF_COUNT, 512, 1, 65536,
-             ConfigurationFlags::IMMUTABLE, None, None],
+            ["nvme-pool-size", &*CFG_NVME_POOL_SIZE, 536_870_912, 1_048_576, 1_099_511_627_776,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["dram-pool-size", &*CFG_DRAM_POOL_SIZE, 536_870_912, 1_048_576, 1_099_511_627_776,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
             ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
@@ -237,7 +230,10 @@ valkey_module! {
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
-        enum: [],
+        enum: [
+            ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Tiered,
+             ConfigurationFlags::IMMUTABLE, None],
+        ],
         module_args_as_configuration: true,
     ]
 }

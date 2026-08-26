@@ -69,7 +69,10 @@ impl NVMePool {
         let ptr = unsafe { seg.base.add(buf.offset as usize) };
         let layout = Layout::from_size_align(buf.len as usize, 4096).unwrap();
         unsafe {
-            self.allocator.lock().unwrap().free(NonNull::new_unchecked(ptr), layout);
+            self.allocator
+                .lock()
+                .unwrap()
+                .free(NonNull::new_unchecked(ptr), layout);
         }
         seg.dec_ref();
     }
@@ -78,7 +81,11 @@ impl NVMePool {
 
     /// Get absolute pointer for a SegmentBuffer.
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
-        unsafe { self.segments[buf.segment_idx as usize].base.add(buf.offset as usize) }
+        unsafe {
+            self.segments[buf.segment_idx as usize]
+                .base
+                .add(buf.offset as usize)
+        }
     }
 
     /// Get iovecs for io_uring registration.

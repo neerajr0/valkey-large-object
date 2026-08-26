@@ -62,6 +62,8 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     // Remove from DRAMPool (if cached). Arc<ObjectContext> Drop frees buffers.
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    // Close cached fd (FdPool owns the lifecycle).
+    crate::storage::get_fd_pool().remove(lo.object_id);
     // Delete NVMe file.
     crate::storage::delete_file(lo.object_id);
 }

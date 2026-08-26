@@ -15,6 +15,7 @@ pub mod uring;
 // Re-exports for convenience.
 pub use context::{ObjectContext, ObjectState, SegmentBuffer, StreamingContext};
 pub use dram_pool::DRAMPool;
+pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;
 
 // ─── Error Types ─────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ use std::sync::OnceLock;
 
 static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
+static FD_POOL: OnceLock<FdPool> = OnceLock::new();
 
 pub fn get_dram_pool() -> &'static DRAMPool {
     DRAM_POOL.get().expect("DRAMPool not initialized")
@@ -49,6 +51,10 @@ pub fn get_dram_pool() -> &'static DRAMPool {
 
 pub fn get_nvme_pool() -> &'static NVMePool {
     NVME_POOL.get().expect("NVMePool not initialized")
+}
+
+pub fn get_fd_pool() -> &'static FdPool {
+    FD_POOL.get().expect("FdPool not initialized")
 }
 
 // ─── Initialization ──────────────────────────────────────────────────────────
@@ -66,6 +72,10 @@ pub fn init(nvme_segment_size: usize, dram_segment_size: usize, _data_dir: &str)
     let nvme_seg_count = get_nvme_pool().segments.len() as u16;
     let dram_pool = DRAMPool::new(1, dram_segment_size, nvme_seg_count);
     DRAM_POOL.set(dram_pool).ok();
+
+    // FdPool: caches open file descriptors for NVMe object files.
+    // Currently basic HashMap; will be upgraded to Arc<FdEntry> + LFRU eviction.
+    FD_POOL.set(FdPool::new()).ok();
 }
 
 /// Register ALL segments (both pools) with io_uring as one combined iovec array.

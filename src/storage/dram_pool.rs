@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use talc::{ClaimOnOom, Span, Talc};
 
-use crate::data_type::ObjectId;
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment::Segment;
+use crate::data_type::ObjectId;
 
 pub struct DRAMPool {
     /// Segments owned by this pool.
@@ -59,7 +59,10 @@ impl DRAMPool {
         let addr = ptr.as_ptr() as usize;
 
         let (seg_idx, offset) = self.find_segment(addr)?;
-        if self.segments[seg_idx].draining.load(std::sync::atomic::Ordering::Acquire) {
+        if self.segments[seg_idx]
+            .draining
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             // Segment draining — free immediately, return None.
             unsafe { self.allocator.lock().unwrap().free(ptr, layout) };
             return None;
@@ -79,7 +82,10 @@ impl DRAMPool {
         let ptr = unsafe { seg.base.add(buf.offset as usize) };
         let layout = Layout::from_size_align(buf.len as usize, 4096).unwrap();
         unsafe {
-            self.allocator.lock().unwrap().free(NonNull::new_unchecked(ptr), layout);
+            self.allocator
+                .lock()
+                .unwrap()
+                .free(NonNull::new_unchecked(ptr), layout);
         }
         seg.dec_ref();
     }
@@ -115,7 +121,11 @@ impl DRAMPool {
 
     /// Get absolute pointer for a SegmentBuffer.
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
-        unsafe { self.segments[buf.segment_idx as usize].base.add(buf.offset as usize) }
+        unsafe {
+            self.segments[buf.segment_idx as usize]
+                .base
+                .add(buf.offset as usize)
+        }
     }
 
     /// Get iovecs for io_uring registration.

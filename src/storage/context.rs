@@ -33,10 +33,7 @@ pub enum ObjectState {
     Ready,
     /// Promotion in progress — batched ReadFixed filling buffers.
     /// `chunks_ready` advances by batch_size atomically after each batch completes.
-    Filling {
-        chunks_ready: AtomicU32,
-        total: u32,
-    },
+    Filling { chunks_ready: AtomicU32, total: u32 },
 }
 
 // ─── ObjectContext ───────────────────────────────────────────────────────────
@@ -164,8 +161,16 @@ mod tests {
     #[test]
     fn test_object_context_ready() {
         let bufs = vec![
-            SegmentBuffer { segment_idx: 0, offset: 0, len: 1024 },
-            SegmentBuffer { segment_idx: 0, offset: 1024, len: 1024 },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 0,
+                len: 1024,
+            },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 1024,
+                len: 1024,
+            },
         ];
         let ctx = ObjectContext::new_ready(bufs, 2048);
         assert!(ctx.is_ready());
@@ -175,9 +180,21 @@ mod tests {
     #[test]
     fn test_object_context_filling() {
         let bufs = vec![
-            SegmentBuffer { segment_idx: 0, offset: 0, len: 8_000_000 },
-            SegmentBuffer { segment_idx: 0, offset: 8_000_000, len: 8_000_000 },
-            SegmentBuffer { segment_idx: 1, offset: 0, len: 8_000_000 },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 0,
+                len: 8_000_000,
+            },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 8_000_000,
+                len: 8_000_000,
+            },
+            SegmentBuffer {
+                segment_idx: 1,
+                offset: 0,
+                len: 8_000_000,
+            },
         ];
         let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3);
         assert!(!ctx.is_ready());
@@ -193,8 +210,16 @@ mod tests {
     #[test]
     fn test_streaming_context_progress() {
         let bufs = vec![
-            SegmentBuffer { segment_idx: 0, offset: 0, len: 8_000_000 },
-            SegmentBuffer { segment_idx: 0, offset: 8_000_000, len: 8_000_000 },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 0,
+                len: 8_000_000,
+            },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 8_000_000,
+                len: 8_000_000,
+            },
         ];
         let mut ctx = StreamingContext::new_for_set(bufs, 50_000_000);
         assert!(!ctx.is_complete());

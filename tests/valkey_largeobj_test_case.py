@@ -26,7 +26,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         direct_io = "no" if os.environ.get("ASAN_BUILD") else "yes"
         args = {
             'enable-debug-command': 'yes',
-            'loadmodule': f"{module_path} data-dir {data_dir} pool-buf-size 4096 pool-buf-count 128 bench-mode no direct-io {direct_io}",
+            'loadmodule': f"{module_path} data-dir {data_dir} nvme-pool-size 1048576 dram-pool-size 1048576 bench-mode no direct-io {direct_io}",
         }
         server_path = f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/{os.environ['SERVER_VERSION']}/valkey-server"
         self.server, self.client = self.create_server(

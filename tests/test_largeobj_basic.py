@@ -1,5 +1,6 @@
 import os
 import glob
+from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 
 
@@ -49,14 +50,17 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         assert len(dat_files_after) < len(dat_files_before)
 
     def test_pool_exhaustion_error(self):
-        """Exceeding pool-buf-count returns an error."""
+        """An object larger than the NVMe pool segment fails allocation."""
         client = self.server.get_new_client()
-        # pool-buf-size is 4096, so 8192 should fail.
-        self.verify_error_response(
-            client,
-            'LO.SET bigkey 8192 ' + 'A' * 8192,
-            'object exceeds buffer size',
-        )
+        # NVMe pool is 1MB. An object of 2MB cannot be allocated.
+        obj_size = 2 * 1024 * 1024
+        payload = 'A' * obj_size
+        try:
+            client.execute_command(f'LO.SET toobig {obj_size} {payload}')
+            assert False, "Expected error for object larger than pool but command succeeded"
+        except ResponseError as e:
+            # Allocation failure from talc when object exceeds segment capacity.
+            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_bench_mode_reply_format(self):
         """With bench-mode=yes, LO.GET returns integer size."""
