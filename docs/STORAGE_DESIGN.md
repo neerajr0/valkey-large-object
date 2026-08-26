@@ -919,6 +919,204 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 
 **Summary:** Main thread handles only the synchronous fast paths (DRAM hit over TCP, DRAM-only SET over TCP). Everything involving NVMe I/O or EFA transport goes through tokio.
 
+**Thread flow diagrams (swimlanes):**
+
+```
+Case 1: TCP GET, DRAMPool hit
+─────────────────────────────
+    Main Thread
+    ───────────
+    │ RwLock.read() → DRAMPool HashMap
+    │ Arc<ObjectContext>.clone()
+    │ VM_ReplyWithStringBuffer(buffer)
+    │ Arc drop
+    ▼ done (no spawn, no I/O)
+```
+
+```
+Case 2: TCP GET, DRAMPool miss (Tiered, no promote)
+────────────────────────────────────────────────────
+    Main Thread              Tokio Task                io-poller
+    ───────────              ──────────                ─────────
+    │ Lookup → miss
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ nvme_pool_talc.lock().alloc(X buffers)
+    │                     │ FdPool.read() → Arc<FdEntry>.clone()
+    │                     │
+    │                     │ [batch loop — accumulate all data]:
+    │                     │──submit_read_batch────────→│ queue X ReadFixed SQEs
+    │                     │                            │ io_uring_submit()
+    │                     │                            │ CQEs arrive → oneshot.send()
+    │                     │←─rx.await─────────────────│
+    │                     │ [next batch until entire object read...]
+    │                     │
+    │                     │ unblock with single reply (full object ≤ 256MB)
+    │←──UnblockClient + VM_ReplyWithStringBuffer(all data)
+    │                     │ nvme_pool_talc.lock().free(X buffers)
+    │                     │ Arc<FdEntry> drop
+    ▼                     ▼
+    (Object must be ≤ lo-max-tcp-object-size for TCP. Larger → rejected at §7.7.)
+```
+
+```
+Case 3: TCP GET, DRAMPool miss (Tiered, promote)
+─────────────────────────────────────────────────
+    Main Thread              Tokio Task                io-poller
+    ───────────              ──────────                ─────────
+    │ Lookup → miss
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ dram_pool_talc.lock().alloc(N buffers — full object)
+    │                     │ RwLock.write() → insert ObjectContext{Filling}
+    │                     │ FdPool.read() → Arc<FdEntry>.clone()
+    │                     │
+    │                     │ [batch loop]:
+    │                     │──submit_read_batch────────→│ ReadFixed into DRAMPool buffers
+    │                     │                            │ oneshot.send()
+    │                     │←─rx.await─────────────────│
+    │                     │ state = Filling{chunks_ready += batch_size}
+    │                     │ wake coalesced waiters (if any)
+    │                     │ [next batch...]
+    │                     │
+    │                     │ state = Ready
+    │                     │ wake all remaining waiters
+    │                     │ UnblockClient + VM_ReplyWithStringBuffer(ObjectContext buffers)
+    │←──single reply──────│
+    ▼                     ▼
+```
+
+```
+Case 4: TCP SET (DRAM-only)
+────────────────────────────
+    Main Thread
+    ───────────
+    │ dram_pool_talc.lock().alloc(N buffers)
+    │ memcpy(querybuf → DRAMPool buffers) per chunk
+    │ crc_hasher.update() per chunk
+    │ verify CRC
+    │ RwLock.write() → insert ObjectContext{Ready}
+    │ create LoValue
+    │ reply OK
+    ▼ done (no spawn, no I/O)
+```
+
+```
+Case 5: TCP SET (Tiered)
+─────────────────────────
+    Main Thread              Tokio Task                io-poller
+    ───────────              ──────────                ─────────
+    │ fallocate NVMe file
+    │ FdPool.write() → open fd, insert Arc<FdEntry>
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ nvme_pool_talc.lock().alloc(X buffers)
+    │                     │
+    │                     │ [batch loop]:
+    │                     │ memcpy(querybuf → buffers)
+    │                     │ crc_hasher.update()
+    │                     │──submit_write_batch───────→│ WriteFixed SQEs
+    │                     │                            │ oneshot.send()
+    │                     │←─rx.await─────────────────│
+    │                     │ [next batch...]
+    │                     │
+    │                     │ verify CRC
+    │                     │ create LoValue
+    │                     │ nvme_pool_talc.lock().free(X buffers)
+    │←──unblock client────│
+    ▼                     ▼
+```
+
+```
+Case 6: EFA SET (Tiered)
+─────────────────────────
+    Main Thread              Tokio Task                io-poller
+    ───────────              ──────────                ─────────
+    │ fallocate NVMe file
+    │ FdPool.write() → open fd
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ nvme_pool_talc.lock().alloc(X buffers)
+    │                     │
+    │                     │ [batch loop]:
+    │                     │ transport.read(client → buffer).await  ← EFA
+    │                     │ crc_hasher.update()
+    │                     │──submit_write_batch───────→│ WriteFixed SQEs
+    │                     │                            │ oneshot.send()
+    │                     │←─rx.await─────────────────│
+    │                     │ [next batch...]
+    │                     │
+    │                     │ verify CRC
+    │                     │ create LoValue
+    │                     │ nvme_pool_talc.lock().free(X buffers)
+    │←──unblock client────│
+    ▼                     ▼
+```
+
+```
+Case 7: EFA GET, DRAMPool hit
+──────────────────────────────
+    Main Thread              Tokio Task
+    ───────────              ──────────
+    │ RwLock.read() → DRAMPool HashMap
+    │ Arc<ObjectContext>.clone()
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ [batch loop — send cached buffers to client]:
+    │                     │ transport.write(buffer[i], chunk_len, client_addr + offset, rkey).await
+    │                     │ [next batch...]
+    │                     │
+    │                     │ Arc<ObjectContext> drop
+    │←──UnblockClient + OK
+    ▼                     ▼
+    (No NVMe I/O. No io-poller. Data served directly from DRAMPool via EFA.)
+```
+
+```
+Case 8: EFA GET, DRAMPool miss (Tiered, no promote)
+─────────────────────────────────────────────────────
+    Main Thread              Tokio Task                io-poller
+    ───────────              ──────────                ─────────
+    │ Lookup → miss
+    │ BlockedClient
+    │──spawn────────────→ │
+    │                     │ nvme_pool_talc.lock().alloc(X buffers)
+    │                     │ FdPool.read() → Arc<FdEntry>.clone()
+    │                     │
+    │                     │ [batch loop]:
+    │                     │──submit_read_batch────────→│ ReadFixed SQEs
+    │                     │                            │ oneshot.send()
+    │                     │←─rx.await─────────────────│
+    │                     │ transport.write(buffer[i], ...).await per chunk in batch
+    │                     │ [next batch...]
+    │                     │
+    │                     │ nvme_pool_talc.lock().free(X buffers)
+    │                     │ Arc<FdEntry> drop
+    │←──UnblockClient + OK
+    ▼                     ▼
+    (EFA can stream per-batch — no single-reply constraint. Unlimited object size.)
+```
+
+```
+Case 9: Free callback (DEL / eviction)
+────────────────────────────────────────
+    Main Thread                                       io-poller
+    ───────────                                       ─────────
+    │ [free_callback(LoValue)]
+    │ LoValue freed (key gone from keyspace)
+    │
+    │ RwLock.write() → DRAMPool HashMap.remove(oid)
+    │   └→ Arc<ObjectContext> drop
+    │       └→ if last ref: dram_pool_talc.lock().free(buffers)
+    │
+    │ RwLock.write() → FdPool.remove(oid)
+    │   └→ Arc<FdEntry> drop
+    │       └→ if last ref: close(fd)
+    │
+    │ dispatch unlink ───────────────────────────────→│ unlink SQE
+    ▼ done                                            ▼
+```
+
 ### 9.3 Global State and Lock Table
 
 | Global | Type | Lock | Threads that access |
