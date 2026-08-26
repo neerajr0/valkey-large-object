@@ -182,75 +182,81 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let blocked_client = ctx.block_client();
 
-    // Submit ReadFixed to io_uring. Callback fires on io-poller thread.
-    uring::submit(uring::IoRequest::Read {
-        fd,
-        buf_index,
-        buf_ptr,
-        file_offset: 0,
-        len: obj_len,
-        on_complete: Box::new(move |result| {
-            unsafe { libc::close(fd) };
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    // Spawn tokio task for async NVMe read + optional EFA write.
+    // io_uring callback fires oneshot → tokio task resumes → replies.
+    crate::runtime_handle().spawn(async move {
+        // Reconstruct pointer from usize (safe: segment memory is stable for module lifetime).
+        let buf_ptr_local = buf_ptr_usize as *mut u8;
 
-            match result {
-                Ok(_bytes_read) => {
-                    if let Some((_rkey, _remote_addr)) = efa_args {
-                        // ─── EFA path: RDMA write buf → client GPU ───────────
-                        // session_arc was cloned before entering this callback.
-                        if let Some(session) = session_arc {
-                            let buf_ptr_raw = buf_ptr_usize as *mut u8;
-                            session.write(
-                                buf_ptr_raw,
-                                obj_len as usize,
-                                _rkey,
-                                _remote_addr,
-                                Box::new(move |_buf_ptr, write_result| {
-                                    storage::get_nvme_pool().free(&seg_buf);
-                                    match write_result {
-                                        Ok(()) => {
-                                            thread_ctx.reply(Ok(ValkeyValue::Integer(
-                                                obj_len as i64,
-                                            )));
-                                        }
-                                        Err(e) => {
-                                            thread_ctx.reply(Err(ValkeyError::String(format!(
-                                                "{}: {}",
-                                                errors::ERR_EFA_WRITE,
-                                                e
-                                            ))));
-                                        }
-                                    }
-                                }),
-                            );
-                        } else {
-                            storage::get_nvme_pool().free(&seg_buf);
-                            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_SESSION_GONE)));
+        // Submit ReadFixed via oneshot bridge — await completion.
+        let read_result = uring::submit_read(fd, buf_index, buf_ptr_local, 0, obj_len).await;
+        unsafe { libc::close(fd) };
+
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+
+        match read_result {
+            Ok(Ok(_bytes_read)) => {
+                if let Some((rkey, remote_addr)) = efa_args {
+                    // ─── EFA path: RDMA write buf → client GPU ───────────
+                    // TODO: Replace with transport.write().await when transport is async.
+                    // For now: use the stub session.write (fires callback synchronously).
+                    if let Some(session) = session_arc {
+                        let buf_ptr_raw = buf_ptr_usize as *mut u8;
+                        let (efa_tx, efa_rx) = tokio::sync::oneshot::channel();
+                        session.write(
+                            buf_ptr_raw,
+                            obj_len as usize,
+                            rkey,
+                            remote_addr,
+                            Box::new(move |_buf_ptr, write_result| {
+                                let _ = efa_tx.send(write_result);
+                            }),
+                        );
+                        match efa_rx.await {
+                            Ok(Ok(())) => {
+                                storage::get_nvme_pool().free(&seg_buf);
+                                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                            }
+                            Ok(Err(e)) => {
+                                storage::get_nvme_pool().free(&seg_buf);
+                                thread_ctx.reply(Err(ValkeyError::String(format!(
+                                    "{}: {}", errors::ERR_EFA_WRITE, e
+                                ))));
+                            }
+                            Err(_) => {
+                                storage::get_nvme_pool().free(&seg_buf);
+                                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_WRITE)));
+                            }
                         }
                     } else {
-                        // ─── TCP path: reply with object data ─────────────────
-                        // Use obj_len (true length), not _bytes_read (aligned).
-                        let data = unsafe {
-                            std::slice::from_raw_parts(
-                                buf_ptr_usize as *const u8,
-                                obj_len as usize,
-                            )
-                            .to_vec()
-                        };
                         storage::get_nvme_pool().free(&seg_buf);
-                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_SESSION_GONE)));
                     }
-                }
-                Err(e) => {
+                } else {
+                    // ─── TCP path: reply with object data ─────────────────
+                    let data = unsafe {
+                        std::slice::from_raw_parts(
+                            buf_ptr_usize as *const u8,
+                            obj_len as usize,
+                        )
+                        .to_vec()
+                    };
                     storage::get_nvme_pool().free(&seg_buf);
-                    thread_ctx.reply(Err(ValkeyError::String(format!(
-                        "{}: {}",
-                        errors::ERR_NVME_READ,
-                        e
-                    ))));
+                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
                 }
             }
-        }),
+            Ok(Err(e)) => {
+                storage::get_nvme_pool().free(&seg_buf);
+                thread_ctx.reply(Err(ValkeyError::String(format!(
+                    "{}: {}", errors::ERR_NVME_READ, e
+                ))));
+            }
+            Err(_) => {
+                // Oneshot channel dropped — io_uring poller died.
+                storage::get_nvme_pool().free(&seg_buf);
+                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+            }
+        }
     });
 
     Ok(ValkeyValue::NoReply)
@@ -372,7 +378,8 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // ─── Shared NVMe Write Logic ─────────────────────────────────────────────────
 //
 // Used by both TCP and EFA SET paths after the buffer is filled.
-// Computes CRC, opens tmp file, submits WriteFixed, on completion renames + creates LoValue.
+// Spawns a tokio task that: computes CRC, opens tmp file, awaits WriteFixed,
+// then renames + creates LoValue.
 
 fn do_nvme_write(
     buf_ptr: *mut u8,
@@ -381,7 +388,7 @@ fn do_nvme_write(
     blocked_client: valkey_module::BlockedClient,
     key_for_reply: Vec<u8>,
 ) {
-    // Compute CRC over actual object bytes.
+    // Compute CRC over actual object bytes (on main thread — data is ready).
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
     // Open tmp file for write.
@@ -405,53 +412,54 @@ fn do_nvme_write(
     let nvme_pool = storage::get_nvme_pool();
     let buf_index = nvme_pool.segments[seg_buf.segment_idx as usize].buf_index;
     let seg_buf_clone = seg_buf.clone();
+    let buf_ptr_usize = buf_ptr as usize; // Cast for Send across thread boundary.
 
-    // Submit WriteFixed. Callback fires on io-poller thread.
-    uring::submit(uring::IoRequest::Write {
-        fd,
-        buf_index,
-        buf_ptr: buf_ptr as *const u8,
-        file_offset: 0,
-        len: obj_len,
-        on_complete: Box::new(move |result| {
-            unsafe { libc::close(fd) };
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    // Spawn tokio task — await WriteFixed completion via oneshot bridge.
+    crate::runtime_handle().spawn(async move {
+        let buf_ptr_local = buf_ptr_usize as *const u8;
+        let write_result = uring::submit_write(fd, buf_index, buf_ptr_local, 0, obj_len).await;
+        unsafe { libc::close(fd) };
 
-            match result {
-                Ok(()) => {
-                    // Atomic rename: tmp → final.
-                    if std::fs::rename(&tmp_path, &file_path).is_ok() {
-                        // Create LoValue in keyspace (requires lock on ThreadSafeContext).
-                        {
-                            let ctx = thread_ctx.lock();
-                            let key_str = ctx.create_string(key_for_reply);
-                            let key = ctx.open_key_writable(&key_str);
-                            let lo_value = LoValue {
-                                object_id: oid,
-                                len: obj_len,
-                                crc32c: crc,
-                            };
-                            key.set_value(&LO_TYPE, lo_value).unwrap();
-                        }
-                        storage::get_nvme_pool().free(&seg_buf_clone);
-                        thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-                    } else {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        storage::get_nvme_pool().free(&seg_buf_clone);
-                        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+
+        match write_result {
+            Ok(Ok(())) => {
+                // Atomic rename: tmp → final.
+                if std::fs::rename(&tmp_path, &file_path).is_ok() {
+                    // Create LoValue in keyspace (requires lock on ThreadSafeContext).
+                    {
+                        let ctx = thread_ctx.lock();
+                        let key_str = ctx.create_string(key_for_reply);
+                        let key = ctx.open_key_writable(&key_str);
+                        let lo_value = LoValue {
+                            object_id: oid,
+                            len: obj_len,
+                            crc32c: crc,
+                        };
+                        key.set_value(&LO_TYPE, lo_value).unwrap();
                     }
-                }
-                Err(e) => {
+                    storage::get_nvme_pool().free(&seg_buf_clone);
+                    thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                } else {
                     let _ = std::fs::remove_file(&tmp_path);
                     storage::get_nvme_pool().free(&seg_buf_clone);
-                    thread_ctx.reply(Err(ValkeyError::String(format!(
-                        "{}: {}",
-                        errors::ERR_NVME_WRITE,
-                        e
-                    ))));
+                    thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
                 }
             }
-        }),
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                storage::get_nvme_pool().free(&seg_buf_clone);
+                thread_ctx.reply(Err(ValkeyError::String(format!(
+                    "{}: {}", errors::ERR_NVME_WRITE, e
+                ))));
+            }
+            Err(_) => {
+                // Oneshot dropped — io_uring poller died.
+                let _ = std::fs::remove_file(&tmp_path);
+                storage::get_nvme_pool().free(&seg_buf_clone);
+                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+            }
+        }
     });
 }
 
