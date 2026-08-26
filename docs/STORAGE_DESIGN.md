@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-The module stores large objects (15KB–8MB) and must serve them via two transports:
+The module stores large objects (15KB to multi-GB (TBD)) and must serve them via two transports:
 - **TCP:** standard RESP reply
 - **EFA:** RDMA fi_write directly to client GPU memory
 
@@ -214,7 +214,9 @@ EFA `fi_write` has no alignment constraint — sends exact `len`.
 Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
-Objects exceeding the largest supported size are rejected at `LO.SET` with `ERR object exceeds max buffer size`. No multi-buffer stitching, no fallback path. Client (LMCache) already chunks by layer/block and can chunk smaller. Module advertises max size via config.
+- **TCP:** Objects exceeding `lo-max-tcp-object-size` (default 256MB) are rejected — Valkey's querybuf cannot stream (§6.8).
+- **EFA:** No hard max. Objects larger than a single buffer are handled via multi-buffer parallel I/O (§6.3–§6.4) or streaming mode (§6.9). The module chunks internally using `lo-buffer-size`.
+- **NVMe capacity:** Objects exceeding available NVMe space are rejected at `LO.SET`.
 
 ---
 
