@@ -376,10 +376,33 @@ struct StreamingContext {
 
 Each object is one file: `/data/lo-data/{oid:016x}.dat`
 
+**File header (25 bytes at start of file; data starts at offset 4096 for O_DIRECT alignment):**
+```rust
+#[repr(C)]
+struct FileHeader {
+    magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
+    version: u8,        // 1 — enables future format changes
+    object_id: u64,     // Matches LoValue.object_id
+    len: u64,           // True object length (before O_DIRECT padding)
+    crc32c: u32,        // Integrity checksum (same as LoValue.crc32c)
+}
+```
+
+**File layout:**
+```
+[0..25):         FileHeader (25 bytes)
+[25..4096):      Unused (padding — aligns data start to 4KB for O_DIRECT)
+[4096..4096+len): Object data
+[4096+len..):    O_DIRECT write padding to 512-byte boundary
+```
+
+Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the data portion are naturally 4KB-aligned. The header page is read only during recovery/reconciliation — never on the hot serving path (LoValue in keyspace has all needed metadata).
+
+**Runtime references:**
 - fd opened at LO.SET, held in FdPool (`HashMap<ObjectId, RawFd>`)
 - Lookup: `fd_pool.get(object_id)` → RawFd for io_uring submission
-- File size = `ceil(len / 512) * 512` (O_DIRECT 512-byte write alignment padding)
-- Actual object length stored in `LoValue.len` (not derived from file size)
+- File size = `4096 + ceil(len / 512) * 512` (header page + O_DIRECT-padded data)
+- Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL: `fd_pool.remove(oid)` closes fd, then `unlink()` deletes file
 
 ### 6.4 ObjectContext Lifetimes
