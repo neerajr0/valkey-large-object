@@ -40,7 +40,17 @@ impl std::fmt::Display for StorageError {
 
 // ─── Global Pool Instances ───────────────────────────────────────────────────
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::OnceLock;
+
+/// Global monotonic counter for io_uring iovec indices.
+/// Each segment gets a unique index. Pools call alloc_iovec_indices() internally.
+static NEXT_IOVEC_INDEX: AtomicU16 = AtomicU16::new(0);
+
+/// Allocate `count` consecutive iovec indices. Returns the starting index.
+pub fn alloc_iovec_indices(count: u16) -> u16 {
+    NEXT_IOVEC_INDEX.fetch_add(count, Ordering::Relaxed)
+}
 
 static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
@@ -65,13 +75,12 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// `dram_segment_size`: total DRAMPool segment size (configurable, larger).
 /// `data_dir`: NVMe file storage directory.
 pub fn init(nvme_segment_size: usize, dram_segment_size: usize, _data_dir: &str) {
-    // NVMePool: 1 segment, fixed at startup. buf_index starts at 0.
-    let nvme_pool = NVMePool::new(1, nvme_segment_size, 0);
+    // NVMePool: 1 segment, fixed at startup.
+    let nvme_pool = NVMePool::new(1, nvme_segment_size);
     NVME_POOL.set(nvme_pool).ok();
 
-    // DRAMPool: 1 segment initially. buf_index starts after NVMePool segments.
-    let nvme_seg_count = get_nvme_pool().segments().len() as u16;
-    let dram_pool = DRAMPool::new(1, dram_segment_size, nvme_seg_count);
+    // DRAMPool: 1 segment initially.
+    let dram_pool = DRAMPool::new(1, dram_segment_size);
     DRAM_POOL.set(dram_pool).ok();
 
     // FdPool: caches open file descriptors for NVMe object files.

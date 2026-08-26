@@ -160,13 +160,19 @@ fn execute_get_tiered(
     };
 
     let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
-    let buf_index = nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].buf_index;
+    // Single-chunk today: one UringOp for the entire object.
+    // Streaming PR will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    let read_op = uring::UringOp {
+        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        buf_ptr: buf_ptr_usize as *mut u8,
+        file_offset: 0,
+        len: obj_len,
+    };
 
     // Spawn tokio task for NVMe read + serve + optional promotion.
     crate::runtime_handle().spawn(async move {
         // submit_read takes *mut u8 — construct from usize at call site (no raw ptr across await).
-        let read_result =
-            uring::submit_read(fd, buf_index, buf_ptr_usize as *mut u8, 0, obj_len).await;
+        let read_result = uring::submit_read(fd, &read_op).await;
         // fd is NOT closed here — FdPool owns it for future reads.
 
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -484,10 +490,16 @@ async fn do_tiered_nvme_write(
     }
 
     let nvme_pool = storage::get_nvme_pool();
-    let buf_index = nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].buf_index;
+    // Single-chunk today: one UringOp for the entire object.
+    // Streaming PR will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    let write_op = uring::UringOp {
+        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        buf_ptr: buf_ptr_usize as *mut u8,
+        file_offset: 0,
+        len: obj_len,
+    };
 
-    let buf_ptr_local = buf_ptr_usize as *const u8;
-    let write_result = uring::submit_write(fd, buf_index, buf_ptr_local, 0, obj_len).await;
+    let write_result = uring::submit_write(fd, &write_op).await;
     unsafe { libc::close(fd) };
 
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -568,7 +580,12 @@ fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
     };
 
     let buf_ptr = dram_pool.buffer_ptr(&seg_buf) as usize;
-    let buf_index = dram_pool.segments()[seg_buf.segment_idx as usize].buf_index;
+    let promote_op = uring::UringOp {
+        iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
+        buf_ptr: buf_ptr as *mut u8,
+        file_offset: 0,
+        len: obj_len,
+    };
 
     // Insert as Filling (visible but not yet servable).
     let obj_ctx = Arc::new(ObjectContext::new_filling(
@@ -604,8 +621,7 @@ fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
 
     // Spawn promotion read (fire-and-forget — doesn't block the original GET reply).
     crate::runtime_handle().spawn(async move {
-        let buf_ptr_local = buf_ptr as *mut u8;
-        let result = uring::submit_read(fd, buf_index, buf_ptr_local, 0, obj_len).await;
+        let result = uring::submit_read(fd, &promote_op).await;
         // fd is NOT closed here — FdPool owns it for future reads.
 
         match result {

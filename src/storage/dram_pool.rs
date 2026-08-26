@@ -19,9 +19,9 @@ pub struct DRAMPool {
 }
 
 impl DRAMPool {
-    pub fn new(segment_count: usize, segment_size: usize, base_buf_index: u16) -> Self {
+    pub fn new(segment_count: usize, segment_size: usize) -> Self {
         Self {
-            pool: SegmentPool::new(segment_count, segment_size, base_buf_index),
+            pool: SegmentPool::new(segment_count, segment_size),
             objects: RwLock::new(HashMap::new()),
         }
     }

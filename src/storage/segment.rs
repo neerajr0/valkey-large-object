@@ -16,8 +16,8 @@ pub struct Segment {
     pub base: *mut u8,
     /// Total size in bytes.
     pub size: usize,
-    /// Index in the io_uring iovec registration array (buf_index for ReadFixed/WriteFixed).
-    pub buf_index: u16,
+    /// Index in the io_uring iovec registration array (for ReadFixed/WriteFixed).
+    pub iovec_index: u16,
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
@@ -28,7 +28,7 @@ pub struct Segment {
 impl Segment {
     /// Allocate a new segment via ValkeyAlloc (alloc_zeroed).
     /// Visible in Valkey's used_memory immediately.
-    pub fn new(size: usize, buf_index: u16) -> Self {
+    pub fn new(size: usize, iovec_index: u16) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
@@ -36,7 +36,7 @@ impl Segment {
         Self {
             base,
             size,
-            buf_index,
+            iovec_index,
             refcount: AtomicU32::new(0),
             draining: AtomicBool::new(false),
         }

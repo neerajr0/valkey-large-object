@@ -6,6 +6,11 @@
 //! - ObjectContext: lives in DRAMPool HashMap, long-lived, complete object.
 //! - StreamingContext: lives on a tokio task, short-lived, partial buffer window.
 //! - SegmentBuffer: a slice within a registered segment (DRAMPool or NVMePool).
+//!
+//! NOTE: CRC32c is NOT stored on either context struct. It is a local variable
+//! in the tokio task that performs the SET. The task computes the rolling CRC as
+//! chunks arrive (`let mut crc: u32 = 0`) and compares against the client-provided
+//! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -107,9 +112,6 @@ pub struct StreamingContext {
     pub total_len: u64,
     /// Progress cursor: bytes completed so far.
     pub bytes_completed: u64,
-    // TODO: CRC32c verification is a local variable in the tokio SET task,
-    // not on this struct. When implementing SET streaming, track crc as
-    // `let mut crc: u32 = 0` in the task and compare against client-provided value.
 }
 
 impl StreamingContext {

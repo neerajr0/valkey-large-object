@@ -20,6 +20,24 @@ use super::StorageError;
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
+/// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
+/// Constructed from ObjectContext or StreamingContext + their owning pool.
+/// Multi-buffer batch support: pass a Vec<UringOp> to submit_batch (future).
+#[derive(Clone)]
+pub struct UringOp {
+    /// Segment's position in the registered iovec array (IORING_REGISTER_BUFFERS).
+    pub iovec_index: u16,
+    /// Pointer to the buffer within the segment (absolute address).
+    pub buf_ptr: *mut u8,
+    /// Offset within the NVMe file.
+    pub file_offset: u64,
+    /// Number of bytes to read/write.
+    pub len: u64,
+}
+
+// SAFETY: buf_ptr points to segment memory that is stable for module lifetime.
+unsafe impl Send for UringOp {}
+
 /// Completion callback: (result or error). Caller retains buffer ownership.
 pub type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
 pub type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
@@ -28,8 +46,8 @@ pub type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
 pub enum IoRequest {
     Read {
         fd: RawFd,
-        /// io_uring buf_index (segment's position in the registered iovec array).
-        buf_index: u16,
+        /// Segment's position in the registered iovec array.
+        iovec_index: u16,
         /// Pointer to the buffer within the segment (absolute address).
         buf_ptr: *mut u8,
         /// Offset within the NVMe file to read from.
@@ -40,7 +58,7 @@ pub enum IoRequest {
     },
     Write {
         fd: RawFd,
-        buf_index: u16,
+        iovec_index: u16,
         buf_ptr: *const u8,
         file_offset: u64,
         len: u64,
@@ -91,18 +109,15 @@ use tokio::sync::oneshot;
 /// The tokio task awaits this receiver. io-poller fires it on CQE completion.
 pub fn submit_read(
     fd: std::os::unix::io::RawFd,
-    buf_index: u16,
-    buf_ptr: *mut u8,
-    file_offset: u64,
-    len: u64,
+    op: &UringOp,
 ) -> oneshot::Receiver<Result<u64, super::StorageError>> {
     let (tx, rx) = oneshot::channel();
     submit(IoRequest::Read {
         fd,
-        buf_index,
-        buf_ptr,
-        file_offset,
-        len,
+        iovec_index: op.iovec_index,
+        buf_ptr: op.buf_ptr,
+        file_offset: op.file_offset,
+        len: op.len,
         on_complete: Box::new(move |result| {
             let _ = tx.send(result);
         }),
@@ -113,18 +128,15 @@ pub fn submit_read(
 /// Submit a WriteFixed and return a oneshot receiver.
 pub fn submit_write(
     fd: std::os::unix::io::RawFd,
-    buf_index: u16,
-    buf_ptr: *const u8,
-    file_offset: u64,
-    len: u64,
+    op: &UringOp,
 ) -> oneshot::Receiver<Result<(), super::StorageError>> {
     let (tx, rx) = oneshot::channel();
     submit(IoRequest::Write {
         fd,
-        buf_index,
-        buf_ptr,
-        file_offset,
-        len,
+        iovec_index: op.iovec_index,
+        buf_ptr: op.buf_ptr as *const u8,
+        file_offset: op.file_offset,
+        len: op.len,
         on_complete: Box::new(move |result| {
             let _ = tx.send(result);
         }),
@@ -221,7 +233,7 @@ impl UringNvmeEngine {
                         let (sqe, op) = match req {
                             IoRequest::Read {
                                 fd,
-                                buf_index,
+                                iovec_index,
                                 buf_ptr,
                                 file_offset,
                                 len,
@@ -233,7 +245,7 @@ impl UringNvmeEngine {
                                         io_uring::types::Fd(fd),
                                         buf_ptr,
                                         read_len,
-                                        buf_index,
+                                        iovec_index,
                                     )
                                     .offset(file_offset)
                                     .build()
@@ -252,7 +264,7 @@ impl UringNvmeEngine {
                             }
                             IoRequest::Write {
                                 fd,
-                                buf_index,
+                                iovec_index,
                                 buf_ptr,
                                 file_offset,
                                 len,
@@ -264,7 +276,7 @@ impl UringNvmeEngine {
                                         io_uring::types::Fd(fd),
                                         buf_ptr,
                                         write_len,
-                                        buf_index,
+                                        iovec_index,
                                     )
                                     .offset(file_offset)
                                     .build()
