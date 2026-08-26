@@ -74,6 +74,59 @@ pub fn submit(req: IoRequest) {
     }
 }
 
+// ─── Oneshot-bridged async submit helpers ────────────────────────────────────
+//
+// These wrap the callback-based submit() with a tokio oneshot channel.
+// The io_uring callback fires tx.send(), the tokio task awaits rx.
+// io_uring remains callback-based internally — this is just the bridge.
+
+use tokio::sync::oneshot;
+
+/// Submit a ReadFixed and return a oneshot receiver.
+/// The tokio task awaits this receiver. io-poller fires it on CQE completion.
+pub fn submit_read(
+    fd: std::os::unix::io::RawFd,
+    buf_index: u16,
+    buf_ptr: *mut u8,
+    file_offset: u64,
+    len: u64,
+) -> oneshot::Receiver<Result<u64, super::StorageError>> {
+    let (tx, rx) = oneshot::channel();
+    submit(IoRequest::Read {
+        fd,
+        buf_index,
+        buf_ptr,
+        file_offset,
+        len,
+        on_complete: Box::new(move |result| {
+            let _ = tx.send(result);
+        }),
+    });
+    rx
+}
+
+/// Submit a WriteFixed and return a oneshot receiver.
+pub fn submit_write(
+    fd: std::os::unix::io::RawFd,
+    buf_index: u16,
+    buf_ptr: *const u8,
+    file_offset: u64,
+    len: u64,
+) -> oneshot::Receiver<Result<(), super::StorageError>> {
+    let (tx, rx) = oneshot::channel();
+    submit(IoRequest::Write {
+        fd,
+        buf_index,
+        buf_ptr,
+        file_offset,
+        len,
+        on_complete: Box::new(move |result| {
+            let _ = tx.send(result);
+        }),
+    });
+    rx
+}
+
 pub fn shutdown() {
     if let Some(engine) = ENGINE.get() {
         engine.shutdown.store(true, Ordering::Relaxed);
