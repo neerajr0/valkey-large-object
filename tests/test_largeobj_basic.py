@@ -17,7 +17,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """LO.SET writes data, LO.GET retrieves it."""
         client = self.server.get_new_client()
         payload = b'A' * 4096
-        result = client.execute_command('LO.SET', 'testkey', '4096', payload)
+        result = client.execute_command('LO.SET', 'testkey', payload)
         assert result == b'OK'
         # GET returns the object bytes
         data = client.execute_command('LO.GET', 'testkey')
@@ -34,7 +34,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """LO.SET creates a .dat file in data-dir."""
         client = self.server.get_new_client()
         payload = b'X' * 4096
-        client.execute_command('LO.SET', 'filekey', '4096', payload)
+        client.execute_command('LO.SET', 'filekey', payload)
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 1, f"Expected .dat file in {self.data_dir}, found: {os.listdir(self.data_dir)}"
 
@@ -42,7 +42,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """DEL on an LO key removes the .dat file."""
         client = self.server.get_new_client()
         payload = b'Y' * 4096
-        client.execute_command('LO.SET', 'delkey', '4096', payload)
+        client.execute_command('LO.SET', 'delkey', payload)
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1, "LO.SET didn't create a .dat file"
         client.execute_command('DEL', 'delkey')
@@ -50,13 +50,13 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         assert len(dat_files_after) < len(dat_files_before)
 
     def test_pool_exhaustion_error(self):
-        """An object larger than the NVMe staging segment fails allocation."""
+        """An object larger than nvme-staging-size fails allocation on the NVMe staging pool."""
         client = self.server.get_new_client()
-        # nvme-staging-size is 1MB. An object of 2MB cannot be staged.
+        # nvme-staging-size is 1MB (base class default). A 2MB object cannot be staged.
         obj_size = 2 * 1024 * 1024
         payload = b'A' * obj_size
         try:
-            client.execute_command('LO.SET', 'toobig', str(obj_size), payload)
+            client.execute_command('LO.SET', 'toobig', payload)
             assert False, "Expected error for object larger than pool but command succeeded"
         except ResponseError as e:
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"

@@ -51,7 +51,7 @@ static IOVECS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// Called by SegmentPool::new() when creating each segment.
 /// Returns the assigned iovec_index (= current array length before push).
 pub fn append_iovec(iov: libc::iovec) -> u16 {
-    let mut iovecs = IOVECS.lock().unwrap();
+    let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
     let idx = iovecs.len() as u16;
     iovecs.push((iov.iov_base as usize, iov.iov_len));
     idx
@@ -100,7 +100,7 @@ pub fn init(
 /// Register ALL segments with io_uring. Uses the global IOVECS vec built during init.
 /// Array position = iovec_index, guaranteed by append_iovec() at creation time.
 pub fn register_buffers() {
-    let pairs = IOVECS.lock().unwrap().clone();
+    let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
     let iovecs: Vec<libc::iovec> = pairs
         .iter()
         .map(|&(ptr, len)| libc::iovec {

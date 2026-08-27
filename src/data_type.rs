@@ -50,15 +50,19 @@ pub struct LoValue {
 }
 
 /// Free callback — triggered by native Valkey DEL.
-/// TODO: Not concurrency-safe. Needs a proper implementation that:
-///   - Checks refcount / in-flight I/O before freeing.
-///   - Ensures no race between free and promotion or NVMe read on same oid.
-///   - This logic should not live in data_type.rs.
+///
+/// TODO (object lifecycle): Not concurrency-safe. In-flight GETs or promotions may hold
+/// Arc<ObjectContext> clones or have io_uring SQEs referencing the fd. Requires refcounted
+/// teardown — only free buffers/close fd when last reference drops. Same mechanism needed
+/// for LO.SET overwrite (see engine.rs) and for module eviction.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
-    crate::storage::get_fd_pool().remove(lo.object_id);
-    crate::storage::delete_file(lo.object_id);
+    // FdPool and NVMe files only exist in Tiered mode.
+    if crate::operating_mode() == crate::OperatingMode::Tiered {
+        crate::storage::get_fd_pool().remove(lo.object_id);
+        crate::storage::delete_file(lo.object_id);
+    }
 }
 
 // ─── Type Registration ───────────────────────────────────────────────────────

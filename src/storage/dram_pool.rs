@@ -49,27 +49,43 @@ impl DRAMPool {
 
     /// Lookup a cached object. Returns Arc clone (safe to use after releasing lock).
     pub fn get_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        self.objects.read().unwrap().get(oid).cloned()
+        self.objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable")
+            .get(oid)
+            .cloned()
     }
 
     /// Insert an ObjectContext (promotion path).
     pub fn insert_object(&self, oid: ObjectId, ctx: Arc<ObjectContext>) {
-        self.objects.write().unwrap().insert(oid, ctx);
+        self.objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .insert(oid, ctx);
     }
 
     /// Remove an ObjectContext (free callback / eviction).
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        self.objects.write().unwrap().remove(oid)
+        self.objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .remove(oid)
     }
 
     /// Check if object exists (coalesce check — is promotion in progress?).
     pub fn contains_object(&self, oid: &ObjectId) -> bool {
-        self.objects.read().unwrap().contains_key(oid)
+        self.objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable")
+            .contains_key(oid)
     }
 
     /// Number of cached objects.
     pub fn object_count(&self) -> usize {
-        self.objects.read().unwrap().len()
+        self.objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable")
+            .len()
     }
 
     /// Try to allocate space and create an ObjectContext for this object.
@@ -79,13 +95,18 @@ impl DRAMPool {
         oid: ObjectId,
         obj_len: u64,
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
-        // Don't promote if already cached.
-        if self.contains_object(&oid) {
+        // Don't promote objects above the configured threshold.
+        if obj_len > crate::max_promote_size() {
             return None;
         }
 
-        // Don't promote objects above the configured threshold.
-        if obj_len > crate::max_promote_size() {
+        // Atomic check-and-insert under write lock to prevent TOCTOU race
+        // (concurrent GETs promoting the same OID simultaneously).
+        let mut objects = self
+            .objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable");
+        if objects.contains_key(&oid) {
             return None;
         }
 
@@ -94,7 +115,7 @@ impl DRAMPool {
             vec![seg_buf],
             obj_len,
         ));
-        self.insert_object(oid, obj_ctx.clone());
+        objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)
     }
 }

@@ -126,7 +126,10 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn nvme_dir() -> String {
-    CFG_NVME_DIR.lock().unwrap().clone()
+    CFG_NVME_DIR
+        .lock()
+        .expect("CFG_NVME_DIR lock unavailable")
+        .clone()
 }
 
 pub fn nvme_staging_size() -> usize {
@@ -162,7 +165,9 @@ pub fn direct_io() -> bool {
 }
 
 pub fn operating_mode() -> OperatingMode {
-    *CFG_OPERATING_MODE.lock().unwrap()
+    *CFG_OPERATING_MODE
+        .lock()
+        .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────

@@ -2,8 +2,8 @@
 //!
 //! LO.HELLO: EFA session establishment
 //! LO.GET key [rkey remote_addr]: engine::execute_get
-//! LO.SET key len <data>           (TCP): engine::execute_set
-//! LO.SET key len rkey remote_addr (EFA): engine::execute_set
+//! LO.SET key <data>                (TCP): engine::execute_set
+//! LO.SET key len rkey remote_addr  (EFA): engine::execute_set
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,7 +54,7 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let client_id = ctx.get_client_id();
     SESSIONS
         .lock()
-        .unwrap()
+        .expect("SESSIONS lock unavailable")
         .insert(client_id, Arc::new(session));
 
     let reply: Vec<ValkeyValue> = server_addrs
@@ -96,7 +96,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         let client_id = ctx.get_client_id();
         let session = SESSIONS
             .lock()
-            .unwrap()
+            .expect("SESSIONS lock unavailable")
             .get(&client_id)
             .ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))?
             .clone();
@@ -125,14 +125,14 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
 
-    let obj_len: u64 = args[2]
-        .to_string_lossy()
-        .parse()
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
-
-    // Determine data source: EFA if rkey+remote_addr provided, else TCP (inline data).
-    let data_source = if args.len() >= 5 {
+    // Determine data source and obj_len based on arg count.
+    let (obj_len, data_source) = if args.len() >= 5 {
         // EFA path: LO.SET key len rkey remote_addr
+        // len is required — server needs to know how many bytes to fi_read from client GPU.
+        let obj_len: u64 = args[2]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
         let rkey: u64 = args[3]
             .to_string_lossy()
             .parse()
@@ -144,19 +144,24 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         let client_id = ctx.get_client_id();
         let session = SESSIONS
             .lock()
-            .unwrap()
+            .expect("SESSIONS lock unavailable")
             .get(&client_id)
             .ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))?
             .clone();
-        DataSource::Efa {
-            session,
-            rkey,
-            remote_addr,
-        }
-    } else if args.len() >= 4 {
-        // TCP path: LO.SET key len <data>
-        let data = args[3].as_slice().to_vec();
-        DataSource::Tcp(data)
+        (
+            obj_len,
+            DataSource::Efa {
+                session,
+                rkey,
+                remote_addr,
+            },
+        )
+    } else if args.len() >= 3 {
+        // TCP path: LO.SET key <data>
+        // data.len() IS the authoritative length. No user-provided len needed.
+        let data = args[2].as_slice().to_vec();
+        let obj_len = data.len() as u64;
+        (obj_len, DataSource::Tcp(data))
     } else {
         return Err(ValkeyError::WrongArity);
     };

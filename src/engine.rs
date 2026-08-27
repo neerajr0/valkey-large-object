@@ -381,9 +381,8 @@ fn execute_set_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // Invalidate existing entry if present (LO.SET overwrites).
-    // ObjectId from existing key would be needed here — for now, skip (new key path).
-    // TODO: look up existing LoValue to get old object_id and remove from DRAMPool.
+    // TODO (object lifecycle): Overwriting a key leaks the old object (DRAMPool entry + fd + .dat file).
+    // Fix requires refcounted teardown — same mechanism as DEL free callback (data_type.rs) and for module eviction.
 
     // Alloc from DRAMPool (this IS the final storage).
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
@@ -464,7 +463,7 @@ fn execute_set_tiered(
 ) {
     let nvme_pool = storage::get_nvme_pool();
 
-    // TODO: invalidate existing DRAMPool entry if key already exists.
+    // TODO (object lifecycle): Overwriting a key leaks old object. See execute_set_dram_efa.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
@@ -546,7 +545,7 @@ async fn do_tiered_nvme_write(
     let object_id = ObjectId::next();
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
-    let c_path = std::ffi::CString::new(file_path.as_str()).unwrap();
+    let c_path = std::ffi::CString::new(file_path.as_str()).expect("file_path null");
     let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
         write_flags |= libc::O_DIRECT;

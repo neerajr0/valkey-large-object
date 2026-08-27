@@ -67,7 +67,7 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.size, 4096).unwrap();
+        let layout = Layout::from_size_align(self.size, 4096).expect("Segment layout");
         unsafe { std::alloc::dealloc(self.base, layout) };
     }
 }

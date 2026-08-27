@@ -279,13 +279,27 @@ impl UringNvmeEngine {
                             }
                         };
 
-                        pending.insert(token, op);
-
                         unsafe {
                             if ring.submission().is_full() {
-                                ring.submit().ok();
+                                let _ = ring.submit();
                             }
-                            ring.submission().push(&sqe).ok();
+                            if ring.submission().push(&sqe).is_err() {
+                                // SQ full even after flush — fire error callback.
+                                match op {
+                                    PendingOp::Read { on_complete } => {
+                                        on_complete(Err(StorageError::IoError {
+                                            code: -libc::EAGAIN,
+                                        }));
+                                    }
+                                    PendingOp::Write { on_complete, .. } => {
+                                        on_complete(Err(StorageError::IoError {
+                                            code: -libc::EAGAIN,
+                                        }));
+                                    }
+                                }
+                            } else {
+                                pending.insert(token, op);
+                            }
                         }
                         batch += 1;
                     }
@@ -293,9 +307,15 @@ impl UringNvmeEngine {
                 }
             }
 
-            // Phase 2: Submit + wait.
+            // Phase 2: Submit + wait. Retry on EINTR (max 3 attempts).
             if !pending.is_empty() {
-                ring.submit_and_wait(1).ok();
+                for _ in 0..3 {
+                    match ring.submit_and_wait(1) {
+                        Ok(_) => break,
+                        Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(_) => break,
+                    }
+                }
             } else if shutdown.load(Ordering::Relaxed) {
                 break;
             } else {
