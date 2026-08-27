@@ -15,25 +15,13 @@
 
 use std::sync::Arc;
 
-use valkey_module::{enum_configuration, ValkeyError, ValkeyValue};
+use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
 use crate::storage::{self, uring, ObjectContext};
 use crate::transport::Session;
-
-// ─── Operating Mode ──────────────────────────────────────────────────────────
-
-enum_configuration! {
-    /// Operating mode — set via `operating-mode` module enum config.
-    /// Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
-    /// DramOnly (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
-    #[derive(Debug, PartialEq, Eq, Copy)]
-    pub enum OperatingMode {
-        Tiered = 0,
-        DramOnly = 1,
-    }
-}
+use crate::OperatingMode;
 
 // ─── Transport context passed to engine ──────────────────────────────────────
 
@@ -46,26 +34,65 @@ pub enum Transport {
     },
 }
 
+// ─── Engine Result ────────────────────────────────────────────────────────────
+
+/// Result of an engine dispatch. Command handler matches on this.
+pub enum EngineResult {
+    /// Sync path completed — return this value directly to Valkey.
+    Sync(Result<ValkeyValue, ValkeyError>),
+    /// Async path — client is blocked, reply will come from tokio task.
+    Async,
+}
+
 // ─── GET Engine ──────────────────────────────────────────────────────────────
 
 /// Execute LO.GET with mode + transport routing.
-/// Called from the command handler after parsing args.
-/// `blocked_client` is used for async paths (tokio spawn).
+/// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
+    ctx: &valkey_module::Context,
     object_id: ObjectId,
     obj_len: u64,
     transport: Transport,
-    blocked_client: valkey_module::BlockedClient,
-) {
+) -> EngineResult {
     let mode = crate::operating_mode();
 
-    match mode {
-        OperatingMode::DramOnly => {
-            execute_get_dram_only(object_id, obj_len, transport, blocked_client);
+    match (mode, &transport) {
+        (OperatingMode::DramOnly, Transport::Tcp) => {
+            // Fully sync — serve from DRAMPool, return directly.
+            EngineResult::Sync(serve_get_dram_tcp(object_id, obj_len))
         }
-        OperatingMode::Tiered => {
-            execute_get_tiered(object_id, obj_len, transport, blocked_client);
+        _ => {
+            // Async — block client, dispatch to tokio.
+            let blocked_client = ctx.block_client();
+            match mode {
+                OperatingMode::DramOnly => {
+                    execute_get_dram_only(object_id, obj_len, transport, blocked_client);
+                }
+                OperatingMode::Tiered => {
+                    execute_get_tiered(object_id, obj_len, transport, blocked_client);
+                }
+            }
+            EngineResult::Async
         }
+    }
+}
+
+/// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
+fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
+    let dram_pool = storage::get_dram_pool();
+    match dram_pool.get_object(&object_id) {
+        Some(obj_ctx) if obj_ctx.is_ready() => {
+            let mut data = Vec::with_capacity(obj_len as usize);
+            for buf in &obj_ctx.buffers {
+                let ptr = dram_pool.buffer_ptr(buf);
+                let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
+                data.extend_from_slice(slice);
+            }
+            data.truncate(obj_len as usize);
+            Ok(ValkeyValue::StringBuffer(data))
+        }
+        Some(_) => Err(ValkeyError::Str("ERR object not ready")),
+        None => Err(ValkeyError::Str("ERR object not in DRAM cache")),
     }
 }
 
@@ -229,22 +256,71 @@ fn execute_get_tiered(
 // ─── SET Engine ──────────────────────────────────────────────────────────────
 
 /// Execute LO.SET with mode + transport routing.
+/// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
-    key_name: Vec<u8>,
+    ctx: &valkey_module::Context,
+    key_name: &valkey_module::ValkeyString,
     obj_len: u64,
     data_source: DataSource,
-    blocked_client: valkey_module::BlockedClient,
-) {
+) -> EngineResult {
     let mode = crate::operating_mode();
 
-    match mode {
-        OperatingMode::DramOnly => {
-            execute_set_dram_only(key_name, obj_len, data_source, blocked_client);
+    match (mode, &data_source) {
+        (OperatingMode::DramOnly, DataSource::Tcp(data)) => {
+            // Fully sync — alloc + memcpy + create LoValue inline.
+            EngineResult::Sync(serve_set_dram_tcp(ctx, key_name, obj_len, data))
         }
-        OperatingMode::Tiered => {
-            execute_set_tiered(key_name, obj_len, data_source, blocked_client);
+        _ => {
+            // Async — block client, dispatch to tokio.
+            let blocked_client = ctx.block_client();
+            let key_name_bytes = key_name.as_slice().to_vec();
+            match mode {
+                OperatingMode::DramOnly => {
+                    execute_set_dram_only(key_name_bytes, obj_len, data_source, blocked_client);
+                }
+                OperatingMode::Tiered => {
+                    execute_set_tiered(key_name_bytes, obj_len, data_source, blocked_client);
+                }
+            }
+            EngineResult::Async
         }
     }
+}
+
+/// Sync DRAM-only TCP SET: alloc + memcpy + create LoValue on main thread.
+fn serve_set_dram_tcp(
+    ctx: &valkey_module::Context,
+    key_name: &valkey_module::ValkeyString,
+    obj_len: u64,
+    data: &[u8],
+) -> Result<ValkeyValue, ValkeyError> {
+    let dram_pool = storage::get_dram_pool();
+
+    let seg_buf = match dram_pool.alloc(obj_len as usize) {
+        Some(b) => b,
+        None => return Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)),
+    };
+
+    let buf_ptr = dram_pool.buffer_ptr(&seg_buf);
+    let copy_len = data.len().min(obj_len as usize);
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
+
+    let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
+
+    let oid = ObjectId::next();
+    let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
+    dram_pool.insert_object(oid, obj_ctx);
+
+    let key = ctx.open_key_writable(key_name);
+    let lo_value = LoValue {
+        object_id: oid,
+        len: obj_len,
+        crc32c: crc,
+    };
+    key.set_value(&LO_TYPE, lo_value)
+        .map_err(|_| ValkeyError::Str("ERR failed to set key"))?;
+
+    Ok(ValkeyValue::SimpleStringStatic("OK"))
 }
 
 pub enum DataSource {
@@ -553,9 +629,8 @@ fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
         return;
     }
 
-    // Don't promote objects above the threshold.
-    // TODO: configurable dram-pool-max-object-size. For now: 256MB.
-    if obj_len > 256 * 1024 * 1024 {
+    // Don't promote objects above the configured threshold.
+    if obj_len > crate::max_promote_size() {
         return;
     }
 

@@ -108,11 +108,11 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         Transport::Tcp
     };
 
-    // Block client and dispatch to engine.
-    let blocked_client = ctx.block_client();
-    engine::execute_get(object_id, obj_len, transport, blocked_client);
-
-    Ok(ValkeyValue::NoReply)
+    // Dispatch to engine — it decides sync vs async internally.
+    match engine::execute_get(ctx, object_id, obj_len, transport) {
+        engine::EngineResult::Sync(result) => result,
+        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
 }
 
 // ─── LO.SET ──────────────────────────────────────────────────────────────────
@@ -124,7 +124,6 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
 
-    let key_name = args[1].as_slice().to_vec();
     let obj_len: u64 = args[2]
         .to_string_lossy()
         .parse()
@@ -161,11 +160,11 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     };
 
-    // Block client and dispatch to engine.
-    let blocked_client = ctx.block_client();
-    engine::execute_set(key_name, obj_len, data_source, blocked_client);
-
-    Ok(ValkeyValue::NoReply)
+    // Dispatch to engine — it decides sync vs async internally.
+    match engine::execute_set(ctx, &args[1], obj_len, data_source) {
+        engine::EngineResult::Sync(result) => result,
+        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

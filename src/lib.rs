@@ -46,7 +46,19 @@ pub mod storage;
 pub mod transport;
 
 use crate::data_type::LO_TYPE;
-use crate::engine::OperatingMode;
+
+use valkey_module::enum_configuration;
+
+enum_configuration! {
+    /// Operating mode — set via `operating-mode` module enum config.
+    /// Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
+    /// DramOnly (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    #[derive(Debug, PartialEq, Eq, Copy)]
+    pub enum OperatingMode {
+        Tiered = 0,
+        DramOnly = 1,
+    }
+}
 
 pub const MODULE_NAME: &str = "largeobj";
 pub const MODULE_VERSION: i32 = 1;
@@ -73,6 +85,11 @@ lazy_static::lazy_static! {
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
+
+    /// Max object size eligible for DRAMPool promotion (Tiered mode).
+    /// Objects larger than this skip promotion and are always served from NVMe.
+    /// Default: 256MB. Supports memory notation (e.g., "256mb").
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
 
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
@@ -125,6 +142,10 @@ pub fn max_bytes() -> u64 {
 
 pub fn transport_threads() -> usize {
     CFG_TRANSPORT_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_promote_size() -> u64 {
+    CFG_MAX_PROMOTE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn bench_mode() -> bool {
@@ -222,6 +243,8 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, None],
             ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
+             ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
             ["data-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
