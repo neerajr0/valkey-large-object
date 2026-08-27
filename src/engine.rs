@@ -180,7 +180,8 @@ fn execute_get_tiered(
                 Ok(Ok(_)) => {
                     // Serve from DRAMPool (object is now cached).
                     let dram_pool = storage::get_dram_pool();
-                    let obj_ctx = dram_pool.get_object(&object_id)
+                    let obj_ctx = dram_pool
+                        .get_object(&object_id)
                         .expect("ObjectContext missing after try_promote_object inserted it");
                     serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
                 }
@@ -250,9 +251,21 @@ fn execute_get_tiered(
                         rkey,
                         remote_addr,
                     } => {
-                        match efa_write_to_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await {
-                            Ok(()) => { thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))); }
-                            Err(e) => { thread_ctx.reply(Err(e)); }
+                        match efa_write_to_client(
+                            session,
+                            buf_ptr_usize,
+                            obj_len as usize,
+                            rkey,
+                            remote_addr,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                            }
+                            Err(e) => {
+                                thread_ctx.reply(Err(e));
+                            }
                         }
                     }
                 }
@@ -428,7 +441,14 @@ fn execute_set_dram_only(
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
-                match efa_read_from_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await
+                match efa_read_from_client(
+                    session,
+                    buf_ptr_usize,
+                    obj_len as usize,
+                    rkey,
+                    remote_addr,
+                )
+                .await
                 {
                     Ok(()) => {
                         let crc = crc32c::crc32c(unsafe {
@@ -448,9 +468,9 @@ fn execute_set_dram_only(
                                 crc32c: crc,
                             };
                             if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
-                    return;
-                }
+                                thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                                return;
+                            }
                         }
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                     }
@@ -507,7 +527,14 @@ fn execute_set_tiered(
         } => {
             // EFA: transport.read into NVMePool buffer, then write to NVMe.
             crate::runtime_handle().spawn(async move {
-                match efa_read_from_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await
+                match efa_read_from_client(
+                    session,
+                    buf_ptr_usize,
+                    obj_len as usize,
+                    rkey,
+                    remote_addr,
+                )
+                .await
                 {
                     Ok(()) => {
                         do_tiered_nvme_write(
@@ -643,7 +670,8 @@ fn serve_from_dram(
             let buf = &obj_ctx.buffers[0]; // Single-chunk for now.
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
             crate::runtime_handle().spawn(async move {
-                match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr).await
+                match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
+                    .await
                 {
                     Ok(()) => thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))),
                     Err(e) => thread_ctx.reply(Err(e)),
