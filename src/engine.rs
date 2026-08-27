@@ -124,7 +124,7 @@ fn execute_get_dram_only(
     }
 }
 
-/// Tiered GET: check DRAMPool → if miss, read from NVMe (with optional promotion).
+/// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
@@ -133,7 +133,7 @@ fn execute_get_tiered(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // ─── DRAMPool hit check ──────────────────────────────────────────────
+    // ─── DRAMPool hit ────────────────────────────────────────────────────
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -142,10 +142,60 @@ fn execute_get_tiered(
         }
         // Filling state: promotion in progress.
         // TODO: coalesce — register as waiter on this ObjectContext.
-        // For now: fall through to NVMe read (duplicate read / buffers).
+        // For now: fall through to NVMe read.
     }
 
-    // ─── DRAMPool miss: read from NVMe ───────────────────────────────────
+    // ─── Try DRAMPool promotion ──────────────────────────────────────────
+    // If pool has space and object is eligible, read directly into DRAMPool.
+    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+        let seg_buf = &obj_ctx.buffers[0];
+        let buf_ptr_usize = dram_pool.buffer_ptr(seg_buf) as usize;
+        let read_op = uring::UringOp {
+            iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
+            buf_ptr: buf_ptr_usize as *mut u8,
+            file_offset: 0,
+            len: obj_len,
+        };
+
+        let fd_pool = storage::get_fd_pool();
+        let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
+            Some(fd) => fd,
+            None => {
+                dram_pool.remove_object(&object_id);
+                dram_pool.free(seg_buf);
+                let thread_ctx =
+                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+                return;
+            }
+        };
+
+        // Read from NVMe directly into DRAMPool buffer, then serve.
+        crate::runtime_handle().spawn(async move {
+            let result = uring::submit_read(fd, &read_op).await;
+            let thread_ctx =
+                valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+
+            match result {
+                Ok(Ok(_)) => {
+                    // Serve from DRAMPool (object is now cached).
+                    let dram_pool = storage::get_dram_pool();
+                    let obj_ctx = dram_pool.get_object(&object_id).unwrap();
+                    serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+                }
+                _ => {
+                    // Read failed — remove entry, free buffer.
+                    storage::get_dram_pool().remove_object(&object_id);
+                    storage::get_dram_pool().free(&obj_ctx.buffers[0]);
+                    thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+                }
+            }
+        });
+        return;
+    }
+
+    // ─── NVMePool fallback (DRAMPool full) ───────────────────────────────
+    // Transient read: alloc NVMePool buffer, serve, free.
     let nvme_pool = storage::get_nvme_pool();
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
         Some(b) => b,
@@ -156,11 +206,8 @@ fn execute_get_tiered(
         }
     };
 
-    // StreamingContext owns the NVMePool buffer for this GET operation.
-    // Single buffer today; multi-batch streaming adds more buffers here.
-    let stream_ctx = storage::StreamingContext::new_for_get(vec![seg_buf], obj_len);
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
-    // Get fd from FdPool (cached) or open fresh.
     let fd_pool = storage::get_fd_pool();
     let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
         Some(fd) => fd,
@@ -182,18 +229,13 @@ fn execute_get_tiered(
         len: obj_len,
     };
 
-    // Spawn tokio task for NVMe read + serve + optional promotion.
+    // Spawn tokio task for NVMe read + serve (no caching — transient).
     crate::runtime_handle().spawn(async move {
-        // submit_read takes *mut u8 — construct from usize at call site (no raw ptr across await).
         let read_result = uring::submit_read(fd, &read_op).await;
-        // fd is NOT closed here — FdPool owns it for future reads.
-
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-        let buf_ptr = buf_ptr_usize as *mut u8;
 
         match read_result {
             Ok(Ok(_bytes_read)) => {
-                // Serve the data.
                 match transport {
                     Transport::Tcp => {
                         let data = unsafe {
@@ -207,8 +249,8 @@ fn execute_get_tiered(
                         rkey,
                         remote_addr,
                     } => {
-                        // EFA: write buf → client GPU via oneshot bridge.
                         let (efa_tx, efa_rx) = tokio::sync::oneshot::channel();
+                        let buf_ptr = buf_ptr_usize as *mut u8;
                         session.write(
                             buf_ptr,
                             obj_len as usize,
@@ -228,13 +270,6 @@ fn execute_get_tiered(
                         }
                     }
                 }
-
-                // ─── Promotion decision ──────────────────────────────────
-                // TODO: Use HeavyKeeper or access-count policy to decide.
-                // For now: always promote (fill DRAMPool on every miss).
-                promote_to_dram(object_id, obj_len);
-
-                // Free NVMePool buffer (served, promotion uses separate ReadFixed).
                 storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             }
             Ok(Err(e)) => {
@@ -307,13 +342,13 @@ fn serve_set_dram_tcp(
 
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
-    let oid = ObjectId::next();
+    let object_id = ObjectId::next();
     let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-    dram_pool.insert_object(oid, obj_ctx);
+    dram_pool.insert_object(object_id, obj_ctx);
 
     let key = ctx.open_key_writable(key_name);
     let lo_value = LoValue {
-        object_id: oid,
+        object_id,
         len: obj_len,
         crc32c: crc,
     };
@@ -372,9 +407,9 @@ fn execute_set_dram_only(
                 crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
             // Create ObjectContext (Ready — data is complete).
-            let oid = ObjectId::next();
+            let object_id = ObjectId::next();
             let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-            dram_pool.insert_object(oid, obj_ctx);
+            dram_pool.insert_object(object_id, obj_ctx);
 
             // Create LoValue in keyspace.
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -383,7 +418,7 @@ fn execute_set_dram_only(
                 let key_str = ctx.create_string(key_name);
                 let key = ctx.open_key_writable(&key_str);
                 let lo_value = LoValue {
-                    object_id: oid,
+                    object_id,
                     len: obj_len,
                     crc32c: crc,
                 };
@@ -417,16 +452,16 @@ fn execute_set_dram_only(
                         let crc = crc32c::crc32c(unsafe {
                             std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
                         });
-                        let oid = ObjectId::next();
+                        let object_id = ObjectId::next();
                         let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-                        storage::get_dram_pool().insert_object(oid, obj_ctx);
+                        storage::get_dram_pool().insert_object(object_id, obj_ctx);
 
                         {
                             let ctx = thread_ctx.lock();
                             let key_str = ctx.create_string(key_name);
                             let key = ctx.open_key_writable(&key_str);
                             let lo_value = LoValue {
-                                object_id: oid,
+                                object_id,
                                 len: obj_len,
                                 crc32c: crc,
                             };
@@ -465,7 +500,7 @@ fn execute_set_tiered(
 
     // StreamingContext owns the NVMePool buffer for this SET operation.
     // Single buffer today; multi-batch streaming adds more buffers here.
-    let stream_ctx = storage::StreamingContext::new_for_set(vec![seg_buf], obj_len);
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let buf_ptr = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]);
     let buf_ptr_usize = buf_ptr as usize;
@@ -534,16 +569,15 @@ async fn do_tiered_nvme_write(
     let buf_ptr = buf_ptr_usize as *mut u8;
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
-    let oid = ObjectId::next();
+    let object_id = ObjectId::next();
     let dir = crate::data_dir();
-    let file_path = oid.file_path(&dir);
-    let tmp_path = format!("{}.tmp", file_path);
-    let c_tmp = std::ffi::CString::new(tmp_path.as_str()).unwrap();
+    let file_path = object_id.file_path(&dir);
+    let c_path = std::ffi::CString::new(file_path.as_str()).unwrap();
     let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
         write_flags |= libc::O_DIRECT;
     }
-    let fd = unsafe { libc::open(c_tmp.as_ptr(), write_flags, 0o644) };
+    let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if fd < 0 {
         storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -568,39 +602,22 @@ async fn do_tiered_nvme_write(
 
     match write_result {
         Ok(Ok(())) => {
-            if std::fs::rename(&tmp_path, &file_path).is_ok() {
-                // Cache the fd in FdPool for future reads.
-                let c_file = std::ffi::CString::new(file_path.as_str()).unwrap();
-                let mut read_flags = libc::O_RDONLY;
-                if crate::direct_io() {
-                    read_flags |= libc::O_DIRECT;
-                }
-                let read_fd = unsafe { libc::open(c_file.as_ptr(), read_flags) };
-                if read_fd >= 0 {
-                    storage::get_fd_pool().insert(oid, read_fd);
-                }
-
-                {
-                    let ctx = thread_ctx.lock();
-                    let key_str = ctx.create_string(key_name);
-                    let key = ctx.open_key_writable(&key_str);
-                    let lo_value = LoValue {
-                        object_id: oid,
-                        len: obj_len,
-                        crc32c: crc,
-                    };
-                    key.set_value(&LO_TYPE, lo_value).unwrap();
-                }
-                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
-                thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-            } else {
-                let _ = std::fs::remove_file(&tmp_path);
-                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
-                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+            {
+                let ctx = thread_ctx.lock();
+                let key_str = ctx.create_string(key_name);
+                let key = ctx.open_key_writable(&key_str);
+                let lo_value = LoValue {
+                    object_id,
+                    len: obj_len,
+                    crc32c: crc,
+                };
+                key.set_value(&LO_TYPE, lo_value).unwrap();
             }
+            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&file_path);
             storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
@@ -609,83 +626,11 @@ async fn do_tiered_nvme_write(
             ))));
         }
         Err(_) => {
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&file_path);
             storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }
     }
-}
-
-// ─── Promotion (Tiered mode: NVMe → DRAMPool) ───────────────────────────────
-
-/// Promote an object to DRAMPool by reading from NVMe directly into DRAMPool buffers.
-/// No memcpy. No NVMePool involvement. ReadFixed lands in final DRAMPool location.
-/// Called after serving a GET miss (fire-and-forget — doesn't block the reply).
-fn promote_to_dram(object_id: ObjectId, obj_len: u64) {
-    let dram_pool = storage::get_dram_pool();
-
-    // Don't promote if already cached (hit or Filling).
-    if dram_pool.contains_object(&object_id) {
-        return;
-    }
-
-    // Don't promote objects above the configured threshold.
-    if obj_len > crate::max_promote_size() {
-        return;
-    }
-
-    // Alloc in DRAMPool (this IS the final storage for the cached copy).
-    let seg_buf = match dram_pool.alloc(obj_len as usize) {
-        Some(b) => b,
-        None => return, // DRAMPool full — skip promotion silently.
-    };
-
-    let buf_ptr = dram_pool.buffer_ptr(&seg_buf) as usize;
-    let promote_op = uring::UringOp {
-        iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
-        buf_ptr: buf_ptr as *mut u8,
-        file_offset: 0,
-        len: obj_len,
-    };
-
-    // Insert as Filling (visible but not yet servable).
-    let obj_ctx = Arc::new(ObjectContext::new_filling(
-        vec![seg_buf.clone()],
-        obj_len,
-        1,
-    ));
-    dram_pool.insert_object(object_id, obj_ctx.clone());
-
-    // Get fd from FdPool (cached) or open fresh for promotion read.
-    let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
-        Some(fd) => fd,
-        None => {
-            // Failed to open — remove the Filling entry and free buffer.
-            dram_pool.remove_object(&object_id);
-            dram_pool.free(&seg_buf);
-            return;
-        }
-    };
-
-    // Spawn promotion read (fire-and-forget — doesn't block the original GET reply).
-    crate::runtime_handle().spawn(async move {
-        let result = uring::submit_read(fd, &promote_op).await;
-        // fd is NOT closed here — FdPool owns it for future reads.
-
-        match result {
-            Ok(Ok(_)) => {
-                // Promotion complete: advance to Ready.
-                obj_ctx.advance_chunks_ready(1);
-                // TODO: wake coalesced waiters here.
-            }
-            _ => {
-                // Promotion failed — remove entry and free buffer.
-                storage::get_dram_pool().remove_object(&object_id);
-                storage::get_dram_pool().free(&seg_buf);
-            }
-        }
-    });
 }
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────

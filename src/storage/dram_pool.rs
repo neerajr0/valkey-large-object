@@ -75,4 +75,30 @@ impl DRAMPool {
     pub fn object_count(&self) -> usize {
         self.objects.read().unwrap().len()
     }
+
+    /// Try to allocate space and create an ObjectContext for this object.
+    /// Returns None if pool is full or object exceeds max-promote-size.
+    pub fn try_promote_object(
+        &self,
+        oid: ObjectId,
+        obj_len: u64,
+    ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
+        // Don't promote if already cached.
+        if self.contains_object(&oid) {
+            return None;
+        }
+
+        // Don't promote objects above the configured threshold.
+        if obj_len > crate::max_promote_size() {
+            return None;
+        }
+
+        let seg_buf = self.alloc(obj_len as usize)?;
+        let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_ready(
+            vec![seg_buf],
+            obj_len,
+        ));
+        self.insert_object(oid, obj_ctx.clone());
+        Some(obj_ctx)
+    }
 }

@@ -110,26 +110,20 @@ pub struct StreamingContext {
     pub buffers: Vec<SegmentBuffer>,
     /// Total object size being transferred.
     pub total_len: u64,
-    /// Progress cursor: bytes completed so far.
-    pub bytes_completed: u64,
+    /// Number of chunks completed.
+    pub chunks_completed: u32,
+    /// Total chunks needed for the full object.
+    pub total_chunks: u32,
 }
 
 impl StreamingContext {
-    /// Create a new StreamingContext for a SET operation.
-    pub fn new_for_set(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
+    /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
+    pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,
             total_len,
-            bytes_completed: 0,
-        }
-    }
-
-    /// Create a new StreamingContext for a GET operation.
-    pub fn new_for_get(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
-        Self {
-            buffers,
-            total_len,
-            bytes_completed: 0,
+            chunks_completed: 0,
+            total_chunks,
         }
     }
 
@@ -138,14 +132,14 @@ impl StreamingContext {
         self.buffers.len()
     }
 
-    /// Advance progress after a batch completes.
-    pub fn advance(&mut self, bytes: u64) {
-        self.bytes_completed += bytes;
+    /// Advance progress after a chunk completes.
+    pub fn advance(&mut self) {
+        self.chunks_completed += 1;
     }
 
     /// Check if the entire object has been transferred.
     pub fn is_complete(&self) -> bool {
-        self.bytes_completed >= self.total_len
+        self.chunks_completed == self.total_chunks
     }
 }
 
@@ -218,16 +212,18 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let mut ctx = StreamingContext::new_for_set(bufs, 50_000_000);
+        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4);
         assert!(!ctx.is_complete());
         assert_eq!(ctx.batch_size(), 2);
 
-        ctx.advance(16_000_000);
+        ctx.advance();
         assert!(!ctx.is_complete());
 
-        ctx.advance(16_000_000);
-        ctx.advance(16_000_000);
-        ctx.advance(2_000_000);
+        ctx.advance();
+        ctx.advance();
+        assert!(!ctx.is_complete());
+
+        ctx.advance();
         assert!(ctx.is_complete());
     }
 }

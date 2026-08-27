@@ -42,31 +42,21 @@ unsafe impl Send for UringOp {}
 pub type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
 pub type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
 
-/// I/O request — references a position within a registered segment.
-pub enum IoRequest {
+/// I/O request — internal transport to the poller thread. Not exposed externally.
+enum IoRequest {
     Read {
         fd: RawFd,
-        /// Segment's position in the registered iovec array.
-        iovec_index: u16,
-        /// Pointer to the buffer within the segment (absolute address).
-        buf_ptr: *mut u8,
-        /// Offset within the NVMe file to read from.
-        file_offset: u64,
-        /// Number of bytes to read (will be aligned up to 4096 for O_DIRECT).
-        len: u64,
+        op: UringOp,
         on_complete: ReadCallback,
     },
     Write {
         fd: RawFd,
-        iovec_index: u16,
-        buf_ptr: *const u8,
-        file_offset: u64,
-        len: u64,
+        op: UringOp,
         on_complete: WriteCallback,
     },
 }
 
-// SAFETY: IoRequest contains raw pointers referring to segment-allocated memory
+// SAFETY: IoRequest contains raw pointers (inside UringOp) referring to segment-allocated memory
 // that is stable for module lifetime. Closures are Send. Only sent across a
 // bounded channel to the single poller thread.
 unsafe impl Send for IoRequest {}
@@ -91,7 +81,7 @@ pub fn set_engine(engine: UringNvmeEngine) {
     ENGINE.set(engine).ok();
 }
 
-pub fn submit(req: IoRequest) {
+fn submit(req: IoRequest) {
     if let Some(engine) = ENGINE.get() {
         engine.tx.send(req).ok();
     }
@@ -114,10 +104,7 @@ pub fn submit_read(
     let (tx, rx) = oneshot::channel();
     submit(IoRequest::Read {
         fd,
-        iovec_index: op.iovec_index,
-        buf_ptr: op.buf_ptr,
-        file_offset: op.file_offset,
-        len: op.len,
+        op: op.clone(),
         on_complete: Box::new(move |result| {
             let _ = tx.send(result);
         }),
@@ -133,10 +120,7 @@ pub fn submit_write(
     let (tx, rx) = oneshot::channel();
     submit(IoRequest::Write {
         fd,
-        iovec_index: op.iovec_index,
-        buf_ptr: op.buf_ptr as *const u8,
-        file_offset: op.file_offset,
-        len: op.len,
+        op: op.clone(),
         on_complete: Box::new(move |result| {
             let _ = tx.send(result);
         }),
@@ -233,30 +217,27 @@ impl UringNvmeEngine {
                         let (sqe, op) = match req {
                             IoRequest::Read {
                                 fd,
-                                iovec_index,
-                                buf_ptr,
-                                file_offset,
-                                len,
+                                op,
                                 on_complete,
                             } => {
-                                let read_len = Self::align_up(len) as u32;
+                                let read_len = Self::align_up(op.len) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::ReadFixed::new(
                                         io_uring::types::Fd(fd),
-                                        buf_ptr,
+                                        op.buf_ptr,
                                         read_len,
-                                        iovec_index,
+                                        op.iovec_index,
                                     )
-                                    .offset(file_offset)
+                                    .offset(op.file_offset)
                                     .build()
                                     .user_data(token)
                                 } else {
                                     io_uring::opcode::Read::new(
                                         io_uring::types::Fd(fd),
-                                        buf_ptr,
+                                        op.buf_ptr,
                                         read_len,
                                     )
-                                    .offset(file_offset)
+                                    .offset(op.file_offset)
                                     .build()
                                     .user_data(token)
                                 };
@@ -264,34 +245,31 @@ impl UringNvmeEngine {
                             }
                             IoRequest::Write {
                                 fd,
-                                iovec_index,
-                                buf_ptr,
-                                file_offset,
-                                len,
+                                op,
                                 on_complete,
                             } => {
-                                let write_len = Self::align_up(len) as u32;
+                                let write_len = Self::align_up(op.len) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::WriteFixed::new(
                                         io_uring::types::Fd(fd),
-                                        buf_ptr,
+                                        op.buf_ptr as *const u8,
                                         write_len,
-                                        iovec_index,
+                                        op.iovec_index,
                                     )
-                                    .offset(file_offset)
+                                    .offset(op.file_offset)
                                     .build()
                                     .user_data(token)
                                 } else {
                                     io_uring::opcode::Write::new(
                                         io_uring::types::Fd(fd),
-                                        buf_ptr,
+                                        op.buf_ptr as *const u8,
                                         write_len,
                                     )
-                                    .offset(file_offset)
+                                    .offset(op.file_offset)
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Write { on_complete, len })
+                                (sqe, PendingOp::Write { on_complete, len: op.len })
                             }
                         };
 
