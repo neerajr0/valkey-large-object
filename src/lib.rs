@@ -16,10 +16,8 @@
 // all steps complete:
 //
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
-//   2. storage::init(nvme_size, dram_size, data_dir)
+//   2. storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, nvme_dir)
 //                              — allocate pool segments, create DRAMPool + NVMePool.
-//                              — scan data_dir for existing .dat files to
-//                                recover OID counter (avoids OID collision).
 //   3. storage::register_buffers()
 //                              — IORING_REGISTER_BUFFERS pins pool pages for
 //                                ReadFixed/WriteFixed zero-copy I/O.
@@ -54,7 +52,7 @@ enum_configuration! {
     /// Dram (default): all objects live exclusively in DRAMPool. No NVMe.
     /// Tiered: objects persist on NVMe, DRAMPool is a read cache with promotion.
     #[derive(Debug, PartialEq, Eq, Copy)]
-    
+
     pub enum OperatingMode {
         Dram = 0,
         Tiered = 1,
@@ -68,7 +66,7 @@ pub const MODULE_VERSION: i32 = 1;
 
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
-    static ref CFG_DATA_DIR: Mutex<String> = Mutex::new(String::new());
+    static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Size of the single NVMe staging segment (DRAM for I/O buffers).
     /// Used in Tiered mode for read/write staging. Default: 64MB.
@@ -127,8 +125,8 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn data_dir() -> String {
-    CFG_DATA_DIR.lock().unwrap().clone()
+pub fn nvme_dir() -> String {
+    CFG_NVME_DIR.lock().unwrap().clone()
 }
 
 pub fn nvme_staging_size() -> usize {
@@ -172,7 +170,7 @@ pub fn operating_mode() -> OperatingMode {
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = data_dir();
+    let dir = nvme_dir();
 
     // nvme-dir is required in Tiered mode.
     if mode == OperatingMode::Tiered && dir.is_empty() {
@@ -182,7 +180,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Ensure data directory exists.
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        ctx.log_warning(&format!("largeobj: failed to create data-dir: {}", e));
+        ctx.log_warning(&format!("largeobj: failed to create nvme-dir: {}", e));
         return Status::Err;
     }
 
@@ -199,7 +197,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     transport::init();
 
     // Step 2: Initialize DRAMPool + NVMePool with configured sizes.
-    let mode = operating_mode();
     let dram_seg_size = dram_segment_size();
     let dram_max = dram_maxmemory();
     let nvme_staging = nvme_staging_size();
@@ -269,7 +266,7 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
-            ["nvme-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],

@@ -2,7 +2,8 @@
 //!
 //! LO.HELLO: EFA session establishment
 //! LO.GET key [rkey remote_addr]: engine::execute_get
-//! LO.SET key len <data|rkey remote_addr>: engine::execute_set
+//! LO.SET key len <data>           (TCP): engine::execute_set
+//! LO.SET key len rkey remote_addr (EFA): engine::execute_set
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

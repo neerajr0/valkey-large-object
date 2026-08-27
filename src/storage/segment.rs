@@ -28,7 +28,8 @@ pub struct Segment {
 impl Segment {
     /// Allocate a new segment via ValkeyAlloc (alloc_zeroed).
     /// Visible in Valkey's used_memory immediately.
-    pub fn new(size: usize, iovec_index: u16) -> Self {
+    /// Allocate a new segment. iovec_index is assigned later via append_iovec().
+    pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
@@ -36,7 +37,7 @@ impl Segment {
         Self {
             base,
             size,
-            iovec_index,
+            iovec_index: 0, // assigned by append_iovec() after creation
             refcount: AtomicU32::new(0),
             draining: AtomicBool::new(false),
         }

@@ -84,8 +84,7 @@ pub fn init(
     nvme_staging_size: usize,
     _nvme_dir: &str,
 ) {
-    // NVMePool + FdPool: only needed in Tiered mode. Created FIRST so iovec_index
-    // matches the order in register_buffers() (NVMe segments come before DRAM).
+    // NVMePool + FdPool: only needed in Tiered mode.
     if mode == crate::OperatingMode::Tiered {
         let nvme_pool = NVMePool::new(1, nvme_staging_size);
         NVME_POOL.set(nvme_pool).ok();
@@ -134,7 +133,7 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 
 /// Delete an object's NVMe file. Called from free callback.
 pub fn delete_file(object_id: ObjectId) {
-    let dir = crate::data_dir();
+    let dir = crate::nvme_dir();
     let path = object_id.file_path(&dir);
     let _ = std::fs::remove_file(&path);
 }

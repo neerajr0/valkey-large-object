@@ -10,7 +10,7 @@ use std::sync::RwLock;
 use crate::data_type::ObjectId;
 
 pub struct FdPool {
-    fds: RwLock<HashMap<u64, RawFd>>,
+    fds: RwLock<HashMap<ObjectId, RawFd>>,
 }
 
 impl Default for FdPool {
@@ -27,7 +27,7 @@ impl FdPool {
     }
 
     pub fn get(&self, oid: ObjectId) -> Option<RawFd> {
-        self.fds.read().unwrap().get(&oid.0).copied()
+        self.fds.read().unwrap().get(&oid).copied()
     }
 
     /// Get cached fd or open the file and cache it.
@@ -51,11 +51,11 @@ impl FdPool {
     }
 
     pub fn insert(&self, oid: ObjectId, fd: RawFd) {
-        self.fds.write().unwrap().insert(oid.0, fd);
+        self.fds.write().unwrap().insert(oid, fd);
     }
 
     pub fn remove(&self, oid: ObjectId) {
-        if let Some(fd) = self.fds.write().unwrap().remove(&oid.0) {
+        if let Some(fd) = self.fds.write().unwrap().remove(&oid) {
             // SAFETY: fd is a valid file descriptor opened by us via libc::open.
             // We own it exclusively (removed from map) and close exactly once.
             unsafe { libc::close(fd) };

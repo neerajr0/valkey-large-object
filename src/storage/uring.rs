@@ -39,8 +39,8 @@ pub struct UringOp {
 unsafe impl Send for UringOp {}
 
 /// Completion callback: (result or error). Caller retains buffer ownership.
-pub type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
-pub type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
+type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
+type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
 
 /// I/O request — internal transport to the poller thread. Not exposed externally.
 enum IoRequest {

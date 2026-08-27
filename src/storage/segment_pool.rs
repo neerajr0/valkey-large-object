@@ -25,9 +25,8 @@ impl SegmentPool {
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
-            let seg = Segment::new(segment_size, 0); // index assigned below
+            let seg = Segment::new(segment_size); // iovec_index assigned below
             let idx = super::append_iovec(seg.iovec());
-            // Safety: we just created the segment, no one else holds a reference yet.
             let mut seg = seg;
             seg.iovec_index = idx;
             segments.push(seg);
@@ -116,14 +115,8 @@ impl SegmentPool {
         }
     }
 
-    /// Get iovecs for io_uring registration.
-    pub fn iovecs(&self) -> Vec<libc::iovec> {
-        self.segments.iter().map(|s| s.iovec()).collect()
-    }
-
     /// Given a raw pointer address, find which segment it belongs to.
     /// Returns (segment_index, offset_within_segment) for io_uring ReadFixed/WriteFixed.
-    /// Currently only 1 segment exists; multiple segments supported for future expand/shrink.
     fn find_segment(&self, addr: usize) -> Option<(usize, usize)> {
         for (i, seg) in self.segments.iter().enumerate() {
             let base = seg.base as usize;

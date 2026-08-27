@@ -66,7 +66,7 @@ pub fn execute_get(
             let blocked_client = ctx.block_client();
             match mode {
                 OperatingMode::Dram => {
-                    execute_get_dram_only(object_id, obj_len, transport, blocked_client);
+                    execute_get_dram_efa(object_id, obj_len, transport, blocked_client);
                 }
                 OperatingMode::Tiered => {
                     execute_get_tiered(object_id, obj_len, transport, blocked_client);
@@ -102,7 +102,7 @@ fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, 
 
 /// DRAM-only GET: object MUST be in DRAMPool. If not found → key doesn't exist
 /// (shouldn't happen — LoValue exists implies ObjectContext exists in DRAM-only mode).
-fn execute_get_dram_only(
+fn execute_get_dram_efa(
     object_id: ObjectId,
     obj_len: u64,
     transport: Transport,
@@ -159,7 +159,7 @@ fn execute_get_tiered(
         };
 
         let fd_pool = storage::get_fd_pool();
-        let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
+        let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
                 dram_pool.remove_object(&object_id);
@@ -211,7 +211,7 @@ fn execute_get_tiered(
     let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get_or_open(object_id, &crate::data_dir()) {
+    let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
         Some(fd) => fd,
         None => {
             nvme_pool.free(&stream_ctx.buffers[0]);
@@ -223,7 +223,7 @@ fn execute_get_tiered(
 
     let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming PR will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let read_op = uring::UringOp {
         iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
         buf_ptr: buf_ptr_usize as *mut u8,
@@ -313,7 +313,7 @@ pub fn execute_set(
             let key_name_bytes = key_name.as_slice().to_vec();
             match mode {
                 OperatingMode::Dram => {
-                    execute_set_dram_only(key_name_bytes, obj_len, data_source, blocked_client);
+                    execute_set_dram_efa(key_name_bytes, obj_len, data_source, blocked_client);
                 }
                 OperatingMode::Tiered => {
                     execute_set_tiered(key_name_bytes, obj_len, data_source, blocked_client);
@@ -373,7 +373,7 @@ pub enum DataSource {
 
 /// DRAM-only SET: alloc in DRAMPool, fill, create ObjectContext + LoValue.
 /// No NVMe. Synchronous for TCP, tokio for EFA.
-fn execute_set_dram_only(
+fn execute_set_dram_efa(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -399,37 +399,8 @@ fn execute_set_dram_only(
     let buf_ptr_usize = buf_ptr as usize;
 
     match data_source {
-        DataSource::Tcp(data) => {
-            // TCP: memcpy inline, synchronous.
-            let copy_len = data.len().min(obj_len as usize);
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
-
-            // Compute CRC.
-            let crc =
-                crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
-
-            // Create ObjectContext (Ready — data is complete).
-            let object_id = ObjectId::next();
-            let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-            dram_pool.insert_object(object_id, obj_ctx);
-
-            // Create LoValue in keyspace.
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            {
-                let ctx = thread_ctx.lock();
-                let key_str = ctx.create_string(key_name);
-                let key = ctx.open_key_writable(&key_str);
-                let lo_value = LoValue {
-                    object_id,
-                    len: obj_len,
-                    crc32c: crc,
-                };
-                if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
-                    return;
-                }
-            }
-            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+        DataSource::Tcp(_) => {
+            panic!("unreachable: Dram+TCP SET routed to sync path via EngineResult");
         }
         DataSource::Efa {
             session,
@@ -492,6 +463,8 @@ fn execute_set_tiered(
     blocked_client: valkey_module::BlockedClient,
 ) {
     let nvme_pool = storage::get_nvme_pool();
+
+    // TODO: invalidate existing DRAMPool entry if key already exists.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
@@ -571,13 +544,14 @@ async fn do_tiered_nvme_write(
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
     let object_id = ObjectId::next();
-    let dir = crate::data_dir();
+    let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
     let c_path = std::ffi::CString::new(file_path.as_str()).unwrap();
     let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
         write_flags |= libc::O_DIRECT;
     }
+    // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
     let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if fd < 0 {
         storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
@@ -588,7 +562,7 @@ async fn do_tiered_nvme_write(
 
     let nvme_pool = storage::get_nvme_pool();
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming PR will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let write_op = uring::UringOp {
         iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
         buf_ptr: buf_ptr_usize as *mut u8,

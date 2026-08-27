@@ -31,10 +31,6 @@ impl NVMePool {
         self.pool.buffer_ptr(buf)
     }
 
-    pub fn iovecs(&self) -> Vec<libc::iovec> {
-        self.pool.iovecs()
-    }
-
     /// Access segments (needed by engine for buf_index lookup).
     pub fn segments(&self) -> &[Segment] {
         &self.pool.segments
