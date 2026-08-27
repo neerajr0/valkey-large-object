@@ -91,8 +91,12 @@ fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, 
             data.truncate(obj_len as usize);
             Ok(ValkeyValue::StringBuffer(data))
         }
-        Some(_) => Err(ValkeyError::Str("ERR object not ready")),
-        None => Err(ValkeyError::Str("ERR object not in DRAM cache")),
+        Some(_) => {
+            panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
+        }
+        None => {
+            panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug");
+        }
     }
 }
 
@@ -113,13 +117,10 @@ fn execute_get_dram_only(
             serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
         }
         Some(_obj_ctx) => {
-            // Filling state in DRAM-only mode — shouldn't happen (SET is synchronous).
-            // But handle gracefully: return error.
-            thread_ctx.reply(Err(ValkeyError::Str("ERR object not ready")));
+            panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
         }
         None => {
-            // Shouldn't happen: LoValue exists but no ObjectContext in DRAM-only mode.
-            thread_ctx.reply(Err(ValkeyError::Str("ERR object not in DRAM cache")));
+            panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug");
         }
     }
 }
@@ -173,14 +174,14 @@ fn execute_get_tiered(
         // Read from NVMe directly into DRAMPool buffer, then serve.
         crate::runtime_handle().spawn(async move {
             let result = uring::submit_read(fd, &read_op).await;
-            let thread_ctx =
-                valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
             match result {
                 Ok(Ok(_)) => {
                     // Serve from DRAMPool (object is now cached).
                     let dram_pool = storage::get_dram_pool();
-                    let obj_ctx = dram_pool.get_object(&object_id).unwrap();
+                    let obj_ctx = dram_pool.get_object(&object_id)
+                        .expect("ObjectContext missing after try_promote_object inserted it");
                     serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
                 }
                 _ => {
@@ -249,24 +250,9 @@ fn execute_get_tiered(
                         rkey,
                         remote_addr,
                     } => {
-                        let (efa_tx, efa_rx) = tokio::sync::oneshot::channel();
-                        let buf_ptr = buf_ptr_usize as *mut u8;
-                        session.write(
-                            buf_ptr,
-                            obj_len as usize,
-                            rkey,
-                            remote_addr,
-                            Box::new(move |_ptr, result| {
-                                let _ = efa_tx.send(result);
-                            }),
-                        );
-                        match efa_rx.await {
-                            Ok(Ok(())) => {
-                                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                            }
-                            _ => {
-                                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_WRITE)));
-                            }
+                        match efa_write_to_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await {
+                            Ok(()) => { thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))); }
+                            Err(e) => { thread_ctx.reply(Err(e)); }
                         }
                     }
                 }
@@ -280,6 +266,9 @@ fn execute_get_tiered(
                     e
                 ))));
             }
+            // RecvError: io_uring poller thread dropped the oneshot sender.
+            // This means the poller panicked or shut down unexpectedly.
+            // TODO: Add error metric counter for poller channel failures.
             Err(_) => {
                 storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
@@ -422,7 +411,10 @@ fn execute_set_dram_only(
                     len: obj_len,
                     crc32c: crc,
                 };
-                key.set_value(&LO_TYPE, lo_value).unwrap();
+                if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                    return;
+                }
             }
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
@@ -433,22 +425,12 @@ fn execute_set_dram_only(
         } => {
             // EFA: transport.read into DRAMPool buffer via tokio task.
             crate::runtime_handle().spawn(async move {
-                let (efa_tx, efa_rx) = tokio::sync::oneshot::channel();
-                let ptr = buf_ptr_usize as *mut u8;
-                session.read(
-                    ptr,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
-                    Box::new(move |_ptr, result| {
-                        let _ = efa_tx.send(result);
-                    }),
-                );
-
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                match efa_rx.await {
-                    Ok(Ok(())) => {
+
+                match efa_read_from_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await
+                {
+                    Ok(()) => {
                         let crc = crc32c::crc32c(unsafe {
                             std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
                         });
@@ -465,11 +447,14 @@ fn execute_set_dram_only(
                                 len: obj_len,
                                 crc32c: crc,
                             };
-                            key.set_value(&LO_TYPE, lo_value).unwrap();
+                            if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                    return;
+                }
                         }
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                     }
-                    _ => {
+                    Err(_) => {
                         storage::get_dram_pool().free(&seg_buf);
                         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
                     }
@@ -522,20 +507,9 @@ fn execute_set_tiered(
         } => {
             // EFA: transport.read into NVMePool buffer, then write to NVMe.
             crate::runtime_handle().spawn(async move {
-                let (efa_tx, efa_rx) = tokio::sync::oneshot::channel();
-                let ptr = buf_ptr_usize as *mut u8;
-                session.read(
-                    ptr,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
-                    Box::new(move |_ptr, result| {
-                        let _ = efa_tx.send(result);
-                    }),
-                );
-
-                match efa_rx.await {
-                    Ok(Ok(())) => {
+                match efa_read_from_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr).await
+                {
+                    Ok(()) => {
                         do_tiered_nvme_write(
                             buf_ptr_usize,
                             obj_len,
@@ -545,7 +519,7 @@ fn execute_set_tiered(
                         )
                         .await;
                     }
-                    _ => {
+                    Err(_) => {
                         storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                         let thread_ctx =
                             valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -611,7 +585,10 @@ async fn do_tiered_nvme_write(
                     len: obj_len,
                     crc32c: crc,
                 };
-                key.set_value(&LO_TYPE, lo_value).unwrap();
+                if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                    return;
+                }
             }
             storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
@@ -625,6 +602,9 @@ async fn do_tiered_nvme_write(
                 e
             ))));
         }
+        // RecvError: io_uring poller thread dropped the oneshot sender.
+        // This means the poller panicked or shut down unexpectedly.
+        // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
             let _ = std::fs::remove_file(&file_path);
             storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
@@ -660,26 +640,65 @@ fn serve_from_dram(
             remote_addr,
         } => {
             // EFA: write from DRAMPool buffer to client GPU.
-            // Must spawn tokio task for the async EFA write.
             let buf = &obj_ctx.buffers[0]; // Single-chunk for now.
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
             crate::runtime_handle().spawn(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let ptr = buf_ptr as *mut u8;
-                session.write(
-                    ptr,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
-                    Box::new(move |_ptr, result| {
-                        let _ = tx.send(result);
-                    }),
-                );
-                match rx.await {
-                    Ok(Ok(())) => thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))),
-                    _ => thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_WRITE))),
+                match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr).await
+                {
+                    Ok(()) => thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))),
+                    Err(e) => thread_ctx.reply(Err(e)),
                 }
             });
         }
+    }
+}
+
+// ─── EFA Transport Helpers ───────────────────────────────────────────────────
+
+/// Read from client GPU into local buffer via EFA. Must be awaited in a tokio task.
+async fn efa_read_from_client(
+    session: Arc<Session>,
+    buf_ptr: usize,
+    len: usize,
+    rkey: u64,
+    remote_addr: u64,
+) -> Result<(), ValkeyError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    session.read(
+        buf_ptr as *mut u8,
+        len,
+        rkey,
+        remote_addr,
+        Box::new(move |_ptr, result| {
+            let _ = tx.send(result);
+        }),
+    );
+    match rx.await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(ValkeyError::Str(errors::ERR_EFA_READ)),
+    }
+}
+
+/// Write from local buffer to client GPU via EFA. Must be awaited in a tokio task.
+async fn efa_write_to_client(
+    session: Arc<Session>,
+    buf_ptr: usize,
+    len: usize,
+    rkey: u64,
+    remote_addr: u64,
+) -> Result<(), ValkeyError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    session.write(
+        buf_ptr as *mut u8,
+        len,
+        rkey,
+        remote_addr,
+        Box::new(move |_ptr, result| {
+            let _ = tx.send(result);
+        }),
+    );
+    match rx.await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(ValkeyError::Str(errors::ERR_EFA_WRITE)),
     }
 }

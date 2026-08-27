@@ -269,7 +269,13 @@ impl UringNvmeEngine {
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Write { on_complete, len: op.len })
+                                (
+                                    sqe,
+                                    PendingOp::Write {
+                                        on_complete,
+                                        len: op.len,
+                                    },
+                                )
                             }
                         };
 
