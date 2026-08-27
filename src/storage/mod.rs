@@ -40,16 +40,21 @@ impl std::fmt::Display for StorageError {
 
 // ─── Global Pool Instances ───────────────────────────────────────────────────
 
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-/// Global monotonic counter for io_uring iovec indices.
-/// Each segment gets a unique index. Pools call alloc_iovec_indices() internally.
-static NEXT_IOVEC_INDEX: AtomicU16 = AtomicU16::new(0);
+/// Global iovec registry. Segments append here at creation time.
+/// Array position = iovec_index used by io_uring ReadFixed/WriteFixed.
+/// register_buffers() passes this directly to the kernel — no reordering.
+/// Stored as (ptr, len) pairs because libc::iovec contains raw pointers (not Send).
+static IOVECS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
-/// Allocate `count` consecutive iovec indices. Returns the starting index.
-pub fn alloc_iovec_indices(count: u16) -> u16 {
-    NEXT_IOVEC_INDEX.fetch_add(count, Ordering::Relaxed)
+/// Called by SegmentPool::new() when creating each segment.
+/// Returns the assigned iovec_index (= current array length before push).
+pub fn append_iovec(iov: libc::iovec) -> u16 {
+    let mut iovecs = IOVECS.lock().unwrap();
+    let idx = iovecs.len() as u16;
+    iovecs.push((iov.iov_base as usize, iov.iov_len));
+    idx
 }
 
 static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
@@ -70,31 +75,40 @@ pub fn get_fd_pool() -> &'static FdPool {
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
-/// Initialize both pools. Called at module startup.
-/// `nvme_segment_size`: total NVMePool segment size (buf_count * buf_size).
-/// `dram_segment_size`: total DRAMPool segment size (configurable, larger).
-/// `data_dir`: NVMe file storage directory.
-pub fn init(nvme_segment_size: usize, dram_segment_size: usize, _data_dir: &str) {
-    // NVMePool: 1 segment, fixed at startup.
-    let nvme_pool = NVMePool::new(1, nvme_segment_size);
-    NVME_POOL.set(nvme_pool).ok();
+/// Initialize pools based on operating mode.
+/// Creation order doesn't matter — iovec indices are assigned via global registry.
+pub fn init(
+    mode: crate::OperatingMode,
+    dram_segment_count: usize,
+    dram_segment_size: usize,
+    nvme_staging_size: usize,
+    _nvme_dir: &str,
+) {
+    // NVMePool + FdPool: only needed in Tiered mode. Created FIRST so iovec_index
+    // matches the order in register_buffers() (NVMe segments come before DRAM).
+    if mode == crate::OperatingMode::Tiered {
+        let nvme_pool = NVMePool::new(1, nvme_staging_size);
+        NVME_POOL.set(nvme_pool).ok();
 
-    // DRAMPool: 1 segment initially.
-    let dram_pool = DRAMPool::new(1, dram_segment_size);
+        FD_POOL.set(FdPool::new()).ok();
+    }
+
+    // DRAMPool: always needed (both modes).
+    let dram_pool = DRAMPool::new(dram_segment_count, dram_segment_size);
     DRAM_POOL.set(dram_pool).ok();
-
-    // FdPool: caches open file descriptors for NVMe object files.
-    // Currently basic HashMap; will be upgraded to Arc<FdEntry> + LFRU eviction.
-    FD_POOL.set(FdPool::new()).ok();
 }
 
-/// Register ALL segments (both pools) with io_uring as one combined iovec array.
-/// Must be called after init().
+/// Register ALL segments with io_uring. Uses the global IOVECS vec built during init.
+/// Array position = iovec_index, guaranteed by append_iovec() at creation time.
 pub fn register_buffers() {
-    let mut iovecs = get_nvme_pool().iovecs();
-    iovecs.extend(get_dram_pool().iovecs());
-
-    // Create io_uring engine with combined iovecs.
+    let pairs = IOVECS.lock().unwrap().clone();
+    let iovecs: Vec<libc::iovec> = pairs
+        .iter()
+        .map(|&(ptr, len)| libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len: len,
+        })
+        .collect();
     let engine = uring::UringNvmeEngine::new(iovecs);
     uring::set_engine(engine);
 }
@@ -107,8 +121,10 @@ pub fn shutdown() {
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
-    for seg in get_nvme_pool().segments() {
-        slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
+    if let Some(nvme_pool) = NVME_POOL.get() {
+        for seg in nvme_pool.segments() {
+            slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
+        }
     }
     for seg in get_dram_pool().segments() {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });

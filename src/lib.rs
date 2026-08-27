@@ -51,12 +51,13 @@ use valkey_module::enum_configuration;
 
 enum_configuration! {
     /// Operating mode — set via `operating-mode` module enum config.
-    /// Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
-    /// DramOnly (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    /// Dram (default): all objects live exclusively in DRAMPool. No NVMe.
+    /// Tiered: objects persist on NVMe, DRAMPool is a read cache with promotion.
     #[derive(Debug, PartialEq, Eq, Copy)]
+    
     pub enum OperatingMode {
-        Tiered = 0,
-        DramOnly = 1,
+        Dram = 0,
+        Tiered = 1,
     }
 }
 
@@ -69,22 +70,24 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_DATA_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// NVMe pool size in bytes. This is the total segment memory for NVMe I/O buffers.
-    /// Used in Tiered mode for read/write staging. Default: 512MB.
-    /// Immutable after load. Supports memory notation via module args (e.g., "512mb").
-    static ref CFG_NVME_POOL_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
+    /// Size of the single NVMe staging segment (DRAM for I/O buffers).
+    /// Used in Tiered mode for read/write staging. Default: 64MB.
+    /// Immutable after load. Always 1 segment of this size.
+    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
-    /// DRAM pool size in bytes. This is the total segment memory for the DRAM cache.
-    /// Used in both modes: DRAM-only stores objects here permanently,
-    /// Tiered mode uses it as a promotion cache. Default: 512MB.
-    /// Immutable after load. Supports memory notation via module args (e.g., "2gb").
-    static ref CFG_DRAM_POOL_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
+    /// Total DRAM budget for cached objects. 0 = no limit (grow on demand).
+    /// In Dram mode: all objects live here. In Tiered mode: promotion cache.
+    static ref CFG_DRAM_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
-    /// Maximum total bytes on NVMe. 0 = unlimited. Supports memory notation (e.g. "10gb").
-    static ref CFG_MAX_BYTES: AtomicI64 = AtomicI64::new(0);
+    /// Size of each DRAMPool segment. Growth unit when dram-maxmemory=0.
+    /// Default: 64MB. Immutable after load.
+    static ref CFG_DRAM_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+
+    /// Max disk usage in nvme-dir. Default: 10GB.
+    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(10 * 1024 * 1024 * 1024);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
-    static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(2);
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
@@ -109,8 +112,8 @@ lazy_static::lazy_static! {
 
     /// Operating mode. Immutable after module load.
     /// - Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
-    /// - DramOnly (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
-    static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Tiered);
+    /// - Dram (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -128,20 +131,24 @@ pub fn data_dir() -> String {
     CFG_DATA_DIR.lock().unwrap().clone()
 }
 
-pub fn nvme_pool_size() -> usize {
-    CFG_NVME_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn nvme_staging_size() -> usize {
+    CFG_NVME_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn dram_pool_size() -> usize {
-    CFG_DRAM_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn dram_maxmemory() -> u64 {
+    CFG_DRAM_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn max_bytes() -> u64 {
-    CFG_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn dram_segment_size() -> usize {
+    CFG_DRAM_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn transport_threads() -> usize {
-    CFG_TRANSPORT_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn nvme_maxmemory() -> u64 {
+    CFG_NVME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn worker_threads() -> usize {
+    CFG_WORKER_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_promote_size() -> u64 {
@@ -164,9 +171,12 @@ pub fn operating_mode() -> OperatingMode {
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
+    let mode = operating_mode();
     let dir = data_dir();
-    if dir.is_empty() {
-        ctx.log_warning("largeobj: data-dir is required");
+
+    // nvme-dir is required in Tiered mode.
+    if mode == OperatingMode::Tiered && dir.is_empty() {
+        ctx.log_warning("largeobj: nvme-dir is required in Tiered operating mode");
         return Status::Err;
     }
 
@@ -178,8 +188,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Step 0: Create tokio runtime (module owns it, transport borrows handle).
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(transport_threads())
-        .thread_name("lo-transport")
+        .worker_threads(worker_threads())
+        .thread_name("largeobj")
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
@@ -190,9 +200,19 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Step 2: Initialize DRAMPool + NVMePool with configured sizes.
     let mode = operating_mode();
-    let nvme_size = nvme_pool_size();
-    let dram_size = dram_pool_size();
-    storage::init(nvme_size, dram_size, &dir);
+    let dram_seg_size = dram_segment_size();
+    let dram_max = dram_maxmemory();
+    let nvme_staging = nvme_staging_size();
+
+    // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
+    // Otherwise pre-allocate maxmemory / segment_size segments.
+    let dram_segment_count = if dram_max == 0 {
+        1
+    } else {
+        ((dram_max as usize) / dram_seg_size).max(1)
+    };
+
+    storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, &dir);
 
     // Step 3: Register all segments with io_uring.
     storage::register_buffers();
@@ -203,12 +223,12 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     transport::register_buffers(&slice_refs);
 
     ctx.log_notice(&format!(
-        "largeobj: initialized mode={:?} data_dir={} nvme_pool={}MB dram_pool={}MB transport_threads={}",
+        "largeobj: initialized mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
         mode,
         dir,
-        nvme_size / (1024 * 1024),
-        dram_size / (1024 * 1024),
-        transport_threads(),
+        dram_segment_count,
+        dram_seg_size / (1024 * 1024),
+        nvme_staging / (1024 * 1024),
     ));
 
     Status::Ok
@@ -235,26 +255,28 @@ valkey_module! {
     ],
     configurations: [
         i64: [
-            ["nvme-pool-size", &*CFG_NVME_POOL_SIZE, 536_870_912, 1_048_576, 1_099_511_627_776,
-             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["dram-pool-size", &*CFG_DRAM_POOL_SIZE, 536_870_912, 1_048_576, 1_099_511_627_776,
-             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
+            ["dram-maxmemory", &*CFG_DRAM_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
-            ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
+            ["dram-segment-size", &*CFG_DRAM_SEGMENT_SIZE, 67_108_864, 1_048_576, i64::MAX,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, i64::MAX,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
+             ConfigurationFlags::MEMORY, None, None],
+            ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
-            ["data-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["nvme-dir", &*CFG_DATA_DIR, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [
-            ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Tiered,
+            ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

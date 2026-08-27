@@ -57,7 +57,7 @@ pub fn execute_get(
     let mode = crate::operating_mode();
 
     match (mode, &transport) {
-        (OperatingMode::DramOnly, Transport::Tcp) => {
+        (OperatingMode::Dram, Transport::Tcp) => {
             // Fully sync — serve from DRAMPool, return directly.
             EngineResult::Sync(serve_get_dram_tcp(object_id, obj_len))
         }
@@ -65,7 +65,7 @@ pub fn execute_get(
             // Async — block client, dispatch to tokio.
             let blocked_client = ctx.block_client();
             match mode {
-                OperatingMode::DramOnly => {
+                OperatingMode::Dram => {
                     execute_get_dram_only(object_id, obj_len, transport, blocked_client);
                 }
                 OperatingMode::Tiered => {
@@ -303,7 +303,7 @@ pub fn execute_set(
     let mode = crate::operating_mode();
 
     match (mode, &data_source) {
-        (OperatingMode::DramOnly, DataSource::Tcp(data)) => {
+        (OperatingMode::Dram, DataSource::Tcp(data)) => {
             // Fully sync — alloc + memcpy + create LoValue inline.
             EngineResult::Sync(serve_set_dram_tcp(ctx, key_name, obj_len, data))
         }
@@ -312,7 +312,7 @@ pub fn execute_set(
             let blocked_client = ctx.block_client();
             let key_name_bytes = key_name.as_slice().to_vec();
             match mode {
-                OperatingMode::DramOnly => {
+                OperatingMode::Dram => {
                     execute_set_dram_only(key_name_bytes, obj_len, data_source, blocked_client);
                 }
                 OperatingMode::Tiered => {

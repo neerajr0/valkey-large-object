@@ -21,12 +21,16 @@ pub struct SegmentPool {
 
 impl SegmentPool {
     /// Create a new SegmentPool with `segment_count` segments of `segment_size` bytes.
-    /// iovec indices are auto-assigned from the global counter.
+    /// Each segment's iovec_index is assigned by appending to the global IOVECS registry.
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
-        let base_iovec_index = super::alloc_iovec_indices(segment_count as u16);
         let mut segments = Vec::with_capacity(segment_count);
-        for i in 0..segment_count {
-            segments.push(Segment::new(segment_size, base_iovec_index + i as u16));
+        for _ in 0..segment_count {
+            let seg = Segment::new(segment_size, 0); // index assigned below
+            let idx = super::append_iovec(seg.iovec());
+            // Safety: we just created the segment, no one else holds a reference yet.
+            let mut seg = seg;
+            seg.iovec_index = idx;
+            segments.push(seg);
         }
 
         // Create talc with first segment as initial span.

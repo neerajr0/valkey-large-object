@@ -50,16 +50,15 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         assert len(dat_files_after) < len(dat_files_before)
 
     def test_pool_exhaustion_error(self):
-        """An object larger than the NVMe pool segment fails allocation."""
+        """An object larger than the NVMe staging segment fails allocation."""
         client = self.server.get_new_client()
-        # NVMe pool is 1MB. An object of 2MB cannot be allocated.
+        # nvme-staging-size is 1MB. An object of 2MB cannot be staged.
         obj_size = 2 * 1024 * 1024
-        payload = 'A' * obj_size
+        payload = b'A' * obj_size
         try:
-            client.execute_command(f'LO.SET toobig {obj_size} {payload}')
+            client.execute_command('LO.SET', 'toobig', str(obj_size), payload)
             assert False, "Expected error for object larger than pool but command succeeded"
         except ResponseError as e:
-            # Allocation failure from talc when object exceeds segment capacity.
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_bench_mode_reply_format(self):
