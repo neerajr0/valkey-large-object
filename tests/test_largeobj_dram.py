@@ -67,3 +67,56 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             data = client.execute_command('LO.GET', f'multi{i}')
             expected = bytes([i % 256]) * 4096
             assert data == expected, f"Key multi{i} mismatch"
+
+    # ─── COPY command tests ───────────────────────────────────────────────
+
+    def test_copy_creates_independent_object(self):
+        """COPY creates a new object with its own data in DRAMPool."""
+        client = self.server.get_new_client()
+        payload = b'C' * 4096
+        client.execute_command('LO.SET', 'srckey', payload)
+
+        result = client.execute_command('COPY', 'srckey', 'dstkey')
+        assert result == 1 or result is True
+
+        src_data = client.execute_command('LO.GET', 'srckey')
+        dst_data = client.execute_command('LO.GET', 'dstkey')
+        assert src_data == payload
+        assert dst_data == payload
+
+    def test_copy_source_unaffected_by_dst_delete(self):
+        """Deleting a COPY destination does not affect the source."""
+        client = self.server.get_new_client()
+        payload = b'E' * 4096
+        client.execute_command('LO.SET', 'copysrc', payload)
+        client.execute_command('COPY', 'copysrc', 'copydst')
+
+        client.execute_command('DEL', 'copydst')
+
+        src_data = client.execute_command('LO.GET', 'copysrc')
+        assert src_data == payload
+
+    def test_copy_different_digest(self):
+        """COPY gets a new OID so its DEBUG DIGEST differs from the source."""
+        client = self.server.get_new_client()
+        payload = b'D' * 4096
+        client.execute_command('LO.SET', 'digestsrc', payload)
+        client.execute_command('COPY', 'digestsrc', 'digestdst')
+
+        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digestsrc')
+        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digestdst')
+        assert src_digest != dst_digest
+
+    def test_copy_pool_exhausted(self):
+        """COPY fails when DRAMPool cannot fit the duplicate."""
+        client = self.server.get_new_client()
+        # Fill most of the 1MB pool with a large object.
+        payload = b'F' * (900 * 1024)
+        client.execute_command('LO.SET', 'bigkey', payload)
+
+        # COPY needs another 900KB — pool is only 1MB total.
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail with pool exhausted"
+        except ResponseError:
+            pass  # Expected — pool cannot fit two 900KB objects
