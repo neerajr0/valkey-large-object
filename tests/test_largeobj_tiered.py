@@ -57,6 +57,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
+        self._wait_for_lazyfree_done(client)
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
