@@ -185,7 +185,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
     // If the reset fails we can't guarantee a clean slate, so refuse to load
     // rather than start dirty.
-    if let Err(e) = storage::cleanup_nvme_dir(mode, &dir) {
+    if let Err(e) = storage::validate_and_clean_nvme_dir(mode, &dir) {
         ctx.log_warning(&format!(
             "largeobj: startup failed to reset nvme-dir {}: {}; aborting module load",
             dir, e
@@ -262,7 +262,7 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::shutdown();
     storage::shutdown(); // stop the io_uring poller
     let dir = nvme_dir();
-    if let Err(e) = storage::cleanup_nvme_dir(operating_mode(), &dir) {
+    if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",
             dir, e

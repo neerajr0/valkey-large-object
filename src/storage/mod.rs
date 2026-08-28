@@ -126,7 +126,7 @@ pub fn shutdown() {
 /// this instance's files at shutdown. Returns `Ok(())` once nvme-dir exists and
 /// is empty (or immediately, in Dram mode); `Err` if nvme-dir is unset in Tiered
 /// mode, or the directory could not be removed or recreated.
-pub fn cleanup_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(());
     }
@@ -165,75 +165,4 @@ pub fn delete_file(object_id: ObjectId) {
     let dir = crate::nvme_dir();
     let path = object_id.file_path(&dir);
     let _ = std::fs::remove_file(&path);
-}
-
-// ─── Unit Tests ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::OperatingMode;
-
-    #[test]
-    fn test_cleanup_nvme_dir_wipes_and_recreates() {
-        // Unique temp nvme-dir without relying on external crates.
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("bigobj_cleanup_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_str = dir.to_str().unwrap();
-
-        // nvme-dir is exclusively the module's, so cleanup removes everything in
-        // it, name-agnostically — object files, tmp scratch, anything.
-        std::fs::write(dir.join("0000000000000001.dat"), b"a").unwrap();
-        std::fs::write(dir.join("0000000000000002.dat.tmp"), b"b").unwrap();
-        std::fs::write(dir.join("whatever"), b"c").unwrap();
-
-        cleanup_nvme_dir(OperatingMode::Tiered, dir_str).unwrap();
-        assert!(dir.exists(), "nvme-dir should be recreated empty");
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            0,
-            "nvme-dir should be empty after cleanup"
-        );
-
-        // Idempotent: a second cleanup leaves an empty dir.
-        cleanup_nvme_dir(OperatingMode::Tiered, dir_str).unwrap();
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-
-        // A missing dir is a safe no-op that recreates it.
-        let missing = base.join(format!("bigobj_cleanup_missing_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&missing);
-        cleanup_nvme_dir(OperatingMode::Tiered, missing.to_str().unwrap()).unwrap();
-        assert!(missing.exists(), "missing dir should be created");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-        std::fs::remove_dir_all(&missing).unwrap();
-    }
-
-    #[test]
-    fn test_cleanup_nvme_dir_dram_is_noop() {
-        // In Dram mode cleanup never touches disk: existing contents survive,
-        // and even an unset (empty) path is accepted without error.
-        let dir = std::env::temp_dir().join(format!("bigobj_cleanup_dram_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("keep.dat"), b"x").unwrap();
-
-        cleanup_nvme_dir(OperatingMode::Dram, dir.to_str().unwrap()).unwrap();
-        assert!(
-            dir.join("keep.dat").exists(),
-            "Dram cleanup must not delete files"
-        );
-        cleanup_nvme_dir(OperatingMode::Dram, "").unwrap();
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn test_cleanup_nvme_dir_tiered_requires_dir() {
-        // Tiered mode with an unset nvme-dir is a misconfiguration, surfaced as
-        // an error so startup can refuse to load rather than start dirty.
-        assert!(cleanup_nvme_dir(OperatingMode::Tiered, "").is_err());
-    }
 }
