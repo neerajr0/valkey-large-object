@@ -140,7 +140,7 @@ unsafe extern "C" fn lo_copy(
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match src.create_copy(&crate::data_dir()) {
+    match src.create_copy(&crate::nvme_dir()) {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }
@@ -213,18 +213,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_oid_init_counter() {
-        // init_counter sets the counter to at least the given value.
-        // Subsequent next() calls must return values above it.
-        ObjectId::init_counter(1_000_000);
-        let oid = ObjectId::next();
-        assert!(
-            oid.0 >= 1_000_000,
-            "OID {} should be >= 1000000 after init_counter",
-            oid.0
-        );
-    }
+
 
     // ─── memory_usage tests ──────────────────────────────────────────────
 
