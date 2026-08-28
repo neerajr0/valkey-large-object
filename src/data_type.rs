@@ -65,15 +65,6 @@ impl LoValue {
     /// Per the Module API contract: returning 0 causes lazyfreeGetFreeEffort()
     /// to map to ULONG_MAX, which always exceeds LAZYFREE_THRESHOLD (64),
     /// guaranteeing async free.
-    ///
-    /// Rationale for always-async:
-    /// 1. Our free callback performs unlink(2) on the NVMe file — a blocking
-    ///    I/O syscall that should never execute on the main event-loop thread.
-    /// 2. The actual LoValue struct is trivial (24 bytes of metadata). The
-    ///    "effort" is the file deletion, which is O(1) regardless of file size
-    ///    on modern filesystems (XFS/ext4 reclaim blocks lazily).
-    /// 3. Thread safety is maintained: storage::delete() is a plain
-    ///    remove_file() syscall with no shared mutable state.
     pub fn free_effort(&self) -> usize {
         0
     }
@@ -88,11 +79,6 @@ impl LoValue {
     ///   COPY is sequenced by the event loop, so the source file cannot vanish
     ///   mid-copy.
     ///
-    /// Future consideration: when read coalescing / refcounting is added, a
-    /// background eviction (io-poller thread) could race with this copy. In
-    /// this case ackground eviction must synchronize with the main
-    /// thread (e.g., via ThreadSafeContext notification) before unlinking any
-    /// file that is still referenced by a live key.
     pub fn create_copy(&self, data_dir: &str) -> Option<LoValue> {
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(data_dir);
