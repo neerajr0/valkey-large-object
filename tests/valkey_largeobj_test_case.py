@@ -1,4 +1,5 @@
 import os
+import glob
 import pytest
 from valkeytestframework.valkey_test_case import ValkeyTestCase
 from valkey import ResponseError
@@ -35,8 +36,12 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     @pytest.fixture(autouse=True)
     def setup_test(self, setup):
         module_path = os.getenv('MODULE_PATH')
-        # Use absolute path for nvme-dir so file assertions work regardless of cwd
-        data_dir = os.path.abspath(self.testdir)
+        # Give the module a DEDICATED nvme-dir under testdir (not testdir itself).
+        # The module owns this directory outright and wipes it wholesale on startup
+        # and teardown, so it must not be shared with the server's own files
+        # (logfile, rdb) which live directly in testdir. Absolute path so file
+        # assertions work regardless of cwd.
+        data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
         # Disable O_DIRECT in ASAN builds — ASAN tests focus on memory safety,
         # not I/O bypass correctness. Avoids EINVAL from O_DIRECT alignment edge cases.
         direct_io = "no" if os.environ.get("ASAN_BUILD") else "yes"
@@ -53,6 +58,10 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         )
         self.data_dir = data_dir
         logging.info("startup args are: %s", args)
+
+    def _object_files(self):
+        """Every file currently in nvme-dir (name-agnostic)."""
+        return sorted(glob.glob(os.path.join(self.data_dir, "*")))
 
     def verify_error_response(self, client, cmd, expected_err_reply):
         try:

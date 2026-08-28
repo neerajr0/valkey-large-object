@@ -18,6 +18,8 @@
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
 //   2. storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, nvme_dir)
 //                              — allocate pool segments, create DRAMPool + NVMePool.
+//      (In Tiered mode, nvme_dir is reset beforehand — created if absent, wiped
+//       clean of any object files a previous run left behind after an unclean exit.)
 //   3. storage::register_buffers()
 //                              — IORING_REGISTER_BUFFERS pins pool pages for
 //                                ReadFixed/WriteFixed zero-copy I/O.
@@ -33,6 +35,7 @@ use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, Status, ValkeyString};
+use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
 
@@ -177,15 +180,16 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     let mode = operating_mode();
     let dir = nvme_dir();
 
-    // nvme-dir is required in Tiered mode.
-    if mode == OperatingMode::Tiered && dir.is_empty() {
-        ctx.log_warning("largeobj: nvme-dir is required in Tiered operating mode");
-        return Status::Err;
-    }
-
-    // Ensure data directory exists.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        ctx.log_warning(&format!("largeobj: failed to create nvme-dir: {}", e));
+    // Reset nvme-dir before use (Tiered mode only; a no-op in Dram, which never
+    // touches disk): reclaim any object files a previous run left behind after an
+    // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
+    // If the reset fails we can't guarantee a clean slate, so refuse to load
+    // rather than start dirty.
+    if let Err(e) = storage::cleanup_nvme_dir(mode, &dir) {
+        ctx.log_warning(&format!(
+            "largeobj: startup failed to reset nvme-dir {}: {}; aborting module load",
+            dir, e
+        ));
         return Status::Err;
     }
 
@@ -236,11 +240,34 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     Status::Ok
 }
 
+/// MODULE UNLOAD entry point.
+///
+/// NOTE: modules that define data types cannot be unloaded by Valkey Core, so
+/// this function is not called (this module defines LO_TYPE). All teardown
+/// therefore lives in `on_server_shutdown`, which fires on graceful server
+/// shutdown.
 fn deinitialize(_ctx: &Context) -> Status {
+    Status::Ok
+}
+
+/// Tear down on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
+/// release transport resources, stop the io_uring poller, and — in Tiered mode —
+/// wipe nvme-dir so object files don't accumulate on the SSD across server
+/// lifetimes. Logs on cleanup failure but never blocks shutdown. A hard crash
+/// (SIGKILL / SIGSEGV / power loss) never reaches this handler; those leftovers
+/// are reclaimed by the startup reset in `initialize`.
+#[shutdown_event_handler]
+fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::deregister_buffers();
     transport::shutdown();
-    storage::shutdown();
-    Status::Ok
+    storage::shutdown(); // stop the io_uring poller
+    let dir = nvme_dir();
+    if let Err(e) = storage::cleanup_nvme_dir(operating_mode(), &dir) {
+        ctx.log_warning(&format!(
+            "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",
+            dir, e
+        ));
+    }
 }
 
 valkey_module! {
