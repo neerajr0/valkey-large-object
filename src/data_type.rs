@@ -4,7 +4,7 @@
 //! - LoValue struct in keyspace (accessed via ValkeyModule_OpenKey)
 //! - OID generation (monotonic counter)
 //! - RDB callbacks (save/load references) (TODO)
-//! - TIERING.REF replication (TODO)
+//! - Replication (TODO)
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,7 @@ use valkey_module::raw;
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
-/// ObjectId IS the file path: deterministic mapping OID → "{data_dir}/{oid:016x}.dat"
+/// ObjectId IS the file path: deterministic mapping OID → "{nvme_dir}/{oid:016x}.dat"
 /// No lookup table. Compact u64 safe for replication streams, RDB, and LoValue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(pub u64);
@@ -31,15 +31,8 @@ impl ObjectId {
     }
 
     /// Deterministic file path from OID.
-    pub fn file_path(&self, data_dir: &str) -> String {
-        format!("{}/{:016x}.dat", data_dir, self.0)
-    }
-
-    /// Initialize OID counter to at least `val`.
-    /// Used at startup after scanning data_dir for existing .dat files.
-    /// Ensures new OIDs never collide with on-disk objects surviving a restart.
-    pub fn init_counter(val: u64) {
-        OID_COUNTER.fetch_max(val, Ordering::Relaxed);
+    pub fn file_path(&self, nvme_dir: &str) -> String {
+        format!("{}/{:016x}.dat", nvme_dir, self.0)
     }
 }
 
@@ -57,13 +50,19 @@ pub struct LoValue {
 }
 
 /// Free callback — triggered by native Valkey DEL.
-/// Deletes the NVMe file for this object.
+///
+/// TODO (object lifecycle): Not concurrency-safe. In-flight GETs or promotions may hold
+/// Arc<ObjectContext> clones or have io_uring SQEs referencing the fd. Requires refcounted
+/// teardown — only free buffers/close fd when last reference drops. Same mechanism needed
+/// for LO.SET overwrite (see engine.rs) and for module eviction.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
-    // SAFETY: value is a valid LoValue pointer that we previously returned from
-    // rdb_load or set_value. We take ownership back and drop it after deleting the file.
     let lo = Box::from_raw(value as *mut LoValue);
-    // Delete NVMe file via storage layer.
-    crate::storage::delete(lo.object_id);
+    crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    // FdPool and NVMe files only exist in Tiered mode.
+    if crate::operating_mode() == crate::OperatingMode::Tiered {
+        crate::storage::get_fd_pool().remove(lo.object_id);
+        crate::storage::delete_file(lo.object_id);
+    }
 }
 
 // ─── Type Registration ───────────────────────────────────────────────────────
@@ -118,19 +117,6 @@ mod tests {
         assert_eq!(
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
-        );
-    }
-
-    #[test]
-    fn test_oid_init_counter() {
-        // init_counter sets the counter to at least the given value.
-        // Subsequent next() calls must return values above it.
-        ObjectId::init_counter(1_000_000);
-        let oid = ObjectId::next();
-        assert!(
-            oid.0 >= 1_000_000,
-            "OID {} should be >= 1000000 after init_counter",
-            oid.0
         );
     }
 }

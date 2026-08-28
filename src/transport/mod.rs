@@ -1,13 +1,10 @@
 //! Transport Crate API (libefa-rs)
 //!
-//! This is a place holder mod which will be replaced by an actual dependency.
+//! Placeholder module — will be replaced by the actual transport crate dependency.
 //! EFA/libfabric lifecycle, multi-device LB, completion handling.
 //! Transport never calls storage or data type.
-//! Module owns the tokio runtime; transport borrows the handle for CQ poller tasks.
 
 use std::sync::OnceLock;
-
-use crate::storage::Buffer;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
 
@@ -139,37 +136,44 @@ impl Session {
 
     /// DMA write: push server buffer → client memory at (rkey, remote_addr).
     /// Non-blocking. Server picks EFA device (least-loaded).
-    /// Takes Buffer ownership during DMA. Returns it in callback.
+    ///
+    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
+    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
+    /// until the callback fires. The transport does NOT own the buffer.
     pub fn write(
         &self,
-        buf: Buffer,
+        buf_ptr: *mut u8,
         _len: usize,
         _rkey: u64,
         _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
     ) {
         // TODO:
         //   1. Pick device (least-loaded)
         //   2. fi_write(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete with Buffer returned
-        on_complete(buf, Ok(()));
+        //   3. CQ poller fires on_complete
+        on_complete(buf_ptr, Ok(()));
     }
 
     /// DMA read: pull client memory at (rkey, remote_addr) → server buffer.
-    /// Non-blocking. Takes Buffer ownership. Returns it in callback.
+    /// Non-blocking.
+    ///
+    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
+    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
+    /// until the callback fires. The transport does NOT own the buffer.
     pub fn read(
         &self,
-        buf: Buffer,
+        buf_ptr: *mut u8,
         _len: usize,
         _rkey: u64,
         _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
+        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
     ) {
         // TODO:
         //   1. Pick device (least-loaded)
         //   2. fi_read(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete with Buffer returned
-        on_complete(buf, Ok(()));
+        //   3. CQ poller fires on_complete
+        on_complete(buf_ptr, Ok(()));
     }
 
     /// Tear down session. In-flight ops receive SessionClosed.
