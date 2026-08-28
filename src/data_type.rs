@@ -54,7 +54,7 @@ pub struct LoValue {
 // ─── LoValue Helper Methods ──────────────────────────────────────────────────
 
 impl LoValue {
-    /// Reports memory usage: in-memory struct size + on-disk object size.
+    /// Reports memory usage in bytes: in-memory struct size + value size.
     /// Used by `MEMORY USAGE <key>`.
     pub fn memory_usage(&self) -> usize {
         std::mem::size_of::<LoValue>() + self.len as usize
@@ -62,9 +62,7 @@ impl LoValue {
 
     /// Returns 0 to signal Valkey to ALWAYS free asynchronously (BIO thread).
     ///
-    /// Per the Module API contract: returning 0 causes lazyfreeGetFreeEffort()
-    /// to map to ULONG_MAX, which always exceeds LAZYFREE_THRESHOLD (64),
-    /// guaranteeing async free.
+    /// Per the Module API contract: returning 0 guarantees async free.
     pub fn free_effort(&self) -> usize {
         0
     }
