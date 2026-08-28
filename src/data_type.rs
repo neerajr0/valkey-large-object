@@ -69,30 +69,96 @@ impl LoValue {
         0
     }
 
-    /// Deep-copy: allocates a new OID and copies the NVMe file.
-    /// Returns None if the file copy fails (e.g., source file missing).
-    ///
-    /// Thread-safety note: This runs on the main thread (COPY command handler).
-    /// The source file is safe to read because:
-    /// - All commands (read/copy/delete) execute on the main thread.
-    /// - The core guarantees a key exists when COPY is dispatched — a DEL after
-    ///   COPY is sequenced by the event loop, so the source file cannot vanish
-    ///   mid-copy.
-    ///
-    pub fn create_copy(&self, data_dir: &str) -> Option<LoValue> {
+    /// Deep-copy for the COPY command callback.
+    /// Dram mode: memcpy from DRAMPool. Tiered mode: copy NVMe file.
+    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
+    pub fn create_copy(&self) -> Option<LoValue> {
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => self.create_copy_dram(),
+            crate::OperatingMode::Tiered => self.create_copy_tiered(),
+        }
+    }
+
+    /// Dram mode: alloc new DRAMPool buffer, memcpy source data, insert ObjectContext.
+    fn create_copy_dram(&self) -> Option<LoValue> {
+        self.do_copy_dram(crate::storage::get_dram_pool())
+    }
+
+    /// Dram copy implementation, parameterized for testability.
+    fn do_copy_dram(&self, dram_pool: &crate::storage::DRAMPool) -> Option<LoValue> {
+        let src_ctx = dram_pool
+            .get_object(&self.object_id)
+            .expect("Dram COPY: LoValue exists but ObjectContext missing");
+
+        let dst_buf = dram_pool.alloc(self.len as usize)?;
+        let dst_ptr = dram_pool.buffer_ptr(&dst_buf);
+        let mut offset = 0usize;
+        for src_buf in &src_ctx.buffers {
+            let src_ptr = dram_pool.buffer_ptr(src_buf);
+            let copy_len = src_buf.len as usize;
+            // SAFETY: src and dst are non-overlapping (fresh allocation), lengths are valid.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr.add(offset), copy_len);
+            }
+            offset += copy_len;
+        }
+
+        let new_oid = ObjectId::next();
+        let obj_ctx = std::sync::Arc::new(crate::storage::ObjectContext::new_ready(
+            vec![dst_buf],
+            self.len,
+        ));
+        dram_pool.insert_object(new_oid, obj_ctx);
+
+        Some(LoValue {
+            object_id: new_oid,
+            len: self.len,
+            crc32c: self.crc32c,
+        })
+    }
+
+    /// Tiered mode: copy NVMe file with a fresh OID.
+    /// Returns None if nvme-maxmemory would be exceeded.
+    fn create_copy_tiered(&self) -> Option<LoValue> {
+        self.do_copy_tiered(&crate::nvme_dir(), crate::nvme_maxmemory())
+    }
+
+    /// Tiered copy implementation, parameterized for testability.
+    fn do_copy_tiered(&self, data_dir: &str, nvme_max: u64) -> Option<LoValue> {
+        // Enforce nvme-maxmemory.
+        if nvme_max > 0 {
+            let current_usage = nvme_dir_disk_usage(data_dir);
+            if current_usage + self.len > nvme_max {
+                return None;
+            }
+        }
+
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(data_dir);
         let dst_path = new_oid.file_path(data_dir);
 
-        match std::fs::copy(&src_path, &dst_path) {
-            Ok(_) => Some(LoValue {
-                object_id: new_oid,
-                len: self.len,
-                crc32c: self.crc32c,
-            }),
-            Err(_) => None,
-        }
+        std::fs::copy(&src_path, &dst_path)
+            .expect("Tiered COPY: source file missing — key exists implies file exists");
+
+        Some(LoValue {
+            object_id: new_oid,
+            len: self.len,
+            crc32c: self.crc32c,
+        })
     }
+}
+
+/// Total disk usage of all files in the NVMe directory.
+fn nvme_dir_disk_usage(dir: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
 }
 
 // ─── Callbacks ───────────────────────────────────────────────────────────────
@@ -133,14 +199,14 @@ unsafe extern "C" fn lo_free_effort(
 }
 
 /// COPY callback.
-/// Deep-copies the NVMe file with a fresh OID. Returns null on failure.
+/// Deep-copies the object based on operating mode. Returns null on failure.
 unsafe extern "C" fn lo_copy(
     _from_key: *mut raw::RedisModuleString,
     _to_key: *mut raw::RedisModuleString,
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match src.create_copy(&crate::nvme_dir()) {
+    match src.create_copy() {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }
@@ -190,7 +256,6 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_oid_monotonic() {
@@ -266,18 +331,74 @@ mod tests {
     }
 
     // ─── create_copy tests ───────────────────────────────────────────────
+    // create_copy_dram tested via do_copy_dram with a local DRAMPool.
+    // create_copy_tiered tested via do_copy_tiered with a local temp dir.
 
     #[test]
-    fn test_copy_success() {
-        let tmp = std::env::temp_dir().join("lo_test_copy_success");
+    fn test_copy_dram_success() {
+        let pool = crate::storage::DRAMPool::new(1, 1024 * 1024);
+        let oid = ObjectId::next();
+        let content = b"dram copy test data";
+        let len = content.len() as u64;
+
+        // Set up source object in pool.
+        let src_buf = pool.alloc(len as usize).unwrap();
+        let src_ptr = pool.buffer_ptr(&src_buf);
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), src_ptr, content.len()) };
+        let obj_ctx =
+            std::sync::Arc::new(crate::storage::ObjectContext::new_ready(vec![src_buf], len));
+        pool.insert_object(oid, obj_ctx);
+
+        let val = LoValue {
+            object_id: oid,
+            len,
+            crc32c: 0xBEEF,
+        };
+
+        let copy = val.do_copy_dram(&pool).unwrap();
+        assert_ne!(copy.object_id, val.object_id);
+        assert_eq!(copy.len, val.len);
+        assert_eq!(copy.crc32c, val.crc32c);
+
+        // Verify data was actually copied.
+        let copy_ctx = pool.get_object(&copy.object_id).unwrap();
+        let copy_ptr = pool.buffer_ptr(&copy_ctx.buffers[0]);
+        let copied_data = unsafe { std::slice::from_raw_parts(copy_ptr, content.len()) };
+        assert_eq!(copied_data, content);
+    }
+
+    #[test]
+    fn test_copy_dram_pool_exhausted() {
+        // Pool with 64KB — fits one 48KB object but not two.
+        let pool = crate::storage::DRAMPool::new(1, 65536);
+        let oid = ObjectId::next();
+        let len = 49152u64; // 48KB
+
+        let src_buf = pool.alloc(len as usize).unwrap();
+        let obj_ctx =
+            std::sync::Arc::new(crate::storage::ObjectContext::new_ready(vec![src_buf], len));
+        pool.insert_object(oid, obj_ctx);
+
+        let val = LoValue {
+            object_id: oid,
+            len,
+            crc32c: 0,
+        };
+
+        // Pool cannot fit another 48KB allocation — copy should return None.
+        let result = val.do_copy_dram(&pool);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_copy_tiered_success() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_tiered_ok");
         std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.to_str().unwrap();
 
         let oid = ObjectId::next();
-        let src_path = oid.file_path(tmp.to_str().unwrap());
-        // Create source file with known content.
         let content = b"hello large object world";
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        f.write_all(content).unwrap();
+        std::fs::write(oid.file_path(dir), content).unwrap();
 
         let val = LoValue {
             object_id: oid,
@@ -285,49 +406,25 @@ mod tests {
             crc32c: 0xDEAD,
         };
 
-        let copy = val.create_copy(tmp.to_str().unwrap()).unwrap();
-
-        // New OID must differ.
+        let copy = val.do_copy_tiered(dir, 0).unwrap();
         assert_ne!(copy.object_id, val.object_id);
-        // Metadata preserved.
         assert_eq!(copy.len, val.len);
         assert_eq!(copy.crc32c, val.crc32c);
-        // New file exists with same content.
-        let dst_path = copy.object_id.file_path(tmp.to_str().unwrap());
-        let read_back = std::fs::read(&dst_path).unwrap();
+
+        let read_back = std::fs::read(copy.object_id.file_path(dir)).unwrap();
         assert_eq!(read_back, content);
 
-        // Cleanup.
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&dst_path);
-        let _ = std::fs::remove_dir(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_copy_missing_source() {
-        let tmp = std::env::temp_dir().join("lo_test_copy_missing");
+    fn test_copy_tiered_different_oid() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_tiered_oid");
         std::fs::create_dir_all(&tmp).unwrap();
-
-        let val = LoValue {
-            object_id: ObjectId(0xDEADBEEF),
-            len: 1024,
-            crc32c: 0,
-        };
-
-        let result = val.create_copy(tmp.to_str().unwrap());
-        assert!(result.is_none());
-
-        let _ = std::fs::remove_dir(&tmp);
-    }
-
-    #[test]
-    fn test_copy_different_oid() {
-        let tmp = std::env::temp_dir().join("lo_test_copy_diff_oid");
-        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.to_str().unwrap();
 
         let oid = ObjectId::next();
-        let src_path = oid.file_path(tmp.to_str().unwrap());
-        std::fs::write(&src_path, b"data").unwrap();
+        std::fs::write(oid.file_path(dir), b"data").unwrap();
 
         let val = LoValue {
             object_id: oid,
@@ -335,13 +432,91 @@ mod tests {
             crc32c: 0,
         };
 
-        let copy = val.create_copy(tmp.to_str().unwrap()).unwrap();
-        assert_ne!(copy.object_id, val.object_id);
+        let c1 = val.do_copy_tiered(dir, 0).unwrap();
+        let c2 = val.do_copy_tiered(dir, 0).unwrap();
+        assert_ne!(c1.object_id, c2.object_id);
+        assert_ne!(c1.object_id, val.object_id);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_copy_tiered_nvme_maxmemory_exceeded() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_tiered_full");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.to_str().unwrap();
+
+        let oid = ObjectId::next();
+        let content = vec![0u8; 1024];
+        std::fs::write(oid.file_path(dir), &content).unwrap();
+
+        let val = LoValue {
+            object_id: oid,
+            len: 1024,
+            crc32c: 0,
+        };
+
+        // nvme_max = 1500: existing 1024 + copy 1024 = 2048 > 1500 → None.
+        let result = val.do_copy_tiered(dir, 1500);
+        assert!(result.is_none());
+
+        // nvme_max = 3000: existing 1024 + copy 1024 = 2048 < 3000 → Some.
+        let result = val.do_copy_tiered(dir, 3000);
+        assert!(result.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[should_panic(expected = "source file missing")]
+    fn test_copy_tiered_missing_source_panics() {
+        let tmp = std::env::temp_dir().join("lo_test_copy_tiered_panic");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.to_str().unwrap();
+
+        let val = LoValue {
+            object_id: ObjectId(0xDEADBEEF),
+            len: 1024,
+            crc32c: 0,
+        };
+
+        // Source file doesn't exist — should panic.
+        val.do_copy_tiered(dir, 0);
+    }
+
+    // ─── nvme_dir_disk_usage tests ───────────────────────────────────────
+
+    #[test]
+    fn test_nvme_dir_disk_usage_sums_files() {
+        let tmp = std::env::temp_dir().join("lo_test_disk_usage");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let dir = tmp.to_str().unwrap();
+        // Empty dir → 0 usage.
+        assert_eq!(super::nvme_dir_disk_usage(dir), 0);
+
+        // Create two files.
+        let f1 = tmp.join("0000000000000001.dat");
+        let f2 = tmp.join("0000000000000002.dat");
+        std::fs::write(&f1, vec![0u8; 1024]).unwrap();
+        std::fs::write(&f2, vec![0u8; 2048]).unwrap();
+
+        assert_eq!(super::nvme_dir_disk_usage(dir), 1024 + 2048);
+
+        // All files counted (future sidecar files included).
+        std::fs::write(tmp.join("0000000000000001.meta"), b"metadata").unwrap();
+        assert_eq!(super::nvme_dir_disk_usage(dir), 1024 + 2048 + 8);
+
+        // Subdirectories are not counted.
+        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
+        assert_eq!(super::nvme_dir_disk_usage(dir), 1024 + 2048 + 8);
 
         // Cleanup.
-        let _ = std::fs::remove_file(&src_path);
-        let dst_path = copy.object_id.file_path(tmp.to_str().unwrap());
-        let _ = std::fs::remove_file(&dst_path);
-        let _ = std::fs::remove_dir(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_nvme_dir_disk_usage_missing_dir() {
+        assert_eq!(super::nvme_dir_disk_usage("/nonexistent/path/xyz"), 0);
     }
 }
