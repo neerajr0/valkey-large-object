@@ -10,7 +10,7 @@ use std::sync::RwLock;
 use crate::data_type::ObjectId;
 
 pub struct FdPool {
-    fds: RwLock<HashMap<u64, RawFd>>,
+    fds: RwLock<HashMap<ObjectId, RawFd>>,
 }
 
 impl Default for FdPool {
@@ -27,15 +27,53 @@ impl FdPool {
     }
 
     pub fn get(&self, oid: ObjectId) -> Option<RawFd> {
-        self.fds.read().unwrap().get(&oid.0).copied()
+        self.fds
+            .read()
+            .expect("FdPool.fds lock unavailable")
+            .get(&oid)
+            .copied()
+    }
+
+    /// Get cached fd or open the file and cache it.
+    /// direct-io is IMMUTABLE so fds opened here remain valid for the module's lifetime.
+    /// Holds write lock for the entire check+open+insert to prevent TOCTOU fd leak.
+    pub fn get_or_open(&self, oid: ObjectId, dir: &str) -> Option<RawFd> {
+        let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
+
+        // Check under write lock — no race.
+        if let Some(&fd) = fds.get(&oid) {
+            return Some(fd);
+        }
+
+        // Open while holding lock — concurrent callers wait.
+        let path = oid.file_path(dir);
+        let c_path = std::ffi::CString::new(path).expect("file_path null");
+        let mut flags = libc::O_RDONLY;
+        if crate::direct_io() {
+            flags |= libc::O_DIRECT;
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return None;
+        }
+        fds.insert(oid, fd);
+        Some(fd)
     }
 
     pub fn insert(&self, oid: ObjectId, fd: RawFd) {
-        self.fds.write().unwrap().insert(oid.0, fd);
+        self.fds
+            .write()
+            .expect("FdPool.fds lock unavailable")
+            .insert(oid, fd);
     }
 
     pub fn remove(&self, oid: ObjectId) {
-        if let Some(fd) = self.fds.write().unwrap().remove(&oid.0) {
+        if let Some(fd) = self
+            .fds
+            .write()
+            .expect("FdPool.fds lock unavailable")
+            .remove(&oid)
+        {
             // SAFETY: fd is a valid file descriptor opened by us via libc::open.
             // We own it exclusively (removed from map) and close exactly once.
             unsafe { libc::close(fd) };
@@ -45,7 +83,12 @@ impl FdPool {
 
 impl Drop for FdPool {
     fn drop(&mut self) {
-        for (_, fd) in self.fds.write().unwrap().drain() {
+        for (_, fd) in self
+            .fds
+            .write()
+            .expect("FdPool.fds lock unavailable")
+            .drain()
+        {
             // SAFETY: All fds were opened by us via libc::open and are valid.
             // drain() ensures each fd is closed exactly once during shutdown.
             unsafe { libc::close(fd) };

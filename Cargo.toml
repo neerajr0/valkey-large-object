@@ -16,6 +16,7 @@ io-uring = "0.7"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 lazy_static = "1"
+talc = { version = "4", default-features = false, features = ["lock_api"] }
 
 [dev-dependencies]
 rstest = "0.23.0"
