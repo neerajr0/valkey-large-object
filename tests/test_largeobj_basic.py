@@ -75,7 +75,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """COPY creates a new large object with its own OID and NVMe file."""
         client = self.server.get_new_client()
         payload = b'C' * 4096
-        client.execute_command('LO.SET', 'srckey', '4096', payload)
+        client.execute_command('LO.SET', 'srckey', payload)
 
         # COPY srckey → dstkey
         result = client.execute_command('COPY', 'srckey', 'dstkey')
@@ -99,7 +99,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """
         client = self.server.get_new_client()
         payload = b'D' * 4096
-        client.execute_command('LO.SET', 'digestsrc', '4096', payload)
+        client.execute_command('LO.SET', 'digestsrc', payload)
         client.execute_command('COPY', 'digestsrc', 'digestdst')
 
         src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digestsrc')
@@ -114,7 +114,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """Deleting a COPY destination does not affect the source."""
         client = self.server.get_new_client()
         payload = b'E' * 4096
-        client.execute_command('LO.SET', 'copysrc', '4096', payload)
+        client.execute_command('LO.SET', 'copysrc', payload)
         client.execute_command('COPY', 'copysrc', 'copydst')
 
         # Delete the copy
@@ -130,7 +130,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """MEMORY USAGE on a large object key returns a positive value."""
         client = self.server.get_new_client()
         payload = b'M' * 4096
-        client.execute_command('LO.SET', 'memkey', '4096', payload)
+        client.execute_command('LO.SET', 'memkey', payload)
 
         mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
         assert mem is not None
@@ -140,7 +140,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """MEMORY USAGE includes the on-disk object size."""
         client = self.server.get_new_client()
         payload = b'N' * 4096
-        client.execute_command('LO.SET', 'memkey2', '4096', payload)
+        client.execute_command('LO.SET', 'memkey2', payload)
 
         mem = client.execute_command('MEMORY', 'USAGE', 'memkey2')
         # Our mem_usage callback returns sizeof(LoValue) + obj_len = 24 + 4096 = 4120.
@@ -158,7 +158,7 @@ class TestLargeObjBasic(ValkeyLargeObjTestCaseBase):
         """DEBUG DIGEST-VALUE is deterministic for the same key."""
         client = self.server.get_new_client()
         payload = b'G' * 4096
-        client.execute_command('LO.SET', 'digkey', '4096', payload)
+        client.execute_command('LO.SET', 'digkey', payload)
 
         d1 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
         d2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
