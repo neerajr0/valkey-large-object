@@ -115,7 +115,6 @@ impl ObjectContext {
 
 impl super::TryClone for ObjectContext {
     fn try_clone(&self) -> Option<Self> {
-        use super::TryClone;
         let mut new_buffers = Vec::with_capacity(self.buffers.len());
         for buf in &self.buffers {
             new_buffers.push(buf.try_clone()?);
