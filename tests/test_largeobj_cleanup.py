@@ -23,13 +23,14 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
 
     def test_shutdown_clean_after_set_and_delete(self):
         """A graceful SHUTDOWN deletes every object file from nvme-dir, whether
-        it was left by a SET or partially cleared by an eager DEL."""
+        it was left by a SET or partially cleared by an async DEL."""
         client = self.server.get_new_client()
         client.execute_command("LO.SET", "a", b"A" * 4096)
         client.execute_command("LO.SET", "b", b"B" * 4096)
         client.execute_command("LO.SET", "c", b"C" * 4096)
-        # DEL removes one file eagerly; shutdown must remove the rest.
+        # DEL frees asynchronously (BIO thread); wait for completion.
         client.execute_command("DEL", "b")
+        self._wait_for_lazyfree_done(client)
         assert len(self._object_files()) == 2
 
         # exit() issues SHUTDOWN NOSAVE, which fires the Shutdown server event
