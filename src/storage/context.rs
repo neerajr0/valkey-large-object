@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// A buffer that is a sub-allocation within a registered segment.
 /// Segment-agnostic: works for both DRAMPool and NVMePool segments.
 /// `segment_idx` identifies which registered iovec entry (io_uring buf_index).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SegmentBuffer {
     /// Which segment this slice lives in (index into the io_uring iovec array).
     pub segment_idx: u8,
@@ -27,6 +27,20 @@ pub struct SegmentBuffer {
     pub offset: u64,
     /// Size of this buffer allocation.
     pub len: u32,
+}
+
+impl super::TryClone for SegmentBuffer {
+    fn try_clone(&self) -> Option<Self> {
+        let pool = crate::storage::get_dram_pool();
+        let new_buf = pool.alloc(self.len as usize)?;
+        let src_ptr = pool.buffer_ptr(self);
+        let dst_ptr = pool.buffer_ptr(&new_buf);
+        // SAFETY: src and dst are non-overlapping regions within pool segment(s).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.len as usize);
+        }
+        Some(new_buf)
+    }
 }
 
 // ─── ObjectState ─────────────────────────────────────────────────────────────
@@ -96,6 +110,17 @@ impl ObjectContext {
         if let ObjectState::Filling { chunks_ready, .. } = &self.state {
             chunks_ready.fetch_add(batch_size, Ordering::Release);
         }
+    }
+}
+
+impl super::TryClone for ObjectContext {
+    fn try_clone(&self) -> Option<Self> {
+        use super::TryClone;
+        let mut new_buffers = Vec::with_capacity(self.buffers.len());
+        for buf in &self.buffers {
+            new_buffers.push(buf.try_clone()?);
+        }
+        Some(Self::new_ready(new_buffers, self.total_len))
     }
 }
 

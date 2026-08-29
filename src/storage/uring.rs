@@ -10,13 +10,34 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::StorageError;
+
+// ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
+
+/// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
+static NVME_DISK_USAGE: AtomicI64 = AtomicI64::new(0);
+
+/// Adjust NVMe disk usage by delta bytes (positive on create, negative on delete).
+pub fn adjust_nvme_disk_usage(delta: i64) {
+    NVME_DISK_USAGE.fetch_add(delta, Ordering::Relaxed);
+}
+
+/// Returns true if writing `obj_len` bytes would stay within nvme-maxmemory.
+/// Returns true if nvme-maxmemory is 0 (unlimited).
+pub fn check_nvme_capacity(obj_len: u64) -> bool {
+    let max = crate::nvme_maxmemory();
+    if max == 0 {
+        return true;
+    }
+    let used = NVME_DISK_USAGE.load(Ordering::Relaxed).max(0) as u64;
+    used + obj_len <= max
+}
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
