@@ -124,6 +124,35 @@ pub fn shutdown() {
     uring::shutdown();
 }
 
+/// Reset the NVMe object directory (Tiered mode only): delete it and everything
+/// under it, then recreate it empty. `nvme-dir` is a dedicated, module-owned
+/// directory (see the `nvme-dir` config docs), so wiping it is safe. A no-op
+/// in Dram mode, which never touches disk.
+///
+/// Called both to reclaim a previous run's leftovers at startup and to clear
+/// this instance's files at shutdown. Returns `Ok(())` once nvme-dir exists and
+/// is empty (or immediately, in Dram mode); `Err` if nvme-dir is unset in Tiered
+/// mode, or the directory could not be removed or recreated.
+pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+    if mode != crate::OperatingMode::Tiered {
+        return Ok(());
+    }
+    if dir.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nvme-dir is required in Tiered operating mode",
+        ));
+    }
+    // remove_dir_all errors if `dir` is absent — but "absent" is already the
+    // state we want, so treat NotFound as success.
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    std::fs::create_dir_all(dir)
+}
+
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
