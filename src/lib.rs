@@ -112,8 +112,8 @@ lazy_static::lazy_static! {
     static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
 
     /// Operating mode. Immutable after module load.
-    /// - Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
-    /// - Dram (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
 }
 
