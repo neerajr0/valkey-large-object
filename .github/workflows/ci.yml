@@ -118,3 +118,7 @@ jobs:
             exit 1
           fi
           rm -f test_output.tmp
+
+      - name: Cleanup stale servers
+        if: always()
+        run: pkill -9 -f valkey-server || true
