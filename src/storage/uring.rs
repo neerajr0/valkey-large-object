@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -21,21 +21,26 @@ use super::StorageError;
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
 
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
-static NVME_DISK_USAGE: AtomicI64 = AtomicI64::new(0);
+static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 
-/// Adjust NVMe disk usage by delta bytes (positive on create, negative on delete).
-pub fn adjust_nvme_disk_usage(delta: i64) {
-    NVME_DISK_USAGE.fetch_add(delta, Ordering::Relaxed);
+/// Increment NVMe disk usage after a file is created.
+pub fn increase_nvme_disk_usage(bytes: u64) {
+    NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Decrement NVMe disk usage after a file is deleted.
+pub fn decrease_nvme_disk_usage(bytes: u64) {
+    NVME_DISK_USAGE.fetch_sub(bytes, Ordering::Relaxed);
 }
 
 /// Returns true if writing `obj_len` bytes would stay within nvme-maxmemory.
 /// Returns true if nvme-maxmemory is 0 (unlimited).
-pub fn check_nvme_capacity(obj_len: u64) -> bool {
+pub fn has_nvme_capacity(obj_len: u64) -> bool {
     let max = crate::nvme_maxmemory();
     if max == 0 {
         return true;
     }
-    let used = NVME_DISK_USAGE.load(Ordering::Relaxed).max(0) as u64;
+    let used = NVME_DISK_USAGE.load(Ordering::Relaxed);
     used + obj_len <= max
 }
 

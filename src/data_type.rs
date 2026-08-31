@@ -97,11 +97,10 @@ impl LoValue {
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
-
+        // Returns None if the DRAM pool cannot allocate buffers for the copy.
         let new_ctx = src_ctx.try_clone()?;
         let new_oid = ObjectId::next();
         dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
-
         Some(LoValue {
             object_id: new_oid,
             len: self.len,
@@ -114,20 +113,15 @@ impl LoValue {
     /// Returns None if nvme-maxmemory would be exceeded.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let data_dir = crate::nvme_dir();
-
-        if !crate::storage::uring::check_nvme_capacity(self.len) {
+        if !crate::storage::uring::has_nvme_capacity(self.len) {
             return None;
         }
-
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(&data_dir);
         let dst_path = new_oid.file_path(&data_dir);
-
         std::fs::copy(&src_path, &dst_path)
             .expect("Tiered COPY: source file missing — key exists implies file exists");
-
-        crate::storage::uring::adjust_nvme_disk_usage(self.len as i64);
-
+        crate::storage::uring::increase_nvme_disk_usage(self.len);
         Some(LoValue {
             object_id: new_oid,
             len: self.len,
@@ -151,7 +145,7 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     if crate::operating_mode() == crate::OperatingMode::Tiered {
         crate::storage::get_fd_pool().remove(lo.object_id);
         crate::storage::delete_file(lo.object_id);
-        crate::storage::uring::adjust_nvme_disk_usage(-(lo.len as i64));
+        crate::storage::uring::decrease_nvme_disk_usage(lo.len);
     }
 }
 
