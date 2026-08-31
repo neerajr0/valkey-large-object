@@ -23,7 +23,7 @@ use super::StorageError;
 
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
-/// Multi-buffer batch support: pass a Vec<UringOp> to submit_batch (future).
+/// TODO: Multi-buffer batch support (STORAGE_DESIGN.md §7.3).
 #[derive(Clone)]
 pub struct UringOp {
     /// Segment's position in the registered iovec array (IORING_REGISTER_BUFFERS).
@@ -64,10 +64,13 @@ unsafe impl Send for IoRequest {}
 enum PendingOp {
     Read {
         tx: oneshot::Sender<Result<u64, StorageError>>,
+        /// Expected byte count for this I/O op. Short reads are rejected.
+        expected_bytes: u64,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
-        len: u64,
+        /// Expected byte count for this I/O op. Short writes are rejected.
+        expected_bytes: u64,
     },
 }
 
@@ -233,7 +236,13 @@ impl UringNvmeEngine {
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Read { tx })
+                                (
+                                    sqe,
+                                    PendingOp::Read {
+                                        tx,
+                                        expected_bytes: op.len,
+                                    },
+                                )
                             }
                             IoRequest::Write { fd, op, tx } => {
                                 let write_len = Self::align_up(op.len) as u32;
@@ -257,7 +266,13 @@ impl UringNvmeEngine {
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Write { tx, len: op.len })
+                                (
+                                    sqe,
+                                    PendingOp::Write {
+                                        tx,
+                                        expected_bytes: op.len,
+                                    },
+                                )
                             }
                         };
 
@@ -268,14 +283,14 @@ impl UringNvmeEngine {
                             if ring.submission().push(&sqe).is_err() {
                                 // SQ full even after flush — send error on oneshot.
                                 match op {
-                                    PendingOp::Read { tx } => {
+                                    PendingOp::Read { tx, .. } => {
                                         let _ = tx.send(Err(StorageError::IoError {
-                                            code: -libc::EAGAIN,
+                                            code: libc::EAGAIN,
                                         }));
                                     }
                                     PendingOp::Write { tx, .. } => {
                                         let _ = tx.send(Err(StorageError::IoError {
-                                            code: -libc::EAGAIN,
+                                            code: libc::EAGAIN,
                                         }));
                                     }
                                 }
@@ -314,20 +329,24 @@ impl UringNvmeEngine {
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
                     match op {
-                        PendingOp::Read { tx } => {
-                            if result >= 0 {
+                        PendingOp::Read { tx, expected_bytes } => {
+                            if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(result as u64));
-                            } else {
+                            } else if result < 0 {
                                 let _ = tx.send(Err(StorageError::IoError { code: -result }));
+                            } else {
+                                // Short read.
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
-                        PendingOp::Write { tx, len } => {
-                            if result >= 0 && result as u64 >= len {
+                        PendingOp::Write { tx, expected_bytes } => {
+                            if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(()));
                             } else if result < 0 {
                                 let _ = tx.send(Err(StorageError::IoError { code: -result }));
                             } else {
-                                let _ = tx.send(Err(StorageError::IoError { code: -1 }));
+                                // Short write.
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
                     }
@@ -341,10 +360,10 @@ impl UringNvmeEngine {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(req) => match req {
                     IoRequest::Read { tx, .. } => {
-                        let _ = tx.send(Err(StorageError::IoError { code: -1 }));
+                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                     }
                     IoRequest::Write { tx, .. } => {
-                        let _ = tx.send(Err(StorageError::IoError { code: -1 }));
+                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                     }
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
