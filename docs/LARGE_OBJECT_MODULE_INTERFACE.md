@@ -163,7 +163,7 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | `operating-mode` | Dram | Enum: `Dram` or `Tiered` |
 | `dram-maxmemory` | 0 (no limit) | Total DRAM budget. 0 = grow on demand. |
 | `dram-segment-size` | 64mb | Size of each DRAMPool segment |
-| `nvme-dir` | (required if Tiered) | Directory for .dat files |
+| `nvme-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files. Wiped wholesale on startup and teardown, so it must NOT be shared with other files. |
 | `nvme-maxmemory` | 10gb | Max disk usage |
 | `nvme-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
 | `max-promote-size` | 256mb | Max object size for DRAMPool promotion. 0 = disable. |
