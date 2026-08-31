@@ -54,10 +54,23 @@ pub struct LoValue {
 // ─── LoValue Helper Methods ──────────────────────────────────────────────────
 
 impl LoValue {
-    /// Reports memory usage in bytes: in-memory struct size + value size.
-    /// Used by `MEMORY USAGE <key>`.
+    /// Reports DRAM memory usage in bytes for `MEMORY USAGE <key>`.
+    /// Always includes the LoValue struct overhead. Includes the object payload
+    /// only when it is actually resident in DRAM:
+    /// - DRAM-only mode: always (object lives exclusively in DRAM).
+    /// - Tiered mode: only if the object has been promoted into DRAMPool.
     pub fn memory_usage(&self) -> usize {
-        std::mem::size_of::<LoValue>() + self.len as usize
+        let base = std::mem::size_of::<LoValue>();
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => base + self.len as usize,
+            crate::OperatingMode::Tiered => {
+                if crate::storage::get_dram_pool().contains_object(&self.object_id) {
+                    base + self.len as usize
+                } else {
+                    base
+                }
+            }
+        }
     }
 
     /// Returns 0 to signal Valkey to ALWAYS free asynchronously (BIO thread).
@@ -143,7 +156,7 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
 }
 
 /// MEMORY USAGE callback.
-/// Reports struct overhead + full on-disk object size for capacity planning.
+/// Reports actual DRAM consumption: struct overhead + payload when resident in DRAM.
 unsafe extern "C" fn lo_mem_usage(value: *const std::ffi::c_void) -> usize {
     let val = &*(value as *const LoValue);
     val.memory_usage()
@@ -239,31 +252,6 @@ mod tests {
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
         );
-    }
-
-    // ─── memory_usage tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_memory_usage() {
-        let val = LoValue {
-            object_id: ObjectId(1),
-            len: 4_194_304, // 4MB
-            crc32c: 0,
-        };
-        assert_eq!(
-            val.memory_usage(),
-            std::mem::size_of::<LoValue>() + 4_194_304
-        );
-    }
-
-    #[test]
-    fn test_memory_usage_zero() {
-        let val = LoValue {
-            object_id: ObjectId(1),
-            len: 0,
-            crc32c: 0,
-        };
-        assert_eq!(val.memory_usage(), std::mem::size_of::<LoValue>());
     }
 
     // ─── free_effort tests ───────────────────────────────────────────────

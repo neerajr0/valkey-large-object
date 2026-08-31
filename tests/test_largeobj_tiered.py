@@ -61,6 +61,51 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
+    # ─── Data type callback tests ────────────────────────────────────────
+
+    def test_data_type_callbacks(self):
+        """COPY, MEMORY USAGE, and DEBUG DIGEST in Tiered mode with promotion."""
+        client = self.server.get_new_client()
+        payload = b'C' * 4096
+        payload_size = len(payload)
+        lo_value_size = 24
+        client.execute_command('LO.SET', 'srckey', payload)
+        # COPY creates an independent object with its own NVMe file
+        result = client.execute_command('COPY', 'srckey', 'dstkey')
+        assert result == 1 or result is True
+        src_data = client.execute_command('LO.GET', 'srckey')
+        dst_data = client.execute_command('LO.GET', 'dstkey')
+        assert src_data == payload
+        assert dst_data == payload
+        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
+        # COPY gets a new OID so digests differ
+        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'dstkey')
+        assert src_digest != dst_digest
+        # Digest is deterministic
+        src_digest2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        assert src_digest == src_digest2
+        # Nonexistent key returns nil digest
+        nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
+        assert nil_digest == [b'0' * 40]
+        # Deleting source does not affect the copy
+        client.execute_command('DEL', 'srckey')
+        self._wait_for_lazyfree_done(client)
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        # Deleting copy does not affect a re-created source
+        client.execute_command('LO.SET', 'srckey2', payload)
+        client.execute_command('COPY', 'srckey2', 'dstkey2')
+        client.execute_command('DEL', 'dstkey2')
+        self._wait_for_lazyfree_done(client)
+        assert client.execute_command('LO.GET', 'srckey2') == payload
+        # MEMORY USAGE after promotion (first GET promoted the object into DRAMPool)
+        mem = client.execute_command('MEMORY', 'USAGE', 'srckey2')
+        assert mem is not None
+        assert mem >= lo_value_size + payload_size, (
+            f"Expected MEMORY USAGE >= {lo_value_size + payload_size} (promoted), got {mem}"
+        )
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
@@ -104,3 +149,28 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             assert False, "Expected pool exhausted error"
         except ResponseError as e:
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+
+    # ─── MEMORY USAGE tests ───────────────────────────────────────────────
+
+    def test_memory_usage_tiered_cold(self):
+        """Without promotion, MEMORY USAGE reports only LoValue struct overhead.
+
+        This test class sets max-promote-size=0, so objects are never promoted
+        to DRAMPool. memory_usage reports only sizeof(LoValue) (24 bytes) — the
+        payload lives on NVMe and does not consume DRAM.
+        """
+        client = self.server.get_new_client()
+        payload_size = 4096
+        payload = b'M' * payload_size
+        client.execute_command('LO.SET', 'memkey', payload)
+        # Even after a GET the object stays cold (max-promote-size=0).
+        client.execute_command('LO.GET', 'memkey')
+        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
+        assert mem is not None
+        lo_value_size = 24
+        # Our callback returns only sizeof(LoValue) = 24. Valkey adds per-key
+        # overhead (~72-120 bytes), so total is well below lo_value_size + payload_size.
+        upper_bound = lo_value_size + payload_size
+        assert mem < upper_bound, (
+            f"Expected MEMORY USAGE < {upper_bound} (cold, not promoted), got {mem}"
+        )

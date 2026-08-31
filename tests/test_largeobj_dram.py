@@ -68,44 +68,46 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             expected = bytes([i % 256]) * 4096
             assert data == expected, f"Key multi{i} mismatch"
 
-    # ─── COPY command tests ───────────────────────────────────────────────
+    # ─── Data type callback tests ────────────────────────────────────────
 
-    def test_copy_creates_independent_object(self):
-        """COPY creates a new object with its own data in DRAMPool."""
+    def test_data_type_callbacks(self):
+        """COPY, MEMORY USAGE, and DEBUG DIGEST in DRAM-only mode."""
         client = self.server.get_new_client()
         payload = b'C' * 4096
+        payload_size = len(payload)
+        lo_value_size = 24
         client.execute_command('LO.SET', 'srckey', payload)
-
+        # COPY creates an independent object
         result = client.execute_command('COPY', 'srckey', 'dstkey')
         assert result == 1 or result is True
-
         src_data = client.execute_command('LO.GET', 'srckey')
         dst_data = client.execute_command('LO.GET', 'dstkey')
         assert src_data == payload
         assert dst_data == payload
-
-    def test_copy_source_unaffected_by_dst_delete(self):
-        """Deleting a COPY destination does not affect the source."""
-        client = self.server.get_new_client()
-        payload = b'E' * 4096
-        client.execute_command('LO.SET', 'copysrc', payload)
-        client.execute_command('COPY', 'copysrc', 'copydst')
-
-        client.execute_command('DEL', 'copydst')
-
-        src_data = client.execute_command('LO.GET', 'copysrc')
-        assert src_data == payload
-
-    def test_copy_different_digest(self):
-        """COPY gets a new OID so its DEBUG DIGEST differs from the source."""
-        client = self.server.get_new_client()
-        payload = b'D' * 4096
-        client.execute_command('LO.SET', 'digestsrc', payload)
-        client.execute_command('COPY', 'digestsrc', 'digestdst')
-
-        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digestsrc')
-        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digestdst')
+        # COPY gets a new OID so digests differ
+        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'dstkey')
         assert src_digest != dst_digest
+        # Digest is deterministic
+        src_digest2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        assert src_digest == src_digest2
+        # Nonexistent key returns nil digest
+        nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
+        assert nil_digest == [b'0' * 40]
+        # Deleting source does not affect the copy
+        client.execute_command('DEL', 'srckey')
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        # Deleting copy does not affect a re-created source
+        client.execute_command('LO.SET', 'srckey2', payload)
+        client.execute_command('COPY', 'srckey2', 'dstkey2')
+        client.execute_command('DEL', 'dstkey2')
+        assert client.execute_command('LO.GET', 'srckey2') == payload
+        # MEMORY USAGE includes struct overhead + payload (object is in DRAM)
+        mem = client.execute_command('MEMORY', 'USAGE', 'srckey2')
+        assert mem is not None
+        assert mem >= lo_value_size + payload_size, (
+            f"Expected MEMORY USAGE >= {lo_value_size + payload_size}, got {mem}"
+        )
 
     def test_copy_pool_exhausted(self):
         """COPY fails when DRAMPool cannot fit the duplicate."""
@@ -113,7 +115,6 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         # Fill most of the 1MB pool with a large object.
         payload = b'F' * (900 * 1024)
         client.execute_command('LO.SET', 'bigkey', payload)
-
         # COPY needs another 900KB — pool is only 1MB total.
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
