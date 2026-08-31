@@ -1,7 +1,7 @@
 //! DRAMPool — long-lived cached objects.
 //!
 //! SegmentPool + RwLock<HashMap<ObjectId, Arc<ObjectContext>>>.
-//! Uses alloc_checked (draining-aware). Segments can expand/shrink.
+//! Uses alloc (segment pool allocator). Segments can expand/shrink.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -29,7 +29,7 @@ impl DRAMPool {
     // ─── Allocator (draining-aware) ──────────────────────────────────────
 
     pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        self.pool.alloc_checked(size)
+        self.pool.alloc(size)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {

@@ -215,7 +215,7 @@ impl UringNvmeEngine {
 
                         let (sqe, op) = match req {
                             IoRequest::Read { fd, op, tx } => {
-                                let read_len = Self::align_up(op.len) as u32;
+                                let read_len = super::align_up(op.len as usize) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::ReadFixed::new(
                                         io_uring::types::Fd(fd),
@@ -245,7 +245,7 @@ impl UringNvmeEngine {
                                 )
                             }
                             IoRequest::Write { fd, op, tx } => {
-                                let write_len = Self::align_up(op.len) as u32;
+                                let write_len = super::align_up(op.len as usize) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::WriteFixed::new(
                                         io_uring::types::Fd(fd),
@@ -374,9 +374,5 @@ impl UringNvmeEngine {
                 Err(_) => break,
             }
         }
-    }
-
-    fn align_up(n: u64) -> u64 {
-        (n + 4095) & !4095
     }
 }

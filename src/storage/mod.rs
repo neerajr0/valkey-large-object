@@ -15,6 +15,16 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+
+/// O_DIRECT / io_uring alignment requirement (XFS default block size).
+/// Both buffer address and I/O length must be multiples of this.
+pub const IO_ALIGN: usize = 4096;
+
+/// Round up to IO_ALIGN boundary. Used by the allocator (buffer size)
+/// and the uring layer (I/O length) to satisfy O_DIRECT requirements.
+pub fn align_up(n: usize) -> usize {
+    (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
+}
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;
