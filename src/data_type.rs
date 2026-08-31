@@ -61,11 +61,12 @@ impl LoValue {
     /// - Tiered mode: only if the object has been promoted into DRAMPool.
     pub fn memory_usage(&self) -> usize {
         let base = std::mem::size_of::<LoValue>();
+        let dram_usage = base + self.len as usize;
         match crate::operating_mode() {
-            crate::OperatingMode::Dram => base + self.len as usize,
+            crate::OperatingMode::Dram => dram_usage,
             crate::OperatingMode::Tiered => {
                 if crate::storage::get_dram_pool().contains_object(&self.object_id) {
-                    base + self.len as usize
+                    dram_usage
                 } else {
                     base
                 }
@@ -97,6 +98,11 @@ impl LoValue {
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
+        // COPY requires a fully Ready object — Filling state means incomplete buffers.
+        assert!(
+            src_ctx.is_ready(),
+            "Dram COPY: ObjectContext is in Filling state"
+        );
         // Returns None if the DRAM pool cannot allocate buffers for the copy.
         let new_ctx = src_ctx.try_clone()?;
         let new_oid = ObjectId::next();
