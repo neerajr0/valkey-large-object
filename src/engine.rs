@@ -117,7 +117,7 @@ fn execute_get_dram_efa(
             serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
         }
         Some(_obj_ctx) => {
-            panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
+            unimplemented!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
         }
         None => {
             panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug");
@@ -178,11 +178,10 @@ fn execute_get_tiered(
 
             match result {
                 Ok(Ok(_)) => {
-                    // Serve from DRAMPool (object is now cached).
+                    // Serve from DRAMPool — obj_ctx Arc is already owned by this task.
+                    // No map re-fetch: lo_free may have removed the map entry during
+                    // the NVMe read, but our Arc keeps the ObjectContext alive.
                     let dram_pool = storage::get_dram_pool();
-                    let obj_ctx = dram_pool
-                        .get_object(&object_id)
-                        .expect("ObjectContext missing after try_promote_object inserted it");
                     serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
                 }
                 _ => {
