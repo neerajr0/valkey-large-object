@@ -14,7 +14,7 @@ pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
-pub use context::{ObjectContext, ObjectState, SegmentBuffer, StreamingContext};
+pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;

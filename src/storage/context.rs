@@ -12,7 +12,7 @@
 //! chunks arrive (`let mut crc: u32 = 0`) and compares against the client-provided
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
@@ -29,16 +29,16 @@ pub struct SegmentBuffer {
     pub len: u32,
 }
 
-// ─── ObjectState ─────────────────────────────────────────────────────────────
+// ─── Object State ────────────────────────────────────────────────────────────
 
-/// State of an ObjectContext in DRAMPool.
-#[derive(Debug)]
+/// Atomic state for ObjectContext. `#[repr(u8)]` for use with AtomicU8.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectState {
     /// All buffers filled, object is servable.
-    Ready,
-    /// Promotion in progress — batched ReadFixed filling buffers.
-    /// `chunks_ready` advances by batch_size atomically after each batch completes.
-    Filling { chunks_ready: AtomicU32, total: u32 },
+    Ready = 0,
+    /// Promotion in progress — NVMe ReadFixed filling buffers.
+    Filling = 1,
 }
 
 // ─── ObjectContext ───────────────────────────────────────────────────────────
@@ -52,8 +52,15 @@ pub struct ObjectContext {
     pub buffers: Vec<SegmentBuffer>,
     /// Total object size (sum of all buffer lens).
     pub total_len: u64,
-    /// Current state: Ready (servable) or Filling (promotion in progress).
-    pub state: ObjectState,
+    /// Filling→Ready transition via mark_ready() with Release ordering.
+    /// Readers use is_ready() with Acquire ordering — guarantees visibility
+    /// of the NVMe read data that was written before mark_ready().
+    state: AtomicU8,
+    /// Chunks completed during promotion (only meaningful when state == Filling).
+    chunks_ready: AtomicU32,
+    /// Total chunks for this object (used by streaming/chunking path).
+    #[allow(dead_code)]
+    total_chunks: u32,
 }
 
 impl ObjectContext {
@@ -62,7 +69,9 @@ impl ObjectContext {
         Self {
             buffers,
             total_len,
-            state: ObjectState::Ready,
+            state: AtomicU8::new(ObjectState::Ready as u8),
+            chunks_ready: AtomicU32::new(0),
+            total_chunks: 0,
         }
     }
 
@@ -71,31 +80,40 @@ impl ObjectContext {
         Self {
             buffers,
             total_len,
-            state: ObjectState::Filling {
-                chunks_ready: AtomicU32::new(0),
-                total: total_chunks,
-            },
+            state: AtomicU8::new(ObjectState::Filling as u8),
+            chunks_ready: AtomicU32::new(0),
+            total_chunks,
         }
     }
 
     /// Check if the object is fully ready for serving.
+    /// Uses Acquire ordering: if this returns true, all data written
+    /// before mark_ready() is guaranteed visible to this thread.
     pub fn is_ready(&self) -> bool {
-        matches!(self.state, ObjectState::Ready)
+        self.state.load(Ordering::Acquire) == ObjectState::Ready as u8
+    }
+
+    /// Transition from Filling to Ready. Called by the tokio task
+    /// after NVMe ReadFixed completes successfully.
+    /// Uses Release ordering: all preceding writes (the NVMe read data
+    /// in the buffer) are visible to any thread that later sees is_ready() == true.
+    pub fn mark_ready(&self) {
+        self.state
+            .store(ObjectState::Ready as u8, Ordering::Release);
     }
 
     /// Get the number of chunks ready (contiguous from offset 0).
     pub fn chunks_ready(&self) -> u32 {
-        match &self.state {
-            ObjectState::Ready => self.buffers.len() as u32,
-            ObjectState::Filling { chunks_ready, .. } => chunks_ready.load(Ordering::Acquire),
+        if self.is_ready() {
+            self.buffers.len() as u32
+        } else {
+            self.chunks_ready.load(Ordering::Acquire)
         }
     }
 
     /// Advance chunks_ready after a batch completes. Called from tokio promotion task.
     pub fn advance_chunks_ready(&self, batch_size: u32) {
-        if let ObjectState::Filling { chunks_ready, .. } = &self.state {
-            chunks_ready.fetch_add(batch_size, Ordering::Release);
-        }
+        self.chunks_ready.fetch_add(batch_size, Ordering::Release);
     }
 }
 

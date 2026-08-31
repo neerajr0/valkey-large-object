@@ -149,6 +149,10 @@ fn execute_get_tiered(
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+        // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+        if obj_ctx.buffers.len() != 1 {
+            todo!("streaming and chunking not yet implemented");
+        }
         let seg_buf = &obj_ctx.buffers[0];
         let buf_ptr_usize = dram_pool.buffer_ptr(seg_buf) as usize;
         let read_op = uring::UringOp {
@@ -178,9 +182,10 @@ fn execute_get_tiered(
 
             match result {
                 Ok(Ok(_)) => {
-                    // Serve from DRAMPool — obj_ctx Arc is already owned by this task.
-                    // No map re-fetch: lo_free may have removed the map entry during
-                    // the NVMe read, but our Arc keeps the ObjectContext alive.
+                    // NVMe read complete — transition Filling→Ready.
+                    // Release ordering ensures buffer data is visible to any
+                    // thread that subsequently sees is_ready() == true.
+                    obj_ctx.mark_ready();
                     let dram_pool = storage::get_dram_pool();
                     serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
                 }
@@ -639,7 +644,11 @@ fn serve_from_dram(
             remote_addr,
         } => {
             // EFA: write from DRAMPool buffer to client GPU.
-            let buf = &obj_ctx.buffers[0]; // Single-chunk for now.
+            // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+            if obj_ctx.buffers.len() != 1 {
+                todo!("streaming and chunking not yet implemented");
+            }
+            let buf = &obj_ctx.buffers[0];
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
             crate::runtime_handle().spawn(async move {
                 match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
