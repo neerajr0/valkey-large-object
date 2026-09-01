@@ -117,7 +117,7 @@ fn execute_get_dram_efa(
             serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
         }
         Some(_obj_ctx) => {
-            unimplemented!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
+            todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
         }
         None => {
             panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug");
@@ -617,6 +617,9 @@ async fn do_tiered_nvme_write(
         len: obj_len,
     };
 
+    // Reserve disk usage before the write — decrement on any failure path.
+    uring::increase_nvme_disk_usage(obj_len);
+
     let write_result = uring::submit_write(fd, &write_op).await;
     unsafe { libc::close(fd) };
 
@@ -632,6 +635,7 @@ async fn do_tiered_nvme_write(
                 if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
                     if existing.object_id > object_id {
                         // Stale write — a newer SET already completed. Discard silently.
+                        uring::decrease_nvme_disk_usage(obj_len);
                         let _ = std::fs::remove_file(&file_path);
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                         return;
@@ -643,15 +647,16 @@ async fn do_tiered_nvme_write(
                     crc32c: crc,
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    uring::decrease_nvme_disk_usage(obj_len);
                     let _ = std::fs::remove_file(&file_path);
                     thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                     return;
                 }
             }
-            uring::increase_nvme_disk_usage(obj_len);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {
+            uring::decrease_nvme_disk_usage(obj_len);
             let _ = std::fs::remove_file(&file_path);
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
@@ -663,6 +668,7 @@ async fn do_tiered_nvme_write(
         // This means the poller panicked or shut down unexpectedly.
         // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
+            uring::decrease_nvme_disk_usage(obj_len);
             let _ = std::fs::remove_file(&file_path);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }
