@@ -207,9 +207,7 @@ impl UringNvmeEngine {
         let mut ring = match io_uring::IoUring::new(256) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("largeobj: io_uring init failed: {}", e);
-                Self::error_drain_loop(rx, shutdown);
-                return;
+                panic!("largeobj: io_uring init failed: {}", e);
             }
         };
 
@@ -220,7 +218,7 @@ impl UringNvmeEngine {
         };
 
         if !use_fixed && !iovecs.is_empty() {
-            eprintln!("largeobj: IORING_REGISTER_BUFFERS failed, using regular Read/Write");
+            panic!("largeobj: IORING_REGISTER_BUFFERS failed — ReadFixed/WriteFixed unavailable");
         }
 
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
@@ -341,8 +339,21 @@ impl UringNvmeEngine {
                 for _ in 0..3 {
                     match ring.submit_and_wait(1) {
                         Ok(_) => break,
+                        // Signal interrupted — normal, retry immediately.
                         Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                        Err(_) => break,
+                        // Transient congestion — reap CQEs in Phase 3, retry next loop.
+                        Err(ref e)
+                            if e.raw_os_error() == Some(libc::EBUSY)
+                                || e.raw_os_error() == Some(libc::EAGAIN)
+                                || e.raw_os_error() == Some(libc::ENOMEM) =>
+                        {
+                            break;
+                        }
+                        // Unrecoverable: EFAULT (bad pointer), EINVAL (bad SQE),
+                        // EBADF (ring dead), EPERM (environment broken).
+                        Err(ref e) => {
+                            panic!("largeobj: io_uring submit_and_wait unrecoverable: {}", e);
+                        }
                     }
                 }
             } else if shutdown.load(Ordering::Relaxed) {
@@ -381,26 +392,15 @@ impl UringNvmeEngine {
                     }
                 }
             }
-        }
-    }
 
-    fn error_drain_loop(rx: Receiver<IoRequest>, shutdown: Arc<AtomicBool>) {
-        loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(req) => match req {
-                    IoRequest::Read { tx, .. } => {
-                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
-                    }
-                    IoRequest::Write { tx, .. } => {
-                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
-                    }
-                },
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            // Phase 4: CQ overflow detection — if the kernel dropped completions,
+            // pending ops will never complete and tasks will hang forever.
+            if ring.completion().overflow() > 0 {
+                panic!(
+                    "largeobj: io_uring CQ overflow detected ({} dropped). \
+                     Pending ops will never complete. Aborting.",
+                    ring.completion().overflow()
+                );
             }
         }
     }
