@@ -46,6 +46,7 @@ pub enum ObjectState {
 /// Long-lived runtime state for a cached object in DRAMPool.
 /// ALL N buffers for the entire object are allocated upfront from DRAMPool segment.
 /// Stored in: `RwLock<HashMap<ObjectId, Arc<ObjectContext>>>`
+/// Buffers are automatically returned to DRAMPool when the last Arc drops.
 #[derive(Debug)]
 pub struct ObjectContext {
     /// Ordered chunks. 1 for small objects, N for large.
@@ -117,11 +118,23 @@ impl ObjectContext {
     }
 }
 
+impl Drop for ObjectContext {
+    fn drop(&mut self) {
+        // Guard: pool may not be initialized in unit tests.
+        if let Some(dram_pool) = super::DRAM_POOL.get() {
+            for buf in &self.buffers {
+                dram_pool.free(buf);
+            }
+        }
+    }
+}
+
 // ─── StreamingContext ────────────────────────────────────────────────────────
 
 /// Short-lived runtime state for a transient I/O operation on NVMePool.
 /// Rotating window of X buffers, reused across batches.
 /// Owned by a single tokio task — no Arc needed.
+/// Buffers are automatically returned to NVMePool on drop.
 #[derive(Debug)]
 pub struct StreamingContext {
     /// Rotating buffer window (max X = batch size).
@@ -132,6 +145,17 @@ pub struct StreamingContext {
     pub chunks_completed: u32,
     /// Total chunks needed for the full object.
     pub total_chunks: u32,
+}
+
+impl Drop for StreamingContext {
+    fn drop(&mut self) {
+        // Guard: pool may not be initialized in unit tests.
+        if let Some(nvme_pool) = super::NVME_POOL.get() {
+            for buf in &self.buffers {
+                nvme_pool.free(buf);
+            }
+        }
+    }
 }
 
 impl StreamingContext {

@@ -15,7 +15,7 @@ use valkey_module::raw;
 
 /// ObjectId IS the file path: deterministic mapping OID → "{nvme_dir}/{oid:016x}.dat"
 /// No lookup table. Compact u64 safe for replication streams, RDB, and LoValue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
 
 /// Monotonic OID counter.

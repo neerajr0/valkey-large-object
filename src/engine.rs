@@ -190,9 +190,8 @@ fn execute_get_tiered(
                     serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
                 }
                 _ => {
-                    // Read failed — remove entry, free buffer.
+                    // Read failed — remove entry. Buffers freed by ObjectContext Drop.
                     storage::get_dram_pool().remove_object(&object_id);
-                    storage::get_dram_pool().free(&obj_ctx.buffers[0]);
                     thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
                 }
             }
@@ -218,7 +217,6 @@ fn execute_get_tiered(
     let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
         Some(fd) => fd,
         None => {
-            nvme_pool.free(&stream_ctx.buffers[0]);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
             return;
@@ -241,42 +239,38 @@ fn execute_get_tiered(
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
         match read_result {
-            Ok(Ok(_bytes_read)) => {
-                match transport {
-                    Transport::Tcp => {
-                        let data = unsafe {
-                            std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
-                                .to_vec()
-                        };
-                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
-                    }
-                    Transport::Efa {
+            Ok(Ok(_bytes_read)) => match transport {
+                Transport::Tcp => {
+                    let data = unsafe {
+                        std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
+                            .to_vec()
+                    };
+                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                }
+                Transport::Efa {
+                    session,
+                    rkey,
+                    remote_addr,
+                } => {
+                    match efa_write_to_client(
                         session,
+                        buf_ptr_usize,
+                        obj_len as usize,
                         rkey,
                         remote_addr,
-                    } => {
-                        match efa_write_to_client(
-                            session,
-                            buf_ptr_usize,
-                            obj_len as usize,
-                            rkey,
-                            remote_addr,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                            }
-                            Err(e) => {
-                                thread_ctx.reply(Err(e));
-                            }
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                        }
+                        Err(e) => {
+                            thread_ctx.reply(Err(e));
                         }
                     }
                 }
-                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
-            }
+            },
             Ok(Err(e)) => {
-                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::String(format!(
                     "{}: {}",
                     errors::ERR_NVME_READ,
@@ -287,7 +281,6 @@ fn execute_get_tiered(
             // This means the poller panicked or shut down unexpectedly.
             // TODO: Add error metric counter for poller channel failures.
             Err(_) => {
-                storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
             }
         }
@@ -305,11 +298,14 @@ pub fn execute_set(
     data_source: DataSource,
 ) -> EngineResult {
     let mode = crate::operating_mode();
+    // Assign object_id at command dispatch time (main thread) — establishes
+    // ordering by arrival, not completion. Used for version checks on async paths.
+    let object_id = ObjectId::next();
 
     match (mode, &data_source) {
         (OperatingMode::Dram, DataSource::Tcp(data)) => {
             // Fully sync — alloc + memcpy + create LoValue inline.
-            EngineResult::Sync(serve_set_dram_tcp(ctx, key_name, obj_len, data))
+            EngineResult::Sync(serve_set_dram_tcp(ctx, key_name, obj_len, data, object_id))
         }
         _ => {
             // Async — block client, dispatch to tokio.
@@ -317,10 +313,22 @@ pub fn execute_set(
             let key_name_bytes = key_name.as_slice().to_vec();
             match mode {
                 OperatingMode::Dram => {
-                    execute_set_dram_efa(key_name_bytes, obj_len, data_source, blocked_client);
+                    execute_set_dram_efa(
+                        key_name_bytes,
+                        obj_len,
+                        data_source,
+                        blocked_client,
+                        object_id,
+                    );
                 }
                 OperatingMode::Tiered => {
-                    execute_set_tiered(key_name_bytes, obj_len, data_source, blocked_client);
+                    execute_set_tiered(
+                        key_name_bytes,
+                        obj_len,
+                        data_source,
+                        blocked_client,
+                        object_id,
+                    );
                 }
             }
             EngineResult::Async
@@ -334,6 +342,7 @@ fn serve_set_dram_tcp(
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
     data: &[u8],
+    object_id: ObjectId,
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
 
@@ -348,18 +357,22 @@ fn serve_set_dram_tcp(
 
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
-    let object_id = ObjectId::next();
-    let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-    dram_pool.insert_object(object_id, obj_ctx);
-
+    // set_value BEFORE insert_object — sync path, no version check needed
+    // (single-threaded main thread, our object_id is always the latest).
+    // If set_value fails, only the buffer needs freeing — no map entry to undo.
     let key = ctx.open_key_writable(key_name);
     let lo_value = LoValue {
         object_id,
         len: obj_len,
         crc32c: crc,
     };
-    key.set_value(&LO_TYPE, lo_value)
-        .map_err(|_| ValkeyError::Str("ERR failed to set key"))?;
+    if key.set_value(&LO_TYPE, lo_value).is_err() {
+        dram_pool.free(&seg_buf);
+        return Err(ValkeyError::Str("ERR failed to set key"));
+    }
+
+    let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
+    dram_pool.insert_object(object_id, obj_ctx);
 
     Ok(ValkeyValue::SimpleStringStatic("OK"))
 }
@@ -382,6 +395,7 @@ fn execute_set_dram_efa(
     obj_len: u64,
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
+    object_id: ObjectId,
 ) {
     let dram_pool = storage::get_dram_pool();
 
@@ -428,24 +442,34 @@ fn execute_set_dram_efa(
                         let crc = crc32c::crc32c(unsafe {
                             std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
                         });
-                        let object_id = ObjectId::next();
-                        let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-                        storage::get_dram_pool().insert_object(object_id, obj_ctx);
 
+                        // Version check + set_value BEFORE insert_object.
                         {
                             let ctx = thread_ctx.lock();
                             let key_str = ctx.create_string(key_name);
                             let key = ctx.open_key_writable(&key_str);
+                            if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
+                                if existing.object_id > object_id {
+                                    // Stale write — a newer SET already completed. Discard silently.
+                                    storage::get_dram_pool().free(&seg_buf);
+                                    thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                                    return;
+                                }
+                            }
                             let lo_value = LoValue {
                                 object_id,
                                 len: obj_len,
                                 crc32c: crc,
                             };
                             if key.set_value(&LO_TYPE, lo_value).is_err() {
+                                storage::get_dram_pool().free(&seg_buf);
                                 thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                                 return;
                             }
                         }
+
+                        let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
+                        storage::get_dram_pool().insert_object(object_id, obj_ctx);
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                     }
                     Err(_) => {
@@ -464,6 +488,7 @@ fn execute_set_tiered(
     obj_len: u64,
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
+    object_id: ObjectId,
 ) {
     let nvme_pool = storage::get_nvme_pool();
 
@@ -492,8 +517,15 @@ fn execute_set_tiered(
             let copy_len = data.len().min(obj_len as usize);
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
             crate::runtime_handle().spawn(async move {
-                do_tiered_nvme_write(buf_ptr_usize, obj_len, stream_ctx, blocked_client, key_name)
-                    .await;
+                do_tiered_nvme_write(
+                    buf_ptr_usize,
+                    obj_len,
+                    stream_ctx,
+                    blocked_client,
+                    key_name,
+                    object_id,
+                )
+                .await;
             });
         }
         DataSource::Efa {
@@ -519,11 +551,11 @@ fn execute_set_tiered(
                             stream_ctx,
                             blocked_client,
                             key_name,
+                            object_id,
                         )
                         .await;
                     }
                     Err(_) => {
-                        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
                         let thread_ctx =
                             valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
@@ -542,11 +574,11 @@ async fn do_tiered_nvme_write(
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     key_name: Vec<u8>,
+    object_id: ObjectId,
 ) {
     let buf_ptr = buf_ptr_usize as *mut u8;
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
-    let object_id = ObjectId::next();
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
     let c_path = std::ffi::CString::new(file_path.as_str()).expect("file_path null");
@@ -557,7 +589,6 @@ async fn do_tiered_nvme_write(
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
     let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if fd < 0 {
-        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
@@ -580,26 +611,34 @@ async fn do_tiered_nvme_write(
 
     match write_result {
         Ok(Ok(())) => {
+            // Version check + set_value. No DRAMPool involvement on Tiered SET.
             {
                 let ctx = thread_ctx.lock();
                 let key_str = ctx.create_string(key_name);
                 let key = ctx.open_key_writable(&key_str);
+                if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
+                    if existing.object_id > object_id {
+                        // Stale write — a newer SET already completed. Discard silently.
+                        let _ = std::fs::remove_file(&file_path);
+                        thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                        return;
+                    }
+                }
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
                     crc32c: crc,
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    let _ = std::fs::remove_file(&file_path);
                     thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                     return;
                 }
             }
-            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {
             let _ = std::fs::remove_file(&file_path);
-            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
                 errors::ERR_NVME_WRITE,
@@ -611,7 +650,6 @@ async fn do_tiered_nvme_write(
         // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
             let _ = std::fs::remove_file(&file_path);
-            storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }
     }

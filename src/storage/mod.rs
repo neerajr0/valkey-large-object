@@ -67,8 +67,8 @@ pub fn append_iovec(iov: libc::iovec) -> u16 {
     idx
 }
 
-static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
-static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
+pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
+pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
 static FD_POOL: OnceLock<FdPool> = OnceLock::new();
 
 pub fn get_dram_pool() -> &'static DRAMPool {
