@@ -218,18 +218,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ((dram_max as usize) / dram_seg_size).max(1)
     };
 
-    // SegmentBuffer.segment_idx is u8 — max 256 segments (indices 0–255).
-    // In Tiered mode, one slot is reserved for the NVMe staging segment.
-    let max_dram_segments = if mode == OperatingMode::Tiered {
-        u8::MAX as usize // 255 DRAM + 1 NVMe = 256 total
-    } else {
-        u8::MAX as usize + 1 // 256 DRAM, no NVMe
-    };
-    if dram_segment_count > max_dram_segments {
+    // SegmentBuffer.segment_idx is u8 — max 256 segments per pool (indices 0–255).
+    // segment_idx is local to each pool (DRAMPool and NVMePool have separate segment vecs),
+    // so the NVMe staging segment does not consume a DRAMPool index.
+    if dram_segment_count > u8::MAX as usize + 1 {
         ctx.log_warning(&format!(
-            "largeobj: too many segments ({}). Max {} in {:?} mode (segment_idx is u8). \
+            "largeobj: too many DRAM segments ({}). Max 256 (segment_idx is u8). \
              Increase dram-segment-size or decrease dram-maxmemory",
-            dram_segment_count, max_dram_segments, mode,
+            dram_segment_count,
         ));
         return Status::Err;
     }

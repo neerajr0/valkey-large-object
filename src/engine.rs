@@ -582,8 +582,8 @@ async fn do_tiered_nvme_write(
     object_id: ObjectId,
 ) {
     // Reject if writing this object would exceed nvme-maxmemory.
+    // stream_ctx Drop frees the buffer on return.
     if !uring::has_nvme_capacity(obj_len) {
-        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
         return;

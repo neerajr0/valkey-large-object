@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 /// `segment_idx` identifies which registered iovec entry (io_uring buf_index).
 #[derive(Debug, Clone)]
 pub struct SegmentBuffer {
-    /// Which segment this slice lives in (index into the io_uring iovec array).
+    /// Which segment this slice lives in (local index into the owning pool's segments vec).
+    /// NOT the global io_uring iovec index - that is on Segment.iovec_index.
     pub segment_idx: u8,
     /// Byte offset within that segment.
     pub offset: u64,
