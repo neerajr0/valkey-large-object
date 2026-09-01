@@ -539,12 +539,20 @@ async fn do_tiered_nvme_write(
     blocked_client: valkey_module::BlockedClient,
     key_name: Vec<u8>,
 ) {
+    // Reject if writing this object would exceed nvme-maxmemory.
+    if !uring::has_nvme_capacity(obj_len) {
+        storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
+        return;
+    }
     let buf_ptr = buf_ptr_usize as *mut u8;
     let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
     let object_id = ObjectId::next();
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
+
     let c_path = std::ffi::CString::new(file_path.as_str()).expect("file_path null");
     let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
@@ -591,6 +599,7 @@ async fn do_tiered_nvme_write(
                 }
             }
             storage::get_nvme_pool().free(&stream_ctx.buffers[0]);
+            uring::increase_nvme_disk_usage(obj_len);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {

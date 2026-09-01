@@ -29,6 +29,20 @@ pub struct SegmentBuffer {
     pub len: u32,
 }
 
+impl super::TryClone for SegmentBuffer {
+    fn try_clone(&self) -> Option<Self> {
+        let pool = crate::storage::get_dram_pool();
+        let new_buf = pool.alloc(self.len as usize)?;
+        let src_ptr = pool.buffer_ptr(self);
+        let dst_ptr = pool.buffer_ptr(&new_buf);
+        // SAFETY: src and dst are non-overlapping regions within pool segment(s).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.len as usize);
+        }
+        Some(new_buf)
+    }
+}
+
 // ─── ObjectState ─────────────────────────────────────────────────────────────
 
 /// State of an ObjectContext in DRAMPool.
@@ -96,6 +110,23 @@ impl ObjectContext {
         if let ObjectState::Filling { chunks_ready, .. } = &self.state {
             chunks_ready.fetch_add(batch_size, Ordering::Release);
         }
+    }
+}
+
+impl super::TryClone for ObjectContext {
+    /// Deep-copies all buffers into new DRAMPool allocations.
+    /// Returns Some(new Ready ObjectContext) on success.
+    /// Returns None if object is Filling (incomplete) or pool is full.
+    fn try_clone(&self) -> Option<Self> {
+        // Cannot copy an object that is still being promoted (buffers incomplete).
+        if !self.is_ready() {
+            return None;
+        }
+        let mut new_buffers = Vec::with_capacity(self.buffers.len());
+        for buf in &self.buffers {
+            new_buffers.push(buf.try_clone()?);
+        }
+        Some(Self::new_ready(new_buffers, self.total_len))
     }
 }
 
