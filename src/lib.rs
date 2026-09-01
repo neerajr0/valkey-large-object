@@ -218,6 +218,16 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ((dram_max as usize) / dram_seg_size).max(1)
     };
 
+    // SegmentBuffer.segment_idx is u8 — max 256 segments (indices 0–255).
+    if dram_segment_count > u8::MAX as usize {
+        ctx.log_warning(&format!(
+            "largeobj: too many segments ({}). Max 256 (segment_idx is u8). \
+             Increase dram-segment-size or decrease dram-maxmemory",
+            dram_segment_count,
+        ));
+        return Status::Err;
+    }
+
     storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, &dir);
 
     // Step 3: Register all segments with io_uring.
