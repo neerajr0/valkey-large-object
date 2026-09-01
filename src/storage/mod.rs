@@ -3,18 +3,18 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
-use crate::data_type::ObjectId;
-
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
 pub mod nvme_pool;
+pub mod object_file;
 pub mod segment;
 pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+pub use object_file::{get_teardown_worker, ObjectFile};
 
 /// O_DIRECT / io_uring alignment requirement (XFS default block size).
 /// Both buffer address and I/O length must be multiples of this.
@@ -236,11 +236,4 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
     }
     slices
-}
-
-/// Delete an object's NVMe file. Called from free callback.
-pub fn delete_file(object_id: ObjectId) {
-    let dir = crate::nvme_dir();
-    let path = object_id.file_path(&dir);
-    let _ = std::fs::remove_file(&path);
 }

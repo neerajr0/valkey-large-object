@@ -20,7 +20,7 @@ use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, uring, ObjectContext};
+use crate::storage::{self, uring, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
 
@@ -71,6 +71,7 @@ pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
     obj_len: u64,
+    file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) -> EngineResult {
     let mode = crate::operating_mode();
@@ -88,7 +89,9 @@ pub fn execute_get(
                     execute_get_dram_efa(object_id, obj_len, transport, blocked_client);
                 }
                 OperatingMode::Tiered => {
-                    execute_get_tiered(object_id, obj_len, transport, blocked_client);
+                    let file =
+                        file.expect("Tiered GET: LoValue.file must be Some (minted at commit)");
+                    execute_get_tiered(object_id, obj_len, file, transport, blocked_client);
                 }
             }
             EngineResult::Async
@@ -132,7 +135,7 @@ fn execute_get_dram_efa(
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Serve from DRAMPool.
-            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx, None);
         }
         Some(_obj_ctx) => {
             todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
@@ -144,9 +147,11 @@ fn execute_get_dram_efa(
 }
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
+/// `file` pins the object's `ObjectFile` (existence + fd) for the whole operation.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
+    file: Arc<ObjectFile>,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
@@ -156,7 +161,14 @@ fn execute_get_tiered(
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+            serve_from_dram(
+                dram_pool,
+                &obj_ctx,
+                obj_len,
+                transport,
+                thread_ctx,
+                Some(file),
+            );
             return;
         }
         // Filling state: promotion in progress.
@@ -166,7 +178,8 @@ fn execute_get_tiered(
 
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+    // The Filling ObjectContext pins the file for the fill.
+    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len, Some(file.clone())) {
         // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
         if obj_ctx.buffers.len() != 1 {
             todo!("streaming and chunking not yet implemented");
@@ -181,7 +194,7 @@ fn execute_get_tiered(
         };
 
         let fd_pool = storage::get_fd_pool();
-        let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
+        let fd = match fd_pool.ensure_open(&file, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -206,10 +219,19 @@ fn execute_get_tiered(
                     // thread that subsequently sees is_ready() == true.
                     obj_ctx.mark_ready();
                     let dram_pool = storage::get_dram_pool();
-                    serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+                    // Move file in so the object stays pinned for the read's duration.
+                    serve_from_dram(
+                        dram_pool,
+                        &obj_ctx,
+                        obj_len,
+                        transport,
+                        thread_ctx,
+                        Some(file),
+                    );
                 }
                 _ => {
                     // Read failed — remove entry. Buffers freed by ObjectContext Drop.
+                    // file drops here → teardown if this was the last strong ref.
                     storage::get_dram_pool().remove_object(&object_id);
                     thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
                 }
@@ -230,10 +252,11 @@ fn execute_get_tiered(
         }
     };
 
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
+    // Transient read StreamingContext pins the file for the read.
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1, Some(file.clone()));
 
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
+    let fd = match fd_pool.ensure_open(&file, &crate::nvme_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -403,6 +426,7 @@ fn serve_set_dram_tcp(
         object_id,
         len: obj_len,
         crc32c: crc,
+        file: None,
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.free(&seg_buf);
@@ -437,8 +461,9 @@ fn execute_set_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks the old object (DRAMPool entry + fd + .dat file).
-    // Fix requires refcounted teardown — same mechanism as DEL free callback (data_type.rs) and for module eviction.
+    // Overwriting a key is safe: set_value over an existing key fires lo_free on the
+    // replaced LoValue, which drops its ObjectContext (DRAMPool entry) and, in Tiered
+    // mode, its Arc<ObjectFile> (fd + .dat teardown). Dram mode has no file.
 
     // Alloc from DRAMPool (this IS the final storage).
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
@@ -498,6 +523,7 @@ fn execute_set_dram_efa(
                                 object_id,
                                 len: obj_len,
                                 crc32c: crc,
+                                file: None,
                             };
                             if key.set_value(&LO_TYPE, lo_value).is_err() {
                                 storage::get_dram_pool().free(&seg_buf);
@@ -530,7 +556,8 @@ fn execute_set_tiered(
 ) {
     let nvme_pool = storage::get_nvme_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks old object. See execute_set_dram_efa.
+    // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
+    // replaced LoValue, dropping its Arc<ObjectFile> → fd close + old .dat unlink.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
@@ -544,7 +571,7 @@ fn execute_set_tiered(
 
     // StreamingContext owns the NVMePool buffer for this SET operation.
     // Single buffer today; multi-batch streaming adds more buffers here.
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1, None);
 
     let buf_ptr = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]);
     let buf_ptr_usize = buf_ptr as usize;
@@ -676,10 +703,15 @@ async fn do_tiered_nvme_write(
                         return;
                     }
                 }
+                // Winning branch (our OID ≥ any committed OID): mint a fresh, cold
+                // ObjectFile that owns this file's existence + lazy read fd. If thsi
+                // write overwrites a prior key, set_value triggers lo_free on the
+                // old LoValue, dropping its ObjectFile (teardown).
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
                     crc32c: crc,
+                    file: Some(Arc::new(ObjectFile::new_cold(object_id))),
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
                     uring::decrease_nvme_disk_usage(obj_len);
@@ -712,12 +744,16 @@ async fn do_tiered_nvme_write(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
+/// Serve a Ready object from DRAMPool buffers. `file` (Tiered only; `None` in Dram
+/// mode) pins the object's `ObjectFile` for the serve; on the EFA path it is moved
+/// into the write task so the pin outlives the async transfer.
 fn serve_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
     obj_len: u64,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    file: Option<Arc<ObjectFile>>,
 ) {
     match transport {
         Transport::Tcp => {
@@ -742,6 +778,7 @@ fn serve_from_dram(
             let buf = &obj_ctx.buffers[0];
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
             crate::runtime_handle().spawn(async move {
+                let _file = file; // pin the object for the transfer's duration
                 match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
                     .await
                 {

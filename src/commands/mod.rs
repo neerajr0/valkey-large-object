@@ -100,6 +100,9 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
 
+    // Pin the file to protect it from asynchronous deletion in tiered mode.
+    let file = lo_value.file.clone();
+
     // Determine transport: EFA if rkey+remote_addr provided, else TCP.
     let transport = if args.len() >= 4 {
         let rkey: u64 = args[2]
@@ -127,7 +130,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_get(ctx, object_id, obj_len, transport) {
+    match engine::execute_get(ctx, object_id, obj_len, file, transport) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }

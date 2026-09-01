@@ -90,10 +90,13 @@ impl DRAMPool {
 
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
+    /// `file` (Tiered mode) is pinned by the resulting `Filling` context for the
+    /// duration of the promotion fill (design §2.4/§3.2).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
         obj_len: u64,
+        file: Option<std::sync::Arc<super::object_file::ObjectFile>>,
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
         // Don't promote objects above the configured threshold.
         if obj_len > crate::max_promote_size() {
@@ -116,6 +119,7 @@ impl DRAMPool {
             vec![seg_buf],
             obj_len,
             1, // TODO: Single chunk today; streaming will pass actual chunk count.
+            file,
         ));
         objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)
