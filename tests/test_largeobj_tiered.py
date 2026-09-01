@@ -2,6 +2,7 @@ import os
 import glob
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
@@ -57,7 +58,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
-        self._wait_for_lazyfree_done(client)
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
@@ -81,13 +82,13 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert src_digest != dst_digest
         # Deleting source does not affect the copy
         client.execute_command('DEL', 'srckey')
-        self._wait_for_lazyfree_done(client)
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('LO.GET', 'dstkey') == payload
         # Deleting copy does not affect the source
         client.execute_command('LO.SET', 'srckey2', payload)
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
-        self._wait_for_lazyfree_done(client)
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('LO.GET', 'srckey2') == payload
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────

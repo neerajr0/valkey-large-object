@@ -1,5 +1,6 @@
 import os
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
@@ -30,7 +31,7 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         client.execute_command("LO.SET", "c", b"C" * 4096)
         # DEL frees asynchronously (BIO thread); wait for completion.
         client.execute_command("DEL", "b")
-        self._wait_for_lazyfree_done(client)
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         assert len(self._object_files()) == 2
 
         # exit() issues SHUTDOWN NOSAVE, which fires the Shutdown server event

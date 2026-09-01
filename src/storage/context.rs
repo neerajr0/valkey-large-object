@@ -114,6 +114,9 @@ impl ObjectContext {
 }
 
 impl super::TryClone for ObjectContext {
+    /// Deep-copies all buffers into new DRAMPool allocations.
+    /// Returns Some(new Ready ObjectContext) on success.
+    /// Returns None if object is Filling (incomplete) or pool is full.
     fn try_clone(&self) -> Option<Self> {
         // Cannot copy an object that is still being promoted (buffers incomplete).
         if !self.is_ready() {
