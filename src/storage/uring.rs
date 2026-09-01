@@ -3,7 +3,7 @@
 //! Architecture:
 //!   Caller: submit(IoRequest) via channel → returns immediately
 //!   Poller thread: owns io_uring ring, submits ReadFixed/WriteFixed, polls CQ,
-//!                  fires completion callback from CQ thread.
+//!                  sends completion result via oneshot channel.
 //!
 //! Segments are registered with IORING_REGISTER_BUFFERS at startup.
 //! ReadFixed/WriteFixed use buf_index (segment index) + offset within segment.
@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use tokio::sync::oneshot;
 
 use super::StorageError;
 
@@ -48,7 +49,7 @@ pub fn has_nvme_capacity(obj_len: u64) -> bool {
 
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
-/// Multi-buffer batch support: pass a Vec<UringOp> to submit_batch (future).
+/// TODO: Multi-buffer batch support (STORAGE_DESIGN.md §7.3).
 #[derive(Clone)]
 pub struct UringOp {
     /// Segment's position in the registered iovec array (IORING_REGISTER_BUFFERS).
@@ -64,26 +65,23 @@ pub struct UringOp {
 // SAFETY: buf_ptr points to segment memory that is stable for module lifetime.
 unsafe impl Send for UringOp {}
 
-/// Completion callback: (result or error). Caller retains buffer ownership.
-type ReadCallback = Box<dyn FnOnce(Result<u64, StorageError>) + Send>;
-type WriteCallback = Box<dyn FnOnce(Result<(), StorageError>) + Send>;
-
-/// I/O request — internal transport to the poller thread. Not exposed externally.
+/// I/O request — internal transport to the poller thread.
+/// Contains the oneshot sender directly — no callback boxing.
 enum IoRequest {
     Read {
         fd: RawFd,
         op: UringOp,
-        on_complete: ReadCallback,
+        tx: oneshot::Sender<Result<u64, StorageError>>,
     },
     Write {
         fd: RawFd,
         op: UringOp,
-        on_complete: WriteCallback,
+        tx: oneshot::Sender<Result<(), StorageError>>,
     },
 }
 
 // SAFETY: IoRequest contains raw pointers (inside UringOp) referring to segment-allocated memory
-// that is stable for module lifetime. Closures are Send. Only sent across a
+// that is stable for module lifetime. oneshot::Sender is Send. Only sent across a
 // bounded channel to the single poller thread.
 unsafe impl Send for IoRequest {}
 
@@ -91,11 +89,14 @@ unsafe impl Send for IoRequest {}
 
 enum PendingOp {
     Read {
-        on_complete: ReadCallback,
+        tx: oneshot::Sender<Result<u64, StorageError>>,
+        /// Expected byte count for this I/O op. Short reads are rejected.
+        expected_bytes: u64,
     },
     Write {
-        on_complete: WriteCallback,
-        len: u64,
+        tx: oneshot::Sender<Result<(), StorageError>>,
+        /// Expected byte count for this I/O op. Short writes are rejected.
+        expected_bytes: u64,
     },
 }
 
@@ -107,50 +108,48 @@ pub fn set_engine(engine: UringNvmeEngine) {
     ENGINE.set(engine).ok();
 }
 
-fn submit(req: IoRequest) {
-    if let Some(engine) = ENGINE.get() {
-        engine.tx.send(req).ok();
+/// Submit an IoRequest to the poller thread.
+/// Returns SendError with the request back on failure (channel disconnected)
+/// so the caller can extract the oneshot sender and fire an explicit error.
+fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
+    match ENGINE.get() {
+        Some(engine) => engine.tx.send(req),
+        None => Err(crossbeam_channel::SendError(req)),
     }
 }
 
-// ─── Oneshot-bridged async submit helpers ────────────────────────────────────
+// ─── Async submit helpers ────────────────────────────────────────────────────
 //
-// These wrap the callback-based submit() with a tokio oneshot channel.
-// The io_uring callback fires tx.send(), the tokio task awaits rx.
-// io_uring remains callback-based internally — this is just the bridge.
-
-use tokio::sync::oneshot;
+// Create a oneshot channel, send the tx inside the IoRequest to the poller.
+// Poller fires tx.send() on CQE completion. Caller awaits rx.
 
 /// Submit a ReadFixed and return a oneshot receiver.
-/// The tokio task awaits this receiver. io-poller fires it on CQE completion.
-pub fn submit_read(
-    fd: std::os::unix::io::RawFd,
-    op: &UringOp,
-) -> oneshot::Receiver<Result<u64, super::StorageError>> {
+/// If the poller is dead, sends an explicit error on the oneshot.
+pub fn submit_read(fd: RawFd, op: &UringOp) -> oneshot::Receiver<Result<u64, StorageError>> {
     let (tx, rx) = oneshot::channel();
-    submit(IoRequest::Read {
+    if let Err(crossbeam_channel::SendError(IoRequest::Read { tx, .. })) = submit(IoRequest::Read {
         fd,
         op: op.clone(),
-        on_complete: Box::new(move |result| {
-            let _ = tx.send(result);
-        }),
-    });
+        tx,
+    }) {
+        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
+    }
     rx
 }
 
 /// Submit a WriteFixed and return a oneshot receiver.
-pub fn submit_write(
-    fd: std::os::unix::io::RawFd,
-    op: &UringOp,
-) -> oneshot::Receiver<Result<(), super::StorageError>> {
+/// If the poller is dead, sends an explicit error on the oneshot.
+pub fn submit_write(fd: RawFd, op: &UringOp) -> oneshot::Receiver<Result<(), StorageError>> {
     let (tx, rx) = oneshot::channel();
-    submit(IoRequest::Write {
-        fd,
-        op: op.clone(),
-        on_complete: Box::new(move |result| {
-            let _ = tx.send(result);
-        }),
-    });
+    if let Err(crossbeam_channel::SendError(IoRequest::Write { tx, .. })) =
+        submit(IoRequest::Write {
+            fd,
+            op: op.clone(),
+            tx,
+        })
+    {
+        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
+    }
     rx
 }
 
@@ -241,12 +240,8 @@ impl UringNvmeEngine {
                         next_token += 1;
 
                         let (sqe, op) = match req {
-                            IoRequest::Read {
-                                fd,
-                                op,
-                                on_complete,
-                            } => {
-                                let read_len = Self::align_up(op.len) as u32;
+                            IoRequest::Read { fd, op, tx } => {
+                                let read_len = super::align_up(op.len as usize) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::ReadFixed::new(
                                         io_uring::types::Fd(fd),
@@ -267,14 +262,16 @@ impl UringNvmeEngine {
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Read { on_complete })
+                                (
+                                    sqe,
+                                    PendingOp::Read {
+                                        tx,
+                                        expected_bytes: op.len,
+                                    },
+                                )
                             }
-                            IoRequest::Write {
-                                fd,
-                                op,
-                                on_complete,
-                            } => {
-                                let write_len = Self::align_up(op.len) as u32;
+                            IoRequest::Write { fd, op, tx } => {
+                                let write_len = super::align_up(op.len as usize) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::WriteFixed::new(
                                         io_uring::types::Fd(fd),
@@ -298,8 +295,8 @@ impl UringNvmeEngine {
                                 (
                                     sqe,
                                     PendingOp::Write {
-                                        on_complete,
-                                        len: op.len,
+                                        tx,
+                                        expected_bytes: op.len,
                                     },
                                 )
                             }
@@ -310,16 +307,16 @@ impl UringNvmeEngine {
                                 let _ = ring.submit();
                             }
                             if ring.submission().push(&sqe).is_err() {
-                                // SQ full even after flush — fire error callback.
+                                // SQ full even after flush — send error on oneshot.
                                 match op {
-                                    PendingOp::Read { on_complete } => {
-                                        on_complete(Err(StorageError::IoError {
-                                            code: -libc::EAGAIN,
+                                    PendingOp::Read { tx, .. } => {
+                                        let _ = tx.send(Err(StorageError::IoError {
+                                            code: libc::EAGAIN,
                                         }));
                                     }
-                                    PendingOp::Write { on_complete, .. } => {
-                                        on_complete(Err(StorageError::IoError {
-                                            code: -libc::EAGAIN,
+                                    PendingOp::Write { tx, .. } => {
+                                        let _ = tx.send(Err(StorageError::IoError {
+                                            code: libc::EAGAIN,
                                         }));
                                     }
                                 }
@@ -349,7 +346,7 @@ impl UringNvmeEngine {
                 continue;
             }
 
-            // Phase 3: Reap CQEs → fire callbacks.
+            // Phase 3: Reap CQEs → send results on oneshot channels.
             let mut completed = Vec::new();
             for cqe in ring.completion() {
                 completed.push((cqe.user_data(), cqe.result()));
@@ -358,20 +355,24 @@ impl UringNvmeEngine {
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
                     match op {
-                        PendingOp::Read { on_complete } => {
-                            if result >= 0 {
-                                on_complete(Ok(result as u64));
+                        PendingOp::Read { tx, expected_bytes } => {
+                            if result >= 0 && result as u64 >= expected_bytes {
+                                let _ = tx.send(Ok(result as u64));
+                            } else if result < 0 {
+                                let _ = tx.send(Err(StorageError::IoError { code: -result }));
                             } else {
-                                on_complete(Err(StorageError::IoError { code: -result }));
+                                // Short read.
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
-                        PendingOp::Write { on_complete, len } => {
-                            if result >= 0 && result as u64 >= len {
-                                on_complete(Ok(()));
+                        PendingOp::Write { tx, expected_bytes } => {
+                            if result >= 0 && result as u64 >= expected_bytes {
+                                let _ = tx.send(Ok(()));
                             } else if result < 0 {
-                                on_complete(Err(StorageError::IoError { code: -result }));
+                                let _ = tx.send(Err(StorageError::IoError { code: -result }));
                             } else {
-                                on_complete(Err(StorageError::IoError { code: -1 }));
+                                // Short write.
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
                     }
@@ -384,11 +385,11 @@ impl UringNvmeEngine {
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(req) => match req {
-                    IoRequest::Read { on_complete, .. } => {
-                        on_complete(Err(StorageError::IoError { code: -1 }));
+                    IoRequest::Read { tx, .. } => {
+                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                     }
-                    IoRequest::Write { on_complete, .. } => {
-                        on_complete(Err(StorageError::IoError { code: -1 }));
+                    IoRequest::Write { tx, .. } => {
+                        let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                     }
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -399,9 +400,5 @@ impl UringNvmeEngine {
                 Err(_) => break,
             }
         }
-    }
-
-    fn align_up(n: u64) -> u64 {
-        (n + 4095) & !4095
     }
 }

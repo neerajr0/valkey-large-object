@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use linkme::distributed_slice;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, LO_TYPE};
@@ -19,6 +20,22 @@ use crate::transport::{self, EfaAddress, Session};
 
 lazy_static::lazy_static! {
     static ref SESSIONS: Mutex<HashMap<u64, Arc<Session>>> = Mutex::new(HashMap::new());
+}
+
+/// Remove a client's EFA session on disconnect.
+/// Registered via #[distributed_slice] — Valkey calls this on client disconnect.
+#[distributed_slice(valkey_module::server_events::CLIENT_CHANGED_SERVER_EVENTS_LIST)]
+fn on_client_change(
+    ctx: &valkey_module::Context,
+    subevent: valkey_module::server_events::ClientChangeSubevent,
+) {
+    if subevent == valkey_module::server_events::ClientChangeSubevent::Disconnected {
+        let client_id = ctx.get_client_id();
+        SESSIONS
+            .lock()
+            .expect("SESSIONS lock unavailable")
+            .remove(&client_id);
+    }
 }
 
 // ─── LO.HELLO ────────────────────────────────────────────────────────────────

@@ -112,8 +112,8 @@ lazy_static::lazy_static! {
     static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
 
     /// Operating mode. Immutable after module load.
-    /// - Tiered (0): objects persist on NVMe, DRAMPool is a read cache with promotion.
-    /// - Dram (1): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
+    /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
 }
 
@@ -217,6 +217,18 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     } else {
         ((dram_max as usize) / dram_seg_size).max(1)
     };
+
+    // SegmentBuffer.segment_idx is u8 — max 256 segments per pool (indices 0–255).
+    // segment_idx is local to each pool (DRAMPool and NVMePool have separate segment vecs),
+    // so the NVMe staging segment does not consume a DRAMPool index.
+    if dram_segment_count > u8::MAX as usize + 1 {
+        ctx.log_warning(&format!(
+            "largeobj: too many DRAM segments ({}). Max 256 (segment_idx is u8). \
+             Increase dram-segment-size or decrease dram-maxmemory",
+            dram_segment_count,
+        ));
+        return Status::Err;
+    }
 
     storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, &dir);
 

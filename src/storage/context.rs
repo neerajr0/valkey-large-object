@@ -12,7 +12,7 @@
 //! chunks arrive (`let mut crc: u32 = 0`) and compares against the client-provided
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// `segment_idx` identifies which registered iovec entry (io_uring buf_index).
 #[derive(Debug, Clone)]
 pub struct SegmentBuffer {
-    /// Which segment this slice lives in (index into the io_uring iovec array).
+    /// Which segment this slice lives in (local index into the owning pool's segments vec).
+    /// NOT the global io_uring iovec index - that is on Segment.iovec_index.
     pub segment_idx: u8,
     /// Byte offset within that segment.
     pub offset: u64,
@@ -43,16 +44,16 @@ impl super::TryClone for SegmentBuffer {
     }
 }
 
-// ─── ObjectState ─────────────────────────────────────────────────────────────
+// ─── Object State ────────────────────────────────────────────────────────────
 
-/// State of an ObjectContext in DRAMPool.
-#[derive(Debug)]
+/// Atomic state for ObjectContext. `#[repr(u8)]` for use with AtomicU8.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectState {
     /// All buffers filled, object is servable.
-    Ready,
-    /// Promotion in progress — batched ReadFixed filling buffers.
-    /// `chunks_ready` advances by batch_size atomically after each batch completes.
-    Filling { chunks_ready: AtomicU32, total: u32 },
+    Ready = 0,
+    /// Promotion in progress — NVMe ReadFixed filling buffers.
+    Filling = 1,
 }
 
 // ─── ObjectContext ───────────────────────────────────────────────────────────
@@ -60,14 +61,22 @@ pub enum ObjectState {
 /// Long-lived runtime state for a cached object in DRAMPool.
 /// ALL N buffers for the entire object are allocated upfront from DRAMPool segment.
 /// Stored in: `RwLock<HashMap<ObjectId, Arc<ObjectContext>>>`
+/// Buffers are automatically returned to DRAMPool when the last Arc drops.
 #[derive(Debug)]
 pub struct ObjectContext {
     /// Ordered chunks. 1 for small objects, N for large.
     pub buffers: Vec<SegmentBuffer>,
     /// Total object size (sum of all buffer lens).
     pub total_len: u64,
-    /// Current state: Ready (servable) or Filling (promotion in progress).
-    pub state: ObjectState,
+    /// Filling→Ready transition via mark_ready() with Release ordering.
+    /// Readers use is_ready() with Acquire ordering — guarantees visibility
+    /// of the NVMe read data that was written before mark_ready().
+    state: AtomicU8,
+    /// Chunks completed during promotion (only meaningful when state == Filling).
+    chunks_ready: AtomicU32,
+    /// Total chunks for this object (used by streaming/chunking path).
+    #[allow(dead_code)]
+    total_chunks: u32,
 }
 
 impl ObjectContext {
@@ -76,7 +85,9 @@ impl ObjectContext {
         Self {
             buffers,
             total_len,
-            state: ObjectState::Ready,
+            state: AtomicU8::new(ObjectState::Ready as u8),
+            chunks_ready: AtomicU32::new(0),
+            total_chunks: 0,
         }
     }
 
@@ -85,30 +96,58 @@ impl ObjectContext {
         Self {
             buffers,
             total_len,
-            state: ObjectState::Filling {
-                chunks_ready: AtomicU32::new(0),
-                total: total_chunks,
-            },
+            state: AtomicU8::new(ObjectState::Filling as u8),
+            chunks_ready: AtomicU32::new(0),
+            total_chunks,
         }
     }
 
     /// Check if the object is fully ready for serving.
+    /// Uses Acquire ordering: if this returns true, all data written
+    /// before mark_ready() is guaranteed visible to this thread.
     pub fn is_ready(&self) -> bool {
-        matches!(self.state, ObjectState::Ready)
+        self.state.load(Ordering::Acquire) == ObjectState::Ready as u8
+    }
+
+    /// Transition from Filling to Ready. Called by the tokio task
+    /// after NVMe ReadFixed completes successfully.
+    /// Uses Release ordering: all preceding writes (the NVMe read data
+    /// in the buffer) are visible to any thread that later sees is_ready() == true.
+    pub fn mark_ready(&self) {
+        assert!(
+            !self.is_ready(),
+            "mark_ready called on an already Ready ObjectContext"
+        );
+        self.state
+            .store(ObjectState::Ready as u8, Ordering::Release);
     }
 
     /// Get the number of chunks ready (contiguous from offset 0).
     pub fn chunks_ready(&self) -> u32 {
-        match &self.state {
-            ObjectState::Ready => self.buffers.len() as u32,
-            ObjectState::Filling { chunks_ready, .. } => chunks_ready.load(Ordering::Acquire),
+        if self.is_ready() {
+            self.buffers.len() as u32
+        } else {
+            self.chunks_ready.load(Ordering::Acquire)
         }
     }
 
     /// Advance chunks_ready after a batch completes. Called from tokio promotion task.
     pub fn advance_chunks_ready(&self, batch_size: u32) {
-        if let ObjectState::Filling { chunks_ready, .. } = &self.state {
-            chunks_ready.fetch_add(batch_size, Ordering::Release);
+        assert!(
+            !self.is_ready(),
+            "advance_chunks_ready called on Ready ObjectContext"
+        );
+        self.chunks_ready.fetch_add(batch_size, Ordering::Release);
+    }
+}
+
+impl Drop for ObjectContext {
+    fn drop(&mut self) {
+        // Guard: pool may not be initialized in unit tests.
+        if let Some(dram_pool) = super::DRAM_POOL.get() {
+            for buf in &self.buffers {
+                dram_pool.free(buf);
+            }
         }
     }
 }
@@ -135,6 +174,7 @@ impl super::TryClone for ObjectContext {
 /// Short-lived runtime state for a transient I/O operation on NVMePool.
 /// Rotating window of X buffers, reused across batches.
 /// Owned by a single tokio task — no Arc needed.
+/// Buffers are automatically returned to NVMePool on drop.
 #[derive(Debug)]
 pub struct StreamingContext {
     /// Rotating buffer window (max X = batch size).
@@ -145,6 +185,17 @@ pub struct StreamingContext {
     pub chunks_completed: u32,
     /// Total chunks needed for the full object.
     pub total_chunks: u32,
+}
+
+impl Drop for StreamingContext {
+    fn drop(&mut self) {
+        // Guard: pool may not be initialized in unit tests.
+        if let Some(nvme_pool) = super::NVME_POOL.get() {
+            for buf in &self.buffers {
+                nvme_pool.free(buf);
+            }
+        }
+    }
 }
 
 impl StreamingContext {

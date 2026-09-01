@@ -14,7 +14,17 @@ pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
-pub use context::{ObjectContext, ObjectState, SegmentBuffer, StreamingContext};
+pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+
+/// O_DIRECT / io_uring alignment requirement (XFS default block size).
+/// Both buffer address and I/O length must be multiples of this.
+pub const IO_ALIGN: usize = 4096;
+
+/// Round up to IO_ALIGN boundary. Used by the allocator (buffer size)
+/// and the uring layer (I/O length) to satisfy O_DIRECT requirements.
+pub fn align_up(n: usize) -> usize {
+    (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
+}
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;
@@ -64,8 +74,8 @@ pub fn append_iovec(iov: libc::iovec) -> u16 {
     idx
 }
 
-static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
-static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
+pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
+pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
 static FD_POOL: OnceLock<FdPool> = OnceLock::new();
 
 pub fn get_dram_pool() -> &'static DRAMPool {

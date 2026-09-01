@@ -51,8 +51,11 @@ impl SegmentPool {
     // ─── Allocator ───────────────────────────────────────────────────────
 
     /// Allocate a buffer. Returns None if pool is exhausted.
+    /// Size is rounded up to 4 KiB to match O_DIRECT / io_uring alignment —
+    /// the uring layer rounds I/O lengths to 4 KiB, so the buffer must be
+    /// at least that large to avoid writing past the allocation.
     pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        let layout = Layout::from_size_align(size, 4096).ok()?;
+        let layout = Layout::from_size_align(super::align_up(size), super::IO_ALIGN).ok()?;
         let ptr = unsafe {
             self.allocator
                 .lock()
@@ -65,43 +68,6 @@ impl SegmentPool {
         let (seg_idx, offset) = self
             .find_segment(addr)
             .expect("talc returned ptr outside segments");
-        self.segments[seg_idx].inc_ref();
-
-        Some(SegmentBuffer {
-            segment_idx: seg_idx as u8,
-            offset: offset as u64,
-            len: size as u32,
-        })
-    }
-
-    /// Allocate with draining check — refuses allocation from draining segments.
-    pub fn alloc_checked(&self, size: usize) -> Option<SegmentBuffer> {
-        let layout = Layout::from_size_align(size, 4096).ok()?;
-        let ptr = unsafe {
-            self.allocator
-                .lock()
-                .expect("allocator lock unavailable")
-                .malloc(layout)
-        }
-        .ok()?;
-        let addr = ptr.as_ptr() as usize;
-
-        let (seg_idx, offset) = self
-            .find_segment(addr)
-            .expect("talc returned ptr outside segments");
-        if self.segments[seg_idx]
-            .draining
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            // Segment draining — free immediately, return None.
-            unsafe {
-                self.allocator
-                    .lock()
-                    .expect("allocator lock unavailable")
-                    .free(ptr, layout)
-            };
-            return None;
-        }
         self.segments[seg_idx].inc_ref();
 
         Some(SegmentBuffer {
@@ -115,7 +81,9 @@ impl SegmentPool {
     pub fn free(&self, buf: &SegmentBuffer) {
         let seg = &self.segments[buf.segment_idx as usize];
         let ptr = unsafe { seg.base.add(buf.offset as usize) };
-        let layout = Layout::from_size_align(buf.len as usize, 4096).expect("SegmentBuffer layout");
+        let aligned_size = super::align_up(buf.len as usize);
+        let layout =
+            Layout::from_size_align(aligned_size, super::IO_ALIGN).expect("SegmentBuffer layout");
         unsafe {
             self.allocator
                 .lock()
