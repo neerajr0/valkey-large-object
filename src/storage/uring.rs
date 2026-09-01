@@ -234,100 +234,106 @@ impl UringNvmeEngine {
             // Phase 1: Drain channel → build SQEs.
             let mut batch = 0;
             while batch < 64 {
-                match rx.try_recv() {
-                    Ok(req) => {
-                        let token = next_token;
-                        next_token += 1;
+                // If nothing is pending and this is the first iteration, block until
+                // a request arrives. Zero CPU when idle, instant wakeup on work.
+                // Once we have at least one pending op or one batched SQE, use try_recv
+                // to drain without blocking.
+                let req = if pending.is_empty() && batch == 0 {
+                    match rx.recv() {
+                        Ok(req) => req,
+                        Err(_) => break, // channel closed → exit loop
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    }
+                };
+                let token = next_token;
+                next_token += 1;
 
-                        let (sqe, op) = match req {
-                            IoRequest::Read { fd, op, tx } => {
-                                let read_len = super::align_up(op.len as usize) as u32;
-                                let sqe = if use_fixed {
-                                    io_uring::opcode::ReadFixed::new(
-                                        io_uring::types::Fd(fd),
-                                        op.buf_ptr,
-                                        read_len,
-                                        op.iovec_index,
-                                    )
-                                    .offset(op.file_offset)
-                                    .build()
-                                    .user_data(token)
-                                } else {
-                                    io_uring::opcode::Read::new(
-                                        io_uring::types::Fd(fd),
-                                        op.buf_ptr,
-                                        read_len,
-                                    )
-                                    .offset(op.file_offset)
-                                    .build()
-                                    .user_data(token)
-                                };
-                                (
-                                    sqe,
-                                    PendingOp::Read {
-                                        tx,
-                                        expected_bytes: op.len,
-                                    },
-                                )
-                            }
-                            IoRequest::Write { fd, op, tx } => {
-                                let write_len = super::align_up(op.len as usize) as u32;
-                                let sqe = if use_fixed {
-                                    io_uring::opcode::WriteFixed::new(
-                                        io_uring::types::Fd(fd),
-                                        op.buf_ptr as *const u8,
-                                        write_len,
-                                        op.iovec_index,
-                                    )
-                                    .offset(op.file_offset)
-                                    .build()
-                                    .user_data(token)
-                                } else {
-                                    io_uring::opcode::Write::new(
-                                        io_uring::types::Fd(fd),
-                                        op.buf_ptr as *const u8,
-                                        write_len,
-                                    )
-                                    .offset(op.file_offset)
-                                    .build()
-                                    .user_data(token)
-                                };
-                                (
-                                    sqe,
-                                    PendingOp::Write {
-                                        tx,
-                                        expected_bytes: op.len,
-                                    },
-                                )
-                            }
+                let (sqe, op) = match req {
+                    IoRequest::Read { fd, op, tx } => {
+                        let read_len = super::align_up(op.len as usize) as u32;
+                        let sqe = if use_fixed {
+                            io_uring::opcode::ReadFixed::new(
+                                io_uring::types::Fd(fd),
+                                op.buf_ptr,
+                                read_len,
+                                op.iovec_index,
+                            )
+                            .offset(op.file_offset)
+                            .build()
+                            .user_data(token)
+                        } else {
+                            io_uring::opcode::Read::new(
+                                io_uring::types::Fd(fd),
+                                op.buf_ptr,
+                                read_len,
+                            )
+                            .offset(op.file_offset)
+                            .build()
+                            .user_data(token)
                         };
+                        (
+                            sqe,
+                            PendingOp::Read {
+                                tx,
+                                expected_bytes: op.len,
+                            },
+                        )
+                    }
+                    IoRequest::Write { fd, op, tx } => {
+                        let write_len = super::align_up(op.len as usize) as u32;
+                        let sqe = if use_fixed {
+                            io_uring::opcode::WriteFixed::new(
+                                io_uring::types::Fd(fd),
+                                op.buf_ptr as *const u8,
+                                write_len,
+                                op.iovec_index,
+                            )
+                            .offset(op.file_offset)
+                            .build()
+                            .user_data(token)
+                        } else {
+                            io_uring::opcode::Write::new(
+                                io_uring::types::Fd(fd),
+                                op.buf_ptr as *const u8,
+                                write_len,
+                            )
+                            .offset(op.file_offset)
+                            .build()
+                            .user_data(token)
+                        };
+                        (
+                            sqe,
+                            PendingOp::Write {
+                                tx,
+                                expected_bytes: op.len,
+                            },
+                        )
+                    }
+                };
 
-                        unsafe {
-                            if ring.submission().is_full() {
-                                let _ = ring.submit();
+                unsafe {
+                    if ring.submission().is_full() {
+                        let _ = ring.submit();
+                    }
+                    if ring.submission().push(&sqe).is_err() {
+                        // SQ full even after flush — send error on oneshot.
+                        match op {
+                            PendingOp::Read { tx, .. } => {
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EAGAIN }));
                             }
-                            if ring.submission().push(&sqe).is_err() {
-                                // SQ full even after flush — send error on oneshot.
-                                match op {
-                                    PendingOp::Read { tx, .. } => {
-                                        let _ = tx.send(Err(StorageError::IoError {
-                                            code: libc::EAGAIN,
-                                        }));
-                                    }
-                                    PendingOp::Write { tx, .. } => {
-                                        let _ = tx.send(Err(StorageError::IoError {
-                                            code: libc::EAGAIN,
-                                        }));
-                                    }
-                                }
-                            } else {
-                                pending.insert(token, op);
+                            PendingOp::Write { tx, .. } => {
+                                let _ = tx.send(Err(StorageError::IoError { code: libc::EAGAIN }));
                             }
                         }
-                        batch += 1;
+                    } else {
+                        pending.insert(token, op);
                     }
-                    Err(_) => break,
                 }
+                batch += 1;
             }
 
             // Phase 2: Submit + wait. Retry on EINTR (max 3 attempts).
@@ -341,9 +347,6 @@ impl UringNvmeEngine {
                 }
             } else if shutdown.load(Ordering::Relaxed) {
                 break;
-            } else {
-                thread::sleep(std::time::Duration::from_micros(50));
-                continue;
             }
 
             // Phase 3: Reap CQEs → send results on oneshot channels.

@@ -13,6 +13,7 @@
 //!   ReadFixed directly into DRAMPool buffers, mark Filling→Ready.
 //!   Concurrent GETs coalesce on Filling ObjectContext.
 
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use valkey_module::{ValkeyError, ValkeyValue};
@@ -600,12 +601,14 @@ async fn do_tiered_nvme_write(
         write_flags |= libc::O_DIRECT;
     }
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
-    let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
-    if fd < 0 {
+    let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
+    if raw_fd < 0 {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
     }
+    // OwnedFd closes on drop — no leak on early return.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     let nvme_pool = storage::get_nvme_pool();
     // Single-chunk today: one UringOp for the entire object.
@@ -620,8 +623,8 @@ async fn do_tiered_nvme_write(
     // Reserve disk usage before the write — decrement on any failure path.
     uring::increase_nvme_disk_usage(obj_len);
 
-    let write_result = uring::submit_write(fd, &write_op).await;
-    unsafe { libc::close(fd) };
+    let write_result = uring::submit_write(fd.as_raw_fd(), &write_op).await;
+    // fd (OwnedFd) drops when out of scope and close() is automatic.
 
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 

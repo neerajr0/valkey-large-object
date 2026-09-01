@@ -176,6 +176,16 @@ pub fn operating_mode() -> OperatingMode {
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
+    // Any panic on any thread (main, tokio, io_uring poller) aborts the server.
+    // We are a no-panic codebase — a panic means a bug, not a recoverable condition.
+    std::panic::set_hook(Box::new(|info| {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: fatal panic — aborting server: {}",
+            info
+        ));
+        std::process::abort();
+    }));
+
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
     let dir = nvme_dir();
@@ -238,7 +248,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 4: Transport::register_buffers() — fi_mr_reg per segment.
     let slices = storage::all_segment_slices();
     let slice_refs: Vec<&[u8]> = slices.to_vec();
-    transport::register_buffers(&slice_refs);
+    if let Err(e) = transport::register_buffers(&slice_refs) {
+        ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
+        return Status::Err;
+    }
 
     ctx.log_notice(&format!(
         "largeobj: initialized mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",

@@ -208,8 +208,8 @@ pub fn efa_context() -> &'static EfaContext {
     EFA_CTX.get().expect("transport not initialized")
 }
 
-pub fn register_buffers(bufs: &[&[u8]]) {
-    let _ = efa_context().register_buffers(bufs);
+pub fn register_buffers(bufs: &[&[u8]]) -> Result<(), TransportError> {
+    efa_context().register_buffers(bufs)
 }
 
 pub fn deregister_buffers() {
