@@ -98,12 +98,7 @@ impl LoValue {
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
-        // COPY requires a fully Ready object — Filling state means incomplete buffers.
-        assert!(
-            src_ctx.is_ready(),
-            "Dram COPY: ObjectContext is in Filling state"
-        );
-        // Returns None if the DRAM pool cannot allocate buffers for the copy.
+        // Returns None if object is Filling (incomplete) or pool is full.
         let new_ctx = src_ctx.try_clone()?;
         let new_oid = ObjectId::next();
         dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
