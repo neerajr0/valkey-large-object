@@ -9,9 +9,12 @@
 //! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
+
+use crate::storage::ObjectFile;
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
@@ -49,6 +52,11 @@ pub struct LoValue {
     pub object_id: ObjectId, // monotonic per-node OID (used as filename)
     pub len: u64,            // object size in bytes
     pub crc32c: u32,         // integrity checksum (verified on replication pull)
+    /// Runtime file handle (Tiered mode only; `None` in Dram mode). Tracks the
+    /// object's on-disk existence and may hold an open read fd behind an `Arc`.
+    /// Dropping the last strong ref closes the fd and unlinks the file. Never
+    /// serialized or reconstructed on load.
+    pub file: Option<Arc<ObjectFile>>,
 }
 
 // ─── LoValue Helper Methods ──────────────────────────────────────────────────
@@ -106,6 +114,7 @@ impl LoValue {
             object_id: new_oid,
             len: self.len,
             crc32c: self.crc32c,
+            file: None,
         })
     }
 
@@ -127,27 +136,30 @@ impl LoValue {
             object_id: new_oid,
             len: self.len,
             crc32c: self.crc32c,
+            file: Some(Arc::new(ObjectFile::new_cold(new_oid))),
         })
     }
 }
 
 // ─── Callbacks ───────────────────────────────────────────────────────────────
 
-/// Free callback — triggered by native Valkey DEL.
+/// Free callback — triggered by native Valkey DEL, overwrite, expiry, eviction, flush.
 ///
-/// TODO (object lifecycle): Not concurrency-safe. In-flight GETs or promotions may hold
-/// Arc<ObjectContext> clones or have io_uring SQEs referencing the fd. Requires refcounted
-/// teardown — only free buffers/close fd when last reference drops. Same mechanism needed
-/// for LO.SET overwrite (see engine.rs) and for module eviction.
+/// Concurrency-safe via refcounted teardown: this callback drops the DRAM `ObjectContext`
+/// and `LoValue` references inline. The respective Arc<ObjectFile>` drop tears down the
+/// file and fd when it is thread safe. Likewise, removing the `ObjectContext` from the
+/// DRAMPool drops the map's strong ref, and `ObjectContext::Drop` returns its buffers to
+/// the arena once the last reader drops it.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
+    // Drop the DRAM cache entry.
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
-    // FdPool and NVMe files only exist in Tiered mode.
+    // NVMe disk-usage accounting only exists in Tiered mode. Paired with the
+    // increase reserved on the write path; decremented here at delete/overwrite time.
     if crate::operating_mode() == crate::OperatingMode::Tiered {
-        crate::storage::get_fd_pool().remove(lo.object_id);
-        crate::storage::delete_file(lo.object_id);
         crate::storage::uring::decrease_nvme_disk_usage(lo.len);
     }
+    // `lo` (and its Option<Arc<ObjectFile>>) drops here.
 }
 
 /// MEMORY USAGE callback.
@@ -258,6 +270,7 @@ mod tests {
             object_id: ObjectId(1),
             len: 512,
             crc32c: 0,
+            file: None,
         };
         assert_eq!(small.free_effort(), 0);
 
@@ -265,6 +278,7 @@ mod tests {
             object_id: ObjectId(2),
             len: 100 * 1024 * 1024,
             crc32c: 0,
+            file: None,
         };
         assert_eq!(large.free_effort(), 0);
 
@@ -272,6 +286,7 @@ mod tests {
             object_id: ObjectId(3),
             len: 0,
             crc32c: 0,
+            file: None,
         };
         assert_eq!(zero.free_effort(), 0);
     }

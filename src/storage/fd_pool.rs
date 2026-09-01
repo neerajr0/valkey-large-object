@@ -1,16 +1,28 @@
-//! File Descriptor Pool — pre-opened fds for NVMe object files.
+//! File Descriptor Pool — a `Weak` registry over `ObjectFile` handles.
 //!
-//! Open once per object (on write), reuse on every read, close on delete.
-//! Saves open()/close() syscalls on the hot read path.
+//! The pool does **not** own fds anymore: the fd lives inside `ObjectFile` and is
+//! closed by its `Drop` (object_file.rs). The pool holds `object_id → Weak<ObjectFile>`
+//! and earns its keep for two jobs:
+//!   1. **Serialize the lazy first-open** — two concurrent first-GETs on the same
+//!      cold object must not both `open()` and leak an fd. The write lock is the
+//!      serialization point.
+//!   2. **Be the registry a future evictor scans** — the enumerable index of objects
+//!      that may have an open fd.
+//!
+//! `remove` is **deregister-only** (closes nothing); closing an fd is either
+//! `ObjectFile::Drop` (on delete) or a future in-place evictor. See the deletion
+//! design doc §4.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock, Weak};
 
+use super::object_file::ObjectFile;
 use crate::data_type::ObjectId;
 
 pub struct FdPool {
-    fds: RwLock<HashMap<ObjectId, RawFd>>,
+    /// object_id → non-owning handle. Registry + open-serializer, NOT an owner.
+    fds: RwLock<HashMap<ObjectId, Weak<ObjectFile>>>,
 }
 
 impl Default for FdPool {
@@ -26,75 +38,72 @@ impl FdPool {
         }
     }
 
-    pub fn get(&self, oid: ObjectId) -> Option<RawFd> {
-        self.fds
-            .read()
-            .expect("FdPool.fds lock unavailable")
-            .get(&oid)
-            .copied()
-    }
-
-    /// Get cached fd or open the file and cache it.
-    /// direct-io is IMMUTABLE so fds opened here remain valid for the module's lifetime.
-    /// Holds write lock for the entire check+open+insert to prevent TOCTOU fd leak.
-    pub fn get_or_open(&self, oid: ObjectId, dir: &str) -> Option<RawFd> {
-        let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
-
-        // Check under write lock — no race.
-        if let Some(&fd) = fds.get(&oid) {
+    /// Return a usable read fd for `objfile`, opening it lazily if needed.
+    ///
+    /// The caller holds a strong `Arc<ObjectFile>`, so the file is guaranteed still
+    /// linked (physical-existence invariant, design §2.4): the `open()` cannot
+    /// spuriously `ENOENT`. Returns `None` only on a genuine `open()` failure.
+    ///
+    /// direct-io is IMMUTABLE, so an fd opened here stays valid until the object is
+    /// deleted (or a future evictor closes it in place, after which the next call
+    /// reopens).
+    pub fn ensure_open(&self, objfile: &Arc<ObjectFile>, dir: &str) -> Option<RawFd> {
+        // Fast path, lock-free: already open.
+        let fd = objfile.fd();
+        if fd >= 0 {
             return Some(fd);
         }
 
-        // Open while holding lock — concurrent callers wait.
-        let path = oid.file_path(dir);
+        // Slow path: serialize opens through the write lock.
+        let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
+
+        // Re-check under the lock: another caller may have opened it meanwhile.
+        let fd = objfile.fd();
+        if fd >= 0 {
+            return Some(fd);
+        }
+
+        let path = objfile.object_id().file_path(dir);
         let c_path = std::ffi::CString::new(path).expect("file_path null");
         let mut flags = libc::O_RDONLY;
         if crate::direct_io() {
             flags |= libc::O_DIRECT;
         }
+        // SAFETY: c_path is a valid NUL-terminated path; open returns a fd or -1.
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd < 0 {
             return None;
         }
-        fds.insert(oid, fd);
+        // Publish the fd into the shared slot and register the Weak.
+        objfile.store_fd(fd);
+        fds.insert(objfile.object_id(), Arc::downgrade(objfile));
         Some(fd)
     }
 
-    pub fn insert(&self, oid: ObjectId, fd: RawFd) {
+    /// Deregister an object's `Weak` entry. **Closes nothing** — the fd is closed by
+    /// `ObjectFile::Drop`. Called from that `Drop`. Idempotent: a missing entry (an
+    /// object whose fd never opened, so never registered) is a no-op.
+    pub fn remove(&self, oid: ObjectId) {
         self.fds
             .write()
             .expect("FdPool.fds lock unavailable")
-            .insert(oid, fd);
+            .remove(&oid);
     }
 
-    pub fn remove(&self, oid: ObjectId) {
-        if let Some(fd) = self
-            .fds
-            .write()
-            .expect("FdPool.fds lock unavailable")
-            .remove(&oid)
-        {
-            // SAFETY: fd is a valid file descriptor opened by us via libc::open.
-            // We own it exclusively (removed from map) and close exactly once.
-            unsafe { libc::close(fd) };
-        }
+    /// Number of registered handles (open or recently-dropped-but-not-yet-pruned).
+    /// Test/introspection helper.
+    pub fn len(&self) -> usize {
+        self.fds.read().expect("FdPool.fds lock unavailable").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
-impl Drop for FdPool {
-    fn drop(&mut self) {
-        for (_, fd) in self
-            .fds
-            .write()
-            .expect("FdPool.fds lock unavailable")
-            .drain()
-        {
-            // SAFETY: All fds were opened by us via libc::open and are valid.
-            // drain() ensures each fd is closed exactly once during shutdown.
-            unsafe { libc::close(fd) };
-        }
-    }
-}
+// No `Drop for FdPool`: the pool owns no fds. Every fd is owned by its `ObjectFile`
+// and closed by `ObjectFile::Drop`. At shutdown, live `LoValue`s (and their
+// `ObjectFile`s) are freed by the keyspace teardown, closing their fds then.
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
@@ -104,33 +113,55 @@ mod tests {
     use crate::data_type::ObjectId;
 
     #[test]
-    fn test_fd_pool_insert_get_remove() {
+    fn test_ensure_open_fast_path_does_not_register() {
+        // When the fd slot is already populated, ensure_open takes the lock-free
+        // fast path: it returns the cached fd and does NOT register a Weak.
         let pool = FdPool::new();
-        let oid = ObjectId(42);
+        let of = Arc::new(ObjectFile::new_cold(ObjectId(1)));
+        of.store_fd(4242); // pretend an fd is already open
+        assert_eq!(pool.ensure_open(&of, "/nonexistent"), Some(4242));
+        assert_eq!(pool.len(), 0, "fast path must not register a Weak");
+    }
 
-        // Open a real temp file to get a valid fd.
-        let tmp = std::ffi::CString::new("/tmp/fdpool_test_XXXXXX").unwrap();
-        let mut buf = tmp.into_bytes_with_nul();
-        // SAFETY: mkstemp takes a mutable C string template, returns a valid fd.
-        let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
-        assert!(fd >= 0, "mkstemp failed");
+    #[test]
+    fn test_remove_is_deregister_only_and_idempotent() {
+        let pool = FdPool::new();
+        // Removing an unregistered oid is a harmless no-op.
+        pool.remove(ObjectId(999));
+        assert!(pool.is_empty());
+    }
 
-        // Insert and retrieve.
-        pool.insert(oid, fd);
-        assert_eq!(pool.get(oid), Some(fd));
+    #[test]
+    fn test_ensure_open_registers_and_remove_does_not_close() {
+        // Bonus end-to-end coverage of the slow (open) path. O_DIRECT can fail on
+        // some filesystems (e.g. tmpfs); if the open fails we can't exercise this
+        // branch here — the Python integration tests cover the real NVMe path.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let oid = ObjectId(0x5151);
+        let path = oid.file_path(dir);
+        std::fs::write(&path, b"hello").unwrap();
 
-        // Remove closes the fd.
-        pool.remove(oid);
-        assert_eq!(pool.get(oid), None);
+        let pool = FdPool::new();
+        let of = Arc::new(ObjectFile::new_cold(oid));
 
-        // Verify fd is actually closed: fcntl should fail with EBADF.
-        // SAFETY: fcntl on a closed fd returns -1 (does not crash).
-        let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(ret, -1, "fd should be closed after remove");
+        if let Some(fd1) = pool.ensure_open(&of, dir) {
+            assert_eq!(pool.len(), 1, "slow path registers exactly one Weak");
+            // Second call hits the fast path and returns the same fd.
+            let fd2 = pool.ensure_open(&of, dir).expect("cached fd");
+            assert_eq!(fd1, fd2);
+            assert_eq!(of.fd(), fd1);
 
-        // Clean up the temp file.
-        let path = std::ffi::CStr::from_bytes_with_nul(&buf).unwrap();
-        // SAFETY: path is a valid C string from mkstemp.
-        unsafe { libc::unlink(path.as_ptr()) };
+            // remove() deregisters but must NOT close the fd.
+            pool.remove(oid);
+            assert_eq!(pool.len(), 0);
+            // SAFETY: fcntl on the fd; still open because remove closes nothing.
+            let r = unsafe { libc::fcntl(fd1, libc::F_GETFD) };
+            assert_ne!(r, -1, "remove must NOT close the fd");
+            // SAFETY: close the fd we opened, cleaning up the test.
+            unsafe { libc::close(fd1) };
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

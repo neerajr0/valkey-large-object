@@ -13,6 +13,9 @@
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
+
+use super::object_file::ObjectFile;
 
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
@@ -77,10 +80,18 @@ pub struct ObjectContext {
     /// Total chunks for this object (used by streaming/chunking path).
     #[allow(dead_code)]
     total_chunks: u32,
+    /// Strong `Arc<ObjectFile>` held only while `Filling` (Tiered promotion): a
+    /// mid-fill promotion depends on the NVMe file, so it pins the file even if the
+    /// request that triggered the promotion goes away (design §2.4/§3.2). A `Ready`
+    /// context holds `None` (an idle cached object must not inflate the file's strong
+    /// count). Released when the context is dropped (removed from the DRAMPool map).
+    #[allow(dead_code)]
+    file: Option<Arc<ObjectFile>>,
 }
 
 impl ObjectContext {
-    /// Create a new ObjectContext in Ready state (e.g., DRAM-only SET).
+    /// Create a new ObjectContext in Ready state (e.g., DRAM-only SET). Holds no
+    /// `ObjectFile` ref — a ready idle object is served from buffers.
     pub fn new_ready(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
         Self {
             buffers,
@@ -88,17 +99,26 @@ impl ObjectContext {
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
             total_chunks: 0,
+            file: None,
         }
     }
 
-    /// Create a new ObjectContext in Filling state (promotion path).
-    pub fn new_filling(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
+    /// Create a new ObjectContext in Filling state (Tiered promotion path). Holds a
+    /// strong `Arc<ObjectFile>` for the duration of the fill (`None` is accepted for
+    /// tests / non-Tiered callers).
+    pub fn new_filling(
+        buffers: Vec<SegmentBuffer>,
+        total_len: u64,
+        total_chunks: u32,
+        file: Option<Arc<ObjectFile>>,
+    ) -> Self {
         Self {
             buffers,
             total_len,
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
             total_chunks,
+            file,
         }
     }
 
@@ -185,6 +205,11 @@ pub struct StreamingContext {
     pub chunks_completed: u32,
     /// Total chunks needed for the full object.
     pub total_chunks: u32,
+    /// Strong `Arc<ObjectFile>` held for a tiered transient READ (keeps the file
+    /// linked + the fd valid for the read's duration, design §2.4/§3.2). `None` on
+    /// the SET write path (the new file has no committed `ObjectFile` until commit).
+    #[allow(dead_code)]
+    file: Option<Arc<ObjectFile>>,
 }
 
 impl Drop for StreamingContext {
@@ -200,12 +225,20 @@ impl Drop for StreamingContext {
 
 impl StreamingContext {
     /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
-    pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
+    /// `file` is `Some` for a tiered read (pins the object's file for the read),
+    /// `None` for a SET write.
+    pub fn new(
+        buffers: Vec<SegmentBuffer>,
+        total_len: u64,
+        total_chunks: u32,
+        file: Option<Arc<ObjectFile>>,
+    ) -> Self {
         Self {
             buffers,
             total_len,
             chunks_completed: 0,
             total_chunks,
+            file,
         }
     }
 
@@ -269,7 +302,7 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3);
+        let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3, None);
         assert!(!ctx.is_ready());
         assert_eq!(ctx.chunks_ready(), 0);
 
@@ -294,7 +327,7 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4);
+        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4, None);
         assert!(!ctx.is_complete());
         assert_eq!(ctx.batch_size(), 2);
 
