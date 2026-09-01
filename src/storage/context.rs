@@ -99,6 +99,10 @@ impl ObjectContext {
     /// Uses Release ordering: all preceding writes (the NVMe read data
     /// in the buffer) are visible to any thread that later sees is_ready() == true.
     pub fn mark_ready(&self) {
+        assert!(
+            !self.is_ready(),
+            "mark_ready called on an already Ready ObjectContext"
+        );
         self.state
             .store(ObjectState::Ready as u8, Ordering::Release);
     }
@@ -114,6 +118,10 @@ impl ObjectContext {
 
     /// Advance chunks_ready after a batch completes. Called from tokio promotion task.
     pub fn advance_chunks_ready(&self, batch_size: u32) {
+        assert!(
+            !self.is_ready(),
+            "advance_chunks_ready called on Ready ObjectContext"
+        );
         self.chunks_ready.fetch_add(batch_size, Ordering::Release);
     }
 }

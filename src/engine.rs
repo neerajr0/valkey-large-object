@@ -166,8 +166,9 @@ fn execute_get_tiered(
         let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
+                // remove_object drops the map's Arc; obj_ctx drops at end of scope
+                // → ObjectContext::Drop frees the buffer automatically.
                 dram_pool.remove_object(&object_id);
-                dram_pool.free(seg_buf);
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
@@ -234,7 +235,11 @@ fn execute_get_tiered(
     };
 
     // Spawn tokio task for NVMe read + serve (no caching — transient).
+    // stream_ctx is moved into the async block so its Drop (which returns the
+    // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
+        let _keep_alive = stream_ctx;
+
         let read_result = uring::submit_read(fd, &read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 

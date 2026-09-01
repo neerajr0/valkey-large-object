@@ -114,7 +114,7 @@ impl DRAMPool {
         let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(
             vec![seg_buf],
             obj_len,
-            1, // Single chunk today; streaming will pass actual chunk count.
+            1, // TODO: Single chunk today; streaming will pass actual chunk count.
         ));
         objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)
