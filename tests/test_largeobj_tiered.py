@@ -2,6 +2,7 @@ import os
 import glob
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
@@ -57,8 +58,67 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
+
+    # ─── COPY callback tests ─────────────────────────────────────────────
+
+    def test_copy(self):
+        """COPY in Tiered mode: independent NVMe file, digest differs, delete independence."""
+        client = self.server.get_new_client()
+        payload = b'C' * 4096
+        client.execute_command('LO.SET', 'srckey', payload)
+        # COPY creates an independent object with its own NVMe file
+        result = client.execute_command('COPY', 'srckey', 'dstkey')
+        assert result == 1 or result is True
+        assert client.execute_command('LO.GET', 'srckey') == payload
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
+        # COPY gets a new OID so digests differ
+        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'dstkey')
+        assert src_digest != dst_digest
+        # Deleting source does not affect the copy
+        client.execute_command('DEL', 'srckey')
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        # Deleting copy does not affect the source
+        client.execute_command('LO.SET', 'srckey2', payload)
+        client.execute_command('COPY', 'srckey2', 'dstkey2')
+        client.execute_command('DEL', 'dstkey2')
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        assert client.execute_command('LO.GET', 'srckey2') == payload
+
+    # ─── MEMORY USAGE callback tests ──────────────────────────────────────
+
+    def test_memory_usage(self):
+        """MEMORY USAGE after promotion includes LoValue struct + payload."""
+        client = self.server.get_new_client()
+        payload_size = 4096
+        client.execute_command('LO.SET', 'memkey', b'M' * payload_size)
+        # Single GET promotes into DRAMPool (promote-on-first-GET policy).
+        client.execute_command('LO.GET', 'memkey')
+        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
+        assert mem is not None
+        lo_value_size = 24
+        assert mem >= lo_value_size + payload_size, (
+            f"Expected MEMORY USAGE >= {lo_value_size + payload_size} (promoted), got {mem}"
+        )
+
+    # ─── DEBUG DIGEST callback tests ──────────────────────────────────────
+
+    def test_debug_digest(self):
+        """DEBUG DIGEST-VALUE is deterministic; nonexistent key returns nil digest."""
+        client = self.server.get_new_client()
+        client.execute_command('LO.SET', 'digkey', b'G' * 4096)
+        d1 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
+        d2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
+        assert d1 == d2
+        # Nonexistent key returns nil digest
+        nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
+        assert nil_digest == [b'0' * 40]
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
@@ -103,3 +163,28 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             assert False, "Expected pool exhausted error"
         except ResponseError as e:
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+
+    # ─── MEMORY USAGE tests ───────────────────────────────────────────────
+
+    def test_memory_usage_tiered_cold(self):
+        """Without promotion, MEMORY USAGE reports only LoValue struct overhead.
+
+        This test class sets max-promote-size=0, so objects are never promoted
+        to DRAMPool. memory_usage reports only sizeof(LoValue) (24 bytes) — the
+        payload lives on NVMe and does not consume DRAM.
+        """
+        client = self.server.get_new_client()
+        payload_size = 4096
+        payload = b'M' * payload_size
+        client.execute_command('LO.SET', 'memkey', payload)
+        # Even after a GET the object stays cold (max-promote-size=0).
+        client.execute_command('LO.GET', 'memkey')
+        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
+        assert mem is not None
+        lo_value_size = 24
+        # Our callback returns only sizeof(LoValue) = 24. Valkey adds per-key
+        # overhead (~72-120 bytes), so total is well below lo_value_size + payload_size.
+        upper_bound = lo_value_size + payload_size
+        assert mem < upper_bound, (
+            f"Expected MEMORY USAGE < {upper_bound} (cold, not promoted), got {mem}"
+        )

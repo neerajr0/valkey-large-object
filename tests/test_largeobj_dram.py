@@ -67,3 +67,68 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             data = client.execute_command('LO.GET', f'multi{i}')
             expected = bytes([i % 256]) * 4096
             assert data == expected, f"Key multi{i} mismatch"
+
+    # ─── COPY callback tests ─────────────────────────────────────────────
+
+    def test_copy(self):
+        """COPY in DRAM-only mode: independent object, digest differs, delete independence."""
+        client = self.server.get_new_client()
+        payload = b'C' * 4096
+        client.execute_command('LO.SET', 'srckey', payload)
+        # COPY creates an independent object
+        result = client.execute_command('COPY', 'srckey', 'dstkey')
+        assert result == 1 or result is True
+        assert client.execute_command('LO.GET', 'srckey') == payload
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        # COPY gets a new OID so digests differ
+        src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
+        dst_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'dstkey')
+        assert src_digest != dst_digest
+        # Deleting source does not affect the copy
+        client.execute_command('DEL', 'srckey')
+        assert client.execute_command('LO.GET', 'dstkey') == payload
+        # Deleting copy does not affect the source
+        client.execute_command('LO.SET', 'srckey2', payload)
+        client.execute_command('COPY', 'srckey2', 'dstkey2')
+        client.execute_command('DEL', 'dstkey2')
+        assert client.execute_command('LO.GET', 'srckey2') == payload
+
+    def test_copy_pool_exhausted(self):
+        """COPY fails when DRAMPool cannot fit the duplicate."""
+        client = self.server.get_new_client()
+        # Fill most of the 1MB pool with a large object.
+        payload = b'F' * (900 * 1024)
+        client.execute_command('LO.SET', 'bigkey', payload)
+        # COPY needs another 900KB — pool is only 1MB total.
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail with pool exhausted"
+        except ResponseError:
+            pass  # Expected — pool cannot fit two 900KB objects
+
+    # ─── MEMORY USAGE callback tests ──────────────────────────────────────
+
+    def test_memory_usage(self):
+        """MEMORY USAGE in DRAM-only mode includes LoValue struct + payload."""
+        client = self.server.get_new_client()
+        payload_size = 4096
+        client.execute_command('LO.SET', 'memkey', b'M' * payload_size)
+        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
+        assert mem is not None
+        lo_value_size = 24
+        assert mem >= lo_value_size + payload_size, (
+            f"Expected MEMORY USAGE >= {lo_value_size + payload_size}, got {mem}"
+        )
+
+    # ─── DEBUG DIGEST callback tests ──────────────────────────────────────
+
+    def test_debug_digest(self):
+        """DEBUG DIGEST-VALUE is deterministic; nonexistent key returns nil digest."""
+        client = self.server.get_new_client()
+        client.execute_command('LO.SET', 'digkey', b'G' * 4096)
+        d1 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
+        d2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
+        assert d1 == d2
+        # Nonexistent key returns nil digest
+        nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
+        assert nil_digest == [b'0' * 40]

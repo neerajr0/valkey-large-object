@@ -6,8 +6,10 @@
 //! - RDB callbacks (save/load references) (TODO)
 //! - Replication (TODO)
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
+//! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
 
@@ -49,6 +51,88 @@ pub struct LoValue {
     pub crc32c: u32,         // integrity checksum (verified on replication pull)
 }
 
+// ─── LoValue Helper Methods ──────────────────────────────────────────────────
+
+impl LoValue {
+    /// Reports DRAM memory usage in bytes for `MEMORY USAGE <key>`.
+    /// Always includes the LoValue struct overhead. Includes the object payload
+    /// only when it is actually resident in DRAM:
+    /// - DRAM-only mode: always (object lives exclusively in DRAM).
+    /// - Tiered mode: only if the object has been promoted into DRAMPool.
+    pub fn memory_usage(&self) -> usize {
+        let base = std::mem::size_of::<LoValue>();
+        let dram_usage = base + self.len as usize;
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => dram_usage,
+            crate::OperatingMode::Tiered => {
+                if crate::storage::get_dram_pool().contains_object(&self.object_id) {
+                    dram_usage
+                } else {
+                    base
+                }
+            }
+        }
+    }
+
+    /// Returns 0 to signal Valkey to ALWAYS free asynchronously (BIO thread).
+    ///
+    /// Per the Module API contract: returning 0 guarantees async free.
+    pub fn free_effort(&self) -> usize {
+        0
+    }
+
+    /// Deep-copy for the COPY command callback.
+    /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
+    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
+    pub fn create_copy(&self) -> Option<LoValue> {
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => self.create_copy_dram(),
+            crate::OperatingMode::Tiered => self.create_copy_tiered(),
+        }
+    }
+
+    /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
+    fn create_copy_dram(&self) -> Option<LoValue> {
+        use crate::storage::TryClone;
+        let dram_pool = crate::storage::get_dram_pool();
+        let src_ctx = dram_pool
+            .get_object(&self.object_id)
+            .expect("Dram COPY: LoValue exists but ObjectContext missing");
+        // Returns None if object is Filling (incomplete) or pool is full.
+        let new_ctx = src_ctx.try_clone()?;
+        let new_oid = ObjectId::next();
+        dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
+        Some(LoValue {
+            object_id: new_oid,
+            len: self.len,
+            crc32c: self.crc32c,
+        })
+    }
+
+    /// Tiered mode: copy NVMe file with a fresh OID.
+    /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
+    /// Returns None if nvme-maxmemory would be exceeded.
+    fn create_copy_tiered(&self) -> Option<LoValue> {
+        let data_dir = crate::nvme_dir();
+        if !crate::storage::uring::has_nvme_capacity(self.len) {
+            return None;
+        }
+        let new_oid = ObjectId::next();
+        let src_path = self.object_id.file_path(&data_dir);
+        let dst_path = new_oid.file_path(&data_dir);
+        std::fs::copy(&src_path, &dst_path)
+            .expect("Tiered COPY: source file missing — key exists implies file exists");
+        crate::storage::uring::increase_nvme_disk_usage(self.len);
+        Some(LoValue {
+            object_id: new_oid,
+            len: self.len,
+            crc32c: self.crc32c,
+        })
+    }
+}
+
+// ─── Callbacks ───────────────────────────────────────────────────────────────
+
 /// Free callback — triggered by native Valkey DEL.
 ///
 /// TODO (object lifecycle): Not concurrency-safe. In-flight GETs or promotions may hold
@@ -62,7 +146,52 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     if crate::operating_mode() == crate::OperatingMode::Tiered {
         crate::storage::get_fd_pool().remove(lo.object_id);
         crate::storage::delete_file(lo.object_id);
+        crate::storage::uring::decrease_nvme_disk_usage(lo.len);
     }
+}
+
+/// MEMORY USAGE callback.
+/// Reports actual DRAM consumption: struct overhead + payload when resident in DRAM.
+unsafe extern "C" fn lo_mem_usage(value: *const std::ffi::c_void) -> usize {
+    let val = &*(value as *const LoValue);
+    val.memory_usage()
+}
+
+/// FREE EFFORT callback.
+/// Always returns 0 to force asynchronous free via BIO thread.
+/// This keeps unlink(2) off the main event-loop thread.
+/// See LoValue::free_effort() for full rationale.
+unsafe extern "C" fn lo_free_effort(
+    _key: *mut raw::RedisModuleString,
+    value: *const std::ffi::c_void,
+) -> usize {
+    let val = &*(value as *const LoValue);
+    val.free_effort()
+}
+
+/// COPY callback.
+/// Deep-copies the object based on operating mode. Returns null on failure.
+unsafe extern "C" fn lo_copy(
+    _from_key: *mut raw::RedisModuleString,
+    _to_key: *mut raw::RedisModuleString,
+    value: *const std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let src = &*(value as *const LoValue);
+    match src.create_copy() {
+        Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// DEBUG DIGEST callback.
+/// Feeds object_id, len, and crc32c into the digest for integrity verification.
+unsafe extern "C" fn lo_digest(md: *mut raw::RedisModuleDigest, value: *mut std::ffi::c_void) {
+    let mut dig = Digest::new(md);
+    let val = &*(value as *const LoValue);
+    dig.add_long_long(val.object_id.0 as i64);
+    dig.add_long_long(val.len as i64);
+    dig.add_long_long(val.crc32c as i64);
+    dig.end_sequence();
 }
 
 // ─── Type Registration ───────────────────────────────────────────────────────
@@ -76,15 +205,15 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
         rdb_save: None,    // TODO
         aof_rewrite: None, // TODO
         free: Some(lo_free),
-        mem_usage: None, // TODO
-        digest: None,    // TODO
-        aux_load: None,  // TODO
-        aux_save: None,  // TODO
+        mem_usage: Some(lo_mem_usage),
+        digest: Some(lo_digest),
+        aux_load: None, // TODO
+        aux_save: None, // TODO
         aux_save2: None,
         aux_save_triggers: 0,
-        free_effort: None, // TODO
+        free_effort: Some(lo_free_effort),
         unlink: None,
-        copy: None,   // TODO
+        copy: Some(lo_copy),
         defrag: None, // TODO
         mem_usage2: None,
         free_effort2: None,
@@ -118,5 +247,32 @@ mod tests {
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
         );
+    }
+
+    // ─── free_effort tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_free_effort_always_zero() {
+        // free_effort always returns 0 (async free) regardless of object size.
+        let small = LoValue {
+            object_id: ObjectId(1),
+            len: 512,
+            crc32c: 0,
+        };
+        assert_eq!(small.free_effort(), 0);
+
+        let large = LoValue {
+            object_id: ObjectId(2),
+            len: 100 * 1024 * 1024,
+            crc32c: 0,
+        };
+        assert_eq!(large.free_effort(), 0);
+
+        let zero = LoValue {
+            object_id: ObjectId(3),
+            len: 0,
+            crc32c: 0,
+        };
+        assert_eq!(zero.free_effort(), 0);
     }
 }
