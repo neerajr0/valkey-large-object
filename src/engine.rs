@@ -47,6 +47,22 @@ pub enum EngineResult {
 
 // ─── GET Engine ──────────────────────────────────────────────────────────────
 
+/// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
+fn collect_dram_bytes(
+    dram_pool: &storage::DRAMPool,
+    obj_ctx: &ObjectContext,
+    obj_len: u64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(obj_len as usize);
+    for buf in &obj_ctx.buffers {
+        let ptr = dram_pool.buffer_ptr(buf);
+        let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
+        data.extend_from_slice(slice);
+    }
+    data.truncate(obj_len as usize);
+    data
+}
+
 /// Execute LO.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
@@ -82,16 +98,9 @@ pub fn execute_get(
 fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
-        Some(obj_ctx) if obj_ctx.is_ready() => {
-            let mut data = Vec::with_capacity(obj_len as usize);
-            for buf in &obj_ctx.buffers {
-                let ptr = dram_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
-                data.extend_from_slice(slice);
-            }
-            data.truncate(obj_len as usize);
-            Ok(ValkeyValue::StringBuffer(data))
-        }
+        Some(obj_ctx) if obj_ctx.is_ready() => Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+            dram_pool, &obj_ctx, obj_len,
+        ))),
         Some(_) => {
             panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
         }
@@ -423,7 +432,7 @@ fn execute_set_dram_efa(
 
     match data_source {
         DataSource::Tcp(_) => {
-            panic!("unreachable: Dram+TCP SET routed to sync path via EngineResult");
+            unreachable!("Dram+TCP SET routed to sync path via EngineResult");
         }
         DataSource::Efa {
             session,
@@ -689,15 +698,9 @@ fn serve_from_dram(
 ) {
     match transport {
         Transport::Tcp => {
-            // Collect data from DRAMPool buffers.
-            let mut data = Vec::with_capacity(obj_len as usize);
-            for buf in &obj_ctx.buffers {
-                let ptr = dram_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
-                data.extend_from_slice(slice);
-            }
-            data.truncate(obj_len as usize);
-            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                dram_pool, obj_ctx, obj_len,
+            ))));
         }
         Transport::Efa {
             session,
