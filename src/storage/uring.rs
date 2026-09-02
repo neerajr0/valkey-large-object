@@ -169,6 +169,52 @@ pub fn shutdown() {
     }
 }
 
+// ─── Batch submit helpers ────────────────────────────────────────────────────
+
+/// Submit multiple ReadFixed ops. Returns one receiver per op.
+pub fn submit_read_batch(
+    fd: RawFd,
+    ops: &[UringOp],
+) -> Vec<oneshot::Receiver<Result<u64, StorageError>>> {
+    ops.iter().map(|op| submit_read(fd, op)).collect()
+}
+
+/// Submit multiple WriteFixed ops. Returns one receiver per op.
+pub fn submit_write_batch(
+    fd: RawFd,
+    ops: &[UringOp],
+) -> Vec<oneshot::Receiver<Result<(), StorageError>>> {
+    ops.iter().map(|op| submit_write(fd, op)).collect()
+}
+
+/// Await all read receivers. Returns Err on first failure.
+pub async fn await_read_batch(
+    receivers: Vec<oneshot::Receiver<Result<u64, StorageError>>>,
+) -> Result<(), StorageError> {
+    for rx in receivers {
+        match rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(StorageError::IoError { code: libc::EIO }),
+        }
+    }
+    Ok(())
+}
+
+/// Await all write receivers. Returns Err on first failure.
+pub async fn await_write_batch(
+    receivers: Vec<oneshot::Receiver<Result<(), StorageError>>>,
+) -> Result<(), StorageError> {
+    for rx in receivers {
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(StorageError::IoError { code: libc::EIO }),
+        }
+    }
+    Ok(())
+}
+
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
 
 pub struct UringNvmeEngine {
