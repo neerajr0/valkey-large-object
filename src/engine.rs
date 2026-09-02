@@ -45,6 +45,32 @@ pub enum EngineResult {
     Async,
 }
 
+// ─── In-flight pin invariant ─────────────────────────────────────────────────
+//
+// A DEL / overwrite / expiry / eviction / flush runs `lo_free`, which drops the
+// keyspace's refs — the DRAM map's `Arc<ObjectContext>` and `LoValue.file` — at
+// any await point of an in-flight request. So any async request that reads or
+// writes keyspace-reachable backing state across an `.await` MUST hold its own
+// clone of that state for the whole operation.
+//
+// Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
+//   - Every DRAM serve that transfers a map-resident object — `serve_from_dram`'s
+//     EFA path, reached from both the DRAM-hit caller and the post-promotion
+//     caller. (TCP serves copy synchronously with no await, so no pin is needed.)
+//   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
+//     already inserted in the map — the task moves that Arc in for the read.
+//   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
+//   commit it, so no concurrent free can reach it.
+//
+// Must pin `Arc<ObjectFile>` (owns the fd + on-disk file; its Drop closes+unlinks):
+//   - Every Tiered request that READS the object: the NVMe promotion read, the
+//     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
+//     a read. The file is held for the whole request, read plus transfer.
+//   NOT needed in Dram mode (there is no file), and NOT on the SET write path: the
+//   file is minted at commit, never read during the write. An overwritten old file
+//   is protected by refcount on the replaced `LoValue` (via `lo_free`), not by the
+//   writer.
+
 // ─── GET Engine ──────────────────────────────────────────────────────────────
 
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
@@ -745,9 +771,12 @@ async fn do_tiered_nvme_write(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
-/// Serve a Ready object from DRAMPool buffers. `file` (Tiered only; `None` in Dram
-/// mode) pins the object's `ObjectFile` for the serve; on the EFA path it is moved
-/// into the write task so the pin outlives the async transfer.
+/// Serve a Ready object from DRAMPool buffers.
+///
+/// On the EFA path two pins are moved into the async write task and held for the
+/// whole RDMA transfer:
+///   - `obj_ctx` — owns the DRAM buffer the RDMA engine reads across the await.
+///   - `file` — the object's `ObjectFile` (Tiered only; `None` in Dram mode).
 fn serve_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
@@ -778,8 +807,9 @@ fn serve_from_dram(
             }
             let buf = &obj_ctx.buffers[0];
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+            let obj_ctx = Arc::clone(obj_ctx);
             crate::runtime_handle().spawn(async move {
-                let _file = file; // pin the object for the transfer's duration
+                let _keep_alive = (obj_ctx, file); // pin the object and file for the transfer's duration
                 match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
                     .await
                 {
