@@ -158,6 +158,58 @@ pub fn get_teardown_worker() -> &'static TeardownWorker {
 mod tests {
     use super::*;
 
+    // The honor rule at the refcount level: while ANY strong ref is alive the fd
+    // stays open; only the LAST drop runs teardown. Integration cannot force this
+    // mid-flight race deterministically — this is the unit-level proof.
+    #[test]
+    fn test_teardown_deferred_until_last_ref() {
+        let tmpl = std::ffi::CString::new("/tmp/objfile_defer_XXXXXX").unwrap();
+        let mut buf = tmpl.into_bytes_with_nul();
+        // SAFETY: mkstemp takes a mutable C-string template and returns a valid fd.
+        let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
+        assert!(fd >= 0, "mkstemp failed");
+        let path = std::ffi::CStr::from_bytes_with_nul(&buf)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Keyspace ref (LoValue.file) + a reader pin (cloned in lo_get before async).
+        let keyspace_ref = std::sync::Arc::new(ObjectFile::new_cold(ObjectId(11)));
+        keyspace_ref.store_fd(fd);
+        let reader_pin = std::sync::Arc::clone(&keyspace_ref);
+        assert_eq!(std::sync::Arc::strong_count(&keyspace_ref), 2);
+
+        // Keyspace ref drops first (e.g. DEL removed the key): must NOT close the fd.
+        drop(keyspace_ref);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // SAFETY: fcntl on the fd; still valid because the reader pin holds it alive.
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "fd must stay open while a reader still holds a ref"
+        );
+
+        // Last ref (the reader) drops -> teardown worker closes the fd.
+        drop(reader_pin);
+        for _ in 0..100 {
+            // SAFETY: fcntl on a (possibly closed) fd returns -1/EBADF, no crash.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // SAFETY: fcntl on the now-closed fd returns -1 with EBADF.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "fd must be closed once the last ref drops"
+        );
+
+        // Drop unlinked the OID-derived path (not our temp path); clean up ours.
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_object_file_cold() {
         let of = ObjectFile::new_cold(ObjectId(7));

@@ -116,3 +116,28 @@ class TestLargeObjDeletion(ValkeyLargeObjTestCaseBase):
             assert client.execute_command("LO.GET", "churn") is None
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
+
+    # ─── Other free triggers: expiry & flush ──────────────────────────────
+
+    def test_expiry_unlinks_file(self):
+        """A key that expires (TTL) frees the LoValue and unlinks its .dat file.
+
+        Expiry is a distinct entry into lo_free from DEL/overwrite."""
+        client = self.server.get_new_client()
+        client.execute_command("LO.SET", "exk", b"E" * 4096)
+        wait_for_equal(self._dat_count, 1)
+        client.execute_command("PEXPIRE", "exk", 50)
+        # Poll EXISTS to drive passive expiry, then let teardown settle.
+        wait_for_equal(lambda: client.execute_command("EXISTS", "exk"), 0)
+        self._wait_free_settled(client)
+        wait_for_equal(self._dat_count, 0)
+
+    def test_flushall_unlinks_all_files(self):
+        """FLUSHALL frees every LoValue and unlinks all .dat files."""
+        client = self.server.get_new_client()
+        for i in range(3):
+            client.execute_command("LO.SET", f"fk{i}", b"F" * 4096)
+        wait_for_equal(self._dat_count, 3)
+        client.execute_command("FLUSHALL")
+        self._wait_free_settled(client)
+        wait_for_equal(self._dat_count, 0)
