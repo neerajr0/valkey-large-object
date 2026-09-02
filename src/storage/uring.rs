@@ -249,6 +249,10 @@ impl UringNvmeEngine {
             }
 
             // Phase 1: Drain channel → build SQEs.
+            // Track which tokens belong to this batch so Phase 3b only errors
+            // ops from this batch, not in-flight ops from previous iterations
+            // whose buffers the kernel may still be accessing.
+            let batch_start_token = next_token;
             let mut batch = 0;
             while batch < 64 {
                 // If nothing is pending and this is the first iteration, block until
@@ -419,13 +423,20 @@ impl UringNvmeEngine {
                 }
             }
 
-            // Phase 3b: If submit failed fatally (ENOMEM), error all remaining
-            // pending ops. submit_and_wait submits the entire SQ batch — on failure
-            // we don't know which ops were submitted vs rejected, so we reap what
-            // we can in Phase 3 and error the rest here.
+            // Phase 3b: If submit failed fatally (ENOMEM), error ops from this
+            // batch only. In-flight ops from previous iterations stay in pending —
+            // their buffers are still being accessed by the kernel via DMA, and
+            // erroring them would let callers free buffers mid-I/O (corruption).
             if let Some(code) = submit_error.take() {
-                for (_, op) in pending.drain() {
-                    op.send_error(code);
+                let batch_tokens: Vec<u64> = pending
+                    .keys()
+                    .filter(|&&t| t >= batch_start_token)
+                    .copied()
+                    .collect();
+                for token in batch_tokens {
+                    if let Some(op) = pending.remove(&token) {
+                        op.send_error(code);
+                    }
                 }
             }
 
