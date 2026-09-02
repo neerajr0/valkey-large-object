@@ -204,8 +204,9 @@ fn execute_get_tiered(
 
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
-    // The Filling ObjectContext pins the file for the fill.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len, Some(file.clone())) {
+    // `file` (captured by the promotion task below) pins the ObjectFile across the
+    // NVMe read and transfer — see the in-flight pin invariant at the top of file.
+    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
         // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
         if obj_ctx.buffers.len() != 1 {
             todo!("streaming and chunking not yet implemented");
