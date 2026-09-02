@@ -114,7 +114,7 @@ impl LoValue {
     /// Returns None if nvme-maxmemory would be exceeded.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let data_dir = crate::nvme_dir();
-        if !crate::storage::uring::has_nvme_capacity(self.len) {
+        if !crate::storage::uring::try_reserve_nvme_capacity(self.len) {
             return None;
         }
         let new_oid = ObjectId::next();
@@ -122,7 +122,6 @@ impl LoValue {
         let dst_path = new_oid.file_path(&data_dir);
         std::fs::copy(&src_path, &dst_path)
             .expect("Tiered COPY: source file missing — key exists implies file exists");
-        crate::storage::uring::increase_nvme_disk_usage(self.len);
         Some(LoValue {
             object_id: new_oid,
             len: self.len,

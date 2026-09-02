@@ -34,15 +34,25 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     NVME_DISK_USAGE.fetch_sub(bytes, Ordering::Relaxed);
 }
 
-/// Returns true if writing `obj_len` bytes would stay within nvme-maxmemory.
-/// Returns true if nvme-maxmemory is 0 (unlimited).
-pub fn has_nvme_capacity(obj_len: u64) -> bool {
+/// Atomically check and reserve NVMe disk capacity.
+/// Returns true on success (capacity reserved), false if it would exceed nvme-maxmemory.
+/// Thread-safe: uses fetch_update to avoid check-then-act TOCTOU race.
+pub fn try_reserve_nvme_capacity(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     if max == 0 {
+        // Unlimited — just increment.
+        increase_nvme_disk_usage(bytes);
         return true;
     }
-    let used = NVME_DISK_USAGE.load(Ordering::Relaxed);
-    used + obj_len <= max
+    NVME_DISK_USAGE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            if used + bytes <= max {
+                Some(used + bytes)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 // ─── Request Types ───────────────────────────────────────────────────────────
