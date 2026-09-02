@@ -94,12 +94,13 @@ impl DRAMPool {
 
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
-    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers (all-or-nothing).
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
         obj_len: u64,
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
+        // Don't promote objects above the configured threshold.
         if obj_len > crate::max_promote_size() {
             return None;
         }
