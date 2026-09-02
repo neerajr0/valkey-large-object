@@ -404,8 +404,8 @@ fn execute_set_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks the old object (DRAMPool entry + fd + .dat file).
-    // Fix requires refcounted teardown — same mechanism as DEL free callback (data_type.rs) and for module eviction.
+    // Overwriting a key: set_value triggers lo_free for the old value, which handles
+    // DRAMPool removal, FdPool removal, and NVMe file deletion. No extra cleanup needed.
 
     // Alloc from DRAMPool (this IS the final storage).
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
@@ -497,7 +497,8 @@ fn execute_set_tiered(
 ) {
     let nvme_pool = storage::get_nvme_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks old object. See execute_set_dram_efa.
+    // Overwriting a key: set_value triggers lo_free for the old value, which handles
+    // DRAMPool removal, FdPool removal, and NVMe file deletion. No extra cleanup needed.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
