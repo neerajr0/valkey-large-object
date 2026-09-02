@@ -141,7 +141,7 @@ fn execute_get_dram_efa(
 }
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
-/// `file` pins the object's `ObjectFile` (existence + fd) for the whole operation.
+/// `file` pins the object's `ObjectFile` (existence + fd) for the whole GET operation.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
@@ -440,9 +440,9 @@ fn execute_set_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // Overwriting a key is safe: set_value over an existing key fires lo_free on the
-    // replaced LoValue, which drops its ObjectContext (DRAMPool entry) and, in Tiered
-    // mode, its Arc<ObjectFile> (fd + .dat teardown). Dram mode has no file.
+    // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
+    // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
+    // has no file, so there is no fd or .dat to tear down here.
 
     // Alloc from DRAMPool (this IS the final storage).
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
@@ -536,7 +536,8 @@ fn execute_set_tiered(
     let nvme_pool = storage::get_nvme_pool();
 
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
-    // replaced LoValue, dropping its Arc<ObjectFile> → fd close + old .dat unlink.
+    // replaced LoValue, dropping its Arc<ObjectFile> which allows for a thread-safe
+    // fd close + old .dat unlink once inflight requests settle.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {

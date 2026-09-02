@@ -80,18 +80,18 @@ pub struct ObjectContext {
     /// Total chunks for this object (used by streaming/chunking path).
     #[allow(dead_code)]
     total_chunks: u32,
-    /// Strong `Arc<ObjectFile>` held only while `Filling` (Tiered promotion): a
-    /// mid-fill promotion depends on the NVMe file, so it pins the file even if the
-    /// request that triggered the promotion goes away (design §2.4/§3.2). A `Ready`
-    /// context holds `None` (an idle cached object must not inflate the file's strong
-    /// count). Released when the context is dropped (removed from the DRAMPool map).
+    /// Strong `Arc<ObjectFile>` — Tiered mode only (`None` in Dram mode and for a
+    /// context created Ready).
+    ///
+    /// Set while `Filling` and is not dropped until the ObjectContext itself is
+    /// dropped. Once updated to a `Ready` state, the benign ObjectFile reference is
+    /// only dropped by the ObjectContext drop which is triggered by `lo_free`.
     #[allow(dead_code)]
     file: Option<Arc<ObjectFile>>,
 }
 
 impl ObjectContext {
-    /// Create a new ObjectContext in Ready state (e.g., DRAM-only SET). Holds no
-    /// `ObjectFile` ref — a ready idle object is served from buffers.
+    /// Create a new ObjectContext in Ready state (e.g., DRAM-only SET).
     pub fn new_ready(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
         Self {
             buffers,
@@ -105,7 +105,7 @@ impl ObjectContext {
 
     /// Create a new ObjectContext in Filling state (Tiered promotion path). Holds a
     /// strong `Arc<ObjectFile>` for the duration of the fill (`None` is accepted for
-    /// tests / non-Tiered callers).
+    /// tests).
     pub fn new_filling(
         buffers: Vec<SegmentBuffer>,
         total_len: u64,
@@ -206,8 +206,8 @@ pub struct StreamingContext {
     /// Total chunks needed for the full object.
     pub total_chunks: u32,
     /// Strong `Arc<ObjectFile>` held for a tiered transient READ (keeps the file
-    /// linked + the fd valid for the read's duration, design §2.4/§3.2). `None` on
-    /// the SET write path (the new file has no committed `ObjectFile` until commit).
+    /// linked + the fd valid for the read's duration). `None` on the SET write
+    /// path (the new file has no committed `ObjectFile` until commit).
     #[allow(dead_code)]
     file: Option<Arc<ObjectFile>>,
 }

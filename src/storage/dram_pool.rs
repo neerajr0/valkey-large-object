@@ -91,7 +91,7 @@ impl DRAMPool {
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
     /// `file` (Tiered mode) is pinned by the resulting `Filling` context for the
-    /// duration of the promotion fill (design §2.4/§3.2).
+    /// duration of the promotion fill.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,

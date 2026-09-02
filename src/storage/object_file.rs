@@ -4,10 +4,21 @@
 //! *open read fd* behind a single `Arc`. The keyspace `LoValue` holds a strong
 //! reference, and so does every in-flight request that resolved the key. The fd is
 //! closed and the NVMe file unlinked **only when the last strong reference drops**
-//! (`ObjectFile::Drop`). Because a reader clones the `Arc` at key-resolve on the
-//! main thread — atomic w.r.t. a synchronous `DEL`'s free callback (also main
-//! thread) — the file cannot vanish under an in-flight read. This is the "honor
-//! rule" (see the deletion design doc §2/§5).
+//! (`ObjectFile::Drop`), and that teardown always runs off the event loop (via the
+//! teardown worker below) — never inline on whichever thread dropped the ref.
+//!
+//! Safety of deletion under a concurrent read (the "honor rule") rests on two facts,
+//! and neither pins teardown to a particular thread:
+//!   1. Reference counting — a reader pins its own `Arc`, so the file cannot be
+//!      closed or unlinked while that reader is alive, no matter which thread drops
+//!      the last remaining ref (a tokio worker, a lazyfree BIO thread, or the main
+//!      thread on a synchronous free).
+//!   2. The keyspace lookup and the keyspace removal are both serialized on the main
+//!      event-loop thread, so a reader either resolves the key *before* it is
+//!      unlinked — taking a pin that outlives the delete — or *after*, seeing it
+//!      already gone. There is no interleaving that yields a half-freed object. This
+//!      holds for async/lazyfree deletes too: Valkey unlinks the key on the main
+//!      thread and only frees the value object off-thread afterward.
 //!
 //! The `FdPool` holds only a `Weak<ObjectFile>` (fd_pool.rs): it can upgrade to
 //! reuse a cached fd, but it never counts toward existence and can neither keep a
@@ -33,7 +44,7 @@ pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
     object_id: ObjectId,
     /// Open read descriptor as an interior-mutable slot. `-1` = not currently open.
-    /// Atomic for lazy open, future in-place eviction, and close-once (`swap`).
+    /// Atomic to support lazy open, a future in-place evictor, and close-once (`swap`).
     fd: AtomicI32,
 }
 
@@ -71,9 +82,10 @@ impl Drop for ObjectFile {
         // unlink."
 
         // 1. Deregister the (now-dangling) Weak from the fd pool. Cheap, inline.
-        //    Guarded: the pool may be uninitialized (unit tests / Dram mode).
-        //    NB: no Arc is dropped inside the pool lock here (we only drop a Weak),
-        //    so this cannot re-enter the lock (see design §2.3 lock discipline).
+        //    Guarded: the pool may be uninitialized in unit tests that build an
+        //    ObjectFile without module init. In production an ObjectFile only ever
+        //    exists in Tiered mode (Dram mode never constructs one), and there the
+        //    fd pool is always initialized.
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(self.object_id);
         }
@@ -81,9 +93,9 @@ impl Drop for ObjectFile {
         // 2. Take the fd (swap makes close-once race-free vs. a future evictor).
         let fd = self.fd.swap(-1, Ordering::AcqRel);
 
-        // 3. Dispatch the blocking teardown OFF the main thread. Drop ⟺ deletion,
-        //    so the unlink is unconditional. object_ids are never reused, so a
-        //    not-yet-unlinked file can never be mistaken for a live one meanwhile.
+        // 3. Dispatch the blocking teardown OFF the main thread. Drop ⟺ deletion, so
+        //    the unlink is unconditional. object_ids are never reused, so a file that is
+        //    not yet unlinked can never be mistaken for a live object in the meantime.
         let object_id = self.object_id;
         get_teardown_worker().enqueue(move || {
             if fd >= 0 {
