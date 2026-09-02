@@ -183,3 +183,67 @@ pub fn delete_file(object_id: ObjectId) {
     let path = object_id.file_path(&dir);
     let _ = std::fs::remove_file(&path);
 }
+
+// ─── FileHeader ──────────────────────────────────────────────────────────────
+
+pub const FILE_HEADER_SIZE: u64 = 4096;
+pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
+pub const FILE_HEADER_VERSION: u8 = 1;
+
+/// On-disk file header for NVMe object files.
+/// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
+#[repr(C)]
+pub struct FileHeader {
+    pub magic: [u8; 4],
+    pub version: u8,
+    pub object_id: u64,
+    pub len: u64,
+    pub crc32c: u32,
+}
+
+impl FileHeader {
+    pub fn new(object_id: ObjectId, len: u64, crc32c: u32) -> Self {
+        Self {
+            magic: *FILE_HEADER_MAGIC,
+            version: FILE_HEADER_VERSION,
+            object_id: object_id.0,
+            len,
+            crc32c,
+        }
+    }
+
+    /// Serialize into a 4096-byte page (header bytes + zero padding).
+    pub fn to_page(&self) -> Vec<u8> {
+        let mut page = vec![0u8; FILE_HEADER_SIZE as usize];
+        page[0..4].copy_from_slice(&self.magic);
+        page[4] = self.version;
+        page[5..13].copy_from_slice(&self.object_id.to_le_bytes());
+        page[13..21].copy_from_slice(&self.len.to_le_bytes());
+        page[21..25].copy_from_slice(&self.crc32c.to_le_bytes());
+        page
+    }
+
+    /// Deserialize from a 4096-byte page. Returns None on invalid magic/version.
+    pub fn from_page(page: &[u8]) -> Option<Self> {
+        if page.len() < 25 {
+            return None;
+        }
+        if &page[0..4] != FILE_HEADER_MAGIC {
+            return None;
+        }
+        let version = page[4];
+        if version != FILE_HEADER_VERSION {
+            return None;
+        }
+        let object_id = u64::from_le_bytes(page[5..13].try_into().ok()?);
+        let len = u64::from_le_bytes(page[13..21].try_into().ok()?);
+        let crc32c = u32::from_le_bytes(page[21..25].try_into().ok()?);
+        Some(Self {
+            magic: *FILE_HEADER_MAGIC,
+            version,
+            object_id,
+            len,
+            crc32c,
+        })
+    }
+}
