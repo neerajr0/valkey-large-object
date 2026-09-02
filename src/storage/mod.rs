@@ -69,7 +69,7 @@ static IOVECS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// Returns the assigned iovec_index (= current array length before push).
 pub fn append_iovec(iov: libc::iovec) -> u16 {
     let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
-    let idx = iovecs.len() as u16;
+    let idx = u16::try_from(iovecs.len()).expect("iovec index overflow (>65535)");
     iovecs.push((iov.iov_base as usize, iov.iov_len));
     idx
 }
