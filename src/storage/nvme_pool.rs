@@ -27,6 +27,10 @@ impl NVMePool {
         self.pool.free(buf)
     }
 
+    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Vec<SegmentBuffer> {
+        self.pool.alloc_n(chunk_size, count)
+    }
+
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
         self.pool.buffer_ptr(buf)
     }

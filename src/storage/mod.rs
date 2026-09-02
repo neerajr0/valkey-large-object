@@ -184,6 +184,27 @@ pub fn delete_file(object_id: ObjectId) {
     let _ = std::fs::remove_file(&path);
 }
 
+// ─── Chunk Helpers ───────────────────────────────────────────────────────────
+
+/// Compute the number of chunks for an object of `obj_len` bytes.
+pub fn chunk_count(obj_len: u64, chunk_size: usize) -> u32 {
+    obj_len.div_ceil(chunk_size as u64) as u32
+}
+
+/// Compute the data length of chunk `i` (last chunk may be shorter).
+pub fn chunk_data_len(i: u32, total_chunks: u32, obj_len: u64, chunk_size: usize) -> usize {
+    if i == total_chunks - 1 {
+        let rem = (obj_len % chunk_size as u64) as usize;
+        if rem == 0 {
+            chunk_size
+        } else {
+            rem
+        }
+    } else {
+        chunk_size
+    }
+}
+
 // ─── FileHeader ──────────────────────────────────────────────────────────────
 
 pub const FILE_HEADER_SIZE: u64 = 4096;

@@ -13,7 +13,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
-            f" dram-segment-size 4194304"
+            f" dram-segment-size 16777216"
             f" max-promote-size 268435456"
             f" bench-mode no"
             f" direct-io no"

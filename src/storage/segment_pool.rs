@@ -77,6 +77,19 @@ impl SegmentPool {
         })
     }
 
+    /// Allocate up to `count` buffers of `chunk_size` each.
+    /// Returns however many succeeded (0 to count). Caller checks vec length.
+    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Vec<SegmentBuffer> {
+        let mut buffers = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.alloc(chunk_size) {
+                Some(buf) => buffers.push(buf),
+                None => break,
+            }
+        }
+        buffers
+    }
+
     /// Free a buffer back to the pool.
     pub fn free(&self, buf: &SegmentBuffer) {
         let seg = &self.segments[buf.segment_idx as usize];
