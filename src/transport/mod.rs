@@ -190,16 +190,21 @@ static EFA_CTX: OnceLock<EfaContext> = OnceLock::new();
 pub fn init() {
     match EfaContext::new() {
         Ok(ctx) => {
-            EFA_CTX.set(ctx).ok();
+            if EFA_CTX.set(ctx).is_err() {
+                panic!("EfaContext already initialized");
+            }
         }
         Err(_) => {
             // EFA unavailable — module works in TCP-only mode.
-            EFA_CTX
+            if EFA_CTX
                 .set(EfaContext {
                     available: false,
                     device_count: 0,
                 })
-                .ok();
+                .is_err()
+            {
+                panic!("EfaContext already initialized");
+            }
         }
     }
 }

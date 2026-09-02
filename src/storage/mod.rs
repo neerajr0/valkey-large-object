@@ -104,14 +104,20 @@ pub fn init(
     // NVMePool + FdPool: only needed in Tiered mode.
     if mode == crate::OperatingMode::Tiered {
         let nvme_pool = NVMePool::new(1, nvme_staging_size);
-        NVME_POOL.set(nvme_pool).ok();
+        if NVME_POOL.set(nvme_pool).is_err() {
+            panic!("NVMePool already initialized");
+        }
 
-        FD_POOL.set(FdPool::new()).ok();
+        if FD_POOL.set(FdPool::new()).is_err() {
+            panic!("FdPool already initialized");
+        }
     }
 
     // DRAMPool: always needed (both modes).
     let dram_pool = DRAMPool::new(dram_segment_count, dram_segment_size);
-    DRAM_POOL.set(dram_pool).ok();
+    if DRAM_POOL.set(dram_pool).is_err() {
+        panic!("DRAMPool already initialized");
+    }
 }
 
 /// Register ALL segments with io_uring. Uses the global IOVECS vec built during init.

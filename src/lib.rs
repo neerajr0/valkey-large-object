@@ -210,7 +210,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    RUNTIME.set(rt).ok();
+    if RUNTIME.set(rt).is_err() {
+        panic!("Runtime already initialized");
+    }
 
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();

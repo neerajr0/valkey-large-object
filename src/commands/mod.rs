@@ -183,7 +183,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     };
 
-    // Reject zero-length objects — nonsensical and causes 0-byte allocs/files.
+    // Reject zero-length values / 0-byte cases.
     if obj_len == 0 {
         return Err(ValkeyError::Str("ERR object length must be > 0"));
     }

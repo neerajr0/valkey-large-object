@@ -105,7 +105,9 @@ enum PendingOp {
 static ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
 
 pub fn set_engine(engine: UringNvmeEngine) {
-    ENGINE.set(engine).ok();
+    if ENGINE.set(engine).is_err() {
+        panic!("UringNvmeEngine already initialized");
+    }
 }
 
 /// Submit an IoRequest to the poller thread.
