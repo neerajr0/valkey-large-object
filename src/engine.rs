@@ -188,7 +188,7 @@ fn execute_get_tiered(
 
         // Read from NVMe directly into DRAMPool buffer, then serve.
         crate::runtime_handle().spawn(async move {
-            let result = uring::submit_read(fd, &read_op).await;
+            let result = uring::submit_read(fd, read_op).await;
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
             match result {
@@ -250,7 +250,7 @@ fn execute_get_tiered(
     crate::runtime_handle().spawn(async move {
         let _keep_alive = stream_ctx;
 
-        let read_result = uring::submit_read(fd, &read_op).await;
+        let read_result = uring::submit_read(fd, read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
         match read_result {
@@ -632,7 +632,7 @@ async fn do_tiered_nvme_write(
     // Reserve disk usage before the write — decrement on any failure path.
     uring::increase_nvme_disk_usage(obj_len);
 
-    let write_result = uring::submit_write(fd.as_raw_fd(), &write_op).await;
+    let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
     // fd (OwnedFd) drops when out of scope and close() is automatic.
 
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);

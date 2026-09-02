@@ -50,7 +50,7 @@ pub fn has_nvme_capacity(obj_len: u64) -> bool {
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
 /// TODO: Multi-buffer batch support (STORAGE_DESIGN.md §7.3).
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct UringOp {
     /// Segment's position in the registered iovec array (IORING_REGISTER_BUFFERS).
     pub iovec_index: u16,
@@ -127,13 +127,11 @@ fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>>
 
 /// Submit a ReadFixed and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_read(fd: RawFd, op: &UringOp) -> oneshot::Receiver<Result<u64, StorageError>> {
+pub fn submit_read(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<u64, StorageError>> {
     let (tx, rx) = oneshot::channel();
-    if let Err(crossbeam_channel::SendError(IoRequest::Read { tx, .. })) = submit(IoRequest::Read {
-        fd,
-        op: op.clone(),
-        tx,
-    }) {
+    if let Err(crossbeam_channel::SendError(IoRequest::Read { tx, .. })) =
+        submit(IoRequest::Read { fd, op, tx })
+    {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
@@ -141,14 +139,10 @@ pub fn submit_read(fd: RawFd, op: &UringOp) -> oneshot::Receiver<Result<u64, Sto
 
 /// Submit a WriteFixed and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_write(fd: RawFd, op: &UringOp) -> oneshot::Receiver<Result<(), StorageError>> {
+pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), StorageError>> {
     let (tx, rx) = oneshot::channel();
     if let Err(crossbeam_channel::SendError(IoRequest::Write { tx, .. })) =
-        submit(IoRequest::Write {
-            fd,
-            op: op.clone(),
-            tx,
-        })
+        submit(IoRequest::Write { fd, op, tx })
     {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
