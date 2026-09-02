@@ -92,52 +92,107 @@ pub fn get_fd_pool() -> &'static FdPool {
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
-/// Initialize pools based on operating mode.
-/// Creation order doesn't matter — iovec indices are assigned via global registry.
-pub fn init(
-    mode: crate::OperatingMode,
-    dram_segment_count: usize,
-    dram_segment_size: usize,
-    nvme_staging_size: usize,
-    _nvme_dir: &str,
-) {
+/// Initialize storage layer: validate config, create pools, spawn io_uring poller (Tiered only).
+/// All OnceLock statics are set at the very end after everything succeeds.
+/// On failure, local variables drop naturally — no cleanup needed, module load retryable.
+/// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
+pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String> {
+    let dram_seg_size = crate::dram_segment_size();
+    let dram_max = crate::dram_maxmemory();
+    let nvme_staging = crate::nvme_staging_size();
+
+    // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
+    // Otherwise pre-allocate maxmemory / segment_size segments.
+    let dram_segment_count = if dram_max == 0 {
+        1
+    } else {
+        ((dram_max as usize) / dram_seg_size).max(1)
+    };
+
+    // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
+    let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
+        1
+    } else {
+        0
+    };
+    let total_segments = dram_segment_count + nvme_segments;
+    if total_segments > u16::MAX as usize + 1 {
+        return Err(format!(
+            "too many segments ({} DRAM + {} NVMe = {}). \
+             Max {} (io_uring iovec_index is u16). \
+             Increase dram-segment-size or decrease dram-maxmemory",
+            dram_segment_count,
+            nvme_segments,
+            total_segments,
+            u16::MAX as usize + 1,
+        ));
+    }
+
+    // ── Create all resources as locals (no OnceLock yet) ──
+
     // NVMePool + FdPool: only needed in Tiered mode.
-    if mode == crate::OperatingMode::Tiered {
-        let nvme_pool = NVMePool::new(1, nvme_staging_size);
-        if NVME_POOL.set(nvme_pool).is_err() {
+    let nvme_pool = if mode == crate::OperatingMode::Tiered {
+        Some(NVMePool::new(1, nvme_staging))
+    } else {
+        None
+    };
+    let fd_pool = if mode == crate::OperatingMode::Tiered {
+        Some(FdPool::new())
+    } else {
+        None
+    };
+
+    // DRAMPool: always needed (both modes).
+    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size);
+
+    // io_uring NVMe engine: only in Tiered mode. Ring creation + buffer registration
+    // happen on this (main) thread so failures return Err, not panic in the poller.
+    let nvme_engine = if mode == crate::OperatingMode::Tiered {
+        let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
+        let iovecs: Vec<libc::iovec> = pairs
+            .iter()
+            .map(|&(ptr, len)| libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: len,
+            })
+            .collect();
+        let engine = uring::UringNvmeEngine::new(iovecs).map_err(|e| {
+            // Engine failed — clear IOVECS so a retry starts fresh.
+            IOVECS.lock().expect("IOVECS lock unavailable").clear();
+            format!("io_uring engine: {}", e)
+        })?;
+        Some(engine)
+    } else {
+        None
+    };
+
+    // ── All succeeded — commit to globals. No failure possible after this point. ──
+
+    if let Some(pool) = nvme_pool {
+        if NVME_POOL.set(pool).is_err() {
             panic!("NVMePool already initialized");
         }
-
-        if FD_POOL.set(FdPool::new()).is_err() {
+    }
+    if let Some(pool) = fd_pool {
+        if FD_POOL.set(pool).is_err() {
             panic!("FdPool already initialized");
         }
     }
-
-    // DRAMPool: always needed (both modes).
-    let dram_pool = DRAMPool::new(dram_segment_count, dram_segment_size);
     if DRAM_POOL.set(dram_pool).is_err() {
         panic!("DRAMPool already initialized");
     }
-}
+    if let Some(engine) = nvme_engine {
+        uring::set_nvme_engine(engine);
+    }
 
-/// Register ALL segments with io_uring. Uses the global IOVECS vec built during init.
-/// Array position = iovec_index, guaranteed by append_iovec() at creation time.
-pub fn register_buffers() {
-    let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
-    let iovecs: Vec<libc::iovec> = pairs
-        .iter()
-        .map(|&(ptr, len)| libc::iovec {
-            iov_base: ptr as *mut libc::c_void,
-            iov_len: len,
-        })
-        .collect();
-    let engine = uring::UringNvmeEngine::new(iovecs);
-    uring::set_engine(engine);
-}
-
-/// Shutdown: signal io_uring poller to exit.
-pub fn shutdown() {
-    uring::shutdown();
+    Ok(format!(
+        "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
+        mode,
+        nvme_dir,
+        dram_segment_count,
+        dram_seg_size / (1024 * 1024),
+        nvme_staging / (1024 * 1024),
+    ))
 }
 
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything

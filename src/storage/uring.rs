@@ -1,4 +1,6 @@
-//! io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//! NVMe io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//!
+//! Only used in Tiered mode. Dram-only mode has no io_uring engine.
 //!
 //! Architecture:
 //!   Caller: submit(IoRequest) via channel → returns immediately
@@ -100,13 +102,13 @@ enum PendingOp {
     },
 }
 
-// ─── Global Engine ───────────────────────────────────────────────────────────
+// ─── Global NVMe Engine ──────────────────────────────────────────────────────
 
-static ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
+static NVME_ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
 
-pub fn set_engine(engine: UringNvmeEngine) {
-    if ENGINE.set(engine).is_err() {
-        panic!("UringNvmeEngine already initialized");
+pub fn set_nvme_engine(engine: UringNvmeEngine) {
+    if NVME_ENGINE.set(engine).is_err() {
+        panic!("NVMe engine already initialized");
     }
 }
 
@@ -114,7 +116,7 @@ pub fn set_engine(engine: UringNvmeEngine) {
 /// Returns SendError with the request back on failure (channel disconnected)
 /// so the caller can extract the oneshot sender and fire an explicit error.
 fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
-    match ENGINE.get() {
+    match NVME_ENGINE.get() {
         Some(engine) => engine.tx.send(req),
         None => Err(crossbeam_channel::SendError(req)),
     }
@@ -150,7 +152,7 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
 }
 
 pub fn shutdown() {
-    if let Some(engine) = ENGINE.get() {
+    if let Some(engine) = NVME_ENGINE.get() {
         engine.shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -164,61 +166,49 @@ pub struct UringNvmeEngine {
 }
 
 impl UringNvmeEngine {
-    /// Create engine and spawn CQ poller thread.
-    /// `iovecs` are the registered segments (combined DRAMPool + NVMePool).
-    pub fn new(iovecs: Vec<libc::iovec>) -> Self {
+    /// Create engine: init io_uring ring + register buffers on the calling thread,
+    /// then spawn CQ poller with the working ring. Returns Err if the kernel
+    /// doesn't support io_uring or buffer registration fails.
+    pub fn new(iovecs: Vec<libc::iovec>) -> Result<Self, String> {
+        // Create ring on main thread — fail gracefully instead of panicking.
+        let ring =
+            io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
+
+        // Register buffers on main thread.
+        if !iovecs.is_empty() {
+            unsafe { ring.submitter().register_buffers(&iovecs) }
+                .map_err(|e| format!("IORING_REGISTER_BUFFERS failed: {}", e))?;
+        }
+
         let (tx, rx) = bounded::<IoRequest>(4096);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
-        // Convert to Send-safe (ptr as usize, len) pairs for the thread boundary.
-        let buf_info: Vec<(usize, usize)> = iovecs
-            .iter()
-            .map(|iov| (iov.iov_base as usize, iov.iov_len))
-            .collect();
-
+        // Pass the fully initialized ring to the poller thread.
         let poller = thread::Builder::new()
             .name("lo-uring-poller".into())
             .spawn(move || {
-                let iovecs: Vec<libc::iovec> = buf_info
-                    .iter()
-                    .map(|&(ptr, len)| libc::iovec {
-                        iov_base: ptr as *mut libc::c_void,
-                        iov_len: len,
-                    })
-                    .collect();
-                Self::poller_loop(rx, shutdown_clone, iovecs);
+                Self::poller_loop(rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
 
-        Self {
+        Ok(Self {
             tx,
             shutdown,
             _poller: Some(poller),
-        }
+        })
     }
 
-    /// The CQ poller loop — owns the io_uring ring.
-    fn poller_loop(rx: Receiver<IoRequest>, shutdown: Arc<AtomicBool>, iovecs: Vec<libc::iovec>) {
-        let mut ring = match io_uring::IoUring::new(256) {
-            Ok(r) => r,
-            Err(e) => {
-                panic!("largeobj: io_uring init failed: {}", e);
-            }
-        };
-
-        let use_fixed = if !iovecs.is_empty() {
-            unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok()
-        } else {
-            false
-        };
-
-        if !use_fixed && !iovecs.is_empty() {
-            panic!("largeobj: IORING_REGISTER_BUFFERS failed — ReadFixed/WriteFixed unavailable");
-        }
-
+    /// The CQ poller loop — owns the io_uring ring (received fully initialized).
+    fn poller_loop(
+        rx: Receiver<IoRequest>,
+        shutdown: Arc<AtomicBool>,
+        mut ring: io_uring::IoUring,
+    ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
+        // Buffer registration is guaranteed by the caller (main thread).
+        let use_fixed = true;
 
         loop {
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
