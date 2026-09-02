@@ -151,18 +151,22 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
     rx
 }
 
-pub fn shutdown() {
-    if let Some(engine) = NVME_ENGINE.get() {
-        engine.shutdown.store(true, Ordering::Relaxed);
-    }
-}
-
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
 
 pub struct UringNvmeEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
     _poller: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for UringNvmeEngine {
+    fn drop(&mut self) {
+        // Set shutdown flag BEFORE tx drops. This ensures the poller sees
+        // shutdown=true when the channel disconnects, and exits cleanly
+        // instead of panicking on unexpected disconnect.
+        // Fires on: (1) init failure (local engine dropped), (2) process exit.
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 impl UringNvmeEngine {
@@ -209,9 +213,23 @@ impl UringNvmeEngine {
         let mut next_token: u64 = 1;
         // Buffer registration is guaranteed by the caller (main thread).
         let use_fixed = true;
+        let mut channel_alive = true;
 
         loop {
+            // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
+                break;
+            }
+            // Channel disconnected without shutdown flag = bug. The sender lives
+            // in an OnceLock for the entire process lifetime. If it's gone without
+            // shutdown being set, something is seriously wrong.
+            if !channel_alive && pending.is_empty() {
+                if !shutdown.load(Ordering::Relaxed) {
+                    panic!(
+                        "largeobj: io_uring poller channel disconnected unexpectedly \
+                         (shutdown flag not set)"
+                    );
+                }
                 break;
             }
 
@@ -225,12 +243,19 @@ impl UringNvmeEngine {
                 let req = if pending.is_empty() && batch == 0 {
                     match rx.recv() {
                         Ok(req) => req,
-                        Err(_) => break, // channel closed → exit loop
+                        Err(_) => {
+                            channel_alive = false;
+                            break;
+                        }
                     }
                 } else {
                     match rx.try_recv() {
                         Ok(req) => req,
-                        Err(_) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            channel_alive = false;
+                            break;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
                     }
                 };
                 let token = next_token;

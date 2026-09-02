@@ -269,7 +269,6 @@ fn deinitialize(_ctx: &Context) -> Status {
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::deregister_buffers();
     transport::shutdown();
-    storage::uring::shutdown(); // signal io_uring poller to stop
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
