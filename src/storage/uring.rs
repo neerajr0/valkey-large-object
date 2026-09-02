@@ -102,6 +102,20 @@ enum PendingOp {
     },
 }
 
+impl PendingOp {
+    /// Send an error to the waiting caller. Used when submit fails fatally.
+    fn send_error(self, code: i32) {
+        match self {
+            PendingOp::Read { tx, .. } => {
+                let _ = tx.send(Err(StorageError::IoError { code }));
+            }
+            PendingOp::Write { tx, .. } => {
+                let _ = tx.send(Err(StorageError::IoError { code }));
+            }
+        }
+    }
+}
+
 // ─── Global NVMe Engine ──────────────────────────────────────────────────────
 
 static NVME_ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
@@ -214,6 +228,7 @@ impl UringNvmeEngine {
         // Buffer registration is guaranteed by the caller (main thread).
         let use_fixed = true;
         let mut channel_alive = true;
+        let mut submit_error: Option<i32> = None;
 
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
@@ -329,15 +344,8 @@ impl UringNvmeEngine {
                         let _ = ring.submit();
                     }
                     if ring.submission().push(&sqe).is_err() {
-                        // SQ full even after flush — send error on oneshot.
-                        match op {
-                            PendingOp::Read { tx, .. } => {
-                                let _ = tx.send(Err(StorageError::IoError { code: libc::EAGAIN }));
-                            }
-                            PendingOp::Write { tx, .. } => {
-                                let _ = tx.send(Err(StorageError::IoError { code: libc::EAGAIN }));
-                            }
-                        }
+                        // SQ full even after flush — error the caller directly.
+                        op.send_error(libc::EAGAIN);
                     } else {
                         pending.insert(token, op);
                     }
@@ -352,12 +360,19 @@ impl UringNvmeEngine {
                         Ok(_) => break,
                         // Signal interrupted — normal, retry immediately.
                         Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                        // Transient congestion — reap CQEs in Phase 3, retry next loop.
+                        // Kernel backpressure — reap CQEs in Phase 3, retry next loop.
+                        // Self-resolving: kernel is actively processing, just needs time.
                         Err(ref e)
                             if e.raw_os_error() == Some(libc::EBUSY)
-                                || e.raw_os_error() == Some(libc::EAGAIN)
-                                || e.raw_os_error() == Some(libc::ENOMEM) =>
+                                || e.raw_os_error() == Some(libc::EAGAIN) =>
                         {
+                            break;
+                        }
+                        // Kernel can't allocate internal resources. Not self-resolving —
+                        // reaping CQEs won't free the right memory. Flag it; Phase 3
+                        // will error all remaining pending ops after reaping what it can.
+                        Err(ref e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                            submit_error = Some(libc::ENOMEM);
                             break;
                         }
                         // Unrecoverable: EFAULT (bad pointer), EINVAL (bad SQE),
@@ -401,6 +416,16 @@ impl UringNvmeEngine {
                             }
                         }
                     }
+                }
+            }
+
+            // Phase 3b: If submit failed fatally (ENOMEM), error all remaining
+            // pending ops. submit_and_wait submits the entire SQ batch — on failure
+            // we don't know which ops were submitted vs rejected, so we reap what
+            // we can in Phase 3 and error the rest here.
+            if let Some(code) = submit_error.take() {
+                for (_, op) in pending.drain() {
+                    op.send_error(code);
                 }
             }
 
