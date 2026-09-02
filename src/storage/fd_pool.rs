@@ -1,17 +1,20 @@
-//! File Descriptor Pool — a `Weak` registry over `ObjectFile` handles.
+//! File Descriptor Pool — the read-fd cache: an index of `object_id → Weak<ObjectFile>`.
 //!
-//! The pool does **not** own fds anymore: the fd lives inside `ObjectFile` and is
-//! closed by its `Drop` (object_file.rs). The pool holds `object_id → Weak<ObjectFile>`
-//! and earns its keep for two jobs:
-//!   1. **Serialize the lazy first-open** — two concurrent first-GETs on the same
-//!      cold object must not both `open()` and leak an fd. The write lock is the
+//! The pool does **not** own fds: each open read fd lives inside its `ObjectFile`
+//! (an `AtomicI32` slot) and is closed by that `ObjectFile`'s `Drop` on delete
+//! (object_file.rs). The pool earns its keep for two jobs:
+//!   1. **Cache open read fds for reuse** — a cold object's read fd is opened lazily
+//!      on the first GET and then reused by every later GET (no repeated `open()`),
+//!      staying open until the object is deleted. TODO: in the future we will close
+//!      cold fds for items that are in DRAM to relieve descriptor pressure.
+//!   2. **Serialize the lazy first-open** — two concurrent first-GETs on the same
+//!      cold object must not both `open()` and leak an fd; the write lock is the
 //!      serialization point.
-//!   2. **Be the registry a future evictor scans** — the enumerable index of objects
-//!      that may have an open fd.
 //!
-//! `remove` is **deregister-only** (closes nothing); closing an fd is either
-//! `ObjectFile::Drop` (on delete) or a future in-place evictor. See the deletion
-//! design doc §4.
+//! `remove` is **deregister-only** (closes nothing). Today it is called only from
+//! `ObjectFile::Drop` (on delete). TODO: a future fd-cache eviction path will also
+//! remove an entry to close an fd *while its file still exists* — reclaiming
+//! descriptors under fd pressure — after which the next GET reopens lazily.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -21,7 +24,6 @@ use super::object_file::ObjectFile;
 use crate::data_type::ObjectId;
 
 pub struct FdPool {
-    /// object_id → non-owning handle. Registry + open-serializer, NOT an owner.
     fds: RwLock<HashMap<ObjectId, Weak<ObjectFile>>>,
 }
 
@@ -41,12 +43,10 @@ impl FdPool {
     /// Return a usable read fd for `objfile`, opening it lazily if needed.
     ///
     /// The caller holds a strong `Arc<ObjectFile>`, so the file is guaranteed still
-    /// linked (physical-existence invariant, design §2.4): the `open()` cannot
-    /// spuriously `ENOENT`. Returns `None` only on a genuine `open()` failure.
-    ///
-    /// direct-io is IMMUTABLE, so an fd opened here stays valid until the object is
-    /// deleted (or a future evictor closes it in place, after which the next call
-    /// reopens).
+    /// linked, so the `open()` cannot spuriously `ENOENT`. Returns `None` only on
+    /// a genuine `open()` failure. Direct-io is IMMUTABLE, so an fd opened here stays
+    /// valid until the object is deleted (or TODO a future evictor closes it in place,
+    /// after which the next call reopens).
     pub fn ensure_open(&self, objfile: &Arc<ObjectFile>, dir: &str) -> Option<RawFd> {
         // Fast path, lock-free: already open.
         let fd = objfile.fd();
