@@ -604,6 +604,7 @@ async fn do_tiered_nvme_write(
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
     let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if fd < 0 {
+        uring::decrease_nvme_disk_usage(obj_len);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;

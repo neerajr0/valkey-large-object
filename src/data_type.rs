@@ -120,8 +120,11 @@ impl LoValue {
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(&data_dir);
         let dst_path = new_oid.file_path(&data_dir);
-        std::fs::copy(&src_path, &dst_path)
-            .expect("Tiered COPY: source file missing — key exists implies file exists");
+        if std::fs::copy(&src_path, &dst_path).is_err() {
+            let _ = std::fs::remove_file(&dst_path);
+            crate::storage::uring::decrease_nvme_disk_usage(self.len);
+            return None;
+        }
         Some(LoValue {
             object_id: new_oid,
             len: self.len,

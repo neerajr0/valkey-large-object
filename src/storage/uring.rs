@@ -187,32 +187,58 @@ pub fn submit_write_batch(
     ops.iter().map(|op| submit_write(fd, op)).collect()
 }
 
-/// Await all read receivers. Returns Err on first failure.
+/// Await all read receivers. Drains every receiver before returning so in-flight
+/// io_uring ops complete before callers free buffers. Returns first error.
 pub async fn await_read_batch(
     receivers: Vec<oneshot::Receiver<Result<u64, StorageError>>>,
 ) -> Result<(), StorageError> {
+    let mut first_err: Option<StorageError> = None;
     for rx in receivers {
         match rx.await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(StorageError::IoError { code: libc::EIO }),
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(_) => {
+                if first_err.is_none() {
+                    first_err = Some(StorageError::IoError { code: libc::EIO });
+                }
+            }
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
-/// Await all write receivers. Returns Err on first failure.
+/// Await all write receivers. Drains every receiver before returning so in-flight
+/// io_uring ops complete before callers free buffers. Returns first error.
 pub async fn await_write_batch(
     receivers: Vec<oneshot::Receiver<Result<(), StorageError>>>,
 ) -> Result<(), StorageError> {
+    let mut first_err: Option<StorageError> = None;
     for rx in receivers {
         match rx.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(StorageError::IoError { code: libc::EIO }),
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(_) => {
+                if first_err.is_none() {
+                    first_err = Some(StorageError::IoError { code: libc::EIO });
+                }
+            }
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
