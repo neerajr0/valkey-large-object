@@ -264,6 +264,38 @@ impl StreamingContext {
 mod tests {
     use super::*;
 
+    // A Filling context pins the ObjectFile; mark_ready() only flips the state
+    // atomic and CANNOT null the Option, so a promoted Ready context keeps a benign
+    // redundant ref that is released on drop, with no cycle. Strong counts are not
+    // observable from an integration test.
+    #[test]
+    fn test_promoted_ready_retains_file_ref_until_drop() {
+        use crate::data_type::ObjectId;
+        let file = Arc::new(ObjectFile::new_cold(ObjectId(21)));
+        let bufs = vec![SegmentBuffer {
+            segment_idx: 0,
+            offset: 0,
+            len: 1024,
+        }];
+        let ctx = ObjectContext::new_filling(bufs, 1024, 1, Some(Arc::clone(&file)));
+        assert_eq!(Arc::strong_count(&file), 2, "Filling context pins the file");
+
+        ctx.mark_ready();
+        assert!(ctx.is_ready());
+        assert_eq!(
+            Arc::strong_count(&file),
+            2,
+            "promoted Ready context still holds the benign ref"
+        );
+
+        drop(ctx);
+        assert_eq!(
+            Arc::strong_count(&file),
+            1,
+            "dropping the context releases the ref (no cycle keeps it alive)"
+        );
+    }
+
     #[test]
     fn test_object_context_ready() {
         let bufs = vec![
