@@ -54,12 +54,14 @@ fn collect_dram_bytes(
     obj_len: u64,
 ) -> Vec<u8> {
     let mut data = Vec::with_capacity(obj_len as usize);
+    let mut remaining = obj_len as usize;
     for buf in &obj_ctx.buffers {
+        let to_copy = remaining.min(buf.len as usize);
         let ptr = dram_pool.buffer_ptr(buf);
-        let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
+        let slice = unsafe { std::slice::from_raw_parts(ptr, to_copy) };
         data.extend_from_slice(slice);
+        remaining -= to_copy;
     }
-    data.truncate(obj_len as usize);
     data
 }
 
