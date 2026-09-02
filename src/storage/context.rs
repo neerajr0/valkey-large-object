@@ -80,14 +80,6 @@ pub struct ObjectContext {
     /// Total chunks for this object (used by streaming/chunking path).
     #[allow(dead_code)]
     total_chunks: u32,
-    /// Strong `Arc<ObjectFile>` — Tiered mode only (`None` in Dram mode and for a
-    /// context created Ready).
-    ///
-    /// Set while `Filling` and is not dropped until the ObjectContext itself is
-    /// dropped. Once updated to a `Ready` state, the benign ObjectFile reference is
-    /// only dropped by the ObjectContext drop which is triggered by `lo_free`.
-    #[allow(dead_code)]
-    file: Option<Arc<ObjectFile>>,
 }
 
 impl ObjectContext {
@@ -99,26 +91,17 @@ impl ObjectContext {
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
             total_chunks: 0,
-            file: None,
         }
     }
 
-    /// Create a new ObjectContext in Filling state (Tiered promotion path). Holds a
-    /// strong `Arc<ObjectFile>` for the duration of the fill (`None` is accepted for
-    /// tests).
-    pub fn new_filling(
-        buffers: Vec<SegmentBuffer>,
-        total_len: u64,
-        total_chunks: u32,
-        file: Option<Arc<ObjectFile>>,
-    ) -> Self {
+    /// Create a new ObjectContext in Filling state (Tiered promotion path).
+    pub fn new_filling(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,
             total_len,
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
             total_chunks,
-            file,
         }
     }
 
@@ -301,38 +284,6 @@ mod tests {
         );
     }
 
-    // A Filling context pins the ObjectFile; mark_ready() only flips the state
-    // atomic and CANNOT null the Option, so a promoted Ready context keeps a benign
-    // redundant ref that is released on drop, with no cycle. Strong counts are not
-    // observable from an integration test.
-    #[test]
-    fn test_promoted_ready_retains_file_ref_until_drop() {
-        use crate::data_type::ObjectId;
-        let file = Arc::new(ObjectFile::new_cold(ObjectId(21)));
-        let bufs = vec![SegmentBuffer {
-            segment_idx: 0,
-            offset: 0,
-            len: 1024,
-        }];
-        let ctx = ObjectContext::new_filling(bufs, 1024, 1, Some(Arc::clone(&file)));
-        assert_eq!(Arc::strong_count(&file), 2, "Filling context pins the file");
-
-        ctx.mark_ready();
-        assert!(ctx.is_ready());
-        assert_eq!(
-            Arc::strong_count(&file),
-            2,
-            "promoted Ready context still holds the benign ref"
-        );
-
-        drop(ctx);
-        assert_eq!(
-            Arc::strong_count(&file),
-            1,
-            "dropping the context releases the ref (no cycle keeps it alive)"
-        );
-    }
-
     #[test]
     fn test_object_context_ready() {
         let bufs = vec![
@@ -371,7 +322,7 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3, None);
+        let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3);
         assert!(!ctx.is_ready());
         assert_eq!(ctx.chunks_ready(), 0);
 
