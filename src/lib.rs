@@ -230,14 +230,19 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ((dram_max as usize) / dram_seg_size).max(1)
     };
 
-    // SegmentBuffer.segment_idx is u8 — max 256 segments per pool (indices 0–255).
-    // segment_idx is local to each pool (DRAMPool and NVMePool have separate segment vecs),
-    // so the NVMe staging segment does not consume a DRAMPool index.
-    if dram_segment_count > u8::MAX as usize + 1 {
+    // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
+    // NVMe staging is always 1 segment in Tiered mode, 0 in Dram mode.
+    let nvme_segments: usize = if mode == OperatingMode::Tiered { 1 } else { 0 };
+    let total_segments = dram_segment_count + nvme_segments;
+    if total_segments > u16::MAX as usize + 1 {
         ctx.log_warning(&format!(
-            "largeobj: too many DRAM segments ({}). Max 256 (segment_idx is u8). \
+            "largeobj: too many segments ({} DRAM + {} NVMe = {}). \
+             Max {} (io_uring iovec_index is u16). \
              Increase dram-segment-size or decrease dram-maxmemory",
             dram_segment_count,
+            nvme_segments,
+            total_segments,
+            u16::MAX as usize + 1,
         ));
         return Status::Err;
     }

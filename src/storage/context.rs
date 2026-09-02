@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 pub struct SegmentBuffer {
     /// Which segment this slice lives in (local index into the owning pool's segments vec).
     /// NOT the global io_uring iovec index - that is on Segment.iovec_index.
-    pub segment_idx: u8,
+    pub segment_idx: u16,
     /// Byte offset within that segment.
     pub offset: u64,
     /// Size of this buffer allocation.
