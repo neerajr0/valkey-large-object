@@ -99,7 +99,9 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-
+        // Alloc BEFORE write lock — talc scan under memory pressure
+        // won't block GET readers waiting on get_object().
+        let seg_buf = self.alloc(obj_len as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -107,10 +109,9 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
+            self.free(&seg_buf);
             return None;
         }
-
-        let seg_buf = self.alloc(obj_len as usize)?;
         let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(
             vec![seg_buf],
             obj_len,

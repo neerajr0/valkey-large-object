@@ -13,6 +13,7 @@
 //!   ReadFixed directly into DRAMPool buffers, mark Filling→Ready.
 //!   Concurrent GETs coalesce on Filling ObjectContext.
 
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use valkey_module::{ValkeyError, ValkeyValue};
@@ -45,6 +46,24 @@ pub enum EngineResult {
 }
 
 // ─── GET Engine ──────────────────────────────────────────────────────────────
+
+/// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
+fn collect_dram_bytes(
+    dram_pool: &storage::DRAMPool,
+    obj_ctx: &ObjectContext,
+    obj_len: u64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(obj_len as usize);
+    let mut remaining = obj_len as usize;
+    for buf in &obj_ctx.buffers {
+        let to_copy = remaining.min(buf.len as usize);
+        let ptr = dram_pool.buffer_ptr(buf);
+        let slice = unsafe { std::slice::from_raw_parts(ptr, to_copy) };
+        data.extend_from_slice(slice);
+        remaining -= to_copy;
+    }
+    data
+}
 
 /// Execute LO.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
@@ -81,16 +100,9 @@ pub fn execute_get(
 fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
-        Some(obj_ctx) if obj_ctx.is_ready() => {
-            let mut data = Vec::with_capacity(obj_len as usize);
-            for buf in &obj_ctx.buffers {
-                let ptr = dram_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
-                data.extend_from_slice(slice);
-            }
-            data.truncate(obj_len as usize);
-            Ok(ValkeyValue::StringBuffer(data))
-        }
+        Some(obj_ctx) if obj_ctx.is_ready() => Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+            dram_pool, &obj_ctx, obj_len,
+        ))),
         Some(_) => {
             panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
         }
@@ -178,7 +190,7 @@ fn execute_get_tiered(
 
         // Read from NVMe directly into DRAMPool buffer, then serve.
         crate::runtime_handle().spawn(async move {
-            let result = uring::submit_read(fd, &read_op).await;
+            let result = uring::submit_read(fd, read_op).await;
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
             match result {
@@ -240,7 +252,7 @@ fn execute_get_tiered(
     crate::runtime_handle().spawn(async move {
         let _keep_alive = stream_ctx;
 
-        let read_result = uring::submit_read(fd, &read_op).await;
+        let read_result = uring::submit_read(fd, read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
         match read_result {
@@ -422,7 +434,7 @@ fn execute_set_dram_efa(
 
     match data_source {
         DataSource::Tcp(_) => {
-            panic!("unreachable: Dram+TCP SET routed to sync path via EngineResult");
+            unreachable!("Dram+TCP SET routed to sync path via EngineResult");
         }
         DataSource::Efa {
             session,
@@ -600,12 +612,14 @@ async fn do_tiered_nvme_write(
         write_flags |= libc::O_DIRECT;
     }
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
-    let fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
-    if fd < 0 {
+    let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
+    if raw_fd < 0 {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
     }
+    // OwnedFd closes on drop — no leak on early return.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     let nvme_pool = storage::get_nvme_pool();
     // Single-chunk today: one UringOp for the entire object.
@@ -620,8 +634,8 @@ async fn do_tiered_nvme_write(
     // Reserve disk usage before the write — decrement on any failure path.
     uring::increase_nvme_disk_usage(obj_len);
 
-    let write_result = uring::submit_write(fd, &write_op).await;
-    unsafe { libc::close(fd) };
+    let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
+    // fd (OwnedFd) drops when out of scope and close() is automatic.
 
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
@@ -686,15 +700,9 @@ fn serve_from_dram(
 ) {
     match transport {
         Transport::Tcp => {
-            // Collect data from DRAMPool buffers.
-            let mut data = Vec::with_capacity(obj_len as usize);
-            for buf in &obj_ctx.buffers {
-                let ptr = dram_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, buf.len as usize) };
-                data.extend_from_slice(slice);
-            }
-            data.truncate(obj_len as usize);
-            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                dram_pool, obj_ctx, obj_len,
+            ))));
         }
         Transport::Efa {
             session,
