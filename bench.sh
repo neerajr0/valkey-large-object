@@ -33,6 +33,9 @@ DRAM_SEGMENT_SIZE="67108864"      # 64MB
 NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
 WORKER_THREADS=2
+IO_THREADS=8                      # Valkey io-threads (network read/write offload)
+SERVER_CPUS="0-15"                # taskset for valkey-server
+BENCH_CPUS="16-63"                # taskset for valkey-benchmark
 MODES_STR=""                      # empty = auto (Dram if no nvme-dir; all 3 if nvme-dir)
 SIZES_STR="4KB 1MB 50MB"
 
@@ -186,6 +189,9 @@ echo "Module:         $MODULE_SO"
 echo "DRAM maxmem:    $DRAM_MAXMEMORY ($((DRAM_MAXMEMORY / 1048576))MB)"
 echo "DRAM segment:   $DRAM_SEGMENT_SIZE ($((DRAM_SEGMENT_SIZE / 1048576))MB)"
 echo "Worker threads: $WORKER_THREADS"
+echo "IO threads:     $IO_THREADS"
+echo "Server CPUs:    $SERVER_CPUS"
+echo "Bench CPUs:     $BENCH_CPUS"
 echo "=============================================="
 echo ""
 
@@ -335,12 +341,15 @@ for BENCH_MODE in $MODES_STR; do
         sleep 1
 
         # Start server
+        # Start server (pinned to SERVER_CPUS, with io-threads for network offload)
+        taskset -c $SERVER_CPUS \
         $VALKEY_SERVER --port $PORT --daemonize yes \
             --logfile /tmp/bench-server-$PORT.log \
             --pidfile /tmp/bench-server-$PORT.pid \
             --loadmodule "$MODULE_SO" $MODULE_ARGS \
             --save "" \
-            --appendonly no
+            --appendonly no \
+            --io-threads $IO_THREADS
         sleep 1
 
         # Wait for server to be ready (Tiered mode allocates 32GB+ on startup)
@@ -424,6 +433,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         BENCH_TIMEOUT=$(( DURATION + 30 ))
         BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
         timeout $BENCH_TIMEOUT \
+            taskset -c $BENCH_CPUS \
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1
         BENCH_EXIT=$?
