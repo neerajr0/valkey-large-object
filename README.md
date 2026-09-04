@@ -90,21 +90,14 @@ TEST_PATTERN=test_lo_set_get_roundtrip ./build.sh test
 ## Benchmark
 
 ```bash
-# Dram mode benchmark (no NVMe needed)
+# Dram only
 ./bench.sh --port 7380
 
-# All 3 modes on NVMe stripe (i8ge: /mnt/bigobj-data)
+# All modes on NVMe stripe
 ./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test
-
-# Skip fio baselines
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test --skip-fio
-
-# Custom parameters
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test \
-    --sizes "4KB 1MB 50MB" --clients 500 --duration 15 --keys 1000
 ```
 
-**IMPORTANT:** `--nvme-dir` must point to a directory on the actual NVMe stripe (e.g., `/mnt/bigobj-data`), NOT the root disk. Verify with `df <path>`.
+See [BENCHMARK.md](BENCHMARK.md) for full documentation, parameters, and troubleshooting.
 
 ## License
 
