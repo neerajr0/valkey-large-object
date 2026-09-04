@@ -416,11 +416,24 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 
         # LO.GET benchmark (timeout = duration + 30s grace)
         BENCH_TIMEOUT=$(( DURATION + 30 ))
-        timeout $BENCH_TIMEOUT \
+        BENCH_OUTPUT=$(timeout $BENCH_TIMEOUT \
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-            -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
-        if [ $? -eq 124 ]; then
+            -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n')
+        BENCH_EXIT=$?
+
+        # Print the results
+        echo "$BENCH_OUTPUT" | grep -E "throughput summary|avg.*min.*p50"
+
+        # Assert benchmark completed and produced results
+        if [ $BENCH_EXIT -eq 124 ]; then
             echo "  FATAL: Benchmark timed out after ${BENCH_TIMEOUT}s. Server may be hung or staging pool exhausted."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
+        if ! echo "$BENCH_OUTPUT" | grep -q "throughput summary"; then
+            echo "  FATAL: Benchmark produced no throughput results."
+            echo "         Raw output:"
+            echo "$BENCH_OUTPUT" | tail -10
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
