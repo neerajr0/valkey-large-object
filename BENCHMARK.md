@@ -168,21 +168,3 @@ In Tiered mode, concurrent GETs for the same key during NVMe→DRAM promotion ea
           avg       min       p50       p95       p99       max
   Disk reads: 1511649
 ```
-
-## Reference Results (i8ge.48xlarge, 16 NVMe striped, /mnt/bigobj-data)
-
-### fio baseline (16 jobs × iodepth 128, O_DIRECT, io_uring)
-
-| Size | IOPS | Bandwidth | Latency |
-|------|------|-----------|---------|
-| 4KB | 1,400K | 5.5 GB/s | ~1ms |
-| 1MB | 51K | 50 GB/s | ~40ms |
-| 50MB | 960 | 49 GB/s | ~1.9s |
-
-### Module (200 clients, bench-mode, 10s duration)
-
-| Mode | 4KB | 1MB | 50MB |
-|------|-----|-----|------|
-| Dram | ~150K rps | ~150K rps | ~145K rps |
-| Tiered | ~160K rps | ~155K rps | ~165K rps |
-| NVMe | ~150K rps | ~50K rps | TBD |
