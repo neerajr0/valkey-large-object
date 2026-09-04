@@ -25,6 +25,7 @@ set -e
 PORT=""
 NVME_DIR=""
 RUN_FIO=0
+SKIP_FIO=0
 CLIENTS=50
 DURATION=10
 NUM_KEYS=500
@@ -44,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --nvme-dir)      NVME_DIR="$2"; shift 2 ;;
         --modes)         MODES_STR="$2"; shift 2 ;;
         --sizes)         SIZES_STR="$2"; shift 2 ;;
-        --fio)           RUN_FIO=1; shift ;;
+        --skip-fio)      SKIP_FIO=1; shift ;;
         --clients)       CLIENTS="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
         --keys)          NUM_KEYS="$2"; shift 2 ;;
@@ -60,7 +61,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --nvme-dir <DIR>           NVMe directory (required for Tiered/NVMe modes)"
             echo "  --modes <\"Dram Tiered NVMe\">  Modes to run (default: Dram if no nvme-dir; all 3 if nvme-dir)"
             echo "  --sizes <\"4KB 1MB ...\">   Object sizes (default: \"4KB 1MB 50MB\")"
-            echo "  --fio                      Run fio baselines before module bench"
+            echo "  --skip-fio                 Skip fio baselines"
             echo "  --clients <N>              Benchmark clients (default: 50)"
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
@@ -97,6 +98,11 @@ if [ -z "$MODES_STR" ]; then
     else
         MODES_STR="Dram"
     fi
+fi
+
+# Auto-enable fio when nvme-dir is provided
+if [ -n "$NVME_DIR" ] && [ $SKIP_FIO -eq 0 ]; then
+    RUN_FIO=1
 fi
 
 # Validate: Tiered/NVMe modes need nvme-dir
