@@ -253,45 +253,15 @@ fn execute_get_tiered(
     };
 
     // Spawn tokio task for NVMe read + serve (no caching — transient).
+    // Spawn tokio task for NVMe read + serve (no caching — transient).
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
-    match crate::dispatch_mode() {
-        1 => {
-            // MainSubmit: submit to io_uring channel from main thread (immediate).
-            let rx = uring::submit_read(fd, read_op);
-            crate::runtime_handle().spawn(async move {
-                let _keep_alive = stream_ctx;
-                let read_result = rx.await;
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                handle_nvme_read_result(
-                    read_result,
-                    transport,
-                    obj_len,
-                    buf_ptr_usize,
-                    thread_ctx,
-                )
-                .await;
-            });
-        }
-        _ => {
-            // Default (0): submit from tokio task.
-            crate::runtime_handle().spawn(async move {
-                let _keep_alive = stream_ctx;
-                let read_result = uring::submit_read(fd, read_op).await;
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                handle_nvme_read_result(
-                    read_result,
-                    transport,
-                    obj_len,
-                    buf_ptr_usize,
-                    thread_ctx,
-                )
-                .await;
-            });
-        }
-    }
+    crate::runtime_handle().spawn(async move {
+        let _keep_alive = stream_ctx;
+        let read_result = uring::submit_read(fd, read_op).await;
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        handle_nvme_read_result(read_result, transport, obj_len, buf_ptr_usize, thread_ctx).await;
+    });
 }
 
 /// Handle NVMe read result — shared by all dispatch modes.
