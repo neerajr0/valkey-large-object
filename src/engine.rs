@@ -100,9 +100,15 @@ pub fn execute_get(
 fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
-        Some(obj_ctx) if obj_ctx.is_ready() => Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-            dram_pool, &obj_ctx, obj_len,
-        ))),
+        Some(obj_ctx) if obj_ctx.is_ready() => {
+            if crate::bench_mode() {
+                Ok(ValkeyValue::Integer(obj_len as i64))
+            } else {
+                Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                    dram_pool, &obj_ctx, obj_len,
+                )))
+            }
+        }
         Some(_) => {
             panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
         }
@@ -258,11 +264,18 @@ fn execute_get_tiered(
         match read_result {
             Ok(Ok(_bytes_read)) => match transport {
                 Transport::Tcp => {
-                    let data = unsafe {
-                        std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
+                    if crate::bench_mode() {
+                        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                    } else {
+                        let data = unsafe {
+                            std::slice::from_raw_parts(
+                                buf_ptr_usize as *const u8,
+                                obj_len as usize,
+                            )
                             .to_vec()
-                    };
-                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                        };
+                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                    }
                 }
                 Transport::Efa {
                     session,
@@ -700,9 +713,13 @@ fn serve_from_dram(
 ) {
     match transport {
         Transport::Tcp => {
-            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                dram_pool, obj_ctx, obj_len,
-            ))));
+            if crate::bench_mode() {
+                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+            } else {
+                thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                    dram_pool, obj_ctx, obj_len,
+                ))));
+            }
         }
         Transport::Efa {
             session,
