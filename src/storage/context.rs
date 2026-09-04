@@ -13,9 +13,6 @@
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
-
-use super::object_file::ObjectFile;
 
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
@@ -188,11 +185,6 @@ pub struct StreamingContext {
     pub chunks_completed: u32,
     /// Total chunks needed for the full object.
     pub total_chunks: u32,
-    /// Strong `Arc<ObjectFile>` held for a tiered transient READ (keeps the file
-    /// linked + the fd valid for the read's duration). `None` on the SET write
-    /// path (the new file has no committed `ObjectFile` until commit).
-    #[allow(dead_code)]
-    file: Option<Arc<ObjectFile>>,
 }
 
 impl Drop for StreamingContext {
@@ -208,20 +200,14 @@ impl Drop for StreamingContext {
 
 impl StreamingContext {
     /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
-    /// `file` is `Some` for a tiered read (pins the object's file for the read),
-    /// `None` for a SET write.
-    pub fn new(
-        buffers: Vec<SegmentBuffer>,
-        total_len: u64,
-        total_chunks: u32,
-        file: Option<Arc<ObjectFile>>,
-    ) -> Self {
+    /// The context owns only its rotating buffer window; the caller's task holds any
+    /// `Arc<ObjectFile>` pin needed to keep the file/fd alive for the transfer.
+    pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,
             total_len,
             chunks_completed: 0,
             total_chunks,
-            file,
         }
     }
 
@@ -246,6 +232,7 @@ impl StreamingContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // The EFA serve reads a DRAM buffer whose lifetime IS the ObjectContext's
     // (ObjectContext::Drop frees the buffer). The fix clones the Arc<ObjectContext>
@@ -347,7 +334,7 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4, None);
+        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4);
         assert!(!ctx.is_complete());
         assert_eq!(ctx.batch_size(), 2);
 
