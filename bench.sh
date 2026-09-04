@@ -92,7 +92,9 @@ if [ -z "$PORT" ]; then
 fi
 
 # Auto-detect modes if not specified
+MODES_AUTO=0
 if [ -z "$MODES_STR" ]; then
+    MODES_AUTO=1
     if [ -n "$NVME_DIR" ]; then
         MODES_STR="Dram Tiered NVMe"
     else
@@ -100,8 +102,10 @@ if [ -z "$MODES_STR" ]; then
     fi
 fi
 
-# Auto-enable fio when nvme-dir is provided
-if [ -n "$NVME_DIR" ] && [ $SKIP_FIO -eq 0 ]; then
+# fio runs automatically when modes are auto-detected with nvme-dir.
+# When --modes is explicit, fio only runs if --skip-fio is NOT set AND nvme-dir is provided.
+# Use --skip-fio to disable fio in auto mode.
+if [ -n "$NVME_DIR" ] && [ $SKIP_FIO -eq 0 ] && [ $MODES_AUTO -eq 1 ]; then
     RUN_FIO=1
 fi
 
