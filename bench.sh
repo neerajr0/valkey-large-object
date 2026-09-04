@@ -256,7 +256,17 @@ for BENCH_MODE in $MODES_STR; do
             --appendonly no
         sleep 1
 
-        if ! $VALKEY_CLI -p $PORT PING > /dev/null 2>&1; then
+        # Wait for server to be ready (Tiered mode allocates 32GB+ on startup)
+        READY=0
+        for attempt in $(seq 1 30); do
+            if $VALKEY_CLI -p $PORT PING > /dev/null 2>&1; then
+                READY=1
+                break
+            fi
+            sleep 1
+        done
+
+        if [ $READY -eq 0 ]; then
             echo "  ERROR: Server failed to start. Check /tmp/bench-server-$PORT.log"
             tail -5 /tmp/bench-server-$PORT.log 2>/dev/null
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
