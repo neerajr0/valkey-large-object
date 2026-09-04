@@ -233,7 +233,9 @@ if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
             FIO_READS_DELTA=$(( FIO_READS_AFTER - FIO_READS_BEFORE ))
             echo "  Disk reads: $FIO_READS_DELTA"
             if [ $FIO_READS_DELTA -eq 0 ]; then
-                echo "  FAIL: fio produced zero disk reads — check mount point"
+                echo "  FATAL: fio produced zero disk reads — nvme-dir ($NVME_DIR) is likely on the wrong device."
+                echo "         Verify with: df $NVME_DIR"
+                exit 1
             fi
         fi
     done
@@ -349,7 +351,16 @@ for BENCH_MODE in $MODES_STR; do
             echo "  ERROR: Server failed to start. Check /tmp/bench-server-$PORT.log"
             tail -5 /tmp/bench-server-$PORT.log 2>/dev/null
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-            continue
+            exit 1
+        fi
+
+        # Verify this is a fresh server, not a stale one from a previous run.
+        # Server uptime should be < 60 seconds (we just started it).
+        UPTIME_SEC=$($VALKEY_CLI -p $PORT INFO server 2>/dev/null | grep uptime_in_seconds | awk -F: '{print $2}' | tr -d '[:space:]')
+        if [ -n "$UPTIME_SEC" ] && [ "$UPTIME_SEC" -gt 60 ] 2>/dev/null; then
+            echo "  FATAL: Stale server detected (uptime=${UPTIME_SEC}s). Expected fresh server with uptime < 60s."
+            echo "         A previous server is still running on port $PORT. Kill it and retry."
+            exit 1
         fi
 
         # Populate keys via raw RESP
@@ -376,7 +387,14 @@ s.close()
 print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE_KEYS/elapsed:.0f} keys/s)')
 "
 
-        echo "  DBSIZE: $($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')"
+        DBSIZE=$($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')
+        echo "  DBSIZE: $DBSIZE"
+        if [ "$DBSIZE" != "$EFFECTIVE_KEYS" ]; then
+            echo "  FATAL: DBSIZE mismatch — expected $EFFECTIVE_KEYS, got $DBSIZE."
+            echo "         LO.SET populate failed or keys were not stored correctly."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
 
         # Disk read assertion: verify actual NVMe I/O is happening.
         # Detect the block device for nvme-dir (e.g., dm-0 for LVM).
@@ -402,7 +420,9 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
         if [ $? -eq 124 ]; then
-            echo "  TIMEOUT: benchmark did not complete in ${BENCH_TIMEOUT}s"
+            echo "  FATAL: Benchmark timed out after ${BENCH_TIMEOUT}s. Server may be hung or staging pool exhausted."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
         fi
 
         # Disk read assertion
@@ -415,12 +435,18 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
                 # Tiered: first GET promotes each key from NVMe → DRAM. Subsequent GETs are DRAM cache hits.
                 # Expect at least EFFECTIVE_KEYS reads (one promotion per key).
                 if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
-                    echo "  FAIL: Tiered mode expected >= $EFFECTIVE_KEYS disk reads (promotion), got $DISK_READS_DELTA"
+                    echo "  FATAL: Tiered mode disk read mismatch — expected >= $EFFECTIVE_KEYS reads (one promotion per key), got $DISK_READS_DELTA."
+                    echo "         NVMe reads are not happening. Check: wrong mount point, key format mismatch, or code bug in promotion path."
+                    $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                    exit 1
                 fi
             elif [ "$BENCH_MODE" = "NVMe" ]; then
                 # NVMe-only: every GET reads from NVMe. Expect reads >> keys.
                 if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
-                    echo "  FAIL: NVMe mode expected >> $EFFECTIVE_KEYS disk reads, got $DISK_READS_DELTA"
+                    echo "  FATAL: NVMe mode disk read mismatch — expected >> $EFFECTIVE_KEYS reads (every GET reads from disk), got $DISK_READS_DELTA."
+                    echo "         NVMe reads are not happening. Check: wrong mount point, key format mismatch, or bench-mode replying before read."
+                    $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                    exit 1
                 fi
             fi
         fi
