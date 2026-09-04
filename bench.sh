@@ -226,9 +226,9 @@ for BENCH_MODE in $MODES_STR; do
         fi
 
         # NVMe staging must hold concurrent reads: clients × obj_size.
-        # Cap at 4GB to avoid IORING_REGISTER_BUFFERS EFAULT on huge segments.
+        # Cap at 1GB — kernel hard limit per registered buffer (IORING_REGISTER_BUFFERS).
         # Reduce effective clients for very large objects if staging would exceed cap.
-        STAGING_CAP=4294967296  # 4GB
+        STAGING_CAP=1073741824  # 1GB
         STAGING_NEEDED=$(( CLIENTS * BYTES ))
         EFFECTIVE_CLIENTS=$CLIENTS
         if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
