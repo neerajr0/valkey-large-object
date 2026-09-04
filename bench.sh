@@ -349,7 +349,7 @@ s.setsockopt(6, 1, 1)
 payload = os.urandom($BYTES)
 start = time.monotonic()
 for i in range($EFFECTIVE_KEYS):
-    s.sendall(resp('LO.SET', f'k:{i:012d}', payload))
+    s.sendall(resp('LO.SET', f'k:{i}', payload))
     r = s.recv(1024)
 elapsed = time.monotonic() - start
 s.close()
