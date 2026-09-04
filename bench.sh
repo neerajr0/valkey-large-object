@@ -470,7 +470,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
 
         # Print the results
-        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -E "throughput summary|avg.*min.*p50" || true
+        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -A2 "throughput summary" || true
 
         # Assert benchmark completed and produced results
         if [ $BENCH_EXIT -eq 124 ]; then
