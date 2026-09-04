@@ -176,7 +176,7 @@ echo "=============================================="
 echo "ValkeyLargeObj Benchmark"
 echo "=============================================="
 echo "Port:           $PORT"
-echo "Modes:          $MODES_STR"
+echo "Modes:          $([ $RUN_FIO -eq 1 ] && echo "fio ")$MODES_STR"
 echo "Sizes:          ${SIZES_LABEL[*]}"
 echo "Clients:        $CLIENTS"
 echo "Duration:       ${DURATION}s"
@@ -192,16 +192,27 @@ echo ""
 # ─── fio baseline ─────────────────────────────────────────────────────────────
 
 if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
+    echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "fio baseline (O_DIRECT random read, io_uring)"
+    echo "  Mode: fio baseline (O_DIRECT random read, io_uring)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Detect block device for disk read assertion
+    FIO_BLOCK_DEV=$(basename "$(readlink -f "$(df "$NVME_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
+    FIO_STAT_FILE="/sys/block/${FIO_BLOCK_DEV}/stat"
 
     FIO_FILE="$NVME_DIR/fio_testfile"
     for i in "${!SIZES_LABEL[@]}"; do
         LABEL="${SIZES_LABEL[$i]}"
         BYTES="${SIZES_BYTES[$i]}"
         echo ""
-        echo "--- fio: $LABEL random read ---"
+        echo "  ── fio: $LABEL random read ──"
+
+        FIO_READS_BEFORE=""
+        if [ -f "$FIO_STAT_FILE" ]; then
+            FIO_READS_BEFORE=$(awk '{print $1}' "$FIO_STAT_FILE")
+        fi
+
         fio --name="randread_${LABEL}" \
             --filename="$FIO_FILE" \
             --size=4294967296 \
@@ -216,6 +227,15 @@ if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
             --group_reporting \
             --output-format=terse \
             2>/dev/null | awk -F';' '{printf "  IOPS: %s  BW: %s KB/s  lat_avg: %s us\n", $8, $7, $16}'
+
+        if [ -n "$FIO_READS_BEFORE" ] && [ -f "$FIO_STAT_FILE" ]; then
+            FIO_READS_AFTER=$(awk '{print $1}' "$FIO_STAT_FILE")
+            FIO_READS_DELTA=$(( FIO_READS_AFTER - FIO_READS_BEFORE ))
+            echo "  Disk reads: $FIO_READS_DELTA"
+            if [ $FIO_READS_DELTA -eq 0 ]; then
+                echo "  FAIL: fio produced zero disk reads — check mount point"
+            fi
+        fi
     done
     rm -f "$FIO_FILE"
     echo ""
