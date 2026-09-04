@@ -214,8 +214,19 @@ for BENCH_MODE in $MODES_STR; do
         LABEL="${SIZES_LABEL[$i]}"
         BYTES="${SIZES_BYTES[$i]}"
 
+        # Scale key count for large objects to keep populate time reasonable.
+        # 50MB × 500 = 25GB over TCP is unrealistic. Target ~10s populate time.
+        EFFECTIVE_KEYS=$NUM_KEYS
+        if [ $BYTES -ge 52428800 ]; then
+            EFFECTIVE_KEYS=20   # 50MB: 20 keys = 1GB, ~10s populate
+        elif [ $BYTES -ge 16777216 ]; then
+            EFFECTIVE_KEYS=50   # 16MB: 50 keys
+        elif [ $BYTES -ge 4194304 ]; then
+            EFFECTIVE_KEYS=100  # 4MB: 100 keys
+        fi
+
         echo ""
-        echo "  ── $LABEL ($BYTES bytes) ──"
+        echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS]"
 
         # Build module args based on mode
         case "$BENCH_MODE" in
@@ -295,18 +306,18 @@ s = socket.socket(); s.connect(('127.0.0.1', $PORT))
 s.setsockopt(6, 1, 1)
 payload = os.urandom($BYTES)
 start = time.monotonic()
-for i in range($NUM_KEYS):
+for i in range($EFFECTIVE_KEYS):
     s.sendall(resp('LO.SET', f'k:{i:012d}', payload))
     r = s.recv(1024)
 elapsed = time.monotonic() - start
 s.close()
-print(f'  Populated $NUM_KEYS keys ($LABEL) in {elapsed:.1f}s ({$NUM_KEYS/elapsed:.0f} keys/s)')
+print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE_KEYS/elapsed:.0f} keys/s)')
 "
 
         echo "  DBSIZE: $($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')"
 
         # LO.GET benchmark
-        $VALKEY_BENCH -p $PORT --duration $DURATION -c $CLIENTS -r $NUM_KEYS \
+        $VALKEY_BENCH -p $PORT --duration $DURATION -c $CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
 
         # Shutdown
