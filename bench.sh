@@ -416,27 +416,31 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 
         # LO.GET benchmark (timeout = duration + 30s grace)
         BENCH_TIMEOUT=$(( DURATION + 30 ))
-        BENCH_OUTPUT=$(timeout $BENCH_TIMEOUT \
+        BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
+        timeout $BENCH_TIMEOUT \
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-            -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n')
+            -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1
         BENCH_EXIT=$?
 
         # Print the results
-        echo "$BENCH_OUTPUT" | grep -E "throughput summary|avg.*min.*p50"
+        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -E "throughput summary|avg.*min.*p50"
 
         # Assert benchmark completed and produced results
         if [ $BENCH_EXIT -eq 124 ]; then
             echo "  FATAL: Benchmark timed out after ${BENCH_TIMEOUT}s. Server may be hung or staging pool exhausted."
+            rm -f "$BENCH_TMPFILE"
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
-        if ! echo "$BENCH_OUTPUT" | grep -q "throughput summary"; then
+        if ! tr '\r' '\n' < "$BENCH_TMPFILE" | grep -q "throughput summary"; then
             echo "  FATAL: Benchmark produced no throughput results."
             echo "         Raw output:"
-            echo "$BENCH_OUTPUT" | tail -10
+            tr '\r' '\n' < "$BENCH_TMPFILE" | tail -10
+            rm -f "$BENCH_TMPFILE"
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
+        rm -f "$BENCH_TMPFILE"
 
         # Disk read assertion
         if [ -n "$DISK_READS_BEFORE" ] && [ -f "$STAT_FILE" ]; then
