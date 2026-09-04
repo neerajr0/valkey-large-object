@@ -270,7 +270,8 @@ fn execute_get_tiered(
                     obj_len,
                     buf_ptr_usize,
                     thread_ctx,
-                );
+                )
+                .await;
             });
         }
         _ => {
@@ -286,7 +287,8 @@ fn execute_get_tiered(
                     obj_len,
                     buf_ptr_usize,
                     thread_ctx,
-                );
+                )
+                .await;
             });
         }
     }
