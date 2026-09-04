@@ -308,7 +308,7 @@ for BENCH_MODE in $MODES_STR; do
 
         echo ""
         echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, clients=$EFFECTIVE_CLIENTS]"
-        echo "     mode=$BENCH_MODE dram=$((DRAM_MAXMEMORY / 1048576))MB seg=$((DRAM_SEGMENT_SIZE / 1048576))MB staging=$((STAGING_NEEDED / 1048576))MB workers=$WORKER_THREADS io-threads=$IO_THREADS"
+        echo "     mode=$BENCH_MODE dram-maxmemory=$((DRAM_MAXMEMORY / 1048576))MB dram-segment-size=$((DRAM_SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
 
         # Build module args based on mode
         case "$BENCH_MODE" in
