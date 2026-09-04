@@ -116,6 +116,25 @@ for m in $MODES_STR; do
 done
 
 MODULE_SO="${MODULE_SO:-$(dirname "$0")/target/release/libvalkey_largeobj.so}"
+
+# Verify nvme-dir is NOT on the root disk (common mistake: /data falls through to /)
+if [ -n "$NVME_DIR" ]; then
+    mkdir -p "$NVME_DIR"
+    NVME_DEV=$(df "$NVME_DIR" 2>/dev/null | tail -1 | awk '{print $1}')
+    ROOT_DEV=$(df / 2>/dev/null | tail -1 | awk '{print $1}')
+    if [ "$NVME_DEV" = "$ROOT_DEV" ]; then
+        echo "WARNING: --nvme-dir ($NVME_DIR) is on the ROOT disk ($ROOT_DEV)!"
+        echo "         NVMe benchmark results will be wrong. Use a path on the NVMe stripe."
+        echo "         Example: --nvme-dir /mnt/bigobj-data/bench-test"
+        echo ""
+        read -p "Continue anyway? [y/N] " -r
+        if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    else
+        echo "NVMe device:    $NVME_DEV ($(df -h "$NVME_DIR" | tail -1 | awk '{print $2}'))"
+    fi
+fi
 VALKEY_SERVER="${VALKEY_SERVER:-valkey-server}"
 VALKEY_CLI="${VALKEY_CLI:-valkey-cli}"
 VALKEY_BENCH="${VALKEY_BENCH:-valkey-benchmark}"
@@ -230,6 +249,8 @@ for BENCH_MODE in $MODES_STR; do
         # Reduce effective clients for very large objects if staging would exceed cap.
         STAGING_CAP=1073741824  # 1GB
         STAGING_NEEDED=$(( CLIENTS * BYTES ))
+        # Add 20% headroom for talc allocator metadata
+        STAGING_NEEDED=$(( STAGING_NEEDED + STAGING_NEEDED / 5 ))
         EFFECTIVE_CLIENTS=$CLIENTS
         if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
             EFFECTIVE_CLIENTS=$(( STAGING_CAP / BYTES ))
@@ -337,9 +358,14 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 
         echo "  DBSIZE: $($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')"
 
-        # LO.GET benchmark
-        $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
+        # LO.GET benchmark (timeout = duration + 30s grace)
+        BENCH_TIMEOUT=$(( DURATION + 30 ))
+        timeout $BENCH_TIMEOUT \
+            $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
+        if [ $? -eq 124 ]; then
+            echo "  TIMEOUT: benchmark did not complete in ${BENCH_TIMEOUT}s"
+        fi
 
         # Shutdown — wait for process to fully exit before next iteration.
         # With 32GB+ allocated, process exit can take several seconds.
@@ -350,6 +376,9 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             fi
             sleep 1
         done
+        # Force kill if graceful shutdown didn't work
+        pkill -9 -f "valkey-server.*port $PORT" 2>/dev/null || true
+        sleep 2
     done
 done
 
