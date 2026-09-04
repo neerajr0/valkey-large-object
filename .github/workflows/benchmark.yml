@@ -36,7 +36,8 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.pr.outputs.ref }}
+          ref: ${{ steps.pr.outputs.sha }}
+          persist-credentials: false
 
       - name: Build
         run: cargo build --release

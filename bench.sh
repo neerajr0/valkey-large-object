@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --nvme-dir <DIR>           NVMe directory (required for Tiered/NVMe modes)"
             echo "  --modes <\"fio Dram ...\"> Modes to run (default: Dram; with nvme-dir: fio Dram Tiered NVMe)"
             echo "  --sizes <\"4KB 1MB ...\">   Object sizes (default: \"4KB 1MB 50MB\")"
-            echo "  --clients <N>              Benchmark clients (default: 50)"
+            echo "  --clients <N>              Benchmark clients (default: 200)"
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
             echo "  --dram-maxmemory <BYTES>   DRAM budget in bytes (default: 34359738368 = 32GB)"
@@ -432,11 +432,11 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         # LO.GET benchmark (timeout = duration + 30s grace)
         BENCH_TIMEOUT=$(( DURATION + 30 ))
         BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
+        BENCH_EXIT=0
         timeout $BENCH_TIMEOUT \
             taskset -c $BENCH_CPUS \
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-            -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1
-        BENCH_EXIT=$?
+            -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
 
         # Print the results
         tr '\r' '\n' < "$BENCH_TMPFILE" | grep -E "throughput summary|avg.*min.*p50"
