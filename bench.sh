@@ -25,7 +25,6 @@ set -e
 PORT=""
 NVME_DIR=""
 RUN_FIO=0
-SKIP_FIO=0
 CLIENTS=200
 DURATION=10
 NUM_KEYS=500
@@ -45,7 +44,6 @@ while [[ $# -gt 0 ]]; do
         --nvme-dir)      NVME_DIR="$2"; shift 2 ;;
         --modes)         MODES_STR="$2"; shift 2 ;;
         --sizes)         SIZES_STR="$2"; shift 2 ;;
-        --skip-fio)      SKIP_FIO=1; shift ;;
         --clients)       CLIENTS="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
         --keys)          NUM_KEYS="$2"; shift 2 ;;
@@ -59,9 +57,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --port <PORT>              Valkey server port (required)"
             echo "  --nvme-dir <DIR>           NVMe directory (required for Tiered/NVMe modes)"
-            echo "  --modes <\"Dram Tiered NVMe\">  Modes to run (default: Dram if no nvme-dir; all 3 if nvme-dir)"
+            echo "  --modes <\"fio Dram ...\"> Modes to run (default: Dram; with nvme-dir: fio Dram Tiered NVMe)"
             echo "  --sizes <\"4KB 1MB ...\">   Object sizes (default: \"4KB 1MB 50MB\")"
-            echo "  --skip-fio                 Skip fio baselines"
             echo "  --clients <N>              Benchmark clients (default: 50)"
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
@@ -92,22 +89,21 @@ if [ -z "$PORT" ]; then
 fi
 
 # Auto-detect modes if not specified
-MODES_AUTO=0
 if [ -z "$MODES_STR" ]; then
-    MODES_AUTO=1
     if [ -n "$NVME_DIR" ]; then
-        MODES_STR="Dram Tiered NVMe"
+        MODES_STR="fio Dram Tiered NVMe"
     else
         MODES_STR="Dram"
     fi
 fi
 
-# fio runs automatically when modes are auto-detected with nvme-dir.
-# When --modes is explicit, fio only runs if --skip-fio is NOT set AND nvme-dir is provided.
-# Use --skip-fio to disable fio in auto mode.
-if [ -n "$NVME_DIR" ] && [ $SKIP_FIO -eq 0 ] && [ $MODES_AUTO -eq 1 ]; then
-    RUN_FIO=1
-fi
+# fio runs if it's in MODES_STR
+RUN_FIO=0
+for m in $MODES_STR; do
+    if [ "$m" = "fio" ]; then
+        RUN_FIO=1
+    fi
+done
 
 # Validate: Tiered/NVMe modes need nvme-dir
 for m in $MODES_STR; do
