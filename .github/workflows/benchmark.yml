@@ -11,7 +11,8 @@ jobs:
   bench:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/bench')
+      contains(github.event.comment.body, '/bench') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, i8ge]
     steps:
       - name: React with eyes (in progress)
