@@ -690,7 +690,7 @@ async fn do_tiered_nvme_write(
     if crate::direct_io() {
         write_flags |= libc::O_DIRECT;
     }
-    // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
+    // FdPool intentionally not used on SET path — fd cached lazily on first GET via ensure_open.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if raw_fd < 0 {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
