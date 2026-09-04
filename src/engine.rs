@@ -290,8 +290,14 @@ async fn handle_nvme_read_result(
                 rkey,
                 remote_addr,
             } => {
-                match efa_write_to_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr)
-                    .await
+                match efa_write_to_client(
+                    session,
+                    buf_ptr_usize,
+                    obj_len as usize,
+                    rkey,
+                    remote_addr,
+                )
+                .await
                 {
                     Ok(()) => {
                         thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
