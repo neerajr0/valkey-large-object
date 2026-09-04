@@ -126,7 +126,7 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | `--nvme-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
 | `--worker-threads` | 2 | Tokio worker threads. |
 
-Config values in bench.sh are passed as **raw bytes**. The module config API also accepts memory notation (e.g., `1gb`) via `CONFIG SET`, but module load args require numeric values.
+Config values in bench.sh use **raw bytes** for module load args. The module also accepts memory notation (e.g., `1gb`) via `CONFIG SET` at runtime.
 
 ## Environment Overrides
 

@@ -423,6 +423,9 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             exit 1
         fi
 
+        # Reset stats before benchmark to get clean hit/miss counts
+        $VALKEY_CLI -p $PORT CONFIG RESETSTAT > /dev/null 2>&1
+
         # Disk read assertion: verify actual NVMe I/O is happening.
         # Detect the block device for nvme-dir (e.g., dm-0 for LVM).
         DISK_READS_BEFORE=""
@@ -494,6 +497,17 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
                     exit 1
                 fi
             fi
+        fi
+
+        # Cache hit/miss assertion: verify benchmark is hitting real keys, not returning nil.
+        CACHE_HITS=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_hits | awk -F: '{print $2}' | tr -d '[:space:]')
+        CACHE_MISSES=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_misses | awk -F: '{print $2}' | tr -d '[:space:]')
+        echo "  Cache hits: ${CACHE_HITS:-0}, misses: ${CACHE_MISSES:-0}"
+        if [ -n "$CACHE_MISSES" ] && [ "$CACHE_MISSES" -gt 0 ] 2>/dev/null; then
+            echo "  FATAL: $CACHE_MISSES cache misses detected — benchmark is querying non-existent keys."
+            echo "         Key format mismatch between populate (k:{i:012d}) and valkey-benchmark (k:__rand_int__)."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
         fi
 
         # Shutdown — wait for process to fully exit before next iteration.
