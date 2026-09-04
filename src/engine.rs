@@ -253,7 +253,6 @@ fn execute_get_tiered(
     };
 
     // Spawn tokio task for NVMe read + serve (no caching — transient).
-    // Spawn tokio task for NVMe read + serve (no caching — transient).
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
@@ -264,7 +263,8 @@ fn execute_get_tiered(
     });
 }
 
-/// Handle NVMe read result — shared by all dispatch modes.
+/// Handle NVMe read result — reply to the blocked client based on the io_uring
+/// completion result and transport type. Shared across GET paths that read from NVMe.
 async fn handle_nvme_read_result(
     read_result: Result<Result<u64, storage::StorageError>, tokio::sync::oneshot::error::RecvError>,
     transport: Transport,
@@ -308,6 +308,7 @@ async fn handle_nvme_read_result(
                 }
             }
         },
+        // io_uring read completed with an error (EIO, short read, etc.)
         Ok(Err(e)) => {
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
@@ -315,6 +316,9 @@ async fn handle_nvme_read_result(
                 e
             ))));
         }
+        // RecvError: io_uring poller thread dropped the oneshot sender.
+        // This means the poller panicked or shut down unexpectedly.
+        // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
         }
