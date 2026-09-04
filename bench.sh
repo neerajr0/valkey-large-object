@@ -278,6 +278,13 @@ for BENCH_MODE in $MODES_STR; do
             find "$NVME_DIR" -name "*.dat" -delete 2>/dev/null || true
         fi
 
+        # Kill any stale server on this port from a previous run
+        $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+        sleep 1
+        # Force kill if graceful shutdown didn't work
+        pkill -f "valkey-server.*port $PORT" 2>/dev/null || true
+        sleep 1
+
         # Start server
         $VALKEY_SERVER --port $PORT --daemonize yes \
             --logfile /tmp/bench-server-$PORT.log \
@@ -334,9 +341,15 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
 
-        # Shutdown
+        # Shutdown — wait for process to fully exit before next iteration.
+        # With 32GB+ allocated, process exit can take several seconds.
         $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-        sleep 1
+        for attempt in $(seq 1 15); do
+            if ! $VALKEY_CLI -p $PORT PING > /dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
     done
 done
 
