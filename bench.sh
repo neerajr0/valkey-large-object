@@ -150,6 +150,13 @@ for bin in "$VALKEY_SERVER" "$VALKEY_CLI" "$VALKEY_BENCH"; do
     fi
 done
 
+if [ $RUN_FIO -eq 1 ]; then
+    if ! command -v fio &>/dev/null; then
+        echo "ERROR: fio not found in PATH (required for fio mode)"
+        exit 1
+    fi
+fi
+
 if [ ! -f "$MODULE_SO" ]; then
     echo "ERROR: Module not found at $MODULE_SO. Build with: cargo build --release"
     exit 1
@@ -179,7 +186,7 @@ echo "=============================================="
 echo "ValkeyLargeObj Benchmark"
 echo "=============================================="
 echo "Port:           $PORT"
-echo "Modes:          $([ $RUN_FIO -eq 1 ] && echo "fio ")$MODES_STR"
+echo "Modes:          $MODES_STR"
 echo "Sizes:          ${SIZES_LABEL[*]}"
 echo "Clients:        $CLIENTS"
 echo "Duration:       ${DURATION}s"
@@ -241,6 +248,7 @@ if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
             if [ $FIO_READS_DELTA -eq 0 ]; then
                 echo "  FATAL: fio produced zero disk reads — nvme-dir ($NVME_DIR) is likely on the wrong device."
                 echo "         Verify with: df $NVME_DIR"
+                rm -f "$FIO_FILE"
                 exit 1
             fi
         fi
@@ -252,6 +260,10 @@ fi
 # ─── Benchmark loop: modes × sizes ───────────────────────────────────────────
 
 for BENCH_MODE in $MODES_STR; do
+    # fio runs separately above, skip it in the module loop
+    if [ "$BENCH_MODE" = "fio" ]; then
+        continue
+    fi
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Mode: $BENCH_MODE"
@@ -439,7 +451,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
 
         # Print the results
-        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -E "throughput summary|avg.*min.*p50"
+        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -E "throughput summary|avg.*min.*p50" || true
 
         # Assert benchmark completed and produced results
         if [ $BENCH_EXIT -eq 124 ]; then

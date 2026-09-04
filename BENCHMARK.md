@@ -97,9 +97,9 @@ Scaled by object size to keep populate time reasonable:
 
 | Object Size | Keys |
 |-------------|------|
-| ≤ 4MB | 500 |
-| 4MB - 16MB | 100 |
-| 16MB - 50MB | 50 |
+| < 4MB | 500 |
+| 4MB – 15MB | 100 |
+| 16MB – 49MB | 50 |
 | ≥ 50MB | 20 |
 
 ### NVMe Staging
