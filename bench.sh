@@ -385,7 +385,12 @@ for BENCH_MODE in $MODES_STR; do
         # Verify this is a fresh server, not a stale one from a previous run.
         # Server uptime should be < 60 seconds (we just started it).
         UPTIME_SEC=$($VALKEY_CLI -p $PORT INFO server 2>/dev/null | grep uptime_in_seconds | awk -F: '{print $2}' | tr -d '[:space:]')
-        if [ -n "$UPTIME_SEC" ] && [ "$UPTIME_SEC" -gt 60 ] 2>/dev/null; then
+        if [ -z "$UPTIME_SEC" ] || ! echo "$UPTIME_SEC" | grep -qE '^[0-9]+$'; then
+            echo "  FATAL: Could not read server uptime (got '$UPTIME_SEC'). Server may not be responding."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
+        if [ "$UPTIME_SEC" -gt 60 ]; then
             echo "  FATAL: Stale server detected (uptime=${UPTIME_SEC}s). Expected fresh server with uptime < 60s."
             echo "         A previous server is still running on port $PORT. Kill it and retry."
             exit 1
@@ -416,6 +421,11 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 "
 
         DBSIZE=$($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')
+        if [ -z "$DBSIZE" ] || ! echo "$DBSIZE" | grep -qE '^[0-9]+$'; then
+            echo "  FATAL: Could not read DBSIZE (got '$DBSIZE'). Server may not be responding."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
         echo "  DBSIZE: $DBSIZE"
         if [ "$DBSIZE" != "$EFFECTIVE_KEYS" ]; then
             echo "  FATAL: DBSIZE mismatch — expected $EFFECTIVE_KEYS, got $DBSIZE."
@@ -503,9 +513,28 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         # Cache hit/miss assertion: verify benchmark is hitting real keys, not returning nil.
         CACHE_HITS=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_hits | awk -F: '{print $2}' | tr -d '[:space:]')
         CACHE_MISSES=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_misses | awk -F: '{print $2}' | tr -d '[:space:]')
-        echo "  Cache hits: ${CACHE_HITS:-0}, misses: ${CACHE_MISSES:-0}"
-        if [ -n "$CACHE_MISSES" ] && [ "$CACHE_MISSES" -gt 0 ] 2>/dev/null; then
-            echo "  FATAL: $CACHE_MISSES cache misses detected — benchmark is querying non-existent keys."
+        echo "  Cache hits: ${CACHE_HITS:-<missing>}, misses: ${CACHE_MISSES:-<missing>}"
+
+        # Validate stats are present and numeric
+        if [ -z "$CACHE_HITS" ] || ! echo "$CACHE_HITS" | grep -qE '^[0-9]+$'; then
+            echo "  FATAL: keyspace_hits is missing or non-numeric ('$CACHE_HITS'). Server stats unavailable."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
+        if [ -z "$CACHE_MISSES" ] || ! echo "$CACHE_MISSES" | grep -qE '^[0-9]+$'; then
+            echo "  FATAL: keyspace_misses is missing or non-numeric ('$CACHE_MISSES'). Server stats unavailable."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
+        # Hits must be > 0 (proves LO.GET actually ran and found keys)
+        if [ "$CACHE_HITS" -eq 0 ]; then
+            echo "  FATAL: 0 cache hits — benchmark did not perform any valid key lookups."
+            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+            exit 1
+        fi
+        # Any miss = keys don't match
+        if [ "$CACHE_MISSES" -gt 0 ]; then
+            echo "  FATAL: $CACHE_MISSES cache misses — benchmark is querying non-existent keys."
             echo "         Key format mismatch between populate (k:{i:012d}) and valkey-benchmark (k:__rand_int__)."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
