@@ -226,14 +226,21 @@ for BENCH_MODE in $MODES_STR; do
         fi
 
         # NVMe staging must hold concurrent reads: clients × obj_size.
-        # Round up to nearest 64MB segment boundary.
+        # Cap at 4GB to avoid IORING_REGISTER_BUFFERS EFAULT on huge segments.
+        # Reduce effective clients for very large objects if staging would exceed cap.
+        STAGING_CAP=4294967296  # 4GB
         STAGING_NEEDED=$(( CLIENTS * BYTES ))
+        EFFECTIVE_CLIENTS=$CLIENTS
+        if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
+            EFFECTIVE_CLIENTS=$(( STAGING_CAP / BYTES ))
+            STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES ))
+        fi
         if [ $STAGING_NEEDED -lt 67108864 ]; then
             STAGING_NEEDED=67108864  # minimum 64MB
         fi
 
         echo ""
-        echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, staging=$((STAGING_NEEDED / 1048576))MB]"
+        echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, clients=$EFFECTIVE_CLIENTS, staging=$((STAGING_NEEDED / 1048576))MB]"
 
         # Build module args based on mode
         case "$BENCH_MODE" in
@@ -324,7 +331,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         echo "  DBSIZE: $($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')"
 
         # LO.GET benchmark
-        $VALKEY_BENCH -p $PORT --duration $DURATION -c $CLIENTS -r $EFFECTIVE_KEYS \
+        $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
 
         # Shutdown
