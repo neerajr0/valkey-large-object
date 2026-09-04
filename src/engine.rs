@@ -255,66 +255,92 @@ fn execute_get_tiered(
     // Spawn tokio task for NVMe read + serve (no caching — transient).
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
-    crate::runtime_handle().spawn(async move {
-        let _keep_alive = stream_ctx;
-
-        let read_result = uring::submit_read(fd, read_op).await;
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-
-        match read_result {
-            Ok(Ok(_bytes_read)) => match transport {
-                Transport::Tcp => {
-                    if crate::bench_mode() {
-                        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                    } else {
-                        let data = unsafe {
-                            std::slice::from_raw_parts(
-                                buf_ptr_usize as *const u8,
-                                obj_len as usize,
-                            )
-                            .to_vec()
-                        };
-                        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
-                    }
-                }
-                Transport::Efa {
-                    session,
-                    rkey,
-                    remote_addr,
-                } => {
-                    match efa_write_to_client(
-                        session,
-                        buf_ptr_usize,
-                        obj_len as usize,
-                        rkey,
-                        remote_addr,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                        }
-                        Err(e) => {
-                            thread_ctx.reply(Err(e));
-                        }
-                    }
-                }
-            },
-            Ok(Err(e)) => {
-                thread_ctx.reply(Err(ValkeyError::String(format!(
-                    "{}: {}",
-                    errors::ERR_NVME_READ,
-                    e
-                ))));
-            }
-            // RecvError: io_uring poller thread dropped the oneshot sender.
-            // This means the poller panicked or shut down unexpectedly.
-            // TODO: Add error metric counter for poller channel failures.
-            Err(_) => {
-                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
-            }
+    match crate::dispatch_mode() {
+        1 => {
+            // MainSubmit: submit to io_uring channel from main thread (immediate).
+            let rx = uring::submit_read(fd, read_op);
+            crate::runtime_handle().spawn(async move {
+                let _keep_alive = stream_ctx;
+                let read_result = rx.await;
+                let thread_ctx =
+                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+                handle_nvme_read_result(
+                    read_result,
+                    transport,
+                    obj_len,
+                    buf_ptr_usize,
+                    thread_ctx,
+                );
+            });
         }
-    });
+        _ => {
+            // Default (0): submit from tokio task.
+            crate::runtime_handle().spawn(async move {
+                let _keep_alive = stream_ctx;
+                let read_result = uring::submit_read(fd, read_op).await;
+                let thread_ctx =
+                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+                handle_nvme_read_result(
+                    read_result,
+                    transport,
+                    obj_len,
+                    buf_ptr_usize,
+                    thread_ctx,
+                );
+            });
+        }
+    }
+}
+
+/// Handle NVMe read result — shared by all dispatch modes.
+async fn handle_nvme_read_result(
+    read_result: Result<Result<u64, storage::StorageError>, tokio::sync::oneshot::error::RecvError>,
+    transport: Transport,
+    obj_len: u64,
+    buf_ptr_usize: usize,
+    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+) {
+    match read_result {
+        Ok(Ok(_bytes_read)) => match transport {
+            Transport::Tcp => {
+                if crate::bench_mode() {
+                    thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                } else {
+                    let data = unsafe {
+                        std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
+                            .to_vec()
+                    };
+                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                }
+            }
+            Transport::Efa {
+                session,
+                rkey,
+                remote_addr,
+            } => {
+                match efa_write_to_client(session, buf_ptr_usize, obj_len as usize, rkey, remote_addr)
+                    .await
+                {
+                    Ok(()) => {
+                        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                    }
+                    Err(e) => {
+                        thread_ctx.reply(Err(e));
+                    }
+                }
+            }
+        },
+        Ok(Err(e)) => {
+            thread_ctx.reply(Err(ValkeyError::String(format!(
+                "{}: {}",
+                errors::ERR_NVME_READ,
+                e
+            ))));
+        }
+        Err(_) => {
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+        }
+    }
 }
 
 // ─── SET Engine ──────────────────────────────────────────────────────────────

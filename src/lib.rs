@@ -114,6 +114,9 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    /// Dispatch mode for NVMe I/O: 0=Default (submit from tokio), 1=MainSubmit (submit from main thread).
+    static ref CFG_DISPATCH_MODE: AtomicI64 = AtomicI64::new(0);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -171,6 +174,10 @@ pub fn operating_mode() -> OperatingMode {
     *CFG_OPERATING_MODE
         .lock()
         .expect("CFG_OPERATING_MODE lock unavailable")
+}
+
+pub fn dispatch_mode() -> i64 {
+    CFG_DISPATCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -301,6 +308,8 @@ valkey_module! {
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
+             ConfigurationFlags::IMMUTABLE, None, None],
+            ["dispatch-mode", &*CFG_DISPATCH_MODE, 0, 0, 1,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
