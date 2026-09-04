@@ -28,13 +28,13 @@ RUN_FIO=0
 CLIENTS=50
 DURATION=10
 NUM_KEYS=500
-DRAM_MAXMEMORY="1073741824"       # 1GB
+DRAM_MAXMEMORY="34359738368"       # 32GB
 DRAM_SEGMENT_SIZE="67108864"      # 64MB
-NVME_MAXMEMORY="10737418240"     # 10GB
+NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
 WORKER_THREADS=2
 MODES_STR=""                      # empty = auto (Dram if no nvme-dir; all 3 if nvme-dir)
-SIZES_STR="4KB 50KB 256KB 1MB"
+SIZES_STR="4KB 1MB 50MB"
 
 # ─── Parse args ───────────────────────────────────────────────────────────────
 
@@ -59,14 +59,14 @@ while [[ $# -gt 0 ]]; do
             echo "  --port <PORT>              Valkey server port (required)"
             echo "  --nvme-dir <DIR>           NVMe directory (required for Tiered/NVMe modes)"
             echo "  --modes <\"Dram Tiered NVMe\">  Modes to run (default: Dram if no nvme-dir; all 3 if nvme-dir)"
-            echo "  --sizes <\"4KB 50KB ...\">   Object sizes (default: \"4KB 50KB 256KB 1MB\")"
+            echo "  --sizes <\"4KB 1MB ...\">   Object sizes (default: \"4KB 1MB 50MB\")"
             echo "  --fio                      Run fio baselines before module bench"
             echo "  --clients <N>              Benchmark clients (default: 50)"
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
-            echo "  --dram-maxmemory <BYTES>   DRAM budget in bytes (default: 1073741824 = 1GB)"
+            echo "  --dram-maxmemory <BYTES>   DRAM budget in bytes (default: 34359738368 = 32GB)"
             echo "  --dram-segment-size <BYTES> Segment size in bytes (default: 67108864 = 64MB)"
-            echo "  --nvme-maxmemory <BYTES>   NVMe budget in bytes (default: 10737418240 = 10GB)"
+            echo "  --nvme-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
             echo ""
             echo "Modes:"
@@ -243,8 +243,8 @@ for BENCH_MODE in $MODES_STR; do
 
         # Clean nvme-dir for Tiered/NVMe modes
         if [ "$BENCH_MODE" = "Tiered" ] || [ "$BENCH_MODE" = "NVMe" ]; then
-            rm -rf "$NVME_DIR"
             mkdir -p "$NVME_DIR"
+            find "$NVME_DIR" -name "*.dat" -delete 2>/dev/null || true
         fi
 
         # Start server
