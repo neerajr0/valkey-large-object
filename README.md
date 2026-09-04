@@ -90,19 +90,21 @@ TEST_PATTERN=test_lo_set_get_roundtrip ./build.sh test
 ## Benchmark
 
 ```bash
-# Dram mode benchmark
-./bench.sh --mode Dram --port 7380 --sizes "4KB 1MB"
+# Dram mode benchmark (no NVMe needed)
+./bench.sh --port 7380
 
-# Tiered mode benchmark (requires NVMe mount)
-./bench.sh --mode Tiered --nvme-dir /mnt/nvme-data --port 7380
+# All 3 modes on NVMe stripe (i8ge: /mnt/bigobj-data)
+./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test
 
-# With fio baselines
-./bench.sh --mode Tiered --nvme-dir /mnt/nvme-data --port 7380 --fio
+# Skip fio baselines
+./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test --skip-fio
 
 # Custom parameters
-./bench.sh --mode Tiered --nvme-dir /mnt/nvme-data --port 7380 \
-    --sizes "4KB 50KB 1MB" --clients 500 --duration 15 --keys 1000
+./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test \
+    --sizes "4KB 1MB 50MB" --clients 500 --duration 15 --keys 1000
 ```
+
+**IMPORTANT:** `--nvme-dir` must point to a directory on the actual NVMe stripe (e.g., `/mnt/bigobj-data`), NOT the root disk. Verify with `df <path>`.
 
 ## License
 
