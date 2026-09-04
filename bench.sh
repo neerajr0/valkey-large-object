@@ -452,6 +452,11 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             fi
             if [ -f "$STAT_FILE" ]; then
                 DISK_READS_BEFORE=$(awk '{print $1}' "$STAT_FILE")
+            else
+                echo "  FATAL: Cannot find block device stat file for $NVME_DIR (tried $STAT_FILE)."
+                echo "         Cannot verify NVMe I/O. Check mount point with: df $NVME_DIR"
+                $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                exit 1
             fi
         fi
 
