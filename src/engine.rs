@@ -273,8 +273,9 @@ fn execute_get_tiered(
         }
     };
 
-    // Transient read StreamingContext pins the file for the read.
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1, Some(file.clone()));
+    // Transient read StreamingContext owns only the NVMe buffer; the file pin is
+    // held by the spawned task (see `_keep_alive` below).
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let fd_pool = storage::get_fd_pool();
     let fd = match fd_pool.ensure_open(&file, &crate::nvme_dir()) {
@@ -300,7 +301,8 @@ fn execute_get_tiered(
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
-        let _keep_alive = stream_ctx;
+        // Pin the buffer (stream_ctx) and the file for the transfer's duration.
+        let _keep_alive = (stream_ctx, file);
 
         let read_result = uring::submit_read(fd, read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -578,7 +580,7 @@ fn execute_set_tiered(
 
     // StreamingContext owns the NVMePool buffer for this SET operation.
     // Single buffer today; multi-batch streaming adds more buffers here.
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1, None);
+    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let buf_ptr = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]);
     let buf_ptr_usize = buf_ptr as usize;
