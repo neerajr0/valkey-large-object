@@ -225,8 +225,15 @@ for BENCH_MODE in $MODES_STR; do
             EFFECTIVE_KEYS=100  # 4MB: 100 keys
         fi
 
+        # NVMe staging must hold concurrent reads: clients × obj_size.
+        # Round up to nearest 64MB segment boundary.
+        STAGING_NEEDED=$(( CLIENTS * BYTES ))
+        if [ $STAGING_NEEDED -lt 67108864 ]; then
+            STAGING_NEEDED=67108864  # minimum 64MB
+        fi
+
         echo ""
-        echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS]"
+        echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, staging=$((STAGING_NEEDED / 1048576))MB]"
 
         # Build module args based on mode
         case "$BENCH_MODE" in
@@ -241,7 +248,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS dram-segment-size $DRAM_SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
-                MODULE_ARGS="$MODULE_ARGS nvme-staging-size $NVME_STAGING_SIZE"
+                MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
@@ -249,7 +256,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS dram-segment-size $DRAM_SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
-                MODULE_ARGS="$MODULE_ARGS nvme-staging-size $NVME_STAGING_SIZE"
+                MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
                 ;;
             *)
