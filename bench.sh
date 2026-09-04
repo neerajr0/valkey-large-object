@@ -269,14 +269,20 @@ for BENCH_MODE in $MODES_STR; do
         # NVMe staging must hold concurrent reads: clients × obj_size.
         # Cap at 1GB — kernel hard limit per registered buffer (IORING_REGISTER_BUFFERS).
         # Reduce effective clients for very large objects if staging would exceed cap.
+        # Use 80% of cap for actual buffers (20% reserved for talc metadata).
         STAGING_CAP=1073741824  # 1GB
+        USABLE_CAP=$(( STAGING_CAP * 80 / 100 ))  # 80% usable after talc overhead
         STAGING_NEEDED=$(( CLIENTS * BYTES ))
-        # Add 20% headroom for talc allocator metadata
-        STAGING_NEEDED=$(( STAGING_NEEDED + STAGING_NEEDED / 5 ))
         EFFECTIVE_CLIENTS=$CLIENTS
+        if [ $STAGING_NEEDED -gt $USABLE_CAP ]; then
+            EFFECTIVE_CLIENTS=$(( USABLE_CAP / BYTES ))
+            if [ $EFFECTIVE_CLIENTS -lt 1 ]; then
+                EFFECTIVE_CLIENTS=1
+            fi
+        fi
+        STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES + EFFECTIVE_CLIENTS * BYTES / 5 ))
         if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
-            EFFECTIVE_CLIENTS=$(( STAGING_CAP / BYTES ))
-            STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES ))
+            STAGING_NEEDED=$STAGING_CAP
         fi
         if [ $STAGING_NEEDED -lt 67108864 ]; then
             STAGING_NEEDED=67108864  # minimum 64MB
