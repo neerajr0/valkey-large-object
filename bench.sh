@@ -358,6 +358,24 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 
         echo "  DBSIZE: $($VALKEY_CLI -p $PORT DBSIZE 2>/dev/null | awk '{print $NF}')"
 
+        # Disk read assertion: verify actual NVMe I/O is happening.
+        # Detect the block device for nvme-dir (e.g., dm-0 for LVM).
+        DISK_READS_BEFORE=""
+        DISK_READS_AFTER=""
+        if [ -n "$NVME_DIR" ] && [ "$BENCH_MODE" != "Dram" ]; then
+            BLOCK_DEV=$(df "$NVME_DIR" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||; s|/|-|g')
+            # Try /sys/block path (works for dm-X, nvmeXnY, etc.)
+            STAT_FILE="/sys/block/${BLOCK_DEV}/stat"
+            if [ ! -f "$STAT_FILE" ]; then
+                # LVM: /dev/mapper/vg-lv -> dm-X
+                BLOCK_DEV=$(basename "$(readlink -f "$(df "$NVME_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
+                STAT_FILE="/sys/block/${BLOCK_DEV}/stat"
+            fi
+            if [ -f "$STAT_FILE" ]; then
+                DISK_READS_BEFORE=$(awk '{print $1}' "$STAT_FILE")
+            fi
+        fi
+
         # LO.GET benchmark (timeout = duration + 30s grace)
         BENCH_TIMEOUT=$(( DURATION + 30 ))
         timeout $BENCH_TIMEOUT \
@@ -365,6 +383,26 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             -- LO.GET "k:__rand_int__" 2>&1 | tr '\r' '\n' | grep -E "throughput summary|avg.*min.*p50"
         if [ $? -eq 124 ]; then
             echo "  TIMEOUT: benchmark did not complete in ${BENCH_TIMEOUT}s"
+        fi
+
+        # Disk read assertion
+        if [ -n "$DISK_READS_BEFORE" ] && [ -f "$STAT_FILE" ]; then
+            DISK_READS_AFTER=$(awk '{print $1}' "$STAT_FILE")
+            DISK_READS_DELTA=$(( DISK_READS_AFTER - DISK_READS_BEFORE ))
+            echo "  Disk reads: $DISK_READS_DELTA"
+
+            if [ "$BENCH_MODE" = "Tiered" ]; then
+                # Tiered: first GET promotes each key from NVMe → DRAM. Subsequent GETs are DRAM cache hits.
+                # Expect at least EFFECTIVE_KEYS reads (one promotion per key).
+                if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
+                    echo "  FAIL: Tiered mode expected >= $EFFECTIVE_KEYS disk reads (promotion), got $DISK_READS_DELTA"
+                fi
+            elif [ "$BENCH_MODE" = "NVMe" ]; then
+                # NVMe-only: every GET reads from NVMe. Expect reads >> keys.
+                if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
+                    echo "  FAIL: NVMe mode expected >> $EFFECTIVE_KEYS disk reads, got $DISK_READS_DELTA"
+                fi
+            fi
         fi
 
         # Shutdown — wait for process to fully exit before next iteration.
