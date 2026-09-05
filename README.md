@@ -1,84 +1,103 @@
 # ValkeyLargeObj
 
-A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) on NVMe with io_uring and optional EFA RDMA transport to GPU memory.
+A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) with a tiered DRAM + NVMe architecture, io_uring zero-copy I/O, and optional EFA RDMA transport to GPU memory.
 
-## Features
+## Architecture
 
-- **LO.SET key len [data]** — Write object to NVMe via io_uring (O_DIRECT, WriteFixed)
-- **LO.GET key** — Read object from NVMe via io_uring (ReadFixed), reply as bulk string
-- **LO.HELLO** — Establish EFA/RDMA session for GPU-direct DMA transfers
-- **Native DEL** — Deletes NVMe file via module free callback
-- **Bench mode** — `bench-mode yes` makes LO.GET return size integer (skips TCP bulk copy, isolates NVMe throughput)
+Two operating modes:
+
+- **Dram** (default) — All objects live in a DRAMPool backed by pre-allocated segments with a talc arena allocator. Fastest reads. No NVMe.
+- **Tiered** — Objects persist on NVMe files. DRAMPool acts as a read cache with automatic promotion. io_uring ReadFixed/WriteFixed with O_DIRECT for zero-copy NVMe I/O.
+
+Storage is organized as segments (contiguous memory regions) managed by pool allocators:
+- **DRAMPool** — Long-lived object cache. Segment memory registered with both io_uring and EFA.
+- **NVMePool** — Transient staging buffer for NVMe reads/writes (Tiered mode only).
+- **FdPool** — Cached file descriptors for NVMe object files (Tiered mode only).
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `LO.SET key <data>` | Store object (TCP). Data length is implicit. |
+| `LO.SET key len rkey remote_addr` | Store object (EFA). Server reads `len` bytes from client GPU via RDMA. |
+| `LO.GET key` | Retrieve object. Returns bulk string (TCP) or DMA to client GPU (EFA). |
+| `LO.HELLO` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
 ## Build
 
 ```bash
-# Requires Rust toolchain
 cargo build --release
 # Output: target/release/libvalkey_largeobj.so
 ```
 
 ## Run
 
+### Dram mode (default)
 ```bash
 valkey-server --port 7380 \
     --loadmodule ./target/release/libvalkey_largeobj.so \
-        data-dir /mnt/bigobj-data \
-        pool-buf-size 4096 \
-        pool-buf-count 1000 \
-        bench-mode no \
-    --io-threads 8
+        operating-mode Dram \
+        dram-maxmemory 1gb \
+        dram-segment-size 64mb
+```
+
+### Tiered mode (DRAM cache + NVMe persistence)
+```bash
+valkey-server --port 7380 \
+    --loadmodule ./target/release/libvalkey_largeobj.so \
+        operating-mode Tiered \
+        nvme-dir /mnt/nvme-data \
+        dram-maxmemory 1gb \
+        dram-segment-size 64mb \
+        nvme-maxmemory 10gb \
+        nvme-staging-size 64mb
 ```
 
 ## Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `data-dir` | (required) | Directory for NVMe .dat files. Must support O_DIRECT. |
-| `pool-buf-size` | 4194304 (4MB) | Size of each buffer in the pool. Must be 4KB-aligned. |
-| `pool-buf-count` | 512 | Number of pre-allocated buffers. Each registered with io_uring. |
-| `bench-mode` | no | When yes, LO.GET returns integer size instead of bulk data. |
-| `max-bytes` | 0 (unlimited) | Max NVMe bytes (eviction not implemented yet). |
-| `transport-threads` | 2 | Threads for EFA transport runtime. |
+| Parameter | Default | Mutable | Description |
+|-----------|---------|---------|-------------|
+| `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
+| `nvme-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
+| `dram-maxmemory` | 0 (unlimited) | Yes | Total DRAM budget. 0 = grow on demand (one segment at a time). |
+| `dram-segment-size` | 64mb | Immutable | Size of each DRAMPool segment. Min 1mb. |
+| `nvme-maxmemory` | 10gb | Yes | Max NVMe disk usage. Min 1mb. |
+| `nvme-staging-size` | 64mb | Immutable | Size of NVMe staging buffer (1 segment). Min 1mb. |
+| `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
+| `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
+| `bench-mode` | no | Yes | LO.GET returns integer size instead of bulk data (isolates NVMe throughput). |
+| `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
+
+All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 
 ## Test
 
 ```bash
-# Builds module, clones valkey from source, clones test framework, runs pytest
+# Full build + test pipeline (fmt, clippy, unit tests, integration tests)
 ./build.sh
 
-# Build only
+# Build only (no valkey-server needed)
 ./build.sh build
 
-# Test only (assumes already built)
-./build.sh test
+# Integration tests only (assumes built)
+./build.sh integ-test
 
-# Run specific test
+# Specific test
 TEST_PATTERN=test_lo_set_get_roundtrip ./build.sh test
 ```
 
 ## Benchmark
 
 ```bash
-# Full run (fio baselines + module benchmark)
-./bench.sh /mnt/bigobj-data 7380
+# Dram only
+./bench.sh --port 7380
 
-# Module benchmark only (skip fio)
-./bench.sh /mnt/bigobj-data 7380 --skip-fio
+# All modes on NVMe stripe
+./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test
 ```
 
-Benchmark uses per-size server restarts, io-threads 8, taskset pinning, 750 clients, 10s duration per size.
-
-## Performance (i8ge.48xlarge, 16 NVMe striped)
-
-| Object Size | Clients | RPS |
-|-------------|---------|-----|
-| 4KB | 750 | 150,000 |
-| 1MB | 750 | 60,000 |
-| 16MB | 750 | 3,900 |
-| 50MB | 750 | 1,000 |
-
-Raw NVMe baseline (fio): 1.4M IOPS at 4KB, 50 GB/s at 1MB+.
+See [BENCHMARK.md](BENCHMARK.md) for full documentation, parameters, and troubleshooting.
 
 ## License
 

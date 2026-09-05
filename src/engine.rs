@@ -100,9 +100,15 @@ pub fn execute_get(
 fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
-        Some(obj_ctx) if obj_ctx.is_ready() => Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-            dram_pool, &obj_ctx, obj_len,
-        ))),
+        Some(obj_ctx) if obj_ctx.is_ready() => {
+            if crate::bench_mode() {
+                Ok(ValkeyValue::Integer(obj_len as i64))
+            } else {
+                Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                    dram_pool, &obj_ctx, obj_len,
+                )))
+            }
+        }
         Some(_) => {
             panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug");
         }
@@ -251,57 +257,72 @@ fn execute_get_tiered(
     // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
         let _keep_alive = stream_ctx;
-
         let read_result = uring::submit_read(fd, read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        handle_nvme_read_result(read_result, transport, obj_len, buf_ptr_usize, thread_ctx).await;
+    });
+}
 
-        match read_result {
-            Ok(Ok(_bytes_read)) => match transport {
-                Transport::Tcp => {
+/// Handle NVMe read result — reply to the blocked client based on the io_uring
+/// completion result and transport type. Shared across GET paths that read from NVMe.
+async fn handle_nvme_read_result(
+    read_result: Result<Result<u64, storage::StorageError>, tokio::sync::oneshot::error::RecvError>,
+    transport: Transport,
+    obj_len: u64,
+    buf_ptr_usize: usize,
+    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+) {
+    match read_result {
+        Ok(Ok(_bytes_read)) => match transport {
+            Transport::Tcp => {
+                if crate::bench_mode() {
+                    thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                } else {
                     let data = unsafe {
                         std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
                             .to_vec()
                     };
                     thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
                 }
-                Transport::Efa {
+            }
+            Transport::Efa {
+                session,
+                rkey,
+                remote_addr,
+            } => {
+                match efa_write_to_client(
                     session,
+                    buf_ptr_usize,
+                    obj_len as usize,
                     rkey,
                     remote_addr,
-                } => {
-                    match efa_write_to_client(
-                        session,
-                        buf_ptr_usize,
-                        obj_len as usize,
-                        rkey,
-                        remote_addr,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                        }
-                        Err(e) => {
-                            thread_ctx.reply(Err(e));
-                        }
+                )
+                .await
+                {
+                    Ok(()) => {
+                        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                    }
+                    Err(e) => {
+                        thread_ctx.reply(Err(e));
                     }
                 }
-            },
-            Ok(Err(e)) => {
-                thread_ctx.reply(Err(ValkeyError::String(format!(
-                    "{}: {}",
-                    errors::ERR_NVME_READ,
-                    e
-                ))));
             }
-            // RecvError: io_uring poller thread dropped the oneshot sender.
-            // This means the poller panicked or shut down unexpectedly.
-            // TODO: Add error metric counter for poller channel failures.
-            Err(_) => {
-                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
-            }
+        },
+        // io_uring read completed with an error (EIO, short read, etc.)
+        Ok(Err(e)) => {
+            thread_ctx.reply(Err(ValkeyError::String(format!(
+                "{}: {}",
+                errors::ERR_NVME_READ,
+                e
+            ))));
         }
-    });
+        // RecvError: io_uring poller thread dropped the oneshot sender.
+        // This means the poller panicked or shut down unexpectedly.
+        // TODO: Add error metric counter for poller channel failures.
+        Err(_) => {
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+        }
+    }
 }
 
 // ─── SET Engine ──────────────────────────────────────────────────────────────
@@ -700,9 +721,13 @@ fn serve_from_dram(
 ) {
     match transport {
         Transport::Tcp => {
-            thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                dram_pool, obj_ctx, obj_len,
-            ))));
+            if crate::bench_mode() {
+                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+            } else {
+                thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
+                    dram_pool, obj_ctx, obj_len,
+                ))));
+            }
         }
         Transport::Efa {
             session,
