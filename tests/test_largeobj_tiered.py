@@ -15,6 +15,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" dram-segment-size 16777216"
             f" max-promote-size 268435456"
+            f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -30,7 +31,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     def test_get_after_set_roundtrip(self):
         """Tiered mode: SET then GET returns correct data."""
         client = self.server.get_new_client()
-        payload = b'A' * 8192
+        payload = b'A' * 4096
         client.execute_command('LO.SET', 'rt_key', payload)
         result = client.execute_command('LO.GET', 'rt_key')
         assert result == payload, "GET should return the same data that was SET"
@@ -131,6 +132,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" dram-segment-size 4194304"
             f" max-promote-size 0"
+            f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )

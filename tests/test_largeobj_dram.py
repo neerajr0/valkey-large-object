@@ -10,6 +10,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
+            f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )
