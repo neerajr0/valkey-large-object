@@ -240,7 +240,7 @@ fn execute_get_tiered(
                     // thread that subsequently sees is_ready() == true.
                     obj_ctx.mark_ready();
                     let dram_pool = storage::get_dram_pool();
-                    // Move file in so the object stays pinned for the read's duration.
+                    // Move ObjectFile in so the ObjectFile stays pinned for the read's duration.
                     serve_from_dram(
                         dram_pool,
                         &obj_ctx,
@@ -252,7 +252,7 @@ fn execute_get_tiered(
                 }
                 _ => {
                     // Read failed — remove entry. Buffers freed by ObjectContext Drop.
-                    // file drops here → teardown if this was the last strong ref.
+                    // ObjectFile drops here → teardown if this was the last strong ref.
                     storage::get_dram_pool().remove_object(&object_id);
                     thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
                 }

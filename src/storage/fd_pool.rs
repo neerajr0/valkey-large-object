@@ -40,7 +40,8 @@ impl FdPool {
         }
     }
 
-    /// Return a usable read fd for `objfile`, opening it lazily if needed.
+    /// Return a usable read fd for `objfile`. Reuses existing fd if available, otherwise,
+    /// opens a new fd.
     ///
     /// The caller holds a strong `Arc<ObjectFile>`, so the file is guaranteed still
     /// linked, so the `open()` cannot spuriously `ENOENT`. Returns `None` only on

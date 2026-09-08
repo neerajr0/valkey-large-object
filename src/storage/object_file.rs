@@ -4,8 +4,9 @@
 //! *open read fd* behind a single `Arc`. The keyspace `LoValue` holds a strong
 //! reference, and so does every in-flight request that resolved the key. The fd is
 //! closed and the NVMe file unlinked **only when the last strong reference drops**
-//! (`ObjectFile::Drop`), and that teardown always runs off the event loop (via the
-//! teardown worker below) — never inline on whichever thread dropped the ref.
+//! (`ObjectFile::Drop`). The teardown syscalls run inline on whichever thread dropped
+//! the last ref. If the drop occurs on the main thread, the deletion is handed to
+//! the tokio blocking pool.
 //!
 //! Safety of deletion under a concurrent read (the "honor rule") rests on two facts,
 //! and neither pins teardown to a particular thread:
@@ -29,8 +30,6 @@
 //! lazily on the first GET.
 
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc;
-use std::sync::OnceLock;
 
 use crate::data_type::ObjectId;
 
@@ -97,12 +96,12 @@ impl Drop for ObjectFile {
         // 2. Take the fd (swap makes close-once race-free vs. a future evictor).
         let fd = self.fd.swap(-1, Ordering::AcqRel);
 
-        // 3. Dispatch the blocking teardown OFF the main thread. Drop ⟺ deletion, so
-        //    the unlink is unconditional. object_ids are never reused, so a file that is
-        //    not yet unlinked can never be mistaken for a live object in the meantime.
+        // 3. close() + unlink() are blocking syscalls. Drop ⟺ deletion, so the unlink
+        //    is unconditional; object_ids are never reused, so an as-yet-unlinked file
+        //    can't be mistaken for a live object in the meantime.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
-        get_teardown_worker().enqueue(move || {
+        let teardown = move || {
             if fd >= 0 {
                 // SAFETY: fd was opened by us via libc::open and swapped out here
                 // exactly once; no other thread can close the same descriptor.
@@ -112,51 +111,24 @@ impl Drop for ObjectFile {
             let _ = std::fs::remove_file(&path);
             // Release exactly what create added — no stat, so it can't drift.
             crate::storage::uring::decrease_nvme_disk_usage(disk_len);
-        });
-    }
-}
+        };
 
-// ─── Teardown worker ─────────────────────────────────────────────────────────
-
-/// A single background thread that runs `ObjectFile::Drop`'s blocking teardown
-/// (close + unlink) off the main event-loop thread. `close()`/`unlink()` are passive
-/// low-priority cleanup, so any off-MT thread is fine; a dedicated worker keeps the
-/// syscalls off the event loop regardless of which thread `Drop` fired on (a
-/// synchronous `DEL` frees on the main thread; a last-in-flight-reader `Drop` runs
-/// on a tokio worker).
-pub struct TeardownWorker {
-    tx: mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
-}
-
-impl TeardownWorker {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
-        std::thread::Builder::new()
-            .name("largeobj-teardown".to_string())
-            .spawn(move || {
-                // Runs until the process exits (the sender lives for the module's
-                // lifetime, so recv() only errors at shutdown).
-                while let Ok(job) = rx.recv() {
-                    job();
+        // If the drop is fired on the main thread, we attempt to hand off
+        // the operation to a tokio runtime to reduce main thread contention.
+        if crate::is_main_thread() {
+            match crate::runtime_handle_opt() {
+                // Fire-and-forget on the blocking pool (the JoinHandle is dropped).
+                Some(handle) => {
+                    handle.spawn_blocking(teardown);
                 }
-            })
-            .expect("failed to spawn largeobj-teardown thread");
-        Self { tx }
+                // Runtime somehow gone on the main thread (pre-init/shutdown edge):
+                // inline is the least-bad fallback.
+                None => teardown(),
+            }
+        } else {
+            teardown();
+        }
     }
-
-    /// Enqueue a teardown job. Non-blocking; the job runs on the worker thread.
-    pub fn enqueue<F: FnOnce() + Send + 'static>(&self, job: F) {
-        // If the worker has gone away (only at shutdown), the drop is a no-op; the
-        // process is exiting and nvme-dir is wiped by the shutdown handler anyway.
-        let _ = self.tx.send(Box::new(job));
-    }
-}
-
-static TEARDOWN_WORKER: OnceLock<TeardownWorker> = OnceLock::new();
-
-/// Global teardown worker, initialized (thread spawned) on first use.
-pub fn get_teardown_worker() -> &'static TeardownWorker {
-    TEARDOWN_WORKER.get_or_init(TeardownWorker::new)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -197,7 +169,7 @@ mod tests {
             "fd must stay open while a reader still holds a ref"
         );
 
-        // Last ref (the reader) drops -> teardown worker closes the fd.
+        // Last ref (the reader) drops -> Drop closes the fd (inline in tests).
         drop(reader_pin);
         for _ in 0..100 {
             // SAFETY: fcntl on a (possibly closed) fd returns -1/EBADF, no crash.
@@ -243,11 +215,11 @@ mod tests {
         of.store_fd(fd);
         assert_eq!(of.fd(), fd);
 
-        // Dropping closes the fd (via the teardown worker). The unlink targets the
-        // OID-derived path (not our temp path), so we verify fd closure directly.
+        // Dropping closes the fd (inline in tests — no runtime). The unlink targets
+        // the OID-derived path (not our temp path), so we verify fd closure directly.
         drop(of);
 
-        // Give the teardown worker a moment to run the close.
+        // Drop runs teardown inline in tests (no runtime); poll to be safe.
         for _ in 0..100 {
             // SAFETY: fcntl on any int is safe; returns -1/EBADF once closed.
             let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
