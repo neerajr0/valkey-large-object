@@ -270,6 +270,23 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::deregister_buffers();
     transport::shutdown();
     let dir = nvme_dir();
+    // Reconcile the NVMe disk-usage counter against ground truth before clean-up.
+    if operating_mode() == OperatingMode::Tiered {
+        let tracked = storage::uring::nvme_disk_usage();
+        match storage::sum_nvme_dir_bytes(&dir) {
+            Ok(on_disk) if on_disk != tracked => ctx.log_warning(&format!(
+                "largeobj: NVMe disk-usage accounting mismatch at shutdown: tracked {} B, on disk {} B (diff {} B)",
+                tracked,
+                on_disk,
+                tracked as i128 - on_disk as i128
+            )),
+            Ok(_) => {}
+            Err(e) => ctx.log_warning(&format!(
+                "largeobj: could not reconcile NVMe disk usage at shutdown (tracked {} B): {}",
+                tracked, e
+            )),
+        }
+    }
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",

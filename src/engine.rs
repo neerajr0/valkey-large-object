@@ -672,9 +672,11 @@ async fn do_tiered_nvme_write(
     key_name: Vec<u8>,
     object_id: ObjectId,
 ) {
+    // On-disk size, accounting for padding.
+    let disk_len = storage::align_up(obj_len as usize) as u64;
     // Reject if writing this object would exceed nvme-maxmemory.
     // stream_ctx Drop frees the buffer on return.
-    if !uring::has_nvme_capacity(obj_len) {
+    if !uring::has_nvme_capacity(disk_len) {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
         return;
@@ -711,7 +713,7 @@ async fn do_tiered_nvme_write(
     };
 
     // Reserve disk usage before the write — decrement on any failure path.
-    uring::increase_nvme_disk_usage(obj_len);
+    uring::increase_nvme_disk_usage(disk_len);
 
     let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
     // fd (OwnedFd) drops when out of scope and close() is automatic.
@@ -728,25 +730,33 @@ async fn do_tiered_nvme_write(
                 if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
                     if existing.object_id > object_id {
                         // Stale write — a newer SET already completed. Discard silently.
-                        uring::decrease_nvme_disk_usage(obj_len);
+                        // No ObjectFile was minted, so release the reservation here.
+                        uring::decrease_nvme_disk_usage(disk_len);
                         let _ = std::fs::remove_file(&file_path);
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                         return;
                     }
                 }
-                // Winning branch (our OID ≥ any committed OID): mint a fresh, cold
-                // ObjectFile that owns this file's existence + lazy read fd. If thsi
-                // write overwrites a prior key, set_value triggers lo_free on the
-                // old LoValue, dropping its ObjectFile (teardown).
+                // Winning branch (our OID ≥ any committed OID). Confirm the write
+                // produced exactly the size we accounted for.
+                let on_disk = std::fs::metadata(&file_path)
+                    .map(|m| m.len())
+                    .unwrap_or(disk_len);
+                assert_eq!(
+                    on_disk, disk_len,
+                    "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
+                     reserved {disk_len} B — write path and accounting have diverged"
+                );
+                // Mint a fresh, cold ObjectFile owning this file's existence, lazy read
+                // fd, and NVMe bytes. An overwrite triggers lo_free on the old LoValue,
+                // dropping its ObjectFile (teardown).
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
                     crc32c: crc,
-                    file: Some(Arc::new(ObjectFile::new_cold(object_id))),
+                    file: Some(Arc::new(ObjectFile::new_cold(object_id, disk_len))),
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    uring::decrease_nvme_disk_usage(obj_len);
-                    let _ = std::fs::remove_file(&file_path);
                     thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                     return;
                 }
@@ -754,7 +764,7 @@ async fn do_tiered_nvme_write(
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {
-            uring::decrease_nvme_disk_usage(obj_len);
+            uring::decrease_nvme_disk_usage(disk_len);
             let _ = std::fs::remove_file(&file_path);
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
@@ -766,7 +776,7 @@ async fn do_tiered_nvme_write(
         // This means the poller panicked or shut down unexpectedly.
         // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
-            uring::decrease_nvme_disk_usage(obj_len);
+            uring::decrease_nvme_disk_usage(disk_len);
             let _ = std::fs::remove_file(&file_path);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }

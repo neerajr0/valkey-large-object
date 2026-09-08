@@ -46,15 +46,19 @@ pub struct ObjectFile {
     /// Open read descriptor as an interior-mutable slot. `-1` = not currently open.
     /// Atomic to support lazy open, a future in-place evictor, and close-once (`swap`).
     fd: AtomicI32,
+    /// True on-disk size, used for NVMe utilization accounting.
+    disk_len: u64,
 }
 
 impl ObjectFile {
     /// Construct a cold handle: the file already exists on NVMe, but no read fd is
     /// open yet. The fd opens lazily on the first GET via `FdPool::ensure_open`.
-    pub fn new_cold(object_id: ObjectId) -> Self {
+    /// `disk_len` is the true on-disk size; `Drop` releases exactly that many bytes.
+    pub fn new_cold(object_id: ObjectId, disk_len: u64) -> Self {
         Self {
             object_id,
             fd: AtomicI32::new(-1),
+            disk_len,
         }
     }
 
@@ -97,6 +101,7 @@ impl Drop for ObjectFile {
         //    the unlink is unconditional. object_ids are never reused, so a file that is
         //    not yet unlinked can never be mistaken for a live object in the meantime.
         let object_id = self.object_id;
+        let disk_len = self.disk_len;
         get_teardown_worker().enqueue(move || {
             if fd >= 0 {
                 // SAFETY: fd was opened by us via libc::open and swapped out here
@@ -105,6 +110,8 @@ impl Drop for ObjectFile {
             }
             let path = object_id.file_path(&crate::nvme_dir());
             let _ = std::fs::remove_file(&path);
+            // Release exactly what create added — no stat, so it can't drift.
+            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
         });
     }
 }
@@ -175,7 +182,7 @@ mod tests {
             .to_string();
 
         // Keyspace ref (LoValue.file) + a reader pin (cloned in lo_get before async).
-        let keyspace_ref = std::sync::Arc::new(ObjectFile::new_cold(ObjectId(11)));
+        let keyspace_ref = std::sync::Arc::new(ObjectFile::new_cold(ObjectId(11), 0));
         keyspace_ref.store_fd(fd);
         let reader_pin = std::sync::Arc::clone(&keyspace_ref);
         assert_eq!(std::sync::Arc::strong_count(&keyspace_ref), 2);
@@ -212,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_object_file_cold() {
-        let of = ObjectFile::new_cold(ObjectId(7));
+        let of = ObjectFile::new_cold(ObjectId(7), 0);
         assert_eq!(of.object_id(), ObjectId(7));
         assert_eq!(of.fd(), -1);
     }
@@ -232,7 +239,7 @@ mod tests {
             .to_string();
         assert!(std::path::Path::new(&path).exists());
 
-        let of = ObjectFile::new_cold(ObjectId(9));
+        let of = ObjectFile::new_cold(ObjectId(9), 0);
         of.store_fd(fd);
         assert_eq!(of.fd(), fd);
 
