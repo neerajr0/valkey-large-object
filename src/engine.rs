@@ -62,7 +62,8 @@ pub enum EngineResult {
 //   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
 //   commit it, so no concurrent free can reach it.
 //
-// Must pin `Arc<ObjectFile>` (owns the fd + on-disk file; its Drop closes+unlinks):
+// Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
+// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
 //   - Every Tiered request that READS the object: the NVMe promotion read, the
 //     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
 //     a read. The file is held for the whole request, read plus transfer.
@@ -173,7 +174,8 @@ fn execute_get_dram_efa(
 }
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
-/// `file` pins the object's `ObjectFile` (existence + fd) for the whole GET operation.
+/// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
+/// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
@@ -221,7 +223,7 @@ fn execute_get_tiered(
         };
 
         let fd_pool = storage::get_fd_pool();
-        let fd = match fd_pool.ensure_open(&file, &crate::nvme_dir()) {
+        let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -236,7 +238,7 @@ fn execute_get_tiered(
 
         // Read from NVMe directly into DRAMPool buffer, then serve.
         crate::runtime_handle().spawn(async move {
-            let result = uring::submit_read(fd, read_op).await;
+            let result = uring::submit_read(fd.as_raw_fd(), read_op).await;
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
             match result {
@@ -284,7 +286,7 @@ fn execute_get_tiered(
     let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.ensure_open(&file, &crate::nvme_dir()) {
+    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -310,7 +312,7 @@ fn execute_get_tiered(
         // Pin the buffer (stream_ctx) and the file for the transfer's duration.
         let _keep_alive = (stream_ctx, file);
 
-        let read_result = uring::submit_read(fd, read_op).await;
+        let read_result = uring::submit_read(fd.as_raw_fd(), read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         handle_nvme_read_result(read_result, transport, obj_len, buf_ptr_usize, thread_ctx).await;
     });
