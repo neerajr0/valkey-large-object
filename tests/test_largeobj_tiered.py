@@ -1,5 +1,6 @@
 import os
 import glob
+import time
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 from valkeytestframework.util.waiters import wait_for_equal
@@ -340,11 +341,11 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
 
     The usage counter is not observable directly (no INFO section / command), so
     these tests exercise it through its only externally-visible effect: the
-    `has_nvme_capacity` gate on the Tiered SET path. A SET that would push tracked
-    usage past `nvme-maxmemory` is rejected with "pool exhausted"; a SET that fits
-    succeeds. By filling to the cap, freeing, and re-filling we prove the counter
-    is incremented on create and -- critically -- decremented at TRUE deletion
-    (ObjectFile::Drop, after teardown), not merely at key-free.
+    reserve-if-capacity gate (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
+    A SET that would push tracked usage past `nvme-maxmemory` is rejected with
+    "pool exhausted"; a SET that fits succeeds. By filling to the cap, freeing,
+    and re-filling we prove the counter is incremented on create and -- critically --
+    decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
     """
 
     def _dat_count(self):
@@ -358,6 +359,32 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
 
     def _set_ok(self, client, key, payload):
         assert client.execute_command("LO.SET", key, payload) == b"OK"
+
+    def _set_ok_eventually(self, client, key, payload, tries=100, delay=0.02):
+        """Overwrite SET that tolerates a *transient* 'pool exhausted'.
+
+        On overwrite the replaced object's bytes are released asynchronously in
+        ObjectFile::Drop (teardown runs on the tokio blocking pool), so a rapid
+        re-SET can momentarily observe the old reservation still outstanding and
+        be rejected. `_wait_free_settled` can't help here: an overwrite frees the
+        value synchronously on the main thread, so lazyfree never even increments.
+        Retry within a bounded budget; if the SET never succeeds the capacity was
+        genuinely not reclaimed -- a real leak -- and the assertion below fails.
+        """
+        last = None
+        for _ in range(tries):
+            try:
+                assert client.execute_command("LO.SET", key, payload) == b"OK"
+                return
+            except ResponseError as e:
+                if "pool exhausted" not in str(e).lower():
+                    raise
+                last = e
+                time.sleep(delay)
+        assert False, (
+            f"SET '{key}' still pool-exhausted after {tries} tries "
+            f"({tries * delay:.1f}s) -- capacity not reclaimed on overwrite (leak): {last}"
+        )
 
     def _set_rejected(self, client, key, payload):
         try:
@@ -434,7 +461,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         # old object's bytes were not freed on overwrite, usage would climb past the
         # cap and a later overwrite would be wrongly rejected.
         for i in range(20):
-            self._set_ok(client, "ow", bytes([65 + (i % 26)]) * self.OBJ)
+            self._set_ok_eventually(client, "ow", bytes([65 + (i % 26)]) * self.OBJ)
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 1)
 

@@ -90,6 +90,55 @@ pub fn get_fd_pool() -> &'static FdPool {
     FD_POOL.get().expect("FdPool not initialized")
 }
 
+// ─── Teardown barrier ──────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Count of in-flight `ObjectFile` teardowns (fd deregister + unlink + accounting
+/// release), whether they run inline or on the tokio blocking pool. Lets shutdown
+/// reconciliation wait for teardowns to finish before it samples the disk-usage
+/// counter and nvme-dir, so a delete caught mid-flight can't produce a spurious
+/// accounting-mismatch warning.
+static PENDING_TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII counter guard: `+1` on construction, `-1` on drop. Built in `ObjectFile::Drop`
+/// before the teardown is dispatched and moved into the teardown closure, so the count
+/// spans the whole operation no matter which thread ends up running it.
+pub struct TeardownGuard;
+
+impl TeardownGuard {
+    pub fn new() -> Self {
+        PENDING_TEARDOWNS.fetch_add(1, Ordering::AcqRel);
+        TeardownGuard
+    }
+}
+
+impl Default for TeardownGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TeardownGuard {
+    fn drop(&mut self) {
+        PENDING_TEARDOWNS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Block until all in-flight teardowns finish, or `timeout` elapses. Called on the
+/// main thread at shutdown before reconciliation. Bounded so a wedged `close()`/
+/// `unlink()` can't hang shutdown; returns `true` if drained, `false` on timeout.
+pub fn wait_for_teardowns_drained(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while PENDING_TEARDOWNS.load(Ordering::Acquire) != 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 /// Initialize storage layer: validate config, create pools, spawn io_uring poller (Tiered only).
@@ -259,4 +308,33 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
     }
     slices
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod teardown_barrier_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // PENDING_TEARDOWNS is a process-global counter; serialize so parallel tests
+    // don't observe each other's guards.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn guard_tracks_count_and_drain_respects_it() {
+        let _l = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(PENDING_TEARDOWNS.load(Ordering::Acquire), 0);
+        {
+            let _g = TeardownGuard::new();
+            assert_eq!(PENDING_TEARDOWNS.load(Ordering::Acquire), 1);
+            // Non-zero: drain must not claim success, and must honor the timeout.
+            let start = std::time::Instant::now();
+            assert!(!wait_for_teardowns_drained(Duration::from_millis(10)));
+            assert!(start.elapsed() >= Duration::from_millis(10));
+        }
+        // Guard dropped -> back to zero -> drain returns promptly.
+        assert_eq!(PENDING_TEARDOWNS.load(Ordering::Acquire), 0);
+        assert!(wait_for_teardowns_drained(Duration::from_millis(100)));
+    }
 }

@@ -291,6 +291,14 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     let dir = nvme_dir();
     // Reconcile the NVMe disk-usage counter against ground truth before clean-up.
     if operating_mode() == OperatingMode::Tiered {
+        // Drain in-flight ObjectFile teardowns. Bounded so a wedged unlink can't
+        // hang shutdown — if it times out we still reconcile, just approximately.
+        if !storage::wait_for_teardowns_drained(std::time::Duration::from_secs(5)) {
+            ctx.log_warning(
+                "largeobj: object teardowns still draining at shutdown; \
+                 NVMe disk-usage reconciliation below may be approximate",
+            );
+        }
         let tracked = storage::uring::nvme_disk_usage();
         match storage::sum_nvme_dir_bytes(&dir) {
             Ok(on_disk) if on_disk != tracked => ctx.log_warning(&format!(

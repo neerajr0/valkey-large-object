@@ -676,9 +676,9 @@ async fn do_tiered_nvme_write(
 ) {
     // On-disk size, accounting for padding.
     let disk_len = storage::align_up(obj_len as usize) as u64;
-    // Reject if writing this object would exceed nvme-maxmemory.
-    // stream_ctx Drop frees the buffer on return.
-    if !uring::has_nvme_capacity(disk_len) {
+    // Atomically reserve the disk budget up-front. Reject if writing this object would
+    // exceed nvme-maxmemory. stream_ctx drop frees the buffer on return.
+    if !uring::try_reserve_nvme_disk_usage(disk_len) {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
         return;
@@ -697,6 +697,7 @@ async fn do_tiered_nvme_write(
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via ensure_open.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if raw_fd < 0 {
+        uring::decrease_nvme_disk_usage(disk_len);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
@@ -713,9 +714,6 @@ async fn do_tiered_nvme_write(
         file_offset: 0,
         len: obj_len,
     };
-
-    // Reserve disk usage before the write — decrement on any failure path.
-    uring::increase_nvme_disk_usage(disk_len);
 
     let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
     // fd (OwnedFd) drops when out of scope and close() is automatic.

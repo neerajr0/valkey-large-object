@@ -36,23 +36,34 @@ pub fn increase_nvme_disk_usage(bytes: u64) {
 /// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
 /// must be accurate for capacity checks, so assert on the issue.
 pub fn decrease_nvme_disk_usage(bytes: u64) {
-    let prev = NVME_DISK_USAGE.fetch_sub(bytes, Ordering::Relaxed);
-    assert!(
-        prev >= bytes,
-        "NVMe disk-usage underflow: tried to free {bytes} B but only {prev} B tracked \
-         — accounting is corrupt (double-free or size mismatch)"
-    );
+    if let Err(tracked) =
+        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            cur.checked_sub(bytes)
+        })
+    {
+        panic!(
+            "NVMe disk-usage underflow: tried to free {bytes} B but only {tracked} B tracked \
+             — accounting is corrupt (double-free or size mismatch)"
+        );
+    }
 }
 
-/// Returns true if writing `obj_len` bytes would stay within nvme-maxmemory.
+/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
+/// Returns true and increments the counter on success; returns false and leaves the
+/// counter unchanged if the reservation would exceed the cap (or overflow).
 /// Returns true if nvme-maxmemory is 0 (unlimited).
-pub fn has_nvme_capacity(obj_len: u64) -> bool {
+pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
-    if max == 0 {
-        return true;
-    }
-    let used = NVME_DISK_USAGE.load(Ordering::Relaxed);
-    used + obj_len <= max
+    NVME_DISK_USAGE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            let next = cur.checked_add(bytes)?;
+            if max == 0 || next <= max {
+                Some(next)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 /// Current tracked NVMe disk usage in bytes.

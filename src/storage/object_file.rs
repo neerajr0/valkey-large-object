@@ -77,9 +77,11 @@ impl Drop for ObjectFile {
         let object_id = self.object_id;
         let disk_len = self.disk_len;
 
+        let guard = super::TeardownGuard::new();
         // Deregistering drops the pool's strong Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
         let teardown = move || {
+            let _guard = guard;
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }

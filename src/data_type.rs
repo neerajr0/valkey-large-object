@@ -126,7 +126,7 @@ impl LoValue {
         // On-disk size: writes are padded to IO_ALIGN and the copy is byte-exact, so
         // this is the aligned length. Added here and released by ObjectFile::Drop.
         let disk_len = crate::storage::align_up(self.len as usize) as u64;
-        if !crate::storage::uring::has_nvme_capacity(disk_len) {
+        if !crate::storage::uring::try_reserve_nvme_disk_usage(disk_len) {
             return None;
         }
         let new_oid = ObjectId::next();
@@ -143,7 +143,6 @@ impl LoValue {
             "NVMe accounting: copied object {new_oid:?} on disk is {on_disk} B but we \
              reserved {disk_len} B — copy path and accounting have diverged"
         );
-        crate::storage::uring::increase_nvme_disk_usage(disk_len);
         Some(LoValue {
             object_id: new_oid,
             len: self.len,
