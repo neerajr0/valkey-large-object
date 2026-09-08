@@ -126,6 +126,22 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
     RUNTIME.get().expect("runtime not initialized").handle()
 }
 
+/// Runtime handle if initialized, else `None`. Used by `ObjectFile::Drop`, which can
+/// fire before init or during shutdown (and in unit tests with no runtime).
+pub fn runtime_handle_opt() -> Option<&'static tokio::runtime::Handle> {
+    RUNTIME.get().map(|rt| rt.handle())
+}
+
+/// Thread id of the Valkey main event-loop thread, captured at module load.
+static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// True iff the caller runs on the Valkey main event-loop thread.
+pub fn is_main_thread() -> bool {
+    MAIN_THREAD_ID
+        .get()
+        .is_some_and(|id| *id == std::thread::current().id())
+}
+
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn nvme_dir() -> String {
@@ -185,6 +201,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ));
         std::process::abort();
     }));
+
+    // Record the main event-loop thread id.
+    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
