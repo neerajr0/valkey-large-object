@@ -117,7 +117,7 @@ mod tests {
         // When the fd slot is already populated, ensure_open takes the lock-free
         // fast path: it returns the cached fd and does NOT register a Weak.
         let pool = FdPool::new();
-        let of = Arc::new(ObjectFile::new_cold(ObjectId(1)));
+        let of = Arc::new(ObjectFile::new_cold(ObjectId(1), 0));
         of.store_fd(4242); // pretend an fd is already open
         assert_eq!(pool.ensure_open(&of, "/nonexistent"), Some(4242));
         assert_eq!(pool.len(), 0, "fast path must not register a Weak");
@@ -143,7 +143,7 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
 
         let pool = FdPool::new();
-        let of = Arc::new(ObjectFile::new_cold(oid));
+        let of = Arc::new(ObjectFile::new_cold(oid, 0));
 
         if let Some(fd1) = pool.ensure_open(&of, dir) {
             assert_eq!(pool.len(), 1, "slow path registers exactly one Weak");

@@ -224,6 +224,29 @@ pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std
     std::fs::create_dir_all(dir)
 }
 
+/// Sum the actual on-disk size of every file in nvme-dir, in bytes.
+///
+/// Used by the shutdown reconciliation to cross-check the tracked NVMe disk-usage
+/// counter against ground truth. Because O_DIRECT writes are padded to `IO_ALIGN`,
+/// each file's real size equals the `disk_len` we account for, so a correct counter
+/// equals this sum. Best-effort: unreadable entries are skipped rather than failing
+/// the check, since it runs during shutdown and is advisory only.
+pub fn sum_nvme_dir_bytes(dir: &str) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
