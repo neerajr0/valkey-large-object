@@ -190,16 +190,21 @@ static EFA_CTX: OnceLock<EfaContext> = OnceLock::new();
 pub fn init() {
     match EfaContext::new() {
         Ok(ctx) => {
-            EFA_CTX.set(ctx).ok();
+            if EFA_CTX.set(ctx).is_err() {
+                panic!("EfaContext already initialized");
+            }
         }
         Err(_) => {
             // EFA unavailable — module works in TCP-only mode.
-            EFA_CTX
+            if EFA_CTX
                 .set(EfaContext {
                     available: false,
                     device_count: 0,
                 })
-                .ok();
+                .is_err()
+            {
+                panic!("EfaContext already initialized");
+            }
         }
     }
 }
@@ -208,8 +213,8 @@ pub fn efa_context() -> &'static EfaContext {
     EFA_CTX.get().expect("transport not initialized")
 }
 
-pub fn register_buffers(bufs: &[&[u8]]) {
-    let _ = efa_context().register_buffers(bufs);
+pub fn register_buffers(bufs: &[&[u8]]) -> Result<(), TransportError> {
+    efa_context().register_buffers(bufs)
 }
 
 pub fn deregister_buffers() {

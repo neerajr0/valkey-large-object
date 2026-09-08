@@ -1,0 +1,113 @@
+name: Benchmark
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: benchmark-i8ge
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/bench') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: [self-hosted, i8ge]
+    steps:
+      - name: React with eyes (in progress)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Get PR branch
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput('ref', pr.data.head.ref);
+            core.setOutput('sha', pr.data.head.sha);
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build valkey (if needed)
+        run: |
+          if ! command -v valkey-server &>/dev/null; then
+            cd tests/build
+            if [ ! -d valkey ]; then
+              git clone --depth 1 --branch unstable https://github.com/valkey-io/valkey.git
+            fi
+            cd valkey && make -j$(nproc) && cd ../../..
+            echo "$(pwd)/tests/build/valkey/src" >> $GITHUB_PATH
+          fi
+
+      - name: Run benchmark
+        run: |
+          pkill -9 -f valkey-server 2>/dev/null || true
+          sleep 2
+          mkdir -p /mnt/bigobj-data/bench-test
+          ./bench.sh --port 7399 --nvme-dir /mnt/bigobj-data/bench-test 2>&1 | tee bench-results.txt
+
+      - name: React with rocket (done)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Post results to PR
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = fs.readFileSync('bench-results.txt', 'utf8');
+            const sha = '${{ steps.pr.outputs.sha }}'.substring(0, 7);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 📊 Benchmark Results (\`${sha}\`)\n\`\`\`\n${results}\n\`\`\``
+            });
+
+      - name: Post failure to PR
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let results = '';
+            try { results = fs.readFileSync('bench-results.txt', 'utf8'); } catch(e) {}
+            const sha = '${{ steps.pr.outputs.sha }}'.substring(0, 7);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ❌ Benchmark Failed (\`${sha}\`)\n\`\`\`\n${results || 'No output captured'}\n\`\`\``
+            });

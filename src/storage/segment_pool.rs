@@ -71,7 +71,7 @@ impl SegmentPool {
         self.segments[seg_idx].inc_ref();
 
         Some(SegmentBuffer {
-            segment_idx: seg_idx as u8,
+            segment_idx: seg_idx as u16,
             offset: offset as u64,
             len: size as u32,
         })

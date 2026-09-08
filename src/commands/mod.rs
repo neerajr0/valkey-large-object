@@ -183,6 +183,11 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     };
 
+    // Reject zero-length values / 0-byte cases.
+    if obj_len == 0 {
+        return Err(ValkeyError::Str("ERR object length must be > 0"));
+    }
+
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,

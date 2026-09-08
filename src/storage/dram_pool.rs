@@ -106,7 +106,16 @@ impl DRAMPool {
         }
         let chunk_size = crate::buffer_size();
         let total_chunks = super::chunk_count(obj_len, chunk_size);
-
+        // Alloc BEFORE write lock — talc scan under memory pressure
+        // won't block GET readers waiting on get_object().
+        let buffers = self.pool.alloc_n(chunk_size, total_chunks as usize);
+        // All-or-nothing: if we couldn't get all N buffers, free partial and skip promotion.
+        if buffers.len() != total_chunks as usize {
+            for buf in &buffers {
+                self.pool.free(buf);
+            }
+            return None;
+        }
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -114,11 +123,6 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
-            return None;
-        }
-        let buffers = self.pool.alloc_n(chunk_size, total_chunks as usize);
-        // All-or-nothing: if we couldn't get all N buffers, free partial and skip promotion.
-        if buffers.len() != total_chunks as usize {
             for buf in &buffers {
                 self.pool.free(buf);
             }

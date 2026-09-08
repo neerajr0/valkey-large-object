@@ -16,16 +16,15 @@
 // all steps complete:
 //
 //   1. transport::init()       — discover EFA devices, create fabric/domain.
-//   2. storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, nvme_dir)
-//                              — allocate pool segments, create DRAMPool + NVMePool.
-//      (In Tiered mode, nvme_dir is reset beforehand — created if absent, wiped
-//       clean of any object files a previous run left behind after an unclean exit.)
-//   3. storage::register_buffers()
-//                              — IORING_REGISTER_BUFFERS pins pool pages for
-//                                ReadFixed/WriteFixed zero-copy I/O.
-//   4. transport::register_buffers()
-//                              — fi_mr_reg same pool buffers with EFA domains
-//                                for RDMA fi_write/fi_read.
+//   2. storage::init(mode, nvme_dir)
+//                              — validate config, allocate pool segments, create
+//                                io_uring engine (Tiered only). All resources are
+//                                created as locals; OnceLock statics are set only
+//                                after everything succeeds. On failure, locals
+//                                drop naturally — module load retryable.
+//   3. transport::register_buffers()
+//                              — fi_mr_reg pool buffers with EFA domains.
+//   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
 // After step 4, commands (LO.GET, LO.SET, LO.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +136,8 @@ lazy_static::lazy_static! {
 // ─── Global Runtime ──────────────────────────────────────────────────────────
 
 /// Tokio runtime — owned by the module, handle passed to transport crate.
-static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+/// Set once at the end of successful init. Never taken back.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub fn runtime_handle() -> &'static tokio::runtime::Handle {
     RUNTIME.get().expect("runtime not initialized").handle()
@@ -209,6 +209,16 @@ pub fn max_tcp_object_size() -> u64 {
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
+    // Any panic on any thread (main, tokio, io_uring poller) aborts the server.
+    // We are a no-panic codebase — a panic means a bug, not a recoverable condition.
+    std::panic::set_hook(Box::new(|info| {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: fatal panic — aborting server: {}",
+            info
+        ));
+        std::process::abort();
+    }));
+
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
     let dir = nvme_dir();
@@ -226,61 +236,48 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Step 0: Create tokio runtime (module owns it, transport borrows handle).
+    // Step 0: Create tokio runtime as a local. Set in OnceLock only after all init succeeds.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
         .thread_name("largeobj")
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    RUNTIME.set(rt).ok();
 
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();
 
-    // Step 2: Initialize DRAMPool + NVMePool with configured sizes.
-    let dram_seg_size = dram_segment_size();
-    let dram_max = dram_maxmemory();
-    let nvme_staging = nvme_staging_size();
-
-    // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
-    // Otherwise pre-allocate maxmemory / segment_size segments.
-    let dram_segment_count = if dram_max == 0 {
-        1
-    } else {
-        ((dram_max as usize) / dram_seg_size).max(1)
+    // Step 2: Initialize storage layer (pools, io_uring engine, validation).
+    // All pool/engine OnceLocks are set inside init() only after everything succeeds.
+    // On failure, locals drop naturally — no cleanup needed.
+    let storage_summary = match storage::init(mode, &dir) {
+        Ok(summary) => summary,
+        Err(e) => {
+            ctx.log_warning(&format!("largeobj: storage init failed: {}", e));
+            return Status::Err;
+        }
     };
 
-    // SegmentBuffer.segment_idx is u8 — max 256 segments per pool (indices 0–255).
-    // segment_idx is local to each pool (DRAMPool and NVMePool have separate segment vecs),
-    // so the NVMe staging segment does not consume a DRAMPool index.
-    if dram_segment_count > u8::MAX as usize + 1 {
-        ctx.log_warning(&format!(
-            "largeobj: too many DRAM segments ({}). Max 256 (segment_idx is u8). \
-             Increase dram-segment-size or decrease dram-maxmemory",
-            dram_segment_count,
-        ));
-        return Status::Err;
-    }
-
-    storage::init(mode, dram_segment_count, dram_seg_size, nvme_staging, &dir);
-
-    // Step 3: Register all segments with io_uring.
-    storage::register_buffers();
-
-    // Step 4: Transport::register_buffers() — fi_mr_reg per segment.
+    // Step 3: Transport::register_buffers() — fi_mr_reg per segment (EFA).
     let slices = storage::all_segment_slices();
     let slice_refs: Vec<&[u8]> = slices.to_vec();
-    transport::register_buffers(&slice_refs);
+    if let Err(e) = transport::register_buffers(&slice_refs) {
+        ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
+        // storage::init() already committed pools/engine to OnceLock.
+        // EFA registration failure after storage commit is fatal — panic.
+        // The admin must fix the EFA environment and restart.
+        panic!(
+            "largeobj: EFA buffer registration failed after storage init: {}",
+            e
+        );
+    }
 
-    ctx.log_notice(&format!(
-        "largeobj: initialized mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
-        mode,
-        dir,
-        dram_segment_count,
-        dram_seg_size / (1024 * 1024),
-        nvme_staging / (1024 * 1024),
-    ));
+    // All init succeeded — commit runtime to OnceLock.
+    if RUNTIME.set(rt).is_err() {
+        panic!("Runtime already initialized");
+    }
+
+    ctx.log_notice(&format!("largeobj: initialized {}", storage_summary));
 
     Status::Ok
 }
@@ -295,17 +292,16 @@ fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
 }
 
-/// Tear down on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// release transport resources, stop the io_uring poller, and — in Tiered mode —
-/// wipe nvme-dir so object files don't accumulate on the SSD across server
-/// lifetimes. Logs on cleanup failure but never blocks shutdown. A hard crash
-/// (SIGKILL / SIGSEGV / power loss) never reaches this handler; those leftovers
-/// are reclaimed by the startup reset in `initialize`.
+/// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
+/// signal the io_uring poller to stop, deregister EFA buffers, and — in Tiered
+/// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
+/// Process exit frees all remaining resources (pools, runtime, transport).
+/// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
+/// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::deregister_buffers();
     transport::shutdown();
-    storage::shutdown(); // stop the io_uring poller
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
