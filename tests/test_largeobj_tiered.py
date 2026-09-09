@@ -222,71 +222,68 @@ class TestLargeObjTieredDeletion(ValkeyLargeObjTestCaseBase):
             lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
         )
 
-    # ─── GET-after-DEL ────────────────────────────────────────────────────
+    # ─── DEL semantics ────────────────────────────────────────────────────
 
-    def test_get_after_del_returns_nil(self):
-        """Once DEL removes the key, a subsequent GET resolves to nil."""
+    def test_delete_semantics(self):
+        """DEL resolves a subsequent GET to nil and unlinks the .dat file -- both
+        for a cold object and one already promoted into DRAMPool (a distinct free
+        path: the DRAM cache entry is dropped alongside the Arc<ObjectFile>)."""
         client = self.server.get_new_client()
         payload = b"D" * 4096
+        assert client.execute_command("DBSIZE") == 0
+
+        # Cold object: GET after DEL is nil; DEL drops the key from the keyspace.
         client.execute_command("LO.SET", "gk", payload)
+        assert client.execute_command("DBSIZE") == 1
         assert client.execute_command("LO.GET", "gk") == payload
         client.execute_command("DEL", "gk")
+        assert client.execute_command("DBSIZE") == 0
         assert client.execute_command("LO.GET", "gk") is None
 
-    def test_del_after_promotion_returns_nil(self):
-        """DEL after the object was promoted into DRAMPool still resolves to nil,
-        and the NVMe file is unlinked."""
-        client = self.server.get_new_client()
-        payload = b"P" * 4096
+        # Promoted object: DEL still resolves to nil and the NVMe file is unlinked.
         client.execute_command("LO.SET", "pk", payload)
-        # First GET promotes into DRAMPool.
-        assert client.execute_command("LO.GET", "pk") == payload
+        assert client.execute_command("LO.GET", "pk") == payload  # first GET promotes
         client.execute_command("DEL", "pk")
+        assert client.execute_command("DBSIZE") == 0
         assert client.execute_command("LO.GET", "pk") is None
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
     # ─── Overwrite ────────────────────────────────────────────────────────
 
-    def test_overwrite_replaces_nvme_file(self):
-        """Overwriting a key mints a new file for the new object and tears down
-        the old one — exactly one .dat file remains and GET returns the new data."""
+    def test_overwrite_semantics(self):
+        """Overwriting a key commits a new object version and tears down the old
+        one: GET returns the new payload and exactly one .dat remains per key.
+        Covers the post-promotion overwrite (stale DRAM entry must be replaced)
+        and repeated overwrite (steady state stays bounded -- no file leak)."""
         client = self.server.get_new_client()
         v1 = b"1" * 4096
         v2 = b"2" * 8192
+
+        # Basic overwrite: the new value wins at commit; the old file is torn down.
         client.execute_command("LO.SET", "ok", v1)
+        assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
         client.execute_command("LO.SET", "ok", v2)
-        # GET returns the new value immediately (new OID wins at commit).
+        assert client.execute_command("DBSIZE") == 1  # overwrite reuses the key
         assert client.execute_command("LO.GET", "ok") == v2
-        # Old object's file is torn down asynchronously → back to a single file.
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 1)
 
-    def test_overwrite_after_promotion_serves_new_data(self):
-        """Overwrite after the old object was promoted to DRAM: the new GET must
-        serve the new payload (stale DRAM entry replaced), one file on disk."""
-        client = self.server.get_new_client()
-        v1 = b"A" * 4096
-        v2 = b"B" * 4096
-        client.execute_command("LO.SET", "opk", v1)
-        # Promote v1 into DRAMPool.
-        assert client.execute_command("LO.GET", "opk") == v1
-        # Overwrite with v2.
-        client.execute_command("LO.SET", "opk", v2)
-        assert client.execute_command("LO.GET", "opk") == v2
-        assert client.execute_command("LO.GET", "opk") == v2
-        self._wait_free_settled(client)
-        wait_for_equal(self._dat_count, 1)
+        # Overwrite after promotion: the new GET must serve the new payload.
+        client.execute_command("LO.SET", "opk", b"A" * 4096)
+        assert client.execute_command("LO.GET", "opk") == b"A" * 4096  # promote v1
+        client.execute_command("LO.SET", "opk", b"B" * 4096)
+        assert client.execute_command("LO.GET", "opk") == b"B" * 4096
+        assert client.execute_command("LO.GET", "opk") == b"B" * 4096
 
-    def test_repeated_overwrite_no_file_leak(self):
-        """Many overwrites of the same key never leak files — steady state is one."""
-        client = self.server.get_new_client()
+        # Repeated overwrite of one key never leaks files.
         for i in range(10):
             client.execute_command("LO.SET", "leakkey", bytes([65 + (i % 26)]) * 4096)
         assert client.execute_command("LO.GET", "leakkey") is not None
         self._wait_free_settled(client)
-        wait_for_equal(self._dat_count, 1)
+        # One live file per surviving key: ok, opk, leakkey.
+        wait_for_equal(self._dat_count, 3)
 
     # ─── GET result outlives a concurrent DEL (honor rule) ────────────────
 
@@ -299,34 +296,36 @@ class TestLargeObjTieredDeletion(ValkeyLargeObjTestCaseBase):
         payload = b"Z" * 8192
         for _ in range(20):
             client.execute_command("LO.SET", "churn", payload)
+            assert client.execute_command("DBSIZE") == 1
             assert client.execute_command("LO.GET", "churn") == payload
             client.execute_command("DEL", "churn")
+            assert client.execute_command("DBSIZE") == 0
             assert client.execute_command("LO.GET", "churn") is None
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
     # ─── Other free triggers: expiry & flush ──────────────────────────────
 
-    def test_expiry_unlinks_file(self):
-        """A key that expires (TTL) frees the LoValue and unlinks its .dat file.
-
-        Expiry is a distinct entry into lo_free from DEL/overwrite."""
+    def test_expiry_and_flushall_unlink_files(self):
+        """Expiry (TTL) and FLUSHALL are free paths distinct from DEL/overwrite;
+        both must unlink the .dat file(s)."""
         client = self.server.get_new_client()
+
+        # Passive expiry: polling EXISTS drives expiry, then teardown unlinks.
         client.execute_command("LO.SET", "exk", b"E" * 4096)
         wait_for_equal(self._dat_count, 1)
         client.execute_command("PEXPIRE", "exk", 50)
-        # Poll EXISTS to drive passive expiry, then let teardown settle.
         wait_for_equal(lambda: client.execute_command("EXISTS", "exk"), 0)
+        assert client.execute_command("DBSIZE") == 0
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
-    def test_flushall_unlinks_all_files(self):
-        """FLUSHALL frees every LoValue and unlinks all .dat files."""
-        client = self.server.get_new_client()
+        # FLUSHALL unlinks every remaining file.
         for i in range(3):
             client.execute_command("LO.SET", f"fk{i}", b"F" * 4096)
         wait_for_equal(self._dat_count, 3)
         client.execute_command("FLUSHALL")
+        assert client.execute_command("DBSIZE") == 0
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
@@ -413,45 +412,41 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             f" direct-io no"
         )
 
-    def test_capacity_reclaimed_after_delete(self):
+    def test_capacity_reclaimed_on_true_free(self):
+        """Capacity is reclaimed only when the file is truly unlinked -- via DEL
+        (partial, per-object) and via FLUSHALL (all). The usage decrement lives in
+        ObjectFile::Drop, so the waits below are load-bearing (freed at TRUE
+        deletion, not merely at key-free)."""
         client = self.server.get_new_client()
         payload = b"X" * self.OBJ
 
-        # Fill the cap exactly (4 * 256 KiB == 1 MiB).
+        # Fill the cap exactly (4 * 256 KiB == 1 MiB); the fifth must be rejected.
         for i in range(4):
             self._set_ok(client, f"k{i}", payload)
         wait_for_equal(self._dat_count, 4)
-
-        # Cap is full -> the fifth object must be rejected.
+        assert client.execute_command("DBSIZE") == 4
+        # A rejected SET must not leave a phantom key in the keyspace.
         self._set_rejected(client, "k4", payload)
+        assert client.execute_command("DBSIZE") == 4
 
-        # Delete one object and wait for its file to be truly unlinked. The usage
-        # decrement lives in ObjectFile::Drop, so capacity is NOT freed until the
-        # teardown runs -- the wait below is load-bearing.
+        # DEL one object: the slot frees only after teardown unlinks the file, so
+        # the previously-rejected SET fits once (and only once) the file is gone.
         client.execute_command("DEL", "k0")
+        assert client.execute_command("DBSIZE") == 3
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 3)
-
-        # Now that one slot is truly freed, the previously-rejected SET fits.
         self._set_ok(client, "k4", payload)
+        assert client.execute_command("DBSIZE") == 4
         wait_for_equal(self._dat_count, 4)
 
-    def test_capacity_reclaimed_after_flushall(self):
-        client = self.server.get_new_client()
-        payload = b"Y" * self.OBJ
-
-        for i in range(4):
-            self._set_ok(client, f"f{i}", payload)
-        self._set_rejected(client, "f4", payload)
-
-        # FLUSHALL frees every object; after teardown the full cap is available.
+        # FLUSHALL frees every object; the full cap becomes available again.
         client.execute_command("FLUSHALL")
+        assert client.execute_command("DBSIZE") == 0
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
-
-        # A full cap's worth of fresh objects fits again -- the counter returned to 0.
         for i in range(4):
             self._set_ok(client, f"g{i}", payload)
+        assert client.execute_command("DBSIZE") == 4
         wait_for_equal(self._dat_count, 4)
 
     def test_overwrite_does_not_leak_capacity(self):
@@ -462,6 +457,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         # cap and a later overwrite would be wrongly rejected.
         for i in range(20):
             self._set_ok_eventually(client, "ow", bytes([65 + (i % 26)]) * self.OBJ)
+        assert client.execute_command("DBSIZE") == 1  # one key throughout
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 1)
 
@@ -484,21 +480,24 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
             f" direct-io no"
         )
 
-    def test_padding_counts_against_capacity(self):
-        client = self.server.get_new_client()
-        # One object whose LOGICAL size fits under the cap (1050624 <= 1050624) but
-        # whose ALIGNED on-disk size does not: align_up(1050624) == 1052672 > cap.
-        # With correct (padded) accounting this SET is rejected; if accounting used
-        # the logical length it would wrongly succeed. Disk is empty, so the
-        # rejection is attributable to padding alone.
-        payload = b"P" * self.CAP  # logical == cap; aligned == cap rounded up
-        self._set_rejected(client, "padkey", payload)
+    def test_padding_accounting(self):
+        """O_DIRECT pads writes up to IO_ALIGN (4096); accounting must count the
+        padded on-disk size, not the logical length.
 
-    def test_logical_fit_without_padding_overflow_succeeds(self):
+        - Rejected: an object whose LOGICAL size fits under the cap
+          (1050624 <= 1050624) but whose ALIGNED size does not
+          (align_up(1050624) == 1052672 > cap). Disk is empty, so the rejection
+          is attributable to padding alone.
+        - Succeeds: a 1 MiB object is already 4096-aligned, so aligned == logical
+          == 1048576 <= cap -- proving the rejection above is padding-specific,
+          not just "large object rejected".
+        """
         client = self.server.get_new_client()
-        # Contrast case: a 1 MiB object is already 4096-aligned, so aligned == logical
-        # == 1048576 <= cap. This one must succeed -- proving the rejection above is
-        # specifically the padding, not just "large object rejected".
-        payload = b"Q" * (1024 * 1024)
-        self._set_ok(client, "fitkey", payload)
+        # Padded-overflow SET is rejected (logical == cap; aligned == cap rounded up)
+        # and must not create a key.
+        self._set_rejected(client, "padkey", b"P" * self.CAP)
+        assert client.execute_command("DBSIZE") == 0
+        # Contrast case: aligned-fit SET succeeds.
+        self._set_ok(client, "fitkey", b"Q" * (1024 * 1024))
+        assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
