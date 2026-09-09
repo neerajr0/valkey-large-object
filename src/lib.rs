@@ -126,12 +126,6 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
     RUNTIME.get().expect("runtime not initialized").handle()
 }
 
-/// Runtime handle if initialized, else `None`. Used by `ObjectFile::Drop`, which can
-/// fire before init or during shutdown (and in unit tests with no runtime).
-pub fn runtime_handle_opt() -> Option<&'static tokio::runtime::Handle> {
-    RUNTIME.get().map(|rt| rt.handle())
-}
-
 /// The Valkey main event-loop thread, captured at module load as its OS thread
 /// handle. We use `pthread_self` rather than `std::thread::current()` on purpose:
 /// `current()` lazily allocates a `Thread` handle into thread-local storage that
@@ -295,31 +289,6 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     transport::deregister_buffers();
     transport::shutdown();
     let dir = nvme_dir();
-    // Reconcile the NVMe disk-usage counter against ground truth before clean-up.
-    if operating_mode() == OperatingMode::Tiered {
-        // Drain in-flight ObjectFile teardowns. Bounded so a wedged unlink can't
-        // hang shutdown — if it times out we still reconcile, just approximately.
-        if !storage::wait_for_teardowns_drained(std::time::Duration::from_secs(5)) {
-            ctx.log_warning(
-                "largeobj: object teardowns still draining at shutdown; \
-                 NVMe disk-usage reconciliation below may be approximate",
-            );
-        }
-        let tracked = storage::uring::nvme_disk_usage();
-        match storage::sum_nvme_dir_bytes(&dir) {
-            Ok(on_disk) if on_disk != tracked => ctx.log_warning(&format!(
-                "largeobj: NVMe disk-usage accounting mismatch at shutdown: tracked {} B, on disk {} B (diff {} B)",
-                tracked,
-                on_disk,
-                tracked as i128 - on_disk as i128
-            )),
-            Ok(_) => {}
-            Err(e) => ctx.log_warning(&format!(
-                "largeobj: could not reconcile NVMe disk usage at shutdown (tracked {} B): {}",
-                tracked, e
-            )),
-        }
-    }
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",

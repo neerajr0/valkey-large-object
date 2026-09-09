@@ -260,7 +260,7 @@ fn execute_get_tiered(
                 }
                 _ => {
                     // Read failed — remove entry. Buffers freed by ObjectContext Drop.
-                    // ObjectFile drops here → teardown if this was the last strong ref.
+                    // ObjectFile drops here → teardown if this was the last ref.
                     storage::get_dram_pool().remove_object(&object_id);
                     thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
                 }

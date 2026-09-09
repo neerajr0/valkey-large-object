@@ -54,7 +54,7 @@ pub struct LoValue {
     pub crc32c: u32,         // integrity checksum (verified on replication pull)
     /// The object's `ObjectFile` handle (Tiered mode only; `None` in Dram mode).
     /// Tracks the object's on-disk existence and may hold an open read fd behind
-    /// an `Arc`. Dropping the last strong ref closes the fd and unlinks the file.
+    /// an `Arc`. Dropping the last ref closes the fd and unlinks the file.
     /// Never serialized or reconstructed on load.
     pub file: Option<Arc<ObjectFile>>,
 }
@@ -159,7 +159,7 @@ impl LoValue {
 /// Concurrency-safe via refcounted teardown: this callback drops the DRAM `ObjectContext`
 /// and `LoValue` references inline. The respective `Arc<ObjectFile>` drop tears down the
 /// file and fd when it is thread safe. Likewise, removing the `ObjectContext` from the
-/// DRAMPool drops the map's strong ref, and `ObjectContext::Drop` returns its buffers to
+/// DRAMPool drops the map's ref, and `ObjectContext::Drop` returns its buffers to
 /// the arena once the last reader drops it.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);

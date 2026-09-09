@@ -2,8 +2,8 @@
 //!
 //! An `ObjectFile` represents one Tiered-mode object's *on-disk existence*: its
 //! identity (`ObjectId`, from which the file path is derived) and the NVMe bytes it
-//! accounts for. The keyspace `LoValue` holds a strong `Arc<ObjectFile>`, and so does
-//! every in-flight request that resolved the key. When the last strong reference drops
+//! accounts for. The keyspace `LoValue` holds an `Arc<ObjectFile>`, and so does
+//! every in-flight request that resolved the key. When the last reference drops
 //! (`ObjectFile::Drop`) the object is gone: we deregister its read fd from the
 //! `FdPool` and unlink the NVMe file.
 //!
@@ -37,7 +37,7 @@ use crate::data_type::ObjectId;
 
 /// Existence handle for one object's NVMe file. Always held behind an `Arc`; its
 /// `Drop` deregisters the read fd from the pool and unlinks the file once, when the
-/// last strong reference goes away.
+/// last reference goes away.
 #[derive(Debug)]
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
@@ -62,7 +62,7 @@ impl ObjectFile {
     }
 
     /// Returns a cloned `Arc<OwnedFd>`. Calls into the `FdPool`, which owns the fd and
-    /// caches it for reuse. The returned strong reference should be used to protect the
+    /// caches it for reuse. The returned reference should be used to protect the
     /// fd from being closed while there are inflight read requests.
     pub fn ensure_open(&self, pool: &FdPool, dir: &str) -> Option<Arc<OwnedFd>> {
         pool.get_or_open(self.object_id, dir)
@@ -71,25 +71,26 @@ impl ObjectFile {
 
 impl Drop for ObjectFile {
     fn drop(&mut self) {
-        // Runs once, when the last strong ref drops: a completed deletion with no
+        // Runs once, when the last ref drops: a completed deletion with no
         // remaining ObjectFile refs. Means "object gone" — deregister the fd and
         // unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
 
-        let guard = super::TeardownGuard::new();
-        // Deregistering drops the pool's strong Arc<OwnedFd>; if no in-flight reader
+        // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
         let teardown = move || {
-            let _guard = guard;
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
             let path = object_id.file_path(&crate::nvme_dir());
-            if let Err(e) = std::fs::remove_file(&path) {
+            if let Err(_e) = std::fs::remove_file(&path) {
+                // Valkey logging APIs panic when the module isn't loaded (unit tests),
+                // where teardown runs inline — so only warn in a real module build.
+                #[cfg(not(test))]
                 valkey_module::logging::log_warning(format!(
                     "largeobj: failed to unlink object file {} during teardown: {}",
-                    path, e
+                    path, _e
                 ));
             }
             // Release exactly what create added — no stat, so it can't drift.
@@ -99,15 +100,7 @@ impl Drop for ObjectFile {
         // The main event-loop thread must be kept syscall-free. Hand the operation
         // off to the tokio pool if the drop() is invoked from the main thread.
         if crate::is_main_thread() {
-            match crate::runtime_handle_opt() {
-                // Fire-and-forget on the blocking pool (the JoinHandle is dropped).
-                Some(handle) => {
-                    handle.spawn_blocking(teardown);
-                }
-                // Runtime somehow gone on the main thread (pre-init/shutdown edge):
-                // inline is the least-bad fallback.
-                None => teardown(),
-            }
+            crate::runtime_handle().spawn(async move { teardown() });
         } else {
             teardown();
         }

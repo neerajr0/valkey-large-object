@@ -1,22 +1,21 @@
-//! File Descriptor Pool — owns and caches open read fds as `Arc<OwnedFd>`.
+//! File Descriptor Pool — owns and caches open read fds as `Arc<OwnedFd>`, keyed by `ObjectId`.
 //!
-//! Each object's read fd is opened lazily on the first GET (via `ObjectFile::ensure_open`,
-//! which calls `get_or_open` here) and cached as a strong `Arc<OwnedFd>` keyed by
-//! `ObjectId`. Every later GET reuses it; every in-flight reader holds its own clone.
-//! Because the fd is an `Arc<OwnedFd>`, it closes itself (RAII) once the last ref — the
-//! pool's cache entry plus any reader clones — is gone.
+//! A read fd is opened lazily on the first GET (via `ObjectFile::ensure_open` →
+//! `get_or_open`) and cached for reuse; every later GET and in-flight reader gets a clone.
+//! Being an `Arc<OwnedFd>`, it closes itself (RAII) once the last ref — the cache entry
+//! plus any reader clones — is gone. An fd is transient metadata, never persisted on the
+//! `LoValue` data type; it lives only in this pool, decoupled from object lifetime.
 //!
 //! The pool earns its keep for three jobs:
-//!   1. **Cache open read fds for reuse** — avoid a fresh `open()` on every GET.
-//!   2. **Serialize the lazy first-open** — two concurrent first-GETs on the same cold
-//!      object must not both `open()` and leak an fd; the write lock is the point.
-//!   3. **Own the fd independently of the `ObjectFile` handle** — holding a strong ref
-//!      here means a future evictor can drop the pool's ref without impacting inflight
-//!      readers that may still hold a strong reference to the fd.
+//!   1. **Reuse** — avoid a fresh `open()` on every GET.
+//!   2. **Serialize the lazy first-open** — the write lock stops two concurrent first-GETs
+//!      on a cold object from both `open()`-ing and leaking an fd.
+//!   3. **Own the fd independently of `ObjectFile`** — a future evictor can drop the pool's
+//!      ref to reclaim a cold fd without disturbing in-flight readers that still hold one.
 //!
-//! `remove` drops the pool's strong ref. Today it is called only from
-//! `ObjectFile::Drop` (on delete); the fd closes once this ref and all reader clones
-//! are gone. TODO: a future cold-fd evictor will also call it to reclaim descriptors
+//! `remove` drops the pool's ref; today only `ObjectFile::Drop` (on delete) calls it. There
+//! is no `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
+//! teardown are reclaimed by process exit. TODO: a cold-fd evictor will also call `remove`
 //! under fd pressure while the file still exists, after which the next GET reopens.
 
 use std::collections::HashMap;
@@ -43,7 +42,7 @@ impl FdPool {
     }
 
     /// Return the cached read fd for `object_id`, opening + caching it if not present.
-    /// A clone of `Arc<OwnedFd>` is returned to the caller. The strong reference can be
+    /// A clone of `Arc<OwnedFd>` is returned to the caller. The reference can be
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<OwnedFd>> {
@@ -82,11 +81,11 @@ impl FdPool {
         Some(fd)
     }
 
-    /// Drop the pool's strong ref to `object_id`'s fd. The fd closes once this ref and all
+    /// Drop the pool's ref to `object_id`'s fd. The fd closes once this ref and all
     /// in-flight reader clones are gone. Called from `ObjectFile::Drop` (on delete).
     pub fn remove(&self, object_id: ObjectId) {
         // Only hold the write lock for remove(). Once the lock is released we can drop
-        // the strong reference which may trigger the drop().
+        // the reference which may trigger the drop().
         let removed = self
             .fds
             .write()
@@ -104,11 +103,6 @@ impl FdPool {
         self.len() == 0
     }
 }
-
-// An fd closes when its cache entry and all reader clones drop. No `Drop for FdPool`:
-// it is a process-lifetime static whose fds are reclaimed by process exit. During
-// normal operation `ObjectFile::Drop` calls `remove(object_id)`, which drops the pool's
-// entry for that object; the fd then closes once the last reader clone is gone too.
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
