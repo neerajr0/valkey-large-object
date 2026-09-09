@@ -132,8 +132,18 @@ impl LoValue {
         let new_oid = ObjectId::next();
         let src_path = self.object_id.file_path(&data_dir);
         let dst_path = new_oid.file_path(&data_dir);
-        std::fs::copy(&src_path, &dst_path)
-            .expect("Tiered COPY: source file missing — key exists implies file exists");
+        // A copy failure (ENOSPC, EIO, ...) fails the COPY (lo_copy maps None -> null)
+        // rather than aborting the node. Release the reservation we took above and
+        // best-effort remove any partial destination.
+        if let Err(e) = std::fs::copy(&src_path, &dst_path) {
+            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
+            let _ = std::fs::remove_file(&dst_path);
+            crate::storage::warn(format!(
+                "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
+                self.object_id
+            ));
+            return None;
+        }
         // Confirm the copy is the size we accounted for (same tripwire as the write path).
         let on_disk = std::fs::metadata(&dst_path)
             .unwrap_or_else(|e| {
