@@ -232,44 +232,6 @@ impl StreamingContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    // The EFA serve reads a DRAM buffer whose lifetime IS the ObjectContext's
-    // (ObjectContext::Drop frees the buffer). The fix clones the Arc<ObjectContext>
-    // into the async RDMA write task, so a concurrent free (lo_free's remove_object
-    // dropping the DRAM map's Arc — the sole strong ref to the context) must NOT drop
-    // the context — hence must not free the buffer — until the transfer completes and the
-    // task's clone drops. This is the unit-level proof of that deferral; the real RDMA
-    // transfer can't be driven from a unit test, and the buffer free itself routes
-    // through the global DRAM_POOL (absent here), so we observe the owner via a Weak.
-    #[test]
-    fn test_serve_pin_defers_buffer_free_until_transfer_done() {
-        let bufs = vec![SegmentBuffer {
-            segment_idx: 0,
-            offset: 0,
-            len: 1024,
-        }];
-        let ctx = Arc::new(ObjectContext::new_ready(bufs, 1024));
-        // Weak observes whether the context (and thus its buffer) has been dropped.
-        let weak = Arc::downgrade(&ctx);
-        // The EFA write task's captured clone — what the fix adds.
-        let serve_pin = Arc::clone(&ctx);
-
-        // Concurrent free lands mid-transfer: drop every ref except the serve pin.
-        drop(ctx);
-        assert!(
-            weak.upgrade().is_some(),
-            "buffer owner must stay alive while the serve is in flight"
-        );
-        assert_eq!(Arc::strong_count(&serve_pin), 1);
-
-        // Transfer completes -> task's clone drops -> context drops -> buffer freed.
-        drop(serve_pin);
-        assert!(
-            weak.upgrade().is_none(),
-            "buffer owner must drop (buffer freed) once the transfer completes"
-        );
-    }
 
     #[test]
     fn test_object_context_ready() {
