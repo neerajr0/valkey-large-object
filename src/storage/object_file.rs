@@ -84,14 +84,8 @@ impl Drop for ObjectFile {
                 pool.remove(object_id);
             }
             let path = object_id.file_path(&crate::nvme_dir());
-            if let Err(_e) = std::fs::remove_file(&path) {
-                // Valkey logging APIs panic when the module isn't loaded (unit tests),
-                // where teardown runs inline — so only warn in a real module build.
-                #[cfg(not(test))]
-                valkey_module::logging::log_warning(format!(
-                    "largeobj: failed to unlink object file {} during teardown: {}",
-                    path, _e
-                ));
+            if let Err(e) = std::fs::remove_file(&path) {
+                super::warn_failed_unlink("teardown", &path, &e);
             }
             // Release exactly what create added — no stat, so it can't drift.
             crate::storage::uring::decrease_nvme_disk_usage(disk_len);

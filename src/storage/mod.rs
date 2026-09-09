@@ -195,6 +195,18 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     ))
 }
 
+/// Warn that an object file couldn't be unlinked (the next
+/// `validate_and_clean_nvme_dir` reclaims the orphan). Compiled out of test
+/// builds: Valkey's logging APIs panic when the module isn't loaded.
+pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
+    #[cfg(not(test))]
+    valkey_module::logging::log_warning(format!(
+        "largeobj: failed to unlink object file {path} during {during}: {err}"
+    ));
+    #[cfg(test)]
+    let _ = (during, path, err);
+}
+
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything
 /// under it, then recreate it empty. `nvme-dir` is a dedicated, module-owned
 /// directory (see the `nvme-dir` config docs), so wiping it is safe. A no-op

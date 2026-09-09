@@ -136,8 +136,13 @@ impl LoValue {
             .expect("Tiered COPY: source file missing — key exists implies file exists");
         // Confirm the copy is the size we accounted for (same tripwire as the write path).
         let on_disk = std::fs::metadata(&dst_path)
-            .map(|m| m.len())
-            .unwrap_or(disk_len);
+            .unwrap_or_else(|e| {
+                panic!(
+                    "NVMe accounting: cannot stat copied object {new_oid:?} at {dst_path} \
+                     to verify copy size: {e}"
+                )
+            })
+            .len();
         assert_eq!(
             on_disk, disk_len,
             "NVMe accounting: copied object {new_oid:?} on disk is {on_disk} B but we \

@@ -732,7 +732,9 @@ async fn do_tiered_nvme_write(
                         // Stale write — a newer SET already completed. Discard silently.
                         // No ObjectFile was minted, so release the reservation here.
                         uring::decrease_nvme_disk_usage(disk_len);
-                        let _ = std::fs::remove_file(&file_path);
+                        if let Err(e) = std::fs::remove_file(&file_path) {
+                            storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+                        }
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                         return;
                     }
@@ -740,8 +742,13 @@ async fn do_tiered_nvme_write(
                 // Winning branch (our OID ≥ any committed OID). Confirm the write
                 // produced exactly the size we accounted for.
                 let on_disk = std::fs::metadata(&file_path)
-                    .map(|m| m.len())
-                    .unwrap_or(disk_len);
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "NVMe accounting: cannot stat object {object_id:?} at {file_path} \
+                             to verify write size: {e}"
+                        )
+                    })
+                    .len();
                 assert_eq!(
                     on_disk, disk_len,
                     "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
@@ -765,7 +772,9 @@ async fn do_tiered_nvme_write(
         }
         Ok(Err(e)) => {
             uring::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&file_path);
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+            }
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
                 errors::ERR_NVME_WRITE,
@@ -777,7 +786,9 @@ async fn do_tiered_nvme_write(
         // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
             uring::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&file_path);
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+            }
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }
     }
