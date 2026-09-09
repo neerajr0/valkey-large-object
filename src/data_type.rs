@@ -152,7 +152,7 @@ impl LoValue {
             object_id: new_oid,
             len: self.len,
             crc32c: self.crc32c,
-            file: Some(Arc::new(ObjectFile::new_cold(new_oid, disk_len))),
+            file: Some(Arc::new(ObjectFile::new(new_oid, disk_len))),
         })
     }
 }

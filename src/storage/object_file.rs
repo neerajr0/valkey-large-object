@@ -47,10 +47,10 @@ pub struct ObjectFile {
 }
 
 impl ObjectFile {
-    /// Construct a cold handle: the file already exists on NVMe, but no read fd is
-    /// open yet. The fd opens lazily on the first GET via `ensure_open`.
+    /// Construct a handle for a file that already exists on NVMe. No read fd is
+    /// open yet — it opens lazily on the first GET via `ensure_open`.
     /// `disk_len` is the true on-disk size; `Drop` releases exactly that many bytes.
-    pub fn new_cold(object_id: ObjectId, disk_len: u64) -> Self {
+    pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         Self {
             object_id,
             disk_len,
@@ -108,8 +108,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_object_file_cold() {
-        let of = ObjectFile::new_cold(ObjectId(7), 0);
+    fn test_object_file_new() {
+        let of = ObjectFile::new(ObjectId(7), 0);
         assert_eq!(of.object_id(), ObjectId(7));
     }
 
@@ -118,7 +118,7 @@ mod tests {
         // Unit tests never run module init, so FD_POOL is None and is_main_thread()
         // is false: Drop skips the pool step, runs teardown inline, ignores the unlink
         // of the (nonexistent) derived path, and releases 0 bytes. Must not panic.
-        let of = ObjectFile::new_cold(ObjectId(0xDEAD), 0);
+        let of = ObjectFile::new(ObjectId(0xDEAD), 0);
         drop(of);
     }
 }

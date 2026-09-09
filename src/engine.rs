@@ -754,14 +754,14 @@ async fn do_tiered_nvme_write(
                     "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
                      reserved {disk_len} B — write path and accounting have diverged"
                 );
-                // Mint a fresh, cold ObjectFile owning this file's existence, lazy read
+                // Mint a fresh ObjectFile owning this file's existence, lazy read
                 // fd, and NVMe bytes. An overwrite triggers lo_free on the old LoValue,
                 // dropping its ObjectFile (teardown).
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
                     crc32c: crc,
-                    file: Some(Arc::new(ObjectFile::new_cold(object_id, disk_len))),
+                    file: Some(Arc::new(ObjectFile::new(object_id, disk_len))),
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
                     thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
