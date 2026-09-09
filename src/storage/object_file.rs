@@ -2,10 +2,12 @@
 //!
 //! An `ObjectFile` represents one Tiered-mode object's *on-disk existence*: its
 //! identity (`ObjectId`, from which the file path is derived) and the NVMe bytes it
-//! accounts for. The keyspace `LoValue` holds an `Arc<ObjectFile>`, and so does
-//! every in-flight request that resolved the key. When the last reference drops
-//! (`ObjectFile::Drop`) the object is gone: we deregister its read fd from the
-//! `FdPool` and unlink the NVMe file.
+//! accounts for. Objects are immutable and versioned: each write or copy creates a
+//! new `ObjectFile` with a monotonically-increasing `ObjectId` (a new version),
+//! and `LoValue` always references the latest one. The keyspace `LoValue` holds an
+//! `Arc<ObjectFile>`, and so does every in-flight request that resolved the key. When
+//! the last reference drops (`ObjectFile::Drop`) that version is gone: we deregister
+//! its read fd from the `FdPool` and unlink the NVMe file.
 //!
 //! Safety of deletion under a concurrent read rests on two facts:
 //!   1. Reference counting on two independent Arcs — a reader pins `Arc<ObjectFile>`
@@ -21,11 +23,11 @@
 //!
 //! Teardown (pool deregister + unlink) runs inline on whichever thread dropped the
 //! last ref, except on the main event-loop thread, where blocking would stall the
-//! server, so it is handed to the tokio blocking pool (see `crate::is_main_thread`).
+//! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
-//! serialized form; it is reconstructed cold on load and its fd opens lazily on the
-//! first GET.
+//! serialized form; on load a handle is reconstructed for the existing file and its
+//! fd opens lazily on the first GET.
 
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -35,7 +37,8 @@ use crate::data_type::ObjectId;
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
 
-/// Existence handle for one object's NVMe file. Always held behind an `Arc`; its
+/// Existence handle for one version of an object's NVMe file. Always held behind an
+/// `Arc`; its
 /// `Drop` deregisters the read fd from the pool and unlinks the file once, when the
 /// last reference goes away.
 #[derive(Debug)]
@@ -47,9 +50,10 @@ pub struct ObjectFile {
 }
 
 impl ObjectFile {
-    /// Construct a handle for a file that already exists on NVMe. No read fd is
-    /// open yet — it opens lazily on the first GET via `ensure_open`.
-    /// `disk_len` is the true on-disk size; `Drop` releases exactly that many bytes.
+    /// Construct the handle for a newly committed object version whose file already
+    /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
+    /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
+    /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         Self {
             object_id,

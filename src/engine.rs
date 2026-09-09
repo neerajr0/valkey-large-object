@@ -68,7 +68,7 @@ pub enum EngineResult {
 //     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
 //     a read. The `ObjectFile` pin is held for the whole request, read plus transfer.
 //   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write path:
-//   the `ObjectFile` is minted at commit, never read during the write. An overwritten
+//   the `ObjectFile` is created at commit, never read during the write. An overwritten
 //   old `ObjectFile` is protected by refcount on the replaced `LoValue` (via
 //   `lo_free`), not by the writer.
 
@@ -117,7 +117,7 @@ pub fn execute_get(
                 }
                 OperatingMode::Tiered => {
                     let file =
-                        file.expect("Tiered GET: LoValue.file must be Some (minted at commit)");
+                        file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
                     execute_get_tiered(object_id, obj_len, file, transport, blocked_client);
                 }
             }
@@ -730,7 +730,7 @@ async fn do_tiered_nvme_write(
                 if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
                     if existing.object_id > object_id {
                         // Stale write — a newer SET already completed. Discard silently.
-                        // No ObjectFile was minted, so release the reservation here.
+                        // No ObjectFile was created, so release the reservation here.
                         uring::decrease_nvme_disk_usage(disk_len);
                         if let Err(e) = std::fs::remove_file(&file_path) {
                             storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
@@ -754,9 +754,9 @@ async fn do_tiered_nvme_write(
                     "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
                      reserved {disk_len} B — write path and accounting have diverged"
                 );
-                // Mint a fresh ObjectFile owning this file's existence, lazy read
-                // fd, and NVMe bytes. An overwrite triggers lo_free on the old LoValue,
-                // dropping its ObjectFile (teardown).
+                // Create the new version's ObjectFile owning this file's existence,
+                // lazy read fd, and NVMe bytes. An overwrite triggers lo_free on the
+                // old LoValue, dropping its ObjectFile (teardown).
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
