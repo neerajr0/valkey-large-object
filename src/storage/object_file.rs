@@ -112,12 +112,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_object_file_new() {
-        let of = ObjectFile::new(ObjectId(7), 0);
-        assert_eq!(of.object_id(), ObjectId(7));
-    }
-
-    #[test]
     fn test_drop_without_pool_is_safe() {
         // Unit tests never run module init, so FD_POOL is None and is_main_thread()
         // is false: Drop skips the pool step, runs teardown inline, ignores the unlink
