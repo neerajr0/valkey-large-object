@@ -123,9 +123,8 @@ impl LoValue {
     /// Returns None if nvme-maxmemory would be exceeded.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let data_dir = crate::nvme_dir();
-        // On-disk size: writes are padded to IO_ALIGN and the copy is byte-exact, so
-        // this is the aligned length. Added here and released by ObjectFile::Drop.
-        let disk_len = crate::storage::align_up(self.len as usize) as u64;
+        // On-disk size.
+        let disk_len = crate::storage::object_disk_len(self.len);
         if !crate::storage::uring::try_reserve_nvme_disk_usage(disk_len) {
             return None;
         }

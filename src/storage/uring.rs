@@ -306,7 +306,7 @@ impl UringNvmeEngine {
 
                 let (sqe, op) = match req {
                     IoRequest::Read { fd, op, tx } => {
-                        let read_len = super::align_up(op.len as usize) as u32;
+                        let read_len = super::object_disk_len(op.len as u64) as u32;
                         let sqe = if use_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
@@ -336,7 +336,7 @@ impl UringNvmeEngine {
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
-                        let write_len = super::align_up(op.len as usize) as u32;
+                        let write_len = super::object_disk_len(op.len as u64) as u32;
                         let sqe = if use_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
@@ -520,7 +520,7 @@ mod tests {
         let _g = lock();
         let base = nvme_disk_usage();
         for len in [1u64, 4095, 4096, 4097, 1_048_576] {
-            let disk_len = super::super::align_up(len as usize) as u64;
+            let disk_len = super::super::object_disk_len(len);
             increase_nvme_disk_usage(disk_len);
             decrease_nvme_disk_usage(disk_len);
         }

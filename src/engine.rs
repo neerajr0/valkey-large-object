@@ -674,8 +674,8 @@ async fn do_tiered_nvme_write(
     key_name: Vec<u8>,
     object_id: ObjectId,
 ) {
-    // On-disk size, accounting for padding.
-    let disk_len = storage::align_up(obj_len as usize) as u64;
+    // On-disk size for the reservation and verified by stat after the write completes.
+    let disk_len = storage::object_disk_len(obj_len);
     // Atomically reserve the disk budget up-front. Reject if writing this object would
     // exceed nvme-maxmemory. stream_ctx drop frees the buffer on return.
     if !uring::try_reserve_nvme_disk_usage(disk_len) {

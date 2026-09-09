@@ -25,6 +25,12 @@ pub const IO_ALIGN: usize = 4096;
 pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
 }
+
+/// O_DIRECT-aligned on-disk size of an object with `logical_len` payload bytes.
+/// Shared helper function to ensure no drift between expected and actual file sizes.
+pub fn object_disk_len(logical_len: u64) -> u64 {
+    align_up(logical_len as usize) as u64
+}
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;
