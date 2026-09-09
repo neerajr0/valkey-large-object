@@ -28,6 +28,15 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 1, "Tiered SET should create an NVMe .dat file"
 
+    def _dat_count(self):
+        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
+
+    def _wait_free_settled(self, client):
+        """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
+        wait_for_equal(
+            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
+        )
+
     def test_get_after_set_roundtrip(self):
         """Tiered mode: SET then GET returns correct data."""
         client = self.server.get_new_client()
@@ -120,107 +129,6 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # Nonexistent key returns nil digest
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
-
-
-class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
-    """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
-
-    def get_module_args(self, data_dir, direct_io):
-        return (
-            f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
-            f" dram-segment-size 4194304"
-            f" max-promote-size 0"
-            f" bench-mode no"
-            f" direct-io no"
-        )
-
-    def test_set_get_roundtrip_no_promotion(self):
-        """With max-promote-size=0, GET always reads from NVMe (no DRAMPool caching)."""
-        client = self.server.get_new_client()
-        payload = b'N' * 8192
-        client.execute_command('LO.SET', 'nvme_key', payload)
-        result = client.execute_command('LO.GET', 'nvme_key')
-        assert result == payload
-
-    def test_multiple_gets_all_from_nvme(self):
-        """Multiple GETs with max-promote-size=0 should all succeed."""
-        client = self.server.get_new_client()
-        payload = b'R' * 4096
-        client.execute_command('LO.SET', 'repeat_key', payload)
-        for _ in range(5):
-            result = client.execute_command('LO.GET', 'repeat_key')
-            assert result == payload
-
-    def test_nvme_staging_exhaustion(self):
-        """An object larger than nvme-staging-size should fail with pool exhausted."""
-        client = self.server.get_new_client()
-        # nvme-staging-size is 4MB. An 8MB object cannot be staged.
-        obj_size = 8 * 1024 * 1024
-        payload = b'Z' * obj_size
-        try:
-            client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
-        except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
-
-    # ─── MEMORY USAGE tests ───────────────────────────────────────────────
-
-    def test_memory_usage_tiered_cold(self):
-        """Without promotion, MEMORY USAGE reports only LoValue struct overhead.
-
-        This test class sets max-promote-size=0, so objects are never promoted
-        to DRAMPool. memory_usage reports only sizeof(LoValue) (24 bytes) — the
-        payload lives on NVMe and does not consume DRAM.
-        """
-        client = self.server.get_new_client()
-        payload_size = 4096
-        payload = b'M' * payload_size
-        client.execute_command('LO.SET', 'memkey', payload)
-        # Even after a GET the object stays cold (max-promote-size=0).
-        client.execute_command('LO.GET', 'memkey')
-        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
-        assert mem is not None
-        lo_value_size = 24
-        # Our callback returns only sizeof(LoValue) = 24. Valkey adds per-key
-        # overhead (~72-120 bytes), so total is well below lo_value_size + payload_size.
-        upper_bound = lo_value_size + payload_size
-        assert mem < upper_bound, (
-            f"Expected MEMORY USAGE < {upper_bound} (cold, not promoted), got {mem}"
-        )
-
-
-
-class TestLargeObjTieredDeletion(ValkeyLargeObjTestCaseBase):
-    """Deletion / overwrite / free semantics of the refcounted teardown design.
-
-    The design roots object existence in the keyspace: DEL, overwrite, expiry and
-    flush all drop the LoValue's Arc<ObjectFile>, whose Drop closes the fd and
-    unlinks the .dat file off the main event-loop thread. These tests assert the
-    on-disk effects. Because teardown is asynchronous, file-count assertions poll
-    rather than check once.
-    """
-
-    def get_module_args(self, data_dir, direct_io):
-        return (
-            f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
-            f" dram-segment-size 4194304"
-            f" max-promote-size 268435456"
-            f" bench-mode no"
-            f" direct-io no"
-        )
-
-    def _dat_count(self):
-        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
-
-    def _wait_free_settled(self, client):
-        """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
-        wait_for_equal(
-            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
-        )
 
     # ─── DEL semantics ────────────────────────────────────────────────────
 
@@ -328,6 +236,75 @@ class TestLargeObjTieredDeletion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command("DBSIZE") == 0
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
+
+
+class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
+    """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" dram-segment-size 4194304"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_set_get_roundtrip_no_promotion(self):
+        """With max-promote-size=0, GET always reads from NVMe (no DRAMPool caching)."""
+        client = self.server.get_new_client()
+        payload = b'N' * 8192
+        client.execute_command('LO.SET', 'nvme_key', payload)
+        result = client.execute_command('LO.GET', 'nvme_key')
+        assert result == payload
+
+    def test_multiple_gets_all_from_nvme(self):
+        """Multiple GETs with max-promote-size=0 should all succeed."""
+        client = self.server.get_new_client()
+        payload = b'R' * 4096
+        client.execute_command('LO.SET', 'repeat_key', payload)
+        for _ in range(5):
+            result = client.execute_command('LO.GET', 'repeat_key')
+            assert result == payload
+
+    def test_nvme_staging_exhaustion(self):
+        """An object larger than nvme-staging-size should fail with pool exhausted."""
+        client = self.server.get_new_client()
+        # nvme-staging-size is 4MB. An 8MB object cannot be staged.
+        obj_size = 8 * 1024 * 1024
+        payload = b'Z' * obj_size
+        try:
+            client.execute_command('LO.SET', 'toobig', payload)
+            assert False, "Expected pool exhausted error"
+        except ResponseError as e:
+            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+
+    # ─── MEMORY USAGE tests ───────────────────────────────────────────────
+
+    def test_memory_usage_tiered_cold(self):
+        """Without promotion, MEMORY USAGE reports only LoValue struct overhead.
+
+        This test class sets max-promote-size=0, so objects are never promoted
+        to DRAMPool. memory_usage reports only sizeof(LoValue) (24 bytes) — the
+        payload lives on NVMe and does not consume DRAM.
+        """
+        client = self.server.get_new_client()
+        payload_size = 4096
+        payload = b'M' * payload_size
+        client.execute_command('LO.SET', 'memkey', payload)
+        # Even after a GET the object stays cold (max-promote-size=0).
+        client.execute_command('LO.GET', 'memkey')
+        mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
+        assert mem is not None
+        lo_value_size = 24
+        # Our callback returns only sizeof(LoValue) = 24. Valkey adds per-key
+        # overhead (~72-120 bytes), so total is well below lo_value_size + payload_size.
+        upper_bound = lo_value_size + payload_size
+        assert mem < upper_bound, (
+            f"Expected MEMORY USAGE < {upper_bound} (cold, not promoted), got {mem}"
+        )
 
 
 # ─── NVMe disk-usage accounting ──────────────────────────────────────────
