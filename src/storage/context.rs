@@ -201,7 +201,7 @@ impl Drop for StreamingContext {
 impl StreamingContext {
     /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
     /// The context owns only its rotating buffer window; the caller's task holds any
-    /// `Arc<ObjectFile>` pin needed to keep the file/fd alive for the transfer.
+    /// `Arc<ObjectFile>` pin needed to keep the `ObjectFile` and fd alive for the transfer.
     pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,

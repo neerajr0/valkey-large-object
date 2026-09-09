@@ -66,11 +66,11 @@ pub enum EngineResult {
 // open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
 //   - Every Tiered request that READS the object: the NVMe promotion read, the
 //     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
-//     a read. The file is held for the whole request, read plus transfer.
-//   NOT needed in Dram mode (there is no file), and NOT on the SET write path: the
-//   file is minted at commit, never read during the write. An overwritten old file
-//   is protected by refcount on the replaced `LoValue` (via `lo_free`), not by the
-//   writer.
+//     a read. The `ObjectFile` pin is held for the whole request, read plus transfer.
+//   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write path:
+//   the `ObjectFile` is minted at commit, never read during the write. An overwritten
+//   old `ObjectFile` is protected by refcount on the replaced `LoValue` (via
+//   `lo_free`), not by the writer.
 
 // ─── GET Engine ──────────────────────────────────────────────────────────────
 
@@ -281,8 +281,8 @@ fn execute_get_tiered(
         }
     };
 
-    // Transient read StreamingContext owns only the NVMe buffer; the file pin is
-    // held by the spawned task (see `_keep_alive` below).
+    // Transient read StreamingContext owns only the NVMe buffer; the `ObjectFile`
+    // pin is held by the spawned task (see `_keep_alive` below).
     let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let fd_pool = storage::get_fd_pool();
@@ -309,7 +309,7 @@ fn execute_get_tiered(
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
-        // Pin the buffer (stream_ctx) and the file for the transfer's duration.
+        // Pin the buffer (stream_ctx) and the `ObjectFile` (`file`) for the transfer's duration.
         let _keep_alive = (stream_ctx, file);
 
         let read_result = uring::submit_read(fd.as_raw_fd(), read_op).await;

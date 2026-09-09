@@ -86,7 +86,12 @@ impl Drop for ObjectFile {
                 pool.remove(object_id);
             }
             let path = object_id.file_path(&crate::nvme_dir());
-            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                valkey_module::logging::log_warning(format!(
+                    "largeobj: failed to unlink object file {} during teardown: {}",
+                    path, e
+                ));
+            }
             // Release exactly what create added — no stat, so it can't drift.
             crate::storage::uring::decrease_nvme_disk_usage(disk_len);
         };
