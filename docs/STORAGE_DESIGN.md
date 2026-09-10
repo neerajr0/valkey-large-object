@@ -32,11 +32,13 @@ Any buffer used for `ReadFixed`/`WriteFixed` must be pre-registered with the ker
 
 `IORING_REGISTER_BUFFERS` takes an array of `iovec` structs. Each entry is one "buffer" from io_uring's perspective. `ReadFixed`/`WriteFixed` operations reference a buffer by its array index (`buf_index`) plus an offset and length within it.
 
-**Critical insight:** Each iovec entry can be arbitrarily large. A 16GB segment is a valid single entry. You then use `buf_index=N` to select the segment and `offset` to target a specific location within it.
+**Critical insight:** `ReadFixed`/`WriteFixed` address a buffer by its array index (`buf_index`) plus an offset and length within it — so a single segment can hold many objects, selected by offset.
+
+**Hard limit — 1 GiB per registered buffer:** Each iovec entry passed to `IORING_REGISTER_BUFFERS` must have `iov_len <= 1 GiB`. The kernel rejects any entry larger than 1 GiB with `EFAULT` (observed at scale on i8ge). A segment is exactly one iovec entry, so **every segment (which is io_uring registered) must be capped at 1 GiB.** Larger capacity is achieved by registering *multiple* ≤1 GiB segments, not one large one.
 
 ```
-Registration:  [ iovec{segment0, 16GB}, iovec{segment1, 16GB}, iovec{segment2, 16GB} ]
-                  buf_index=0              buf_index=1            buf_index=2
+Registration:  [ iovec{segment0, 1GiB}, iovec{segment1, 1GiB}, iovec{segment2, 1GiB} ]
+                  buf_index=0             buf_index=1            buf_index=2
 
 ReadFixed:  buf_index=1, offset=0x5000, len=4MB
             → reads 4MB from NVMe into segment1 at byte offset 0x5000
@@ -111,7 +113,7 @@ Class 3: 8MB buffers  × 250    (serves 1-8MB objects)
 - Fixed capacity per class decided at startup
 - Cannot handle objects larger than largest class (reject with ERR)
 
-### 4.2 Approach B: Arena with Slab Allocator (talc) [Recommended]
+### 4.2 Approach B: Arena with Slab Allocator (talc) [Recommended/Chosen]
 
 Allocate one or more large contiguous memory segments at startup. Register each segment with EFA. Sub-allocate exact-sized slots from the segments using a general-purpose allocator (talc).
 
@@ -188,10 +190,10 @@ We use Approach B (talc arena). Object sizes are unknown at design time — talc
 **Two separate talc instances, each with their own segments:**
 
 ```
-NVMePool:    Segment(s) (e.g., 2GB)   — own Mutex<Talc>, high churn, short-lived StreamingContexts
-DRAMPool:    Segment(s) (e.g., 16GB)  — own Mutex<Talc>, low churn, long-lived ObjectContexts
+NVMePool:    N segments (each ≤1GiB)   — own Mutex<Talc>, high churn, short-lived StreamingContexts
+DRAMPool:    N segments (each ≤1GiB)   — own Mutex<Talc>, low churn, long-lived ObjectContexts
 
-io_uring registration: [iovec{NVMePool_seg, 2GB}, iovec{DRAMPool_seg, 16GB}] — all segments in one array
+io_uring registration: [iovec{seg, ≤1GiB}, iovec{seg, ≤1GiB}, ...] — every segment in one array, each ≤1GiB
 EFA registration:      fi_mr_reg per segment — enables fi_write from any buffer in either pool
 ```
 
@@ -216,7 +218,7 @@ O_DIRECT bypasses the kernel page cache for direct NVMe I/O. It imposes two cons
 1. **Buffer address** must be 4KB-aligned (filesystem block size). Handled by `PinnedBuffer::new()` via `Layout::from_size_align(size, 4096)`.
 2. **Write length** must be a multiple of 512 bytes (logical sector size). Objects not naturally aligned are padded on disk: `ceil(len / 512) * 512`. Up to 511 bytes waste on disk. Reads return only `len` bytes (stored in LoValue metadata).
 
-**Both read and write paths must round up the I/O length.** The kernel rejects non-aligned lengths with `EINVAL`. The module handles this explicitly — O_DIRECT does not auto-pad. Current code (`uring.rs`) uses `align_up()` which rounds to 4096 — over-aligned but correct. Read path applies this; write path currently does not (BUG — masked because benchmark object sizes are naturally aligned). Must be fixed.
+**Both read and write paths round up the I/O length.** The kernel rejects non-aligned lengths with `EINVAL`; O_DIRECT does not auto-pad. The module rounds up explicitly via `object_disk_len()` (`ceil(len / 4096) * 4096`) on both paths. On SET the reserved and written disk length is this aligned value, and the on-disk size is asserted to equal it.
 
 EFA `fi_write` has no alignment constraint — sends exact `len`.
 
@@ -324,34 +326,40 @@ Only durable, object-intrinsic data. No runtime state (fd, DRAM cache location, 
 - **NVMePool inflight:** transient `StreamingContext` per in-flight request — buffers in NVMePool segments, dropped on completion
 - **Allocators:** `Mutex<Talc>` per layer — `dram_pool_talc` for DRAMPool, `nvme_pool_talc` for NVMePool (§4.5)
 
-### 6.2 ObjectContext, StreamingContext, and Buffer
+### 6.2 ObjectContext, StreamingContext, and SegmentBuffer
 
 Module-internal runtime companions to LoValue. Not serialized — rebuilt on load, evicted independently of commands.
 
 ```rust
-struct Buffer {
-    segment_idx: u8,       // Which segment this slice lives in (DRAMPool or NVMePool)
+// A plain move/copy descriptor of a slice within a segment. NOT refcounted,
+// NO Drop — freed explicitly by the owning context's Drop (or pool.free on
+// error paths). `#[derive(Clone, Copy)]`.
+struct SegmentBuffer {
+    segment_idx: u16,      // Pool-local segment index (distinct from the global iovec_index)
     offset: u64,           // Byte offset within that segment
-    len: u32,              // This chunk's size
+    len: u32,              // This chunk's requested size
 }
 // Always within a registered segment → ReadFixed + EFA fi_write capable
 
 struct ObjectContext {
-    buffers: Vec<Buffer>,  // ALL chunks (complete object). Allocated from DRAMPool.
+    buffers: Vec<SegmentBuffer>, // ALL chunks (complete object). Allocated from DRAMPool.
     total_len: u64,
-    state: ObjectState,
+    state: AtomicU8,             // ObjectState: Ready | Filling
+    chunks_ready: AtomicU32,     // Advances per batch during promotion fill
+    // total_chunks: u32         // (present but currently unused — single-chunk only today)
 }
 
-enum ObjectState {
-    Ready,                                          // Fully filled, servable
-    Filling { chunks_ready: u32, total: u32 },      // Promotion in progress (§7.3.4)
-}
+// ObjectState values encoded in the AtomicU8:
+//   Ready    — fully filled, servable
+//   Filling  — promotion in progress (§7.3.4); chunks_ready tracks progress
 
 struct StreamingContext {
-    buffers: Vec<Buffer>,       // Rotating window of X buffers. Allocated from NVMePool.
+    buffers: Vec<SegmentBuffer>, // Rotating window of X buffers. Allocated from NVMePool.
     total_len: u64,
-    bytes_completed: u64,       // Progress cursor
-    crc_hasher: Option<Crc32c>, // For SET verification
+    chunks_completed: u32,       // Progress cursor (chunks, not bytes)
+    total_chunks: u32,
+    // NOTE: the SET CRC32c is a LOCAL variable in the tokio SET task,
+    //       NOT a field on this struct.
 }
 ```
 
@@ -367,10 +375,10 @@ struct StreamingContext {
 - Used for: SET writes to NVMe, GET serve-and-discard (no promotion)
 - Freed entirely after operation completes
 
-**Buffer:**
+**SegmentBuffer:**
 - Segment-agnostic: works for both DRAMPool and NVMePool segments
-- Same struct regardless of lifetime or pool
-- `segment_idx` identifies which registered iovec entry (DRAMSegment or NVMeSegment)
+- Same struct regardless of lifetime or pool; a plain `Copy` descriptor with no `Drop`
+- `segment_idx` is the pool-local segment index; the engine maps it to the global registered iovec entry via `pool.segments()[segment_idx].iovec_index`
 
 ### 6.3 NVMe File Reference
 
@@ -435,7 +443,7 @@ struct FdPool {
 
 ### 6.5 ObjectContext Lifetimes
 
-ObjectContext exists in two layers with different lifetimes. Same struct, same Buffer type, but allocated from **separate talc instances in separate segments** (§4.5).
+ObjectContext exists in two layers with different lifetimes. Same struct, same SegmentBuffer type, but allocated from **separate talc instances in separate segments** (§4.5).
 
 **DRAMPool (long-lived):**
 - ObjectContext created on cache promotion (LO.GET hit policy admits it)
@@ -551,7 +559,7 @@ All I/O operations (SET and GET) use the same chunked streaming pattern. "Full p
 Every chunked I/O operation runs as a tokio task with X buffers (the batch/pipeline depth). The task submits a **single batch of X I/Os** to the io layer, awaits all completions, then reuses the buffers for the next batch.
 
 ```rust
-async fn stream_batched(buffers: &mut [Buffer], fd: RawFd, total_len: u64, chunk_size: usize) {
+async fn stream_batched(buffers: &mut [SegmentBuffer], fd: RawFd, total_len: u64, chunk_size: usize) {
     let x = buffers.len();  // batch size
     let total_chunks = ceil(total_len, chunk_size);
     
@@ -891,10 +899,10 @@ This section describes how shared state is protected, which structures are refco
 |---|---|---|---|
 | ObjectContext (DRAMPool) | `Arc<ObjectContext>` | DRAMPool HashMap (1), each in-flight GET reader (1 each) | `Drop` impl: `dram_pool_talc.lock().free()` for each buffer, decrement segment refcounts |
 | StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | Leader task only (coalesced waiters wait on notification, don't hold the context) | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
-| Buffer | **Not refcounted** — owned exclusively by parent context | ObjectContext or StreamingContext (never shared independently) | Freed when parent drops: `talc.free(ptr, layout)` + segment refcount decrement |
-| FdEntry | `Arc<FdEntry>` | FdPool HashMap (1), each in-flight I/O op (1 each) | `Drop` impl: `close(fd)` |
-| DRAMSegment | `AtomicU32` refcount | Each live ObjectContext buffer in this segment (+1 per alloc, -1 per free) | If draining: safe to IORING_UNREGISTER + dealloc |
-| NVMeSegment | `AtomicU32` refcount | Each live StreamingContext buffer in this segment (+1 per alloc, -1 per free) | If draining: safe to IORING_UNREGISTER + dealloc |
+| SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
+| ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
+| Open fd | `Arc<OwnedFd>` | FdPool HashMap (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops |
+| Segment | `AtomicU32` refcount + `AtomicBool draining` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: safe to IORING_UNREGISTER + dealloc |
 
 ### 9.2 Threading Model: Which Thread Does What
 
