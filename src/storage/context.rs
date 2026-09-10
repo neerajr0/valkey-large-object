@@ -91,7 +91,7 @@ impl ObjectContext {
         }
     }
 
-    /// Create a new ObjectContext in Filling state (promotion path).
+    /// Create a new ObjectContext in Filling state (Tiered promotion path).
     pub fn new_filling(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,
@@ -200,6 +200,8 @@ impl Drop for StreamingContext {
 
 impl StreamingContext {
     /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
+    /// The context owns only its rotating buffer window; the caller's task holds any
+    /// `Arc<ObjectFile>` pin needed to keep the `ObjectFile` and fd alive for the transfer.
     pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
         Self {
             buffers,

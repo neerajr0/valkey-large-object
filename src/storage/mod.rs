@@ -3,18 +3,18 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
-use crate::data_type::ObjectId;
-
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
 pub mod nvme_pool;
+pub mod object_file;
 pub mod segment;
 pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+pub use object_file::ObjectFile;
 
 /// O_DIRECT / io_uring alignment requirement (XFS default block size).
 /// Both buffer address and I/O length must be multiples of this.
@@ -24,6 +24,12 @@ pub const IO_ALIGN: usize = 4096;
 /// and the uring layer (I/O length) to satisfy O_DIRECT requirements.
 pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
+}
+
+/// O_DIRECT-aligned on-disk size of an object with `logical_len` payload bytes.
+/// Shared helper function to ensure no drift between expected and actual file sizes.
+pub fn object_disk_len(logical_len: u64) -> u64 {
+    align_up(logical_len as usize) as u64
 }
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
@@ -193,6 +199,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         dram_seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),
     ))
+}
+
+/// Warn that an object file couldn't be unlinked (the next
+/// `validate_and_clean_nvme_dir` reclaims the orphan).
+pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
+    valkey_module::logging::log_warning(format!(
+        "largeobj: failed to unlink object file {path} during {during}: {err}"
+    ));
 }
 
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything
