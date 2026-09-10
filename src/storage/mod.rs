@@ -201,20 +201,10 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     ))
 }
 
-/// Emit a module warning to Valkey's log. The single place the `cfg(test)` guard
-/// lives: Valkey's logging APIs panic when the module isn't loaded, so warnings
-/// are compiled out of test builds.
-pub(crate) fn warn(msg: String) {
-    #[cfg(not(test))]
-    valkey_module::logging::log_warning(msg);
-    #[cfg(test)]
-    let _ = msg;
-}
-
 /// Warn that an object file couldn't be unlinked (the next
 /// `validate_and_clean_nvme_dir` reclaims the orphan).
 pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
-    warn(format!(
+    valkey_module::logging::log_warning(format!(
         "largeobj: failed to unlink object file {path} during {during}: {err}"
     ));
 }

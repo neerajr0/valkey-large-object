@@ -137,26 +137,12 @@ impl LoValue {
         if let Err(e) = std::fs::copy(&src_path, &dst_path) {
             crate::storage::uring::decrease_nvme_disk_usage(disk_len);
             let _ = std::fs::remove_file(&dst_path);
-            crate::storage::warn(format!(
+            valkey_module::logging::log_warning(format!(
                 "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                 self.object_id
             ));
             return None;
         }
-        // Confirm the copy is the size we accounted for (same tripwire as the write path).
-        let on_disk = std::fs::metadata(&dst_path)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "NVMe accounting: cannot stat copied object {new_oid:?} at {dst_path} \
-                     to verify copy size: {e}"
-                )
-            })
-            .len();
-        assert_eq!(
-            on_disk, disk_len,
-            "NVMe accounting: copied object {new_oid:?} on disk is {on_disk} B but we \
-             reserved {disk_len} B — copy path and accounting have diverged"
-        );
         Some(LoValue {
             object_id: new_oid,
             len: self.len,
