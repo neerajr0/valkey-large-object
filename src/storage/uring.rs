@@ -75,7 +75,6 @@ pub fn nvme_disk_usage() -> u64 {
 
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
-/// TODO: Multi-buffer batch support (STORAGE_DESIGN.md §7.3).
 #[derive(Debug)]
 pub struct UringOp {
     /// Segment's position in the registered iovec array (IORING_REGISTER_BUFFERS).
