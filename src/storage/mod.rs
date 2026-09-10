@@ -4,6 +4,7 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
+use std::mem::size_of;
 
 pub mod context;
 pub mod dram_pool;
@@ -288,8 +289,24 @@ pub const FILE_HEADER_SIZE: u64 = 4096;
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
 
+/// Packed wire size of the header fields (no inter-field padding).
+/// Computed from field types so adding a field updates this automatically.
+pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
+    + size_of::<u8>()                                           // version
+    + size_of::<u64>()                                          // object_id
+    + size_of::<u64>()                                          // len
+    + size_of::<u32>();                                         // crc32c
+
+// Static assert: wire header fits within the page.
+const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
+
 /// On-disk file header for NVMe object files.
 /// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
+///
+/// The struct layout (`repr(C)`) does NOT match the on-disk wire format —
+/// the compiler inserts padding for natural field alignment. Serialization
+/// is handled by `to_page` (sequential writes) and `from_page` (sequential
+/// reads with validation). Do not attempt to byte-cast this struct.
 #[repr(C)]
 pub struct FileHeader {
     pub magic: [u8; 4],
@@ -312,36 +329,39 @@ impl FileHeader {
 
     /// Serialize into a 4096-byte page (header bytes + zero padding).
     pub fn to_page(&self) -> Vec<u8> {
-        let mut page = vec![0u8; FILE_HEADER_SIZE as usize];
-        page[0..4].copy_from_slice(&self.magic);
-        page[4] = self.version;
-        page[5..13].copy_from_slice(&self.object_id.to_le_bytes());
-        page[13..21].copy_from_slice(&self.len.to_le_bytes());
-        page[21..25].copy_from_slice(&self.crc32c.to_le_bytes());
+        let mut page = Vec::with_capacity(FILE_HEADER_SIZE as usize);
+        page.extend_from_slice(&self.magic);
+        page.push(self.version);
+        page.extend_from_slice(&self.object_id.to_le_bytes());
+        page.extend_from_slice(&self.len.to_le_bytes());
+        page.extend_from_slice(&self.crc32c.to_le_bytes());
+        debug_assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
+        page.resize(FILE_HEADER_SIZE as usize, 0);
         page
     }
 
-    /// Deserialize from a 4096-byte page. Returns None on invalid magic/version.
+    /// Deserialize from a page. Returns None on invalid magic/version.
+    /// Fields are read sequentially via cursor — no hardcoded offsets.
     pub fn from_page(page: &[u8]) -> Option<Self> {
-        if page.len() < 25 {
+        if page.len() < FILE_HEADER_WIRE_LEN {
             return None;
         }
-        if &page[0..4] != FILE_HEADER_MAGIC {
+        let mut cur = 0;
+        let magic: [u8; 4] = page[cur..cur + 4].try_into().ok()?;
+        cur += 4;
+        if &magic != FILE_HEADER_MAGIC {
             return None;
         }
-        let version = page[4];
+        let version = page[cur];
+        cur += 1;
         if version != FILE_HEADER_VERSION {
             return None;
         }
-        let object_id = u64::from_le_bytes(page[5..13].try_into().ok()?);
-        let len = u64::from_le_bytes(page[13..21].try_into().ok()?);
-        let crc32c = u32::from_le_bytes(page[21..25].try_into().ok()?);
-        Some(Self {
-            magic: *FILE_HEADER_MAGIC,
-            version,
-            object_id,
-            len,
-            crc32c,
-        })
+        let object_id = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
+        cur += 8;
+        let len = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
+        cur += 8;
+        let crc32c = u32::from_le_bytes(page[cur..cur + 4].try_into().ok()?);
+        Some(Self { magic, version, object_id, len, crc32c })
     }
 }
