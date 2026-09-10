@@ -225,9 +225,10 @@ EFA `fi_write` has no alignment constraint — sends exact `len`.
 Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
-- **TCP:** Objects exceeding `lo-max-tcp-object-size` (default 256MB) are rejected — Valkey's querybuf cannot stream (§7.7).
-- **EFA:** No hard max. Objects larger than a single buffer are handled via multi-buffer parallel I/O (§7.3) or streaming mode (§7.3). The module chunks internally using `lo-buffer-size`.
-- **NVMe capacity:** Objects exceeding available NVMe space are rejected at `LO.SET`.
+- **`lo-max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `LO.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
+- **TCP additionally:** Valkey's querybuf accumulates the whole payload before dispatch and cannot stream, so TCP is bounded by `lo-max-object-size` in the same way (§7.7).
+- **EFA:** Objects larger than a single buffer are chunked internally via multi-buffer parallel I/O (§7.3) using `lo-buffer-size`, still subject to `lo-max-object-size`.
+- **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `LO.SET`.
 
 ---
 
@@ -277,17 +278,21 @@ LO.GET key [rkey remote_addr len] — DRAMPool hit:
   8a. TCP: reply from buffer
   8b. EFA: fi_write from buffer (zero-copy)
 
-LO.GET key [rkey remote_addr len] — DRAMPool miss:
+LO.GET key [rkey remote_addr len] — DRAMPool miss (serve-and-discard, no promotion):
   9. Alloc buffer from NVMePool (registered memory)
   10. io_uring ReadFixed from NVMe into NVMePool buffer (O_DIRECT)
   11a. TCP: reply from NVMePool buffer
   11b. EFA: fi_write from NVMePool buffer (zero-copy)
   12. Free NVMePool buffer
-  13. If promotion policy says YES:
-      - Alloc ObjectContext with N buffers directly in DRAMPool segment
-      - ReadFixed from NVMe directly into DRAMPool buffers (no memcpy, no NVMePool involvement)
-      - Mark ObjectContext as Filling → Ready when complete
-      - Concurrent GETs coalesce on this ObjectContext (§7.3.5)
+
+LO.GET key [rkey remote_addr len] — DRAMPool miss + promotion (promotion policy says YES):
+  9. Alloc ObjectContext with N buffers directly in a DRAMPool segment, insert as Filling
+  10. io_uring ReadFixed from NVMe directly into the DRAMPool buffers (no memcpy, no NVMePool involvement)
+  11. Mark ObjectContext Ready when complete; serve the client from it:
+      11a. TCP: reply from DRAMPool buffers
+      11b. EFA: fi_write from DRAMPool buffers (zero-copy)
+  12. Buffers stay — they ARE the cached object (served directly on subsequent hits)
+      Concurrent GETs coalesce on this Filling ObjectContext (§7.3.5)
 
 Eviction (DRAMPool pressure):
   13. Free buffer. Data safe on NVMe.
@@ -741,6 +746,12 @@ This integrates with PR #42's CoalescingMap: the DRAMPool HashMap entry in `Fill
 | `lo-streaming-min-buffers` (Y) | 2 | Min buffers to start (below = reject). Y=2 enables double-buffering. |
 | `lo-max-streaming-ops` | 2 | Max concurrent streaming operations (prevents cascading) |
 
+> **Note (open tuning item):** the values above are placeholders. The maximum
+> buffers per operation (X) and the chunk size (`lo-buffer-size`) still need to be
+> chosen empirically to optimize throughput/performance — they trade pipeline
+> depth against per-op pool pressure and SQE count, and the sweet spot depends on
+> object-size distribution and device behavior. To be settled with benchmarks.
+
 **X = batch size = pipeline depth.** Each iteration of the streaming loop submits X I/Os, awaits all X, then reuses all X for the next batch. Progress advances by X chunks atomically.
 
 Decision logic on NVMePool alloc:
@@ -775,7 +786,7 @@ With pipelining (4–8 buffers in flight), only 4–8 buffers are checked out at
 
 Large objects (>256MB) are **never promoted to DRAMPool**:
 - Cost/benefit is poor (256MB DRAM for one key vs serving hundreds of smaller hot objects)
-- Promotion threshold is configurable: `dram-cache-max-object-size` (default: 256MB)
+- Promotion threshold is configurable: `max-promote-size` (default: 256MB; `0` disables promotion)
 - Objects above this threshold always read from NVMe via the parallel pipeline
 - Objects below this threshold can be promoted to DRAMPool on repeated access (§5.2 step 13, §7.3.4)
 
@@ -826,9 +837,9 @@ Valkey's RESP command dispatch accumulates the full payload in `client->querybuf
 **Consequence:** A 10GB LO.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
 
 **v1 behavior:**
-- `LO.SET` over TCP: reject with `ERR object exceeds max TCP size` if payload > `lo-max-tcp-object-size` (configurable, default 256MB)
-- `LO.GET` over TCP: reject with same error if stored object size > threshold
-- EFA clients are not subject to this limit — they use multi-buffer parallel I/O (Cases 1/2 above)
+- `LO.SET`: reject with `ERR object exceeds lo-max-object-size` if payload > `lo-max-object-size` (configurable, applies to all modes and transports)
+- `LO.GET`: reject with the same error if a stored object's size somehow exceeds the current `lo-max-object-size`
+- Over TCP this is the only size bound (querybuf cannot stream); EFA clients are additionally chunked via multi-buffer parallel I/O (Cases 1/2 above) but remain subject to `lo-max-object-size`
 
 **Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
 
@@ -898,7 +909,7 @@ This section describes how shared state is protected, which structures are refco
 | Component | Mechanism | Who holds refs | Drop-to-0 action |
 |---|---|---|---|
 | ObjectContext (DRAMPool) | `Arc<ObjectContext>` | DRAMPool HashMap (1), each in-flight GET reader (1 each) | `Drop` impl: `dram_pool_talc.lock().free()` for each buffer, decrement segment refcounts |
-| StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | Leader task only (coalesced waiters wait on notification, don't hold the context) | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
+| StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | The one task that owns it | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
 | SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
 | ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
 | Open fd | `Arc<OwnedFd>` | FdPool HashMap (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops |
@@ -964,7 +975,7 @@ Case 2: TCP GET, DRAMPool miss (Tiered, no promote)
     │                     │ nvme_pool_talc.lock().free(X buffers)
     │                     │ Arc<FdEntry> drop
     ▼                     ▼
-    (Object must be ≤ lo-max-tcp-object-size for TCP. Larger → rejected at §7.7.)
+    (Object must be ≤ lo-max-object-size. Larger → rejected at §7.7.)
 ```
 
 ```
@@ -1143,29 +1154,32 @@ Case 9: Free callback (DEL / eviction)
 
 ### 9.4 Free Callback Lifecycle
 
-When Valkey DELs or evicts a key (`free_effort=1`, sync on main thread):
+When Valkey DELs or evicts a key, the data type's `free` callback (`lo_free`) runs. `free_effort` returns `0`, so Valkey always runs the free lazily on the background (BIO) path rather than inline on the main thread.
 
-The Valkey module data type struct (LoValue) is deleted immediately within the free callback scope — it is removed from the keyspace and freed. After this returns, no new command can find or access this key. The actual resource cleanup (buffers, fd, NVMe file) happens lazily via Arc drop:
+`lo_free` itself does almost nothing — it removes the key's DRAM entry and then relies on `Arc` drops to do the real cleanup:
 
 ```
-free_callback(LoValue) — main thread:
-  0. LoValue struct freed (Valkey module data type container) — key no longer visible to new requests
+lo_free(LoValue):
+  0. Reconstruct the Box<LoValue> and drop it at the end of scope.
 
-  1. DRAMPool HashMap: remove Arc<ObjectContext> for this oid
-     → If this was the last Arc (no in-flight readers): Drop runs immediately
-       → talc.free each buffer, decrement segment refcounts
-     → If in-flight readers hold clones: Drop deferred until last reader finishes
-       → No blocking. Main thread continues. Last reader's drop triggers cleanup on their thread.
+  1. DRAMPool map: remove_object(oid) → drops the map's Arc<ObjectContext>.
+     → If no in-flight GET readers hold clones: ObjectContext::Drop runs now
+       → dram_pool.free() for each SegmentBuffer (talc.free + segment refcount decrement).
+     → If readers hold clones: Drop is deferred until the last reader finishes,
+       on whatever thread drops the last Arc. No blocking.
 
-  2. FdPool: remove Arc<FdEntry> for this oid
-     → Same pattern: if refcount > 0 (in-flight I/O), fd stays open until last I/O drops its Arc
-     → close(fd) runs from whichever thread drops the last Arc
-
-  3. NVMe file: dispatch unlink to io-poller (submit unlink SQE)
-     → Or inline unlink(path) if acceptable (~1μs)
+  2. LoValue drops → its Option<Arc<ObjectFile>> drops.
+     → On the last Arc, ObjectFile::Drop performs the disk teardown:
+         - FdPool.remove(oid)      → drops the pool's Arc<OwnedFd> (fd closes when
+                                      the last in-flight-read clone is also gone)
+         - std::fs::remove_file(path)   (path derived from the ObjectId)
+         - decrease_nvme_disk_usage(disk_len)
+     → Teardown runs inline on the dropping thread, EXCEPT if that thread is the
+       Valkey main thread (is_main_thread()), in which case it is spawned onto
+       tokio so the main thread never does blocking fs work.
 ```
 
-**Invariant:** The free callback never blocks waiting for in-flight operations. LoValue is deleted immediately (new requests get key-not-found). Internal resources (buffers, fd, file) are cleaned up lazily — HashMap removals prevent new refs, Arc handles the rest. The main thread is never stalled.
+**Invariant:** `lo_free` never blocks on in-flight operations. The key stops being visible immediately (new requests get key-not-found). Buffers, fd, and the NVMe file are reclaimed lazily via `Arc` drops — the two-Arc model (`Arc<ObjectFile>` for existence + `Arc<OwnedFd>` for the fd) keeps any in-flight read safe until it completes, and disk teardown is kept off the main thread.
 
 ### 9.5 Segment Draining Lifecycle
 
