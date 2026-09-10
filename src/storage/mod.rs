@@ -295,7 +295,7 @@ pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
     + size_of::<u8>()                                           // version
     + size_of::<u64>()                                          // object_id
     + size_of::<u64>()                                          // len
-    + size_of::<u32>();                                         // crc32c
+    + size_of::<u32>(); // crc32c
 
 // Static assert: wire header fits within the page.
 const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
@@ -344,17 +344,30 @@ impl FileHeader {
     /// Fields are read sequentially via cursor — no hardcoded offsets.
     pub fn from_page(page: &[u8]) -> Option<Self> {
         if page.len() < FILE_HEADER_WIRE_LEN {
+            valkey_module::logging::log_warning(format!(
+                "largeobj: file header too short ({} bytes, need {})",
+                page.len(),
+                FILE_HEADER_WIRE_LEN
+            ));
             return None;
         }
         let mut cur = 0;
         let magic: [u8; 4] = page[cur..cur + 4].try_into().ok()?;
         cur += 4;
         if &magic != FILE_HEADER_MAGIC {
+            valkey_module::logging::log_warning(format!(
+                "largeobj: file header invalid magic {:?} (expected {:?})",
+                magic, FILE_HEADER_MAGIC
+            ));
             return None;
         }
         let version = page[cur];
         cur += 1;
         if version != FILE_HEADER_VERSION {
+            valkey_module::logging::log_warning(format!(
+                "largeobj: file header unsupported version {} (expected {})",
+                version, FILE_HEADER_VERSION
+            ));
             return None;
         }
         let object_id = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
@@ -362,6 +375,12 @@ impl FileHeader {
         let len = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
         cur += 8;
         let crc32c = u32::from_le_bytes(page[cur..cur + 4].try_into().ok()?);
-        Some(Self { magic, version, object_id, len, crc32c })
+        Some(Self {
+            magic,
+            version,
+            object_id,
+            len,
+            crc32c,
+        })
     }
 }
