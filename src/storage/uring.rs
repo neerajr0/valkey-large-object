@@ -32,19 +32,43 @@ pub fn increase_nvme_disk_usage(bytes: u64) {
 }
 
 /// Decrement NVMe disk usage after a file is deleted.
+///
+/// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
+/// must be accurate for capacity checks, so assert on the issue.
 pub fn decrease_nvme_disk_usage(bytes: u64) {
-    NVME_DISK_USAGE.fetch_sub(bytes, Ordering::Relaxed);
+    if let Err(tracked) =
+        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            cur.checked_sub(bytes)
+        })
+    {
+        panic!(
+            "NVMe disk-usage underflow: tried to free {bytes} B but only {tracked} B tracked \
+             — accounting is corrupt (double-free or size mismatch)"
+        );
+    }
 }
 
-/// Returns true if writing `obj_len` bytes would stay within nvme-maxmemory.
+/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
+/// Returns true and increments the counter on success; returns false and leaves the
+/// counter unchanged if the reservation would exceed the cap (or overflow).
 /// Returns true if nvme-maxmemory is 0 (unlimited).
-pub fn has_nvme_capacity(obj_len: u64) -> bool {
+pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
-    if max == 0 {
-        return true;
-    }
-    let used = NVME_DISK_USAGE.load(Ordering::Relaxed);
-    used + obj_len <= max
+    NVME_DISK_USAGE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            let next = cur.checked_add(bytes)?;
+            if max == 0 || next <= max {
+                Some(next)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+/// Current tracked NVMe disk usage in bytes.
+pub fn nvme_disk_usage() -> u64 {
+    NVME_DISK_USAGE.load(Ordering::Relaxed)
 }
 
 // ─── Request Types ───────────────────────────────────────────────────────────
@@ -282,7 +306,7 @@ impl UringNvmeEngine {
 
                 let (sqe, op) = match req {
                     IoRequest::Read { fd, op, tx } => {
-                        let read_len = super::align_up(op.len as usize) as u32;
+                        let read_len = super::object_disk_len(op.len) as u32;
                         let sqe = if use_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
@@ -312,7 +336,7 @@ impl UringNvmeEngine {
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
-                        let write_len = super::align_up(op.len as usize) as u32;
+                        let write_len = super::object_disk_len(op.len) as u32;
                         let sqe = if use_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
@@ -450,5 +474,67 @@ impl UringNvmeEngine {
                 );
             }
         }
+    }
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // NVME_DISK_USAGE is a process-global static shared by every test in this
+    // binary, and cargo runs tests in parallel. Serialize the accounting tests so
+    // their reads/writes don't interleave. Recover from a poisoned lock (the
+    // underflow test panics by design) so one panicking test can't wedge the rest.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // increase/decrease are exact inverses: an equal amount added and removed must
+    // leave the counter where it started. Asserted as a delta against a fresh
+    // baseline so a corrupt absolute value from another test can't affect it.
+    #[test]
+    fn test_increase_decrease_symmetry() {
+        let _g = lock();
+        let base = nvme_disk_usage();
+
+        increase_nvme_disk_usage(4096);
+        assert_eq!(nvme_disk_usage(), base + 4096);
+        increase_nvme_disk_usage(8192);
+        assert_eq!(nvme_disk_usage(), base + 12288);
+
+        decrease_nvme_disk_usage(8192);
+        assert_eq!(nvme_disk_usage(), base + 4096);
+        decrease_nvme_disk_usage(4096);
+        assert_eq!(nvme_disk_usage(), base, "counter must return to baseline");
+    }
+
+    // Freeing exactly what was reserved must return to baseline — the same
+    // reserve-then-free balance the SET path relies on for aligned disk_len.
+    #[test]
+    fn test_reserve_then_free_returns_to_zero() {
+        let _g = lock();
+        let base = nvme_disk_usage();
+        for len in [1u64, 4095, 4096, 4097, 1_048_576] {
+            let disk_len = super::super::object_disk_len(len);
+            increase_nvme_disk_usage(disk_len);
+            decrease_nvme_disk_usage(disk_len);
+        }
+        assert_eq!(nvme_disk_usage(), base);
+    }
+
+    // Decrementing more than is tracked is a corrupt-accounting bug and MUST abort,
+    // not silently wrap the counter (which would poison every capacity check).
+    #[test]
+    #[should_panic(expected = "underflow")]
+    fn test_decrease_underflow_is_fatal() {
+        let _g = lock();
+        // Subtracting u64::MAX underflows from any real baseline, triggering the
+        // fatal assert regardless of what the counter currently holds.
+        decrease_nvme_disk_usage(u64::MAX);
     }
 }

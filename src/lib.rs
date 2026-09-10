@@ -126,6 +126,21 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
     RUNTIME.get().expect("runtime not initialized").handle()
 }
 
+/// The Valkey main event-loop thread, captured at module load as its OS thread
+/// handle. We use `pthread_self` rather than `std::thread::current()` on purpose:
+/// `current()` lazily allocates a `Thread` handle into thread-local storage that
+/// LSan reports as a leak at graceful shutdown, and this predicate is called on
+/// every teardown thread.
+static MAIN_THREAD: OnceLock<libc::pthread_t> = OnceLock::new();
+
+/// True iff the caller runs on the Valkey main event-loop thread.
+pub fn is_main_thread() -> bool {
+    MAIN_THREAD
+        .get()
+        // SAFETY: pthread_self/pthread_equal take no pointers and always succeed.
+        .is_some_and(|&main| unsafe { libc::pthread_equal(libc::pthread_self(), main) != 0 })
+}
+
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn nvme_dir() -> String {
@@ -185,6 +200,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ));
         std::process::abort();
     }));
+
+    // Record the main event-loop thread. SAFETY: pthread_self takes no arguments
+    // and always succeeds; we store the opaque handle for later pthread_equal.
+    let _ = MAIN_THREAD.set(unsafe { libc::pthread_self() });
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();

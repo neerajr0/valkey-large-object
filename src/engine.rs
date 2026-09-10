@@ -20,7 +20,7 @@ use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, uring, ObjectContext};
+use crate::storage::{self, uring, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
 
@@ -44,6 +44,33 @@ pub enum EngineResult {
     /// Async path — client is blocked, reply will come from tokio task.
     Async,
 }
+
+// ─── In-flight pin invariant ─────────────────────────────────────────────────
+//
+// A DEL / overwrite / expiry / eviction / flush runs `lo_free`, which drops the
+// keyspace's refs — the DRAM map's `Arc<ObjectContext>` and `LoValue.file` — at
+// any await point of an in-flight request. So any async request that reads or
+// writes keyspace-reachable backing state across an `.await` MUST hold its own
+// clone of that state for the whole operation.
+//
+// Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
+//   - Every DRAM serve that transfers a map-resident object — `serve_from_dram`'s
+//     EFA path, reached from both the DRAM-hit caller and the post-promotion
+//     caller. (TCP serves copy synchronously with no await, so no pin is needed.)
+//   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
+//     already inserted in the map — the task moves that Arc in for the read.
+//   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
+//   commit it, so no concurrent free can reach it.
+//
+// Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
+// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
+//   - Every Tiered request that READS the object: the NVMe promotion read, the
+//     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
+//     a read. The `ObjectFile` pin is held for the whole request, read plus transfer.
+//   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write path:
+//   the `ObjectFile` is created at commit, never read during the write. An overwritten
+//   old `ObjectFile` is protected by refcount on the replaced `LoValue` (via
+//   `lo_free`), not by the writer.
 
 // ─── GET Engine ──────────────────────────────────────────────────────────────
 
@@ -71,6 +98,7 @@ pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
     obj_len: u64,
+    file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) -> EngineResult {
     let mode = crate::operating_mode();
@@ -88,7 +116,9 @@ pub fn execute_get(
                     execute_get_dram_efa(object_id, obj_len, transport, blocked_client);
                 }
                 OperatingMode::Tiered => {
-                    execute_get_tiered(object_id, obj_len, transport, blocked_client);
+                    let file =
+                        file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
+                    execute_get_tiered(object_id, obj_len, file, transport, blocked_client);
                 }
             }
             EngineResult::Async
@@ -132,7 +162,7 @@ fn execute_get_dram_efa(
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Serve from DRAMPool.
-            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx, None);
         }
         Some(_obj_ctx) => {
             todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
@@ -144,9 +174,12 @@ fn execute_get_dram_efa(
 }
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
+/// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
+/// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
+    file: Arc<ObjectFile>,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
@@ -156,7 +189,14 @@ fn execute_get_tiered(
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+            serve_from_dram(
+                dram_pool,
+                &obj_ctx,
+                obj_len,
+                transport,
+                thread_ctx,
+                Some(file),
+            );
             return;
         }
         // Filling state: promotion in progress.
@@ -166,6 +206,8 @@ fn execute_get_tiered(
 
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
+    // `file` (captured by the promotion task below) pins the ObjectFile across the
+    // NVMe read and transfer — see the in-flight pin invariant at the top of file.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
         // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
         if obj_ctx.buffers.len() != 1 {
@@ -181,7 +223,7 @@ fn execute_get_tiered(
         };
 
         let fd_pool = storage::get_fd_pool();
-        let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
+        let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -196,7 +238,7 @@ fn execute_get_tiered(
 
         // Read from NVMe directly into DRAMPool buffer, then serve.
         crate::runtime_handle().spawn(async move {
-            let result = uring::submit_read(fd, read_op).await;
+            let result = uring::submit_read(fd.as_raw_fd(), read_op).await;
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
 
             match result {
@@ -206,10 +248,19 @@ fn execute_get_tiered(
                     // thread that subsequently sees is_ready() == true.
                     obj_ctx.mark_ready();
                     let dram_pool = storage::get_dram_pool();
-                    serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx);
+                    // Move ObjectFile in so the ObjectFile stays pinned for the read's duration.
+                    serve_from_dram(
+                        dram_pool,
+                        &obj_ctx,
+                        obj_len,
+                        transport,
+                        thread_ctx,
+                        Some(file),
+                    );
                 }
                 _ => {
                     // Read failed — remove entry. Buffers freed by ObjectContext Drop.
+                    // ObjectFile drops here → teardown if this was the last ref.
                     storage::get_dram_pool().remove_object(&object_id);
                     thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
                 }
@@ -230,10 +281,12 @@ fn execute_get_tiered(
         }
     };
 
+    // Transient read StreamingContext owns only the NVMe buffer; the `ObjectFile`
+    // pin is held by the spawned task (see `_keep_alive` below).
     let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
 
     let fd_pool = storage::get_fd_pool();
-    let fd = match fd_pool.get_or_open(object_id, &crate::nvme_dir()) {
+    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -256,8 +309,10 @@ fn execute_get_tiered(
     // stream_ctx is moved into the async block so its Drop (which returns the
     // NVMe buffer to the pool) doesn't fire until the task completes.
     crate::runtime_handle().spawn(async move {
-        let _keep_alive = stream_ctx;
-        let read_result = uring::submit_read(fd, read_op).await;
+        // Pin the buffer (stream_ctx) and the `ObjectFile` (`file`) for the transfer's duration.
+        let _keep_alive = (stream_ctx, file);
+
+        let read_result = uring::submit_read(fd.as_raw_fd(), read_op).await;
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         handle_nvme_read_result(read_result, transport, obj_len, buf_ptr_usize, thread_ctx).await;
     });
@@ -403,6 +458,7 @@ fn serve_set_dram_tcp(
         object_id,
         len: obj_len,
         crc32c: crc,
+        file: None,
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.free(&seg_buf);
@@ -437,8 +493,9 @@ fn execute_set_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks the old object (DRAMPool entry + fd + .dat file).
-    // Fix requires refcounted teardown — same mechanism as DEL free callback (data_type.rs) and for module eviction.
+    // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
+    // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
+    // has no file, so there is no fd or .dat to tear down here.
 
     // Alloc from DRAMPool (this IS the final storage).
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
@@ -498,6 +555,7 @@ fn execute_set_dram_efa(
                                 object_id,
                                 len: obj_len,
                                 crc32c: crc,
+                                file: None,
                             };
                             if key.set_value(&LO_TYPE, lo_value).is_err() {
                                 storage::get_dram_pool().free(&seg_buf);
@@ -530,7 +588,9 @@ fn execute_set_tiered(
 ) {
     let nvme_pool = storage::get_nvme_pool();
 
-    // TODO (object lifecycle): Overwriting a key leaks old object. See execute_set_dram_efa.
+    // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
+    // replaced LoValue, dropping its Arc<ObjectFile> which allows for a thread-safe
+    // fd close + old .dat unlink once inflight requests settle.
 
     // Alloc NVMePool buffer for the write.
     let seg_buf = match nvme_pool.alloc(obj_len as usize) {
@@ -614,9 +674,11 @@ async fn do_tiered_nvme_write(
     key_name: Vec<u8>,
     object_id: ObjectId,
 ) {
-    // Reject if writing this object would exceed nvme-maxmemory.
-    // stream_ctx Drop frees the buffer on return.
-    if !uring::has_nvme_capacity(obj_len) {
+    // On-disk size for the reservation and verified by stat after the write completes.
+    let disk_len = storage::object_disk_len(obj_len);
+    // Atomically reserve the disk budget up-front. Reject if writing this object would
+    // exceed nvme-maxmemory. stream_ctx drop frees the buffer on return.
+    if !uring::try_reserve_nvme_disk_usage(disk_len) {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
         return;
@@ -632,9 +694,10 @@ async fn do_tiered_nvme_write(
     if crate::direct_io() {
         write_flags |= libc::O_DIRECT;
     }
-    // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
+    // FdPool intentionally not used on SET path — fd cached lazily on first GET via ensure_open.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
     if raw_fd < 0 {
+        uring::decrease_nvme_disk_usage(disk_len);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
@@ -652,9 +715,6 @@ async fn do_tiered_nvme_write(
         len: obj_len,
     };
 
-    // Reserve disk usage before the write — decrement on any failure path.
-    uring::increase_nvme_disk_usage(obj_len);
-
     let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
     // fd (OwnedFd) drops when out of scope and close() is automatic.
 
@@ -670,20 +730,40 @@ async fn do_tiered_nvme_write(
                 if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
                     if existing.object_id > object_id {
                         // Stale write — a newer SET already completed. Discard silently.
-                        uring::decrease_nvme_disk_usage(obj_len);
-                        let _ = std::fs::remove_file(&file_path);
+                        // No ObjectFile was created, so release the reservation here.
+                        uring::decrease_nvme_disk_usage(disk_len);
+                        if let Err(e) = std::fs::remove_file(&file_path) {
+                            storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+                        }
                         thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                         return;
                     }
                 }
+                // Winning branch (our OID ≥ any committed OID). Confirm the write
+                // produced exactly the size we accounted for.
+                let on_disk = std::fs::metadata(&file_path)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "NVMe accounting: cannot stat object {object_id:?} at {file_path} \
+                             to verify write size: {e}"
+                        )
+                    })
+                    .len();
+                assert_eq!(
+                    on_disk, disk_len,
+                    "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
+                     reserved {disk_len} B — write path and accounting have diverged"
+                );
+                // Create the new version's ObjectFile owning this file's existence,
+                // lazy read fd, and NVMe bytes. An overwrite triggers lo_free on the
+                // old LoValue, dropping its ObjectFile (teardown).
                 let lo_value = LoValue {
                     object_id,
                     len: obj_len,
                     crc32c: crc,
+                    file: Some(Arc::new(ObjectFile::new(object_id, disk_len))),
                 };
                 if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    uring::decrease_nvme_disk_usage(obj_len);
-                    let _ = std::fs::remove_file(&file_path);
                     thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                     return;
                 }
@@ -691,8 +771,10 @@ async fn do_tiered_nvme_write(
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(Err(e)) => {
-            uring::decrease_nvme_disk_usage(obj_len);
-            let _ = std::fs::remove_file(&file_path);
+            uring::decrease_nvme_disk_usage(disk_len);
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+            }
             thread_ctx.reply(Err(ValkeyError::String(format!(
                 "{}: {}",
                 errors::ERR_NVME_WRITE,
@@ -703,8 +785,10 @@ async fn do_tiered_nvme_write(
         // This means the poller panicked or shut down unexpectedly.
         // TODO: Add error metric counter for poller channel failures.
         Err(_) => {
-            uring::decrease_nvme_disk_usage(obj_len);
-            let _ = std::fs::remove_file(&file_path);
+            uring::decrease_nvme_disk_usage(disk_len);
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
+            }
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         }
     }
@@ -712,12 +796,19 @@ async fn do_tiered_nvme_write(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
+/// Serve a Ready object from DRAMPool buffers.
+///
+/// On the EFA path two pins are moved into the async write task and held for the
+/// whole RDMA transfer:
+///   - `obj_ctx` — owns the DRAM buffer the RDMA engine reads across the await.
+///   - `file` — the object's `ObjectFile` (Tiered only; `None` in Dram mode).
 fn serve_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
     obj_len: u64,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    file: Option<Arc<ObjectFile>>,
 ) {
     match transport {
         Transport::Tcp => {
@@ -741,7 +832,9 @@ fn serve_from_dram(
             }
             let buf = &obj_ctx.buffers[0];
             let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+            let obj_ctx = Arc::clone(obj_ctx);
             crate::runtime_handle().spawn(async move {
+                let _keep_alive = (obj_ctx, file); // pin the object and file for the transfer's duration
                 match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
                     .await
                 {
