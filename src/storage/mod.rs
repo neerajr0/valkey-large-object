@@ -3,6 +3,8 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
+use crate::data_type::ObjectId;
+
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;

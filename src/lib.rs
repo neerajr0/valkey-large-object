@@ -126,11 +126,6 @@ lazy_static::lazy_static! {
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
     static ref CFG_STREAMING_MIN_BUFFERS: AtomicI64 = AtomicI64::new(2);
-
-    /// Max object size for TCP transport. Objects above this are rejected over TCP.
-    /// Addresses querybuf accumulation (SET) and VM_ReplyWithStringBuffer (GET).
-    /// Default: 256MB.
-    static ref CFG_MAX_TCP_OBJECT_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -215,10 +210,6 @@ pub fn max_buffers_per_op() -> usize {
 
 pub fn streaming_min_buffers() -> usize {
     CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
-}
-
-pub fn max_tcp_object_size() -> u64 {
-    CFG_MAX_TCP_OBJECT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -362,8 +353,6 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, None],
-            ["lo-max-tcp-object-size", &*CFG_MAX_TCP_OBJECT_SIZE, 268_435_456, 0, i64::MAX,
-             ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
             ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],

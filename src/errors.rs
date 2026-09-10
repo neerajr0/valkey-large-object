@@ -43,7 +43,6 @@ define_errors! {
     ERR_CRC_MISMATCH => "ERR integrity check failed: CRC mismatch",
     ERR_HEADER_READ => "ERR failed to read file header",
     ERR_HEADER_INVALID => "ERR invalid file header",
-    ERR_TCP_OBJECT_TOO_LARGE => "ERR object exceeds max TCP object size",
     ERR_INSUFFICIENT_BUFFERS => "ERR insufficient buffer capacity",
 }
 
