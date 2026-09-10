@@ -255,13 +255,6 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
     slices
 }
 
-/// Delete an object's NVMe file. Called from free callback.
-pub fn delete_file(object_id: ObjectId) {
-    let dir = crate::nvme_dir();
-    let path = object_id.file_path(&dir);
-    let _ = std::fs::remove_file(&path);
-}
-
 // ─── Chunk Helpers ───────────────────────────────────────────────────────────
 
 /// Compute the number of chunks for an object of `obj_len` bytes.
@@ -307,7 +300,6 @@ const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
 /// the compiler inserts padding for natural field alignment. Serialization
 /// is handled by `to_page` (sequential writes) and `from_page` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.
-#[repr(C)]
 pub struct FileHeader {
     pub magic: [u8; 4],
     pub version: u8,

@@ -188,12 +188,6 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
     rx
 }
 
-pub fn shutdown() {
-    if let Some(engine) = NVME_ENGINE.get() {
-        engine.shutdown.store(true, Ordering::Relaxed);
-    }
-}
-
 // ─── Batch submit helpers ────────────────────────────────────────────────────
 
 /// Submit multiple ReadFixed ops. Returns one receiver per op.
@@ -224,11 +218,19 @@ pub async fn await_read_batch(
             Ok(Err(e)) => {
                 if first_err.is_none() {
                     first_err = Some(e);
+                } else {
+                    valkey_module::logging::log_warning(format!(
+                        "largeobj: read batch error (suppressed): {e}"
+                    ));
                 }
             }
             Err(_) => {
                 if first_err.is_none() {
                     first_err = Some(StorageError::IoError { code: libc::EIO });
+                } else {
+                    valkey_module::logging::log_warning(
+                        "largeobj: read batch receiver dropped (suppressed)",
+                    );
                 }
             }
         }
@@ -251,11 +253,19 @@ pub async fn await_write_batch(
             Ok(Err(e)) => {
                 if first_err.is_none() {
                     first_err = Some(e);
+                } else {
+                    valkey_module::logging::log_warning(format!(
+                        "largeobj: write batch error (suppressed): {e}"
+                    ));
                 }
             }
             Err(_) => {
                 if first_err.is_none() {
                     first_err = Some(StorageError::IoError { code: libc::EIO });
+                } else {
+                    valkey_module::logging::log_warning(
+                        "largeobj: write batch receiver dropped (suppressed)",
+                    );
                 }
             }
         }
