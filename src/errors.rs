@@ -40,9 +40,6 @@ define_errors! {
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
-    ERR_CRC_MISMATCH => "ERR integrity check failed: CRC mismatch",
-    ERR_HEADER_READ => "ERR failed to read file header",
-    ERR_HEADER_INVALID => "ERR invalid file header",
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
 }
