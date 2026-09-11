@@ -55,39 +55,58 @@ impl SegmentPool {
     /// the uring layer rounds I/O lengths to 4 KiB, so the buffer must be
     /// at least that large to avoid writing past the allocation.
     pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        let layout = Layout::from_size_align(super::align_up(size), super::IO_ALIGN).ok()?;
-        let ptr = unsafe {
-            self.allocator
-                .lock()
-                .expect("allocator lock unavailable")
-                .malloc(layout)
-        }
-        .ok()?;
-        let addr = ptr.as_ptr() as usize;
-
-        let (seg_idx, offset) = self
-            .find_segment(addr)
-            .expect("talc returned ptr outside segments");
-        self.segments[seg_idx].inc_ref();
-
-        Some(SegmentBuffer {
-            segment_idx: seg_idx as u16,
-            offset: offset as u64,
-            len: size as u32,
-        })
+        self.alloc_n(size, 1, 1).map(|mut v| v.remove(0))
     }
 
-    /// Allocate up to `count` buffers of `chunk_size` each.
-    /// Returns however many succeeded (0 to count). Caller checks vec length.
-    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Vec<SegmentBuffer> {
+    /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
+    /// `min_required`. Takes the lock once — all allocations and any rollback
+    /// happen under a single lock acquisition, so the all-or-nothing guarantee
+    /// is atomic against concurrent allocations.
+    ///
+    /// Returns `None` if fewer than `min_required` buffers could be allocated
+    /// (partial allocation freed internally). On success returns
+    /// `min_required..=count` buffers. Callers never need cleanup logic.
+    ///
+    /// Use cases:
+    /// - Object context (all-or-nothing): `min_required = total_chunks`
+    /// - Streaming context (graceful degradation): `min_required = streaming_min_buffers`
+    pub fn alloc_n(
+        &self,
+        chunk_size: usize,
+        count: usize,
+        min_required: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
+        let layout = Layout::from_size_align(super::align_up(chunk_size), super::IO_ALIGN)
+            .expect("alloc_n: invalid chunk_size layout");
+        let mut talc = self.allocator.lock().expect("allocator lock unavailable");
         let mut buffers = Vec::with_capacity(count);
         for _ in 0..count {
-            match self.alloc(chunk_size) {
-                Some(buf) => buffers.push(buf),
-                None => break,
-            }
+            let ptr = match unsafe { talc.malloc(layout) } {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let addr = ptr.as_ptr() as usize;
+            let (seg_idx, offset) = self
+                .find_segment(addr)
+                .expect("talc returned ptr outside segments");
+            self.segments[seg_idx].inc_ref();
+            buffers.push(SegmentBuffer {
+                segment_idx: seg_idx as u16,
+                offset: offset as u64,
+                len: chunk_size as u32,
+            });
         }
-        buffers
+        if buffers.len() < min_required {
+            // Still under the same lock — rollback is atomic against concurrent allocations.
+            for buf in &buffers {
+                let seg = &self.segments[buf.segment_idx as usize];
+                let ptr = unsafe { seg.base.add(buf.offset as usize) };
+                unsafe { talc.free(NonNull::new_unchecked(ptr), layout) };
+                seg.dec_ref();
+            }
+            return None;
+        }
+        Some(buffers)
     }
 
     /// Free a buffer back to the pool.
