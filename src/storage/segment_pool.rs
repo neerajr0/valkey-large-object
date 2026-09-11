@@ -99,10 +99,7 @@ impl SegmentPool {
         if buffers.len() < min_required {
             // Still under the same lock — rollback is atomic against concurrent allocations.
             for buf in &buffers {
-                let seg = &self.segments[buf.segment_idx as usize];
-                let ptr = unsafe { seg.base.add(buf.offset as usize) };
-                unsafe { talc.free(NonNull::new_unchecked(ptr), layout) };
-                seg.dec_ref();
+                self.free_with_lock(&mut talc, buf, layout);
             }
             return None;
         }
@@ -111,17 +108,19 @@ impl SegmentPool {
 
     /// Free a buffer back to the pool.
     pub fn free(&self, buf: &SegmentBuffer) {
-        let seg = &self.segments[buf.segment_idx as usize];
-        let ptr = unsafe { seg.base.add(buf.offset as usize) };
         let aligned_size = super::align_up(buf.len as usize);
         let layout =
             Layout::from_size_align(aligned_size, super::IO_ALIGN).expect("SegmentBuffer layout");
-        unsafe {
-            self.allocator
-                .lock()
-                .expect("allocator lock unavailable")
-                .free(NonNull::new_unchecked(ptr), layout);
-        }
+        let mut talc = self.allocator.lock().expect("allocator lock unavailable");
+        self.free_with_lock(&mut talc, buf, layout);
+    }
+
+    /// Free a single buffer under an already-held allocator lock.
+    /// Shared by `alloc_n` (rollback) and `free` (public API).
+    fn free_with_lock(&self, talc: &mut Talc<ClaimOnOom>, buf: &SegmentBuffer, layout: Layout) {
+        let seg = &self.segments[buf.segment_idx as usize];
+        let ptr = unsafe { seg.base.add(buf.offset as usize) };
+        unsafe { talc.free(NonNull::new_unchecked(ptr), layout) };
         seg.dec_ref();
     }
 

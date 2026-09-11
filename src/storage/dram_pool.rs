@@ -36,13 +36,8 @@ impl DRAMPool {
         self.pool.free(buf)
     }
 
-    pub fn alloc_n(
-        &self,
-        chunk_size: usize,
-        count: usize,
-        min_required: usize,
-    ) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_n(chunk_size, count, min_required)
+    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_n(chunk_size, count, count)
     }
 
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
@@ -117,9 +112,7 @@ impl DRAMPool {
         // All-or-nothing: alloc_n rolls back internally if pool can't satisfy all chunks.
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let buffers =
-            self.pool
-                .alloc_n(chunk_size, total_chunks as usize, total_chunks as usize)?;
+        let buffers = self.alloc_n(chunk_size, total_chunks as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self

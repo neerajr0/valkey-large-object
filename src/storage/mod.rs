@@ -332,8 +332,8 @@ impl FileHeader {
         page
     }
 
-    /// Deserialize from a page. Returns None on invalid magic/version.
-    /// Fields are read sequentially via cursor — no hardcoded offsets.
+    /// Deserialize from a page. Panics on invalid magic, version, or truncated page
+    /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
     pub fn from_page(page: &[u8]) -> Option<Self> {
         if page.len() < FILE_HEADER_WIRE_LEN {
             valkey_module::logging::log_warning(format!(
@@ -341,7 +341,11 @@ impl FileHeader {
                 page.len(),
                 FILE_HEADER_WIRE_LEN
             ));
-            return None;
+            panic!(
+                "largeobj: file header too short ({} bytes, need {})",
+                page.len(),
+                FILE_HEADER_WIRE_LEN
+            );
         }
         let mut cur = 0;
         let magic: [u8; 4] = page[cur..cur + 4].try_into().ok()?;
@@ -351,7 +355,10 @@ impl FileHeader {
                 "largeobj: file header invalid magic {:?} (expected {:?})",
                 magic, FILE_HEADER_MAGIC
             ));
-            return None;
+            panic!(
+                "largeobj: file header invalid magic {:?} (expected {:?})",
+                magic, FILE_HEADER_MAGIC
+            );
         }
         let version = page[cur];
         cur += 1;
@@ -360,7 +367,10 @@ impl FileHeader {
                 "largeobj: file header unsupported version {} (expected {})",
                 version, FILE_HEADER_VERSION
             ));
-            return None;
+            panic!(
+                "largeobj: file header unsupported version {} (expected {})",
+                version, FILE_HEADER_VERSION
+            );
         }
         let object_id = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
         cur += 8;

@@ -17,6 +17,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use tokio::sync::oneshot;
 
 use super::StorageError;
@@ -206,66 +208,44 @@ pub fn submit_write_batch(
     ops.into_iter().map(|op| submit_write(fd, op)).collect()
 }
 
-/// Await all read receivers. Drains every receiver before returning so in-flight
-/// io_uring ops complete before callers free buffers. Returns first error.
-pub async fn await_read_batch(
-    receivers: Vec<oneshot::Receiver<Result<u64, StorageError>>>,
-) -> Result<(), StorageError> {
-    let mut first_err: Option<StorageError> = None;
-    for rx in receivers {
-        match rx.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                } else {
-                    valkey_module::logging::log_warning(format!(
-                        "largeobj: read batch error (suppressed): {e}"
-                    ));
-                }
+/// Convert batch receivers into a stream of (batch_idx, result) pairs
+/// that yields completions as they arrive (unordered). The caller drives
+/// the stream — TCP drains it via `await_batch`, EFA acts on each completion.
+pub fn into_completions<T: Send + 'static>(
+    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
+) -> FuturesUnordered<impl std::future::Future<Output = (usize, Result<T, StorageError>)>> {
+    let stream = FuturesUnordered::new();
+    for (i, rx) in receivers.into_iter().enumerate() {
+        stream.push(async move {
+            match rx.await {
+                Ok(result) => (i, result),
+                Err(_) => (i, Err(StorageError::IoError { code: libc::EIO })),
             }
-            Err(_) => {
-                if first_err.is_none() {
-                    first_err = Some(StorageError::IoError { code: libc::EIO });
-                } else {
-                    valkey_module::logging::log_warning(
-                        "largeobj: read batch receiver dropped (suppressed)",
-                    );
-                }
-            }
-        }
+        });
     }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    stream
 }
 
-/// Await all write receivers. Drains every receiver before returning so in-flight
-/// io_uring ops complete before callers free buffers. Returns first error.
-pub async fn await_write_batch(
-    receivers: Vec<oneshot::Receiver<Result<(), StorageError>>>,
+/// TCP-path helper: await all batch receivers (unordered). Drains every
+/// receiver before returning so in-flight io_uring ops complete before
+/// callers free buffers. Returns first error encountered.
+/// `op` is "read" or "write" — used only in suppressed-error log messages.
+pub async fn await_batch<T: Send + 'static>(
+    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
+    op: &str,
 ) -> Result<(), StorageError> {
+    let mut completions = into_completions(receivers);
     let mut first_err: Option<StorageError> = None;
-    for rx in receivers {
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+    while let Some((_idx, result)) = completions.next().await {
+        match result {
+            Ok(_) => {}
+            Err(e) => {
                 if first_err.is_none() {
                     first_err = Some(e);
                 } else {
                     valkey_module::logging::log_warning(format!(
-                        "largeobj: write batch error (suppressed): {e}"
+                        "largeobj: {op} batch error (suppressed): {e}"
                     ));
-                }
-            }
-            Err(_) => {
-                if first_err.is_none() {
-                    first_err = Some(StorageError::IoError { code: libc::EIO });
-                } else {
-                    valkey_module::logging::log_warning(
-                        "largeobj: write batch receiver dropped (suppressed)",
-                    );
                 }
             }
         }

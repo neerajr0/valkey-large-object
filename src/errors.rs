@@ -29,7 +29,7 @@ define_errors! {
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_OBJECT_EXCEEDS_BUF => "ERR object exceeds buffer size",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call LO.HELLO first)",
-    ERR_POOL_EXHAUSTED => "ERR pool exhausted",
+    ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
     ERR_SESSION_GONE => "ERR session gone",
 
     // Storage/Engine Errors
@@ -43,7 +43,8 @@ define_errors! {
     ERR_CRC_MISMATCH => "ERR integrity check failed: CRC mismatch",
     ERR_HEADER_READ => "ERR failed to read file header",
     ERR_HEADER_INVALID => "ERR invalid file header",
-    ERR_INSUFFICIENT_BUFFERS => "ERR insufficient buffer capacity",
+    ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
+    ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
