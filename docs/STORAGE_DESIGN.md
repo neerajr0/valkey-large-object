@@ -387,12 +387,28 @@ struct StreamingContext {
 
 ### 6.3 NVMe File Reference
 
-Each object is one file: `/data/lo-data/{oid:016x}.dat`
+Each object version is one file, named directly from its `ObjectId` under the
+configured `nvme-dir`: `{nvme-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
+There is no extra subdirectory — `nvme-dir` is the module-owned directory. The
+runtime handle is `ObjectFile { object_id, disk_len }` (held behind
+`Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
+and the fd is managed separately by the FdPool (§6.4).
 
-**File header (25 bytes at start of file; data starts at offset 4096 for O_DIRECT alignment):**
+**File header (`FILE_HEADER_SIZE` = 4096 bytes at start of file; data starts at
+offset 4096 for O_DIRECT alignment):**
 ```rust
-#[repr(C)]
-struct FileHeader {
+// consts in storage/mod.rs
+pub const FILE_HEADER_SIZE: u64 = 4096;
+pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
+pub const FILE_HEADER_VERSION: u8 = 1;
+// Packed wire size, derived from field types (NOT hand-counted):
+pub const FILE_HEADER_WIRE_LEN: usize =
+    size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
+    + size_of::<u64>() + size_of::<u32>();
+const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
+
+#[derive(Clone)]
+pub struct FileHeader {
     magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
     version: u8,        // 1 — enables future format changes
     object_id: u64,     // Matches LoValue.object_id
@@ -401,15 +417,20 @@ struct FileHeader {
 }
 ```
 
+The header is serialized to the page on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed.
+
 **File layout:**
 ```
-[0..25):         FileHeader (25 bytes)
-[25..4096):      Unused (padding — aligns data start to 4KB for O_DIRECT)
-[4096..4096+len): Object data
-[4096+len..):    O_DIRECT write padding to 512-byte boundary
+[0..WIRE_LEN):          FileHeader fields (little-endian, packed)
+[WIRE_LEN..4096):       Zero padding (aligns data start to 4KB for O_DIRECT)
+[4096..4096+len):       Object data
+[4096+len..):           O_DIRECT write padding to 4KB boundary
 ```
 
-Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the data portion are naturally 4KB-aligned. The header page is read only during recovery/reconciliation — never on the hot serving path (LoValue in keyspace has all needed metadata).
+Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the
+data portion are naturally 4KB-aligned. The header page is read only during
+recovery/reconciliation — never on the hot serving path (LoValue in the keyspace
+carries all metadata needed to serve).
 
 **Runtime references:**
 - fd opened at LO.SET, held in FdPool (`HashMap<ObjectId, RawFd>`)
@@ -938,204 +959,6 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 
 **Summary:** Main thread handles only the synchronous fast paths (DRAM hit over TCP, DRAM-only SET over TCP). Everything involving NVMe I/O or EFA transport goes through tokio.
 
-**Thread flow diagrams (swimlanes):**
-
-```
-Case 1: TCP GET, DRAMPool hit
-─────────────────────────────
-    Main Thread
-    ───────────
-    │ RwLock.read() → DRAMPool HashMap
-    │ Arc<ObjectContext>.clone()
-    │ VM_ReplyWithStringBuffer(buffer)
-    │ Arc drop
-    ▼ done (no spawn, no I/O)
-```
-
-```
-Case 2: TCP GET, DRAMPool miss (Tiered, no promote)
-────────────────────────────────────────────────────
-    Main Thread              Tokio Task                io-poller
-    ───────────              ──────────                ─────────
-    │ Lookup → miss
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ nvme_pool_talc.lock().alloc(X buffers)
-    │                     │ FdPool.read() → Arc<FdEntry>.clone()
-    │                     │
-    │                     │ [batch loop — accumulate all data]:
-    │                     │──submit_read_batch────────→│ queue X ReadFixed SQEs
-    │                     │                            │ io_uring_submit()
-    │                     │                            │ CQEs arrive → oneshot.send()
-    │                     │←─rx.await─────────────────│
-    │                     │ [next batch until entire object read...]
-    │                     │
-    │                     │ unblock with single reply (full object ≤ 256MB)
-    │←──UnblockClient + VM_ReplyWithStringBuffer(all data)
-    │                     │ nvme_pool_talc.lock().free(X buffers)
-    │                     │ Arc<FdEntry> drop
-    ▼                     ▼
-    (Object must be ≤ lo-max-object-size. Larger → rejected at §7.7.)
-```
-
-```
-Case 3: TCP GET, DRAMPool miss (Tiered, promote)
-─────────────────────────────────────────────────
-    Main Thread              Tokio Task                io-poller
-    ───────────              ──────────                ─────────
-    │ Lookup → miss
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ dram_pool_talc.lock().alloc(N buffers — full object)
-    │                     │ RwLock.write() → insert ObjectContext{Filling}
-    │                     │ FdPool.read() → Arc<FdEntry>.clone()
-    │                     │
-    │                     │ [batch loop]:
-    │                     │──submit_read_batch────────→│ ReadFixed into DRAMPool buffers
-    │                     │                            │ oneshot.send()
-    │                     │←─rx.await─────────────────│
-    │                     │ state = Filling{chunks_ready += batch_size}
-    │                     │ wake coalesced waiters (if any)
-    │                     │ [next batch...]
-    │                     │
-    │                     │ state = Ready
-    │                     │ wake all remaining waiters
-    │                     │ UnblockClient + VM_ReplyWithStringBuffer(ObjectContext buffers)
-    │←──single reply──────│
-    ▼                     ▼
-```
-
-```
-Case 4: TCP SET (DRAM-only)
-────────────────────────────
-    Main Thread
-    ───────────
-    │ dram_pool_talc.lock().alloc(N buffers)
-    │ memcpy(querybuf → DRAMPool buffers) per chunk
-    │ crc_hasher.update() per chunk
-    │ verify CRC
-    │ RwLock.write() → insert ObjectContext{Ready}
-    │ create LoValue
-    │ reply OK
-    ▼ done (no spawn, no I/O)
-```
-
-```
-Case 5: TCP SET (Tiered)
-─────────────────────────
-    Main Thread              Tokio Task                io-poller
-    ───────────              ──────────                ─────────
-    │ fallocate NVMe file
-    │ FdPool.write() → open fd, insert Arc<FdEntry>
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ nvme_pool_talc.lock().alloc(X buffers)
-    │                     │
-    │                     │ [batch loop]:
-    │                     │ memcpy(querybuf → buffers)
-    │                     │ crc_hasher.update()
-    │                     │──submit_write_batch───────→│ WriteFixed SQEs
-    │                     │                            │ oneshot.send()
-    │                     │←─rx.await─────────────────│
-    │                     │ [next batch...]
-    │                     │
-    │                     │ verify CRC
-    │                     │ create LoValue
-    │                     │ nvme_pool_talc.lock().free(X buffers)
-    │←──unblock client────│
-    ▼                     ▼
-```
-
-```
-Case 6: EFA SET (Tiered)
-─────────────────────────
-    Main Thread              Tokio Task                io-poller
-    ───────────              ──────────                ─────────
-    │ fallocate NVMe file
-    │ FdPool.write() → open fd
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ nvme_pool_talc.lock().alloc(X buffers)
-    │                     │
-    │                     │ [batch loop]:
-    │                     │ transport.read(client → buffer).await  ← EFA
-    │                     │ crc_hasher.update()
-    │                     │──submit_write_batch───────→│ WriteFixed SQEs
-    │                     │                            │ oneshot.send()
-    │                     │←─rx.await─────────────────│
-    │                     │ [next batch...]
-    │                     │
-    │                     │ verify CRC
-    │                     │ create LoValue
-    │                     │ nvme_pool_talc.lock().free(X buffers)
-    │←──unblock client────│
-    ▼                     ▼
-```
-
-```
-Case 7: EFA GET, DRAMPool hit
-──────────────────────────────
-    Main Thread              Tokio Task
-    ───────────              ──────────
-    │ RwLock.read() → DRAMPool HashMap
-    │ Arc<ObjectContext>.clone()
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ [batch loop — send cached buffers to client]:
-    │                     │ transport.write(buffer[i], chunk_len, client_addr + offset, rkey).await
-    │                     │ [next batch...]
-    │                     │
-    │                     │ Arc<ObjectContext> drop
-    │←──UnblockClient + OK
-    ▼                     ▼
-    (No NVMe I/O. No io-poller. Data served directly from DRAMPool via EFA.)
-```
-
-```
-Case 8: EFA GET, DRAMPool miss (Tiered, no promote)
-─────────────────────────────────────────────────────
-    Main Thread              Tokio Task                io-poller
-    ───────────              ──────────                ─────────
-    │ Lookup → miss
-    │ BlockedClient
-    │──spawn────────────→ │
-    │                     │ nvme_pool_talc.lock().alloc(X buffers)
-    │                     │ FdPool.read() → Arc<FdEntry>.clone()
-    │                     │
-    │                     │ [batch loop]:
-    │                     │──submit_read_batch────────→│ ReadFixed SQEs
-    │                     │                            │ oneshot.send()
-    │                     │←─rx.await─────────────────│
-    │                     │ transport.write(buffer[i], ...).await per chunk in batch
-    │                     │ [next batch...]
-    │                     │
-    │                     │ nvme_pool_talc.lock().free(X buffers)
-    │                     │ Arc<FdEntry> drop
-    │←──UnblockClient + OK
-    ▼                     ▼
-    (EFA can stream per-batch — no single-reply constraint. Unlimited object size.)
-```
-
-```
-Case 9: Free callback (DEL / eviction)
-────────────────────────────────────────
-    Main Thread                                       io-poller
-    ───────────                                       ─────────
-    │ [free_callback(LoValue)]
-    │ LoValue freed (key gone from keyspace)
-    │
-    │ RwLock.write() → DRAMPool HashMap.remove(oid)
-    │   └→ Arc<ObjectContext> drop
-    │       └→ if last ref: dram_pool_talc.lock().free(buffers)
-    │
-    │ RwLock.write() → FdPool.remove(oid)
-    │   └→ Arc<FdEntry> drop
-    │       └→ if last ref: close(fd)
-    │
-    │ dispatch unlink ───────────────────────────────→│ unlink SQE
-    ▼ done                                            ▼
-```
-
 ### 9.3 Global State and Lock Table
 
 | Global | Type | Lock | Threads that access |
@@ -1143,7 +966,8 @@ Case 9: Free callback (DEL / eviction)
 | DRAMPool object map | `HashMap<ObjectId, Arc<ObjectContext>>` | `RwLock` | Main (read on GET hit, remove on free callback), tokio (read for coalesce check, write for promotion insert + Filling state update) |
 | DRAMPool allocator | `Mutex<Talc>` (dram_pool_talc) | Mutex | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc) |
 | NVMePool allocator | `Mutex<Talc>` (nvme_pool_talc) | Mutex | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
-| FdPool | `HashMap<ObjectId, Arc<FdEntry>>` | `RwLock` | Main (remove on DEL/free callback), tokio (get_or_open on SET/GET miss) |
+| FdPool | `HashMap<ObjectId, Arc<OwnedFd>>` | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET). SET does NOT use FdPool — it opens a private fd. |
+| NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment metadata | `Vec<Segment>` (per pool) | Read-only after init (no lock needed) | All threads (read segment base/size/buf_index). Draining flag is AtomicBool. |
 
 **Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
@@ -1151,6 +975,8 @@ Case 9: Free callback (DEL / eviction)
 **Why Mutex for talc:** Allocator operations modify internal free-list state — no concurrent access possible. Hold time ~10-50ns. Negligible contention.
 
 **Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call talc.free if last ref).
+
+**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `nvme-maxmemory` and fails the SET if it would exceed the cap (`nvme-maxmemory` of 0 = unlimited). This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
 
 ### 9.4 Free Callback Lifecycle
 
