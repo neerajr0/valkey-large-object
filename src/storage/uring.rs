@@ -226,10 +226,8 @@ pub fn into_completions<T: Send + 'static>(
     stream
 }
 
-/// TCP-path helper: await all batch receivers (unordered). Drains every
-/// receiver before returning so in-flight io_uring ops complete before
-/// callers free buffers. Returns first error encountered.
 /// `op` is "read" or "write" — used only in suppressed-error log messages.
+/// Used by TCP path for awaiting all batch receivers.
 pub async fn await_batch<T: Send + 'static>(
     receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
     op: &str,

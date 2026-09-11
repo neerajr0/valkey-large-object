@@ -334,13 +334,8 @@ impl FileHeader {
 
     /// Deserialize from a page. Panics on invalid magic, version, or truncated page
     /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
-    pub fn from_page(page: &[u8]) -> Option<Self> {
+    pub fn from_page(page: &[u8]) -> Self {
         if page.len() < FILE_HEADER_WIRE_LEN {
-            valkey_module::logging::log_warning(format!(
-                "largeobj: file header too short ({} bytes, need {})",
-                page.len(),
-                FILE_HEADER_WIRE_LEN
-            ));
             panic!(
                 "largeobj: file header too short ({} bytes, need {})",
                 page.len(),
@@ -348,13 +343,11 @@ impl FileHeader {
             );
         }
         let mut cur = 0;
-        let magic: [u8; 4] = page[cur..cur + 4].try_into().ok()?;
+        let magic: [u8; 4] = page[cur..cur + 4]
+            .try_into()
+            .expect("file header magic slice");
         cur += 4;
         if &magic != FILE_HEADER_MAGIC {
-            valkey_module::logging::log_warning(format!(
-                "largeobj: file header invalid magic {:?} (expected {:?})",
-                magic, FILE_HEADER_MAGIC
-            ));
             panic!(
                 "largeobj: file header invalid magic {:?} (expected {:?})",
                 magic, FILE_HEADER_MAGIC
@@ -363,26 +356,34 @@ impl FileHeader {
         let version = page[cur];
         cur += 1;
         if version != FILE_HEADER_VERSION {
-            valkey_module::logging::log_warning(format!(
-                "largeobj: file header unsupported version {} (expected {})",
-                version, FILE_HEADER_VERSION
-            ));
             panic!(
                 "largeobj: file header unsupported version {} (expected {})",
                 version, FILE_HEADER_VERSION
             );
         }
-        let object_id = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
+        let object_id = u64::from_le_bytes(
+            page[cur..cur + 8]
+                .try_into()
+                .expect("file header object_id slice"),
+        );
         cur += 8;
-        let len = u64::from_le_bytes(page[cur..cur + 8].try_into().ok()?);
+        let len = u64::from_le_bytes(
+            page[cur..cur + 8]
+                .try_into()
+                .expect("file header len slice"),
+        );
         cur += 8;
-        let crc32c = u32::from_le_bytes(page[cur..cur + 4].try_into().ok()?);
-        Some(Self {
+        let crc32c = u32::from_le_bytes(
+            page[cur..cur + 4]
+                .try_into()
+                .expect("file header crc32c slice"),
+        );
+        Self {
             magic,
             version,
             object_id,
             len,
             crc32c,
-        })
+        }
     }
 }
