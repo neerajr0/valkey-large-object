@@ -811,7 +811,8 @@ Pool exhaustion mid-stream: impossible. Buffers are allocated once at the start 
 
 #### 7.3.7 Data Correctness
 
-- **CRC32c** computed incrementally during SET streaming, verified at end
+- **CRC32c (SET/write path)** computed incrementally as chunks arrive during SET streaming, verified at end (single-shot over the buffer today, since only single-chunk objects are implemented; incremental once multi-chunk streaming lands)
+- **CRC32c (GET/read path)** the expected value is known upfront (`LoValue.crc32c`), so verification is a single equality check against the file header's `crc32c` — not accumulated over the streamed bytes. It confirms byte integrity, not offset layout.
 - **LoValue** created ONLY after all chunks written AND CRC verified
 - **Client disconnect mid-SET:** unlink partial file, no LoValue created
 - **Server crash mid-SET:** orphan file without LoValue → reconciliation deletes
@@ -840,25 +841,44 @@ Objects larger than `max-promote-size` are **never promoted to DRAMPool**:
 
 ### 7.6 EFA Transport for Large Objects
 
+**Both cases resolve to the same thing: an upfront chunk→client-memory mapping.**
+The server always chunks the object by `lo-buffer-size` (chunk `i` covers logical
+bytes `[i*chunk_size, (i+1)*chunk_size)`). Before any I/O, it computes a plan mapping
+each chunk to where it lands in client memory — `chunk_index → [(rkey, addr, len), …]`
+— using inputs all known at command time (`total_len`, `lo-buffer-size`, and the
+client's destination). The I/O loop then just executes that plan. The two cases
+differ only in what the destination is: a single region (Case 2) or a list of
+regions (Case 1).
+
 Two cases for how EFA handles large objects:
 
 **Case 1: Client provides multiple address/len pairs in the command**
 
-The command itself includes multiple regions. Server performs parallel transport.read/transport.write across all of them simultaneously:
+The command includes multiple client regions:
 
 ```
 LO.SET key <total_len> <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 
-- Client has multiple GPU memory registrations (e.g., multi-GPU, or multiple buffers on one GPU)
-- Server calls transport.read/transport.write in parallel across all provided regions
-- Each region maps to one or more NVMe chunks
-- Client controls the parallelism and memory layout explicitly
+- The server treats the regions as **one logical contiguous destination** (region1
+  then region2 …) and chunks that logical space by `lo-buffer-size` — the server
+  owns the chunking; the client's region sizes need no alignment.
+- The upfront plan maps each chunk to its region(s): a chunk that fits inside one
+  region is one transport post; a chunk that **straddles** a region boundary is split
+  into two posts (tail of one region + head of the next). This is the only extra work
+  Case 1 adds over Case 2.
+- Client memory layout is just a destination map — it does **not** control the
+  server's chunking or parallelism.
+- Use case: client has multiple GPU registrations (multi-GPU, or several buffers on
+  one GPU).
 
 **Case 2: Client provides a single large address/len that exceeds comfortable buffer size**
 
-The client provides one region larger than the server's buffer size. Two sub-options:
+The client provides one region larger than the server's buffer size. This is the
+**trivial instance of the same plan** — one destination region, so every chunk maps
+to exactly one post with no straddling: chunk `i` → `addr + i*chunk_size`. Two
+sub-options:
 
 - **Reject:** Return ERR if `len > max_efa_transfer_size`. Simple, forces client to use Case 1.
 - **Accept and split (preferred — product requirement):** Server internally splits the single large region into chunk-sized fi_write/fi_read calls at sequential offsets within the client's region:
