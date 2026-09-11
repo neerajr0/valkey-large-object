@@ -119,13 +119,13 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ Segment 0 (16GB, io_uring buf_index=0)                    │
+│ Segment 0 (1GiB, io_uring buf_index=0)                    │
 │ ┌──────┐┌─────────┐┌──┐┌─────────────┐┌──────┐ ...      │
 │ │ 47KB ││  820KB  ││4K││    6.2MB    ││ 91KB │          │
 │ └──────┘└─────────┘└──┘└─────────────┘└──────┘          │
 └────────────────────────────────────────────────────────────┘
 ┌────────────────────────────────────────────────────────────┐
-│ Segment 1 (16GB, io_uring buf_index=1)                    │
+│ Segment 1 (1GiB, io_uring buf_index=1)                    │
 │ ...                                                        │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -216,7 +216,7 @@ EFA registration:      fi_mr_reg per segment — enables fi_write from any buffe
 **O_DIRECT alignment (NVMe mode only — does not apply to DRAM-only mode):**
 O_DIRECT bypasses the kernel page cache for direct NVMe I/O. It imposes two constraints:
 1. **Buffer address** must be 4KB-aligned (filesystem block size). Handled by `PinnedBuffer::new()` via `Layout::from_size_align(size, 4096)`.
-2. **Write length** must be a multiple of 512 bytes (logical sector size). Objects not naturally aligned are padded on disk: `ceil(len / 512) * 512`. Up to 511 bytes waste on disk. Reads return only `len` bytes (stored in LoValue metadata).
+2. **Write length** must be 4KB-aligned (the module rounds to the 4096 filesystem block via `object_disk_len`). Objects not naturally aligned are padded on disk: `ceil(len / 4096) * 4096`. Up to 4095 bytes waste on disk. Reads return only `len` bytes (stored in LoValue metadata).
 
 **Both read and write paths round up the I/O length.** The kernel rejects non-aligned lengths with `EINVAL`; O_DIRECT does not auto-pad. The module rounds up explicitly via `object_disk_len()` (`ceil(len / 4096) * 4096`) on both paths. On SET the reserved and written disk length is this aligned value, and the on-disk size is asserted to equal it.
 
@@ -269,7 +269,7 @@ LO.SET key len <payload> [rkey remote_addr]:
   2. Alloc buffer (registered memory)
   3a. TCP: copy payload into buffer
   3b. EFA: fi_read from client GPU into buffer (zero-copy)
-  4. io_uring WriteFixed to NVMe (O_DIRECT, 512-byte aligned length)
+  4. io_uring WriteFixed to NVMe (O_DIRECT, 4KB-aligned length via object_disk_len)
   5. Free buffer (no DRAMPool caching on write path)
   6. Track file in key/object: key → NVMe location only
 
@@ -319,14 +319,20 @@ Stored in Valkey's keyspace via the module data type. One per LO key. ~20 bytes.
 
 ```rust
 pub struct LoValue {
-    pub object_id: ObjectId,  // Monotonic per-node OID (used as NVMe filename)
-    pub len: u64,             // Object size in bytes (exact)
-    pub crc32c: u32,          // Integrity checksum (verified on replication pull)
+    pub object_id: ObjectId,          // Monotonic per-node OID (used as NVMe filename)
+    pub len: u64,                     // Object size in bytes (exact)
+    pub crc32c: u32,                  // Integrity checksum (verified on replication pull)
+    pub file: Option<Arc<ObjectFile>>,// On-disk handle (Some in Tiered, None in Dram).
+                                      // NOT serialized — rebuilt on load.
 }
 ```
 
-Only durable, object-intrinsic data. No runtime state (fd, DRAM cache location, flags). Runtime references are in module-internal structures:
-- **FdPool:** `HashMap<ObjectId, RawFd>` — rebuilt on load, not serialized
+The three durable fields (`object_id`, `len`, `crc32c`) are serialized to RDB. The
+`file` handle is runtime-only (an `Arc<ObjectFile>` tracking on-disk existence and,
+lazily, an open read fd) and is never serialized or reconstructed on load. No other
+runtime state (DRAM cache location, flags) lives on LoValue — those are in
+module-internal structures:
+- **FdPool:** `HashMap<ObjectId, FdEntry>` (each entry wraps an `Arc<OwnedFd>` plus LFRU scoring) — rebuilt on load, not serialized (§6.4)
 - **DRAMPool:** `HashMap<ObjectId, ObjectContext>` — buffers in DRAMPool segments, populated on GET hits, evicted independently
 - **NVMePool inflight:** transient `StreamingContext` per in-flight request — buffers in NVMePool segments, dropped on completion
 - **Allocators:** `Mutex<Talc>` per layer — `dram_pool_talc` for DRAMPool, `nvme_pool_talc` for NVMePool (§4.5)
@@ -433,39 +439,60 @@ recovery/reconciliation — never on the hot serving path (LoValue in the keyspa
 carries all metadata needed to serve).
 
 **Runtime references:**
-- fd opened at LO.SET, held in FdPool (`HashMap<ObjectId, RawFd>`)
-- Lookup: `fd_pool.get(object_id)` → RawFd for io_uring submission
-- File size = `4096 + ceil(len / 512) * 512` (header page + O_DIRECT-padded data)
+- The read fd is opened lazily on the first GET and cached in FdPool as `Arc<OwnedFd>` (SET opens its own private fd, not via FdPool — §6.4)
+- Lookup: `fd_pool.get_or_open(object_id, nvme_dir)` → `Arc<OwnedFd>` for io_uring submission
+- File size = `4096 + ceil(len / 4096) * 4096` (header page + O_DIRECT-padded data)
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
-- On DEL: `fd_pool.remove(oid)` closes fd, then `unlink()` deletes file
+- On DEL/free: `ObjectFile::Drop` removes the fd from FdPool (closes on last ref) and unlinks the file
 
 ### 6.4 FdPool (File Descriptor Management)
 
-Manages open NVMe file descriptors with LFRU eviction and a configurable cap.
+Caches open NVMe read file descriptors, keyed by `ObjectId`, so repeated GETs on a
+hot object reuse one fd instead of re-opening per request. The base structure is a
+map of reference-counted owned fds; the cap and eviction policy layer on top of it
+without changing that primitive.
 
 ```rust
 struct FdEntry {
-    fd: RawFd,
-    refcount: AtomicU32,     // In-flight I/Os using this fd
-    access_count: AtomicU64, // LFRU scoring (frequency)
-    last_access: AtomicU64,  // LFRU scoring (recency)
+    fd: Arc<OwnedFd>,        // The owned fd; in-flight readers hold clones of this Arc
+    access_count: AtomicU64, // LFRU scoring — frequency
+    last_access: AtomicU64,  // LFRU scoring — recency
 }
 
 struct FdPool {
-    entries: RwLock<HashMap<ObjectId, Arc<FdEntry>>>,
-    max_open: usize,         // Cap — evict when exceeded (configurable)
+    fds: RwLock<HashMap<ObjectId, FdEntry>>,
+    max_open: usize,         // Cap on simultaneously-open fds (0 = unlimited)
 }
 ```
 
-**Why capped:** OS file descriptor limits and kernel inode cache pressure. With millions of objects on NVMe, keeping all fds open wastes kernel resources. LFRU eviction closes cold fds; hot fds stay open.
+The lifetime-safety primitive is `Arc<OwnedFd>`: each in-flight read holds a clone,
+so an fd removed from the map — by DEL or by eviction — stays valid until the last
+reader finishes, and `OwnedFd` closes it via RAII on the final drop. **Everything
+else is policy built on this primitive; none of it can cause a use-after-close.**
 
 **Operations:**
-- **GET/SET:** `fd_pool.get_or_open(oid)` → returns `Arc<FdEntry>` (refcount incremented). Caller holds Arc for duration of I/O. Drop decrements refcount.
-- **Eviction (cap hit):** Find lowest-scored entry with `refcount == 0`. Close fd, remove from HashMap. If all candidates have refcount > 0 (in-flight), open beyond cap temporarily.
-- **DEL/free callback:** Remove entry from HashMap. If refcount > 0, fd stays open until last I/O completes (Arc drop triggers close). If refcount == 0, close immediately.
-- **Reopen:** If a GET arrives for an object whose fd was evicted from pool, reopen from path `/data/lo-data/{oid:016x}.dat`.
+- **GET:** `fd_pool.get_or_open(oid, nvme_dir)` — read-lock fast path returns a clone
+  of the cached `Arc<OwnedFd>` and bumps `access_count`/`last_access`; on a miss it
+  takes the write lock, re-checks (double-checked locking), `libc::open`s the file
+  (`O_RDONLY`, plus `O_DIRECT` when `direct-io` is on), wraps it in `Arc<OwnedFd>`,
+  inserts an `FdEntry`, and returns a clone. Returns `None` only on a genuine
+  `open()` failure.
+- **SET:** does **not** use FdPool — the write path opens its own private `OwnedFd`
+  that closes when the SET task's scope ends.
+- **DEL/free:** `ObjectFile::Drop` calls `fd_pool.remove(oid)`, dropping the map's
+  `Arc<OwnedFd>`. The fd closes once the last in-flight-read clone is also dropped.
 
-**Why Arc<FdEntry>:** I/O operations hold a clone of the Arc. HashMap removal (on DEL or eviction) drops one ref. In-flight I/Os still hold valid refs — no dangling pointer, no use-after-close.
+**Cap and eviction (LFRU):** when an insert would exceed `max_open`, the pool evicts
+the coldest entry, scored by `access_count` (frequency) and `last_access` (recency).
+The eviction-safety rule falls out of the Arc model for free — an entry is evictable
+iff no in-flight reader holds it, i.e. `Arc::strong_count(&entry.fd) == 1` (only the
+map's own reference remains). Eviction is just `remove` from the map; if a read is
+still in flight it holds a clone and keeps the fd alive until it completes, exactly
+as DEL does. There is **no separate refcount field** — the `Arc` strong count *is*
+the in-flight count, so the policy reads it rather than maintaining a parallel
+counter. (The cap and LFRU scoring are the planned policy layer; the base
+`Arc<OwnedFd>` map with lazy `get_or_open` is what exists today, and eviction slots
+in on top of it without touching the safety model.)
 
 ### 6.5 ObjectContext Lifetimes
 
@@ -493,7 +520,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get(42) → RawFd → /data/lo-data/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<OwnedFd> → {nvme-dir}/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -512,11 +539,11 @@ key "obj-A"
                     ┌────────────────────────────────┘
                     ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │ DRAMPool Segment 0 (16GB, io_uring buf_index=0)               │
+  │ DRAMPool Segment 0 (1GiB, io_uring buf_index=0)               │
   │ [...buf[0]...][...buf[1]...][...buf[3]...][...buf[5]...]    │
   └─────────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────────┐
-  │ DRAMPool Segment 1 (16GB, io_uring buf_index=1)               │
+  │ DRAMPool Segment 1 (1GiB, io_uring buf_index=1)               │
   │ [...buf[2]...][...buf[4]...][...buf[6]...]                  │
   └─────────────────────────────────────────────────────────────┘
 ```
@@ -529,7 +556,7 @@ key "obj-A"
 Objects can be much larger than a single I/O buffer (e.g., 10GB object with 64MB buffers). The module handles this by streaming through multiple buffers in parallel — never allocating the full object in DRAM at once.
 
 **Transport-dependent behavior:**
-- **TCP:** Valkey's command dispatch accumulates the full payload in `querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental/streaming API. **TCP rejects objects above a configurable max size** (e.g., 256MB). Multi-buffer parallel I/O applies only to EFA.
+- **TCP:** Valkey's command dispatch accumulates the full payload in `querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental/streaming API. **TCP rejects objects above `lo-max-object-size`.** Multi-buffer parallel I/O applies only to EFA.
 - **EFA:** The module controls chunk size via async transport.read/transport.write. Multi-buffer parallel I/O is the primary large object path.
 
 ### 7.1 NVMe Representation: Single File Per Object
@@ -538,7 +565,7 @@ Each object is one contiguous file on NVMe regardless of size:
 
 ```
 Object "key123" (10GB):
-  NVMe: /data/lo-data/00000042.dat   (10GB file, XFS extent-allocated)
+  NVMe: {nvme-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
   LoValue: {oid=42, len=10GB, crc32c=0xAB12}
 ```
 
@@ -574,7 +601,7 @@ Server does:   alloc 4-8 buffers (pipeline depth)
                EFA: transport.write each chunk to client at addr + i*chunk_size
 ```
 
-**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / lo-buffer-size)` internal operations. The last operation uses `len = total_len % lo-buffer-size` (partial chunk). O_DIRECT write path pads the final write to 512-byte boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
+**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / lo-buffer-size)` internal operations. The last operation uses `len = total_len % lo-buffer-size` (partial chunk). O_DIRECT write path pads the final write to the 4KB boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
 
 ### 7.3 Chunked Streaming I/O
 
@@ -805,8 +832,8 @@ With pipelining (4–8 buffers in flight), only 4–8 buffers are checked out at
 
 ### 7.5 DRAMPool for Large Objects
 
-Large objects (>256MB) are **never promoted to DRAMPool**:
-- Cost/benefit is poor (256MB DRAM for one key vs serving hundreds of smaller hot objects)
+Objects larger than `max-promote-size` are **never promoted to DRAMPool**:
+- Cost/benefit is poor (a large object evicts many smaller hot objects from cache)
 - Promotion threshold is configurable: `max-promote-size` (default: 256MB; `0` disables promotion)
 - Objects above this threshold always read from NVMe via the parallel pipeline
 - Objects below this threshold can be promoted to DRAMPool on repeated access (§5.2 step 13, §7.3.4)
@@ -886,7 +913,7 @@ This will be solved using a cron job from the Module that monitors memory usage 
 
 ### 8.3 How Expansion Works
 
-1. Allocate new segment (contiguous region, e.g., 16GB)
+1. Allocate new segment (contiguous region, ≤1GiB per the §2 cap)
 2. Register with io_uring: `IORING_UNREGISTER_BUFFERS` → append new iovec → `IORING_REGISTER_BUFFERS`
 3. Add to allocator: `talc.claim(Span::new(base, base + size))`
 4. New allocations can immediately use the new segment
@@ -919,7 +946,7 @@ Eviction is cheap — objects survive on NVMe. Next GET is a DRAMPool miss.
 ```
 Evacuation is mandatory — data only exists in DRAM. Cannot shrink if remaining segments are too full to absorb evacuated objects (reject the shrink request).
 
-Evacuation cost: proportional to live data in segment. 5% utilized 16GB segment = ~800MB copy = ~80ms.
+Evacuation cost: proportional to live data in segment. 5% utilized 1GiB segment = ~50MB copy = ~5ms.
 
 ## 9. Concurrency, Refcounting, and Lifecycle
 
@@ -933,7 +960,7 @@ This section describes how shared state is protected, which structures are refco
 | StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | The one task that owns it | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
 | SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
 | ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
-| Open fd | `Arc<OwnedFd>` | FdPool HashMap (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops |
+| Open fd | `Arc<OwnedFd>` (inside `FdEntry`) | FdPool map (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops. The strong count *is* the in-flight count — eviction removes an entry only when `strong_count == 1` (no separate refcount field) |
 | Segment | `AtomicU32` refcount + `AtomicBool draining` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: safe to IORING_UNREGISTER + dealloc |
 
 ### 9.2 Threading Model: Which Thread Does What
@@ -966,7 +993,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | DRAMPool object map | `HashMap<ObjectId, Arc<ObjectContext>>` | `RwLock` | Main (read on GET hit, remove on free callback), tokio (read for coalesce check, write for promotion insert + Filling state update) |
 | DRAMPool allocator | `Mutex<Talc>` (dram_pool_talc) | Mutex | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc) |
 | NVMePool allocator | `Mutex<Talc>` (nvme_pool_talc) | Mutex | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
-| FdPool | `HashMap<ObjectId, Arc<OwnedFd>>` | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET). SET does NOT use FdPool — it opens a private fd. |
+| FdPool | `HashMap<ObjectId, FdEntry>` (entry = `Arc<OwnedFd>` + LFRU scoring) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFRU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment metadata | `Vec<Segment>` (per pool) | Read-only after init (no lock needed) | All threads (read segment base/size/buf_index). Draining flag is AtomicBool. |
 
