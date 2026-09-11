@@ -279,16 +279,16 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             assert result == payload
 
     def test_nvme_staging_exhaustion(self):
-        """An object larger than nvme-staging-size should fail with pool exhausted."""
+        """An object larger than nvme-staging-size should fail with staging buffer exhaustion."""
         client = self.server.get_new_client()
         # nvme-staging-size is 4MB. An 8MB object cannot be staged.
         obj_size = 8 * 1024 * 1024
         payload = b'Z' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
+            assert False, "Expected NVMe staging buffer exhaustion error"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'nvme staging buffer pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     # ─── MEMORY USAGE tests ───────────────────────────────────────────────
 
@@ -328,7 +328,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     these tests exercise it through its only externally-visible effect: the
     reserve-if-capacity gate (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
     A SET that would push tracked usage past `nvme-maxmemory` is rejected with
-    "pool exhausted"; a SET that fits succeeds. By filling to the cap, freeing,
+    "NVMe disk capacity exceeded"; a SET that fits succeeds. By filling to the cap, freeing,
     and re-filling we prove the counter is incremented on create and -- critically --
     decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
     """
@@ -346,7 +346,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
         assert client.execute_command("LO.SET", key, payload) == b"OK"
 
     def _set_ok_eventually(self, client, key, payload, tries=100, delay=0.02):
-        """Overwrite SET that tolerates a *transient* 'pool exhausted'.
+        """Overwrite SET that tolerates a *transient* 'capacity exceeded'.
 
         On overwrite the replaced object's bytes are released asynchronously in
         ObjectFile::Drop (teardown runs on the tokio blocking pool), so a rapid
@@ -362,7 +362,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
                 assert client.execute_command("LO.SET", key, payload) == b"OK"
                 return
             except ResponseError as e:
-                if "pool exhausted" not in str(e).lower():
+                if "nvme disk capacity exceeded" not in str(e).lower():
                     raise
                 last = e
                 time.sleep(delay)
@@ -374,9 +374,9 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     def _set_rejected(self, client, key, payload):
         try:
             client.execute_command("LO.SET", key, payload)
-            assert False, f"Expected '{key}' SET to be rejected (pool exhausted)"
+            assert False, f"Expected '{key}' SET to be rejected (capacity exceeded)"
         except ResponseError as e:
-            assert "pool exhausted" in str(e).lower(), f"Unexpected error: {e}"
+            assert "nvme disk capacity exceeded" in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):

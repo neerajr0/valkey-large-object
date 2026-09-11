@@ -296,7 +296,7 @@ const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
 /// On-disk file header for NVMe object files.
 /// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
 ///
-/// The struct layout (`repr(C)`) does NOT match the on-disk wire format —
+/// The struct's in-memory layout does NOT match the on-disk wire format —
 /// the compiler inserts padding for natural field alignment. Serialization
 /// is handled by `to_page` (sequential writes) and `from_page` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.
