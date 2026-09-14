@@ -108,11 +108,21 @@ impl SegmentPool {
 
     /// Free a buffer back to the pool.
     pub fn free(&self, buf: &SegmentBuffer) {
-        let aligned_size = super::align_up(buf.len as usize);
-        let layout =
-            Layout::from_size_align(aligned_size, super::IO_ALIGN).expect("SegmentBuffer layout");
+        self.free_n(std::slice::from_ref(buf));
+    }
+
+    /// Free multiple buffers back to the pool under a single lock acquisition.
+    pub fn free_n(&self, buffers: &[SegmentBuffer]) {
+        if buffers.is_empty() {
+            return;
+        }
         let mut talc = self.allocator.lock().expect("allocator lock unavailable");
-        self.free_with_lock(&mut talc, buf, layout);
+        for buf in buffers {
+            let aligned_size = super::align_up(buf.len as usize);
+            let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
+                .expect("SegmentBuffer layout");
+            self.free_with_lock(&mut talc, buf, layout);
+        }
     }
 
     /// Free a single buffer under an already-held allocator lock.

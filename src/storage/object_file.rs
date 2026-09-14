@@ -92,7 +92,7 @@ impl Drop for ObjectFile {
                 super::warn_failed_unlink("teardown", &path, &e);
             }
             // Release exactly what create added — no stat, so it can't drift.
-            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
+            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
         };
 
         // The main event-loop thread must be kept syscall-free. Hand the operation

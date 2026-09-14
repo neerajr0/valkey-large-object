@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, Status, ValkeyString};
+use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyError, ValkeyString};
+use valkey_module_macros::info_command_handler;
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -42,6 +43,7 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod metrics;
 pub mod storage;
 pub mod transport;
 
@@ -300,6 +302,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 /// shutdown.
 fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
+}
+
+/// INFO command handler — exposes module error metrics via `INFO largeobj`.
+/// Also called during crash reports (`for_crash_report = true`) to include
+/// metric counters in the crash log.
+#[info_command_handler]
+fn info_handler(ctx: &InfoContext, for_crash_report: bool) -> Result<(), ValkeyError> {
+    metrics::largeobj_info_handler(ctx, for_crash_report)
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):

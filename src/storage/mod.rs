@@ -3,12 +3,10 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
-use crate::data_type::ObjectId;
-use std::mem::size_of;
-
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
+pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
 pub mod segment;
@@ -19,6 +17,20 @@ pub mod uring;
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
 pub use object_file::ObjectFile;
 
+// Re-exports from nvme.rs
+pub use nvme::{
+    object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
+    validate_and_clean_nvme_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
+    FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
+};
+
+// Re-export for crate-internal use only.
+pub(crate) use nvme::warn_failed_unlink;
+
+pub use dram_pool::DRAMPool;
+pub use fd_pool::FdPool;
+pub use nvme_pool::NVMePool;
+
 /// O_DIRECT / io_uring alignment requirement (XFS default block size).
 /// Both buffer address and I/O length must be multiples of this.
 pub const IO_ALIGN: usize = 4096;
@@ -28,15 +40,6 @@ pub const IO_ALIGN: usize = 4096;
 pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
 }
-
-/// O_DIRECT-aligned on-disk size of an object with `logical_len` payload bytes.
-/// Shared helper function to ensure no drift between expected and actual file sizes.
-pub fn object_disk_len(logical_len: u64) -> u64 {
-    align_up(logical_len as usize) as u64
-}
-pub use dram_pool::DRAMPool;
-pub use fd_pool::FdPool;
-pub use nvme_pool::NVMePool;
 
 // ─── TryClone Trait ──────────────────────────────────────────────────────────
 
@@ -109,7 +112,6 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     let dram_seg_size = crate::dram_segment_size();
     let dram_max = crate::dram_maxmemory();
     let nvme_staging = crate::nvme_staging_size();
-
     // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
     // Otherwise pre-allocate maxmemory / segment_size segments.
     let dram_segment_count = if dram_max == 0 {
@@ -117,7 +119,6 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     } else {
         ((dram_max as usize) / dram_seg_size).max(1)
     };
-
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
         1
@@ -136,9 +137,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
             u16::MAX as usize + 1,
         ));
     }
-
     // ── Create all resources as locals (no OnceLock yet) ──
-
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
         Some(NVMePool::new(1, nvme_staging))
@@ -150,10 +149,8 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     } else {
         None
     };
-
     // DRAMPool: always needed (both modes).
     let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size);
-
     // io_uring NVMe engine: only in Tiered mode. Ring creation + buffer registration
     // happen on this (main) thread so failures return Err, not panic in the poller.
     let nvme_engine = if mode == crate::OperatingMode::Tiered {
@@ -174,9 +171,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     } else {
         None
     };
-
     // ── All succeeded — commit to globals. No failure possible after this point. ──
-
     if let Some(pool) = nvme_pool {
         if NVME_POOL.set(pool).is_err() {
             panic!("NVMePool already initialized");
@@ -193,7 +188,6 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
     }
-
     Ok(format!(
         "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
         mode,
@@ -202,43 +196,6 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         dram_seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),
     ))
-}
-
-/// Warn that an object file couldn't be unlinked (the next
-/// `validate_and_clean_nvme_dir` reclaims the orphan).
-pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
-    valkey_module::logging::log_warning(format!(
-        "largeobj: failed to unlink object file {path} during {during}: {err}"
-    ));
-}
-
-/// Reset the NVMe object directory (Tiered mode only): delete it and everything
-/// under it, then recreate it empty. `nvme-dir` is a dedicated, module-owned
-/// directory (see the `nvme-dir` config docs), so wiping it is safe. A no-op
-/// in Dram mode, which never touches disk.
-///
-/// Called both to reclaim a previous run's leftovers at startup and to clear
-/// this instance's files at shutdown. Returns `Ok(())` once nvme-dir exists and
-/// is empty (or immediately, in Dram mode); `Err` if nvme-dir is unset in Tiered
-/// mode, or the directory could not be removed or recreated.
-pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
-    if mode != crate::OperatingMode::Tiered {
-        return Ok(());
-    }
-    if dir.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "nvme-dir is required in Tiered operating mode",
-        ));
-    }
-    // remove_dir_all errors if `dir` is absent — but "absent" is already the
-    // state we want, so treat NotFound as success.
-    if let Err(e) = std::fs::remove_dir_all(dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(e);
-        }
-    }
-    std::fs::create_dir_all(dir)
 }
 
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
@@ -255,135 +212,248 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
     slices
 }
 
-// ─── Chunk Helpers ───────────────────────────────────────────────────────────
+// ─── ChunkBuilder ────────────────────────────────────────────────────────────
 
-/// Compute the number of chunks for an object of `obj_len` bytes.
-pub fn chunk_count(obj_len: u64, chunk_size: usize) -> u32 {
-    obj_len.div_ceil(chunk_size as u64) as u32
+/// One region of client-visible memory for a chunk (EFA transfer target).
+/// In the single-address case, every chunk has exactly one region.
+/// In the multi-address case, chunks straddling a client buffer boundary
+/// will have two regions.
+#[derive(Debug, Clone)]
+pub struct ClientRegion {
+    pub remote_addr: u64,
+    pub len: usize,
 }
 
-/// Compute the data length of chunk `i` (last chunk may be shorter).
-pub fn chunk_data_len(i: u32, total_chunks: u32, obj_len: u64, chunk_size: usize) -> usize {
-    if i == total_chunks - 1 {
-        let rem = (obj_len % chunk_size as u64) as usize;
-        if rem == 0 {
-            chunk_size
+/// Builds chunk descriptors for an object. Encapsulates chunking geometry
+/// and client address mapping. Decoupled from buffer ownership — callers
+/// index into their own buffer collections using chunk indices from this builder.
+pub struct ChunkBuilder {
+    obj_len: u64,
+    chunk_size: usize,
+    total_chunks: u32,
+    /// Per-chunk client address mappings. Populated by map_client_addresses().
+    mappings: Vec<Vec<ClientRegion>>,
+}
+
+impl ChunkBuilder {
+    /// Create a new ChunkBuilder.
+    /// Panics on zero obj_len or zero chunk_size (callers must reject these earlier).
+    pub fn new(obj_len: u64, chunk_size: usize) -> Self {
+        debug_assert!(obj_len > 0, "ChunkBuilder: obj_len must be > 0");
+        debug_assert!(chunk_size > 0, "ChunkBuilder: chunk_size must be > 0");
+        let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
+        Self {
+            obj_len,
+            chunk_size,
+            total_chunks,
+            mappings: Vec::new(),
+        }
+    }
+
+    pub fn total_chunks(&self) -> u32 {
+        self.total_chunks
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Data length for chunk i (last chunk may be shorter).
+    pub fn data_len(&self, i: u32) -> usize {
+        debug_assert!(
+            i < self.total_chunks,
+            "chunk index {} >= total_chunks {}",
+            i,
+            self.total_chunks
+        );
+        if i == self.total_chunks - 1 {
+            let rem = (self.obj_len % self.chunk_size as u64) as usize;
+            if rem == 0 {
+                self.chunk_size
+            } else {
+                rem
+            }
         } else {
-            rem
+            self.chunk_size
         }
-    } else {
-        chunk_size
+    }
+
+    /// Compute client address mapping for all chunks (single-pass).
+    /// Returns Err if total client address space is insufficient.
+    pub fn map_client_addresses(
+        &mut self,
+        client_addrs: &[(u64, usize)],
+    ) -> Result<(), &'static str> {
+        let mut mappings = Vec::with_capacity(self.total_chunks as usize);
+        let mut current_addr_idx: usize = 0;
+        let mut current_offset: usize = 0;
+        for chunk_idx in 0..self.total_chunks {
+            let mut remaining = self.data_len(chunk_idx);
+            let mut regions = Vec::new();
+            // Consume client address space until this chunk is fully covered.
+            while remaining > 0 {
+                // No more client addresses — total address space is insufficient.
+                if current_addr_idx >= client_addrs.len() {
+                    return Err("insufficient client address space");
+                }
+                // Bytes remaining in the current client address region.
+                let avail = client_addrs[current_addr_idx].1 - current_offset;
+                // Current region exhausted — advance to the next one.
+                if avail == 0 {
+                    current_addr_idx += 1;
+                    current_offset = 0;
+                    continue;
+                }
+                // Take as much as we need (or as much as is available).
+                let take = remaining.min(avail);
+                regions.push(ClientRegion {
+                    remote_addr: client_addrs[current_addr_idx].0 + current_offset as u64,
+                    len: take,
+                });
+                current_offset += take;
+                remaining -= take;
+            }
+            mappings.push(regions);
+        }
+        self.mappings = mappings;
+        Ok(())
+    }
+
+    /// Get the client regions for chunk i. Panics if map_client_addresses not called.
+    pub fn client_regions(&self, i: u32) -> &[ClientRegion] {
+        assert!(
+            !self.mappings.is_empty(),
+            "client_regions called before map_client_addresses"
+        );
+        &self.mappings[i as usize]
     }
 }
 
-// ─── FileHeader ──────────────────────────────────────────────────────────────
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
 
-pub const FILE_HEADER_SIZE: u64 = 4096;
-pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
-pub const FILE_HEADER_VERSION: u8 = 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Packed wire size of the header fields (no inter-field padding).
-/// Computed from field types so adding a field updates this automatically.
-pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
-    + size_of::<u8>()                                           // version
-    + size_of::<u64>()                                          // object_id
-    + size_of::<u64>()                                          // len
-    + size_of::<u32>(); // crc32c
+    // ─── ChunkBuilder: geometry ──────────────────────────────────────────
 
-// Static assert: wire header fits within the page.
-const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
+    #[test]
+    fn test_chunk_builder_single_chunk_exact() {
+        // obj_len == chunk_size → exactly 1 full chunk.
+        let b = ChunkBuilder::new(4096, 4096);
+        assert_eq!(b.total_chunks(), 1);
+        assert_eq!(b.data_len(0), 4096);
+    }
 
-/// On-disk file header for NVMe object files.
-/// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
-///
-/// The struct's in-memory layout does NOT match the on-disk wire format —
-/// the compiler inserts padding for natural field alignment. Serialization
-/// is handled by `to_page` (sequential writes) and `from_page` (sequential
-/// reads with validation). Do not attempt to byte-cast this struct.
-pub struct FileHeader {
-    pub magic: [u8; 4],
-    pub version: u8,
-    pub object_id: u64,
-    pub len: u64,
-    pub crc32c: u32,
-}
+    #[test]
+    fn test_chunk_builder_single_byte() {
+        // Smallest possible object: 1 byte → 1 chunk of 1 byte.
+        let b = ChunkBuilder::new(1, 4096);
+        assert_eq!(b.total_chunks(), 1);
+        assert_eq!(b.data_len(0), 1);
+    }
 
-impl FileHeader {
-    pub fn new(object_id: ObjectId, len: u64, crc32c: u32) -> Self {
-        Self {
-            magic: *FILE_HEADER_MAGIC,
-            version: FILE_HEADER_VERSION,
-            object_id: object_id.0,
-            len,
-            crc32c,
+    #[test]
+    fn test_chunk_builder_exact_multiple() {
+        // obj_len is an exact multiple of chunk_size → all chunks are full.
+        let b = ChunkBuilder::new(16384, 4096);
+        assert_eq!(b.total_chunks(), 4);
+        for i in 0..4 {
+            assert_eq!(b.data_len(i), 4096);
         }
     }
 
-    /// Serialize into a 4096-byte page (header bytes + zero padding).
-    pub fn to_page(&self) -> Vec<u8> {
-        let mut page = Vec::with_capacity(FILE_HEADER_SIZE as usize);
-        page.extend_from_slice(&self.magic);
-        page.push(self.version);
-        page.extend_from_slice(&self.object_id.to_le_bytes());
-        page.extend_from_slice(&self.len.to_le_bytes());
-        page.extend_from_slice(&self.crc32c.to_le_bytes());
-        debug_assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
-        page.resize(FILE_HEADER_SIZE as usize, 0);
-        page
+    #[test]
+    fn test_chunk_builder_partial_last_chunk() {
+        // obj_len = 3 * chunk_size + 1 → last chunk has 1 byte.
+        let b = ChunkBuilder::new(12289, 4096);
+        assert_eq!(b.total_chunks(), 4);
+        assert_eq!(b.data_len(0), 4096);
+        assert_eq!(b.data_len(1), 4096);
+        assert_eq!(b.data_len(2), 4096);
+        assert_eq!(b.data_len(3), 1);
     }
 
-    /// Deserialize from a page. Panics on invalid magic, version, or truncated page
-    /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
-    pub fn from_page(page: &[u8]) -> Self {
-        if page.len() < FILE_HEADER_WIRE_LEN {
-            panic!(
-                "largeobj: file header too short ({} bytes, need {})",
-                page.len(),
-                FILE_HEADER_WIRE_LEN
-            );
+    #[test]
+    fn test_chunk_builder_large_object() {
+        // 50 MB object with 8 MB chunks → 7 chunks, last has 50%8=2 MB.
+        let obj_len = 50 * 1024 * 1024u64;
+        let chunk_size = 8 * 1024 * 1024;
+        let b = ChunkBuilder::new(obj_len, chunk_size);
+        assert_eq!(b.total_chunks(), 7);
+        for i in 0..6 {
+            assert_eq!(b.data_len(i), chunk_size);
         }
-        let mut cur = 0;
-        let magic: [u8; 4] = page[cur..cur + 4]
-            .try_into()
-            .expect("file header magic slice");
-        cur += 4;
-        if &magic != FILE_HEADER_MAGIC {
-            panic!(
-                "largeobj: file header invalid magic {:?} (expected {:?})",
-                magic, FILE_HEADER_MAGIC
-            );
-        }
-        let version = page[cur];
-        cur += 1;
-        if version != FILE_HEADER_VERSION {
-            panic!(
-                "largeobj: file header unsupported version {} (expected {})",
-                version, FILE_HEADER_VERSION
-            );
-        }
-        let object_id = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header object_id slice"),
-        );
-        cur += 8;
-        let len = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header len slice"),
-        );
-        cur += 8;
-        let crc32c = u32::from_le_bytes(
-            page[cur..cur + 4]
-                .try_into()
-                .expect("file header crc32c slice"),
-        );
-        Self {
-            magic,
-            version,
-            object_id,
-            len,
-            crc32c,
-        }
+        assert_eq!(b.data_len(6), 2 * 1024 * 1024);
+    }
+
+    // ─── ChunkBuilder: map_client_addresses ──────────────────────────────
+
+    #[test]
+    fn test_map_single_contiguous_address() {
+        // Single client address covering the full object.
+        let mut b = ChunkBuilder::new(8193, 4096);
+        assert_eq!(b.total_chunks(), 3);
+        b.map_client_addresses(&[(0x1000, 8193)]).unwrap();
+        // Chunk 0: one region covering full chunk_size.
+        let r0 = b.client_regions(0);
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].remote_addr, 0x1000);
+        assert_eq!(r0[0].len, 4096);
+        // Chunk 1: one region covering full chunk_size.
+        let r1 = b.client_regions(1);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].remote_addr, 0x1000 + 4096);
+        assert_eq!(r1[0].len, 4096);
+        // Chunk 2: one region covering partial last chunk (1 byte).
+        let r2 = b.client_regions(2);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].remote_addr, 0x1000 + 8192);
+        assert_eq!(r2[0].len, 1);
+    }
+
+    #[test]
+    fn test_map_multiple_addresses_chunk_straddling() {
+        // Two client addresses: first covers 5000 bytes, second covers 3193.
+        // Object is 8193 bytes with chunk_size=4096 → 3 chunks.
+        // Chunk 0 (4096 bytes): entirely in address 0.
+        // Chunk 1 (4096 bytes): 904 bytes from address 0 + 3192 bytes from address 1.
+        // Chunk 2 (1 byte): from address 1.
+        let mut b = ChunkBuilder::new(8193, 4096);
+        b.map_client_addresses(&[(0x1000, 5000), (0x2000, 3193)])
+            .unwrap();
+        // Chunk 0: single region.
+        let r0 = b.client_regions(0);
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].remote_addr, 0x1000);
+        assert_eq!(r0[0].len, 4096);
+        // Chunk 1: straddles two addresses.
+        let r1 = b.client_regions(1);
+        assert_eq!(r1.len(), 2);
+        assert_eq!(r1[0].remote_addr, 0x1000 + 4096); // remaining 904 bytes of addr 0
+        assert_eq!(r1[0].len, 904);
+        assert_eq!(r1[1].remote_addr, 0x2000); // 3192 bytes from addr 1
+        assert_eq!(r1[1].len, 3192);
+        // Chunk 2: single region from address 1.
+        let r2 = b.client_regions(2);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].remote_addr, 0x2000 + 3192);
+        assert_eq!(r2[0].len, 1);
+    }
+
+    #[test]
+    fn test_map_insufficient_address_space() {
+        // Client address space is smaller than obj_len.
+        let mut b = ChunkBuilder::new(8192, 4096);
+        let result = b.map_client_addresses(&[(0x1000, 4096)]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "insufficient client address space");
+    }
+
+    #[test]
+    #[should_panic(expected = "client_regions called before map_client_addresses")]
+    fn test_client_regions_panics_without_mapping() {
+        let b = ChunkBuilder::new(4096, 4096);
+        let _ = b.client_regions(0);
     }
 }

@@ -8,21 +8,61 @@
 //!   TCP SET, Tiered             → tokio task (NVMe write)
 //!   EFA anything                → tokio task
 //!
+//! Streaming:
+//!   All paths use multi-buffer chunked I/O. Buffer allocation uses alloc_n()
+//!   with chunk_size from lo-buffer-size config. NVMe paths write FileHeader
+//!   at offset 0, data at offset 4096+. SET computes CRC incrementally per
+//!   chunk; GET verifies CRC via FileHeader comparison only (no rolling hash
+//!   on the read path).
+//!
 //! Promotion (Tiered GET miss):
 //!   If admission policy says yes → alloc ObjectContext in DRAMPool,
 //!   ReadFixed directly into DRAMPool buffers, mark Filling→Ready.
 //!   Concurrent GETs coalesce on Filling ObjectContext.
 
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, uring, ObjectContext, ObjectFile};
+use crate::storage::{self, nvme, uring, ClientRegion, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
+
+// ─── In-flight pin invariant ─────────────────────────────────────────────────
+//
+// A DEL / overwrite / expiry / eviction / flush runs `lo_free`, which drops the
+// keyspace's refs — the DRAM map's `Arc<ObjectContext>` and `LoValue.file` — at
+// any await point of an in-flight request. So any async request that reads or
+// writes keyspace-reachable backing state across an `.await` MUST hold its own
+// clone of that state for the whole operation.
+//
+// Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
+//   - Every DRAM serve that transfers a map-resident object — `serve_from_dram`'s
+//     EFA path, and `do_tiered_promote_and_serve_tcp/efa`. (TCP serves copy
+//     synchronously with no await via `collect_dram_bytes`, so no pin is needed.)
+//   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
+//     already inserted in the map — the task moves that Arc in for the read.
+//   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
+//   commit it, so no concurrent free can reach it.
+//
+// Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
+// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
+//   - Every Tiered request that READS the object: the NVMe promotion read
+//     (`do_tiered_promote_and_serve_tcp/efa`), the transient NVMe read
+//     (`do_tiered_nvme_read_and_serve_tcp/efa`), and — by the blanket rule — the
+//     DRAM serve that follows a promotion. The `ObjectFile` pin is held for the
+//     whole request, read plus transfer, via `_keep_alive = (file, fd)`.
+//   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write
+//   path: the `ObjectFile` is created at commit via `set_finalize`, never read
+//   during the write. An overwritten old `ObjectFile` is protected by refcount
+//   on the replaced `LoValue` (via `lo_free`), not by the writer.
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Transport context passed to engine ──────────────────────────────────────
 
@@ -35,6 +75,24 @@ pub enum Transport {
     },
 }
 
+/// EFA transfer context — session, remote key, and remote address.
+/// Extracted from Transport::Efa so async task functions take one param instead of three.
+struct EfaCtx {
+    session: Arc<Session>,
+    rkey: u64,
+    remote_addr: u64,
+}
+
+/// Resolved object identity for GET operations — the subset of LoValue fields
+/// needed by async read tasks. Extracted because LoValue itself can't be moved
+/// out of the keyspace (it's behind a Module API key handle), and its
+/// Arc<ObjectFile> is pinned separately via _keep_alive.
+struct GetObjectInfo {
+    object_id: ObjectId,
+    obj_len: u64,
+    crc32c: u32,
+}
+
 // ─── Engine Result ────────────────────────────────────────────────────────────
 
 /// Result of an engine dispatch. Command handler matches on this.
@@ -45,34 +103,7 @@ pub enum EngineResult {
     Async,
 }
 
-// ─── In-flight pin invariant ─────────────────────────────────────────────────
-//
-// A DEL / overwrite / expiry / eviction / flush runs `lo_free`, which drops the
-// keyspace's refs — the DRAM map's `Arc<ObjectContext>` and `LoValue.file` — at
-// any await point of an in-flight request. So any async request that reads or
-// writes keyspace-reachable backing state across an `.await` MUST hold its own
-// clone of that state for the whole operation.
-//
-// Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
-//   - Every DRAM serve that transfers a map-resident object — `serve_from_dram`'s
-//     EFA path, reached from both the DRAM-hit caller and the post-promotion
-//     caller. (TCP serves copy synchronously with no await, so no pin is needed.)
-//   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
-//     already inserted in the map — the task moves that Arc in for the read.
-//   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
-//   commit it, so no concurrent free can reach it.
-//
-// Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
-// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
-//   - Every Tiered request that READS the object: the NVMe promotion read, the
-//     transient NVMe read, and — by the blanket rule — the DRAM serve that follows
-//     a read. The `ObjectFile` pin is held for the whole request, read plus transfer.
-//   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write path:
-//   the `ObjectFile` is created at commit, never read during the write. An overwritten
-//   old `ObjectFile` is protected by refcount on the replaced `LoValue` (via
-//   `lo_free`), not by the writer.
-
-// ─── GET Engine ──────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
 fn collect_dram_bytes(
@@ -92,17 +123,76 @@ fn collect_dram_bytes(
     data
 }
 
+/// Describes a completed NVMe write ready to be committed to the keyspace.
+struct NvmeWriteResult<'a> {
+    object_id: ObjectId,
+    obj_len: u64,
+    crc: u32,
+    disk_len: u64,
+    file_path: &'a str,
+}
+
+/// Version check + set_value on the async SET path.
+/// `on_discard` runs if the write is stale (newer SET won) or set_value fails.
+/// Returns true if value was set, false if stale (silently discarded).
+fn set_finalize<F: FnOnce()>(
+    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    key_name: &[u8],
+    write: &NvmeWriteResult,
+    on_discard: F,
+) -> Result<bool, ValkeyError> {
+    let ctx = thread_ctx.lock();
+    let key_str = ctx.create_string(key_name.to_vec());
+    let key = ctx.open_key_writable(&key_str);
+    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
+        if existing.object_id > write.object_id {
+            on_discard();
+            return Ok(false);
+        }
+    }
+    let on_disk = std::fs::metadata(write.file_path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "NVMe accounting: cannot stat object {:?} at {} \
+                 to verify write size: {e}",
+                write.object_id, write.file_path
+            )
+        })
+        .len();
+    assert_eq!(
+        on_disk, write.disk_len,
+        "NVMe accounting: object {:?} on disk is {on_disk} B but we \
+         reserved {} B — write path and accounting have diverged",
+        write.object_id, write.disk_len
+    );
+    let lo_value = LoValue {
+        object_id: write.object_id,
+        len: write.obj_len,
+        crc32c: write.crc,
+        file: Some(Arc::new(ObjectFile::new(write.object_id, write.disk_len))),
+    };
+    if key.set_value(&LO_TYPE, lo_value).is_err() {
+        on_discard();
+        return Err(ValkeyError::Str("ERR failed to set key"));
+    }
+    Ok(true)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /// Execute LO.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
     obj_len: u64,
+    crc32c: u32,
     file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) -> EngineResult {
     let mode = crate::operating_mode();
-
     match (mode, &transport) {
         (OperatingMode::Dram, Transport::Tcp) => {
             // Fully sync — serve from DRAMPool, return directly.
@@ -118,7 +208,7 @@ pub fn execute_get(
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    execute_get_tiered(object_id, obj_len, file, transport, blocked_client);
+                    execute_get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
                 }
             }
             EngineResult::Async
@@ -126,7 +216,10 @@ pub fn execute_get(
     }
 }
 
+// ─── DRAM-only TCP GET ────────────────────────────────────────────
+
 /// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
+/// Multi-buffer: collect_dram_bytes iterates all buffers, copying up to obj_len total.
 fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
@@ -148,7 +241,9 @@ fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, 
     }
 }
 
-/// DRAM-only GET: object MUST be in DRAMPool. If not found → key doesn't exist
+// ─── DRAM-only EFA GET ────────────────────────────────────────────
+
+/// DRAM-only EFA GET: object MUST be in DRAMPool. If not found → key doesn't exist
 /// (shouldn't happen — LoValue exists implies ObjectContext exists in DRAM-only mode).
 fn execute_get_dram_efa(
     object_id: ObjectId,
@@ -158,13 +253,13 @@ fn execute_get_dram_efa(
 ) {
     let dram_pool = storage::get_dram_pool();
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Serve from DRAMPool.
             serve_from_dram(dram_pool, &obj_ctx, obj_len, transport, thread_ctx, None);
         }
         Some(_obj_ctx) => {
+            // TODO: Replace with waiter registration on the watch channel (coalescing).
             todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
         }
         None => {
@@ -173,18 +268,20 @@ fn execute_get_dram_efa(
     }
 }
 
+// ─── Tiered GET ──────────────────────────────────────────────
+
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
 /// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
+    crc32c: u32,
     file: Arc<ObjectFile>,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
     let dram_pool = storage::get_dram_pool();
-
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
@@ -203,25 +300,9 @@ fn execute_get_tiered(
         // TODO: coalesce — register as waiter on this ObjectContext.
         // For now: fall through to NVMe read.
     }
-
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
-    // `file` (captured by the promotion task below) pins the ObjectFile across the
-    // NVMe read and transfer — see the in-flight pin invariant at the top of file.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
-        // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
-        if obj_ctx.buffers.len() != 1 {
-            todo!("streaming and chunking not yet implemented");
-        }
-        let seg_buf = &obj_ctx.buffers[0];
-        let buf_ptr_usize = dram_pool.buffer_ptr(seg_buf) as usize;
-        let read_op = uring::UringOp {
-            iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
-            buf_ptr: buf_ptr_usize as *mut u8,
-            file_offset: 0,
-            len: obj_len,
-        };
-
+    if let Some((obj_ctx, chunk_size)) = dram_pool.try_promote_object(object_id, obj_len) {
         let fd_pool = storage::get_fd_pool();
         let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
@@ -235,56 +316,85 @@ fn execute_get_tiered(
                 return;
             }
         };
-
-        // Read from NVMe directly into DRAMPool buffer, then serve.
-        crate::runtime_handle().spawn(async move {
-            let result = uring::submit_read(fd.as_raw_fd(), read_op).await;
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-
-            match result {
-                Ok(Ok(_)) => {
-                    // NVMe read complete — transition Filling→Ready.
-                    // Release ordering ensures buffer data is visible to any
-                    // thread that subsequently sees is_ready() == true.
-                    obj_ctx.mark_ready();
-                    let dram_pool = storage::get_dram_pool();
-                    // Move ObjectFile in so the ObjectFile stays pinned for the read's duration.
-                    serve_from_dram(
-                        dram_pool,
-                        &obj_ctx,
-                        obj_len,
-                        transport,
-                        thread_ctx,
-                        Some(file),
-                    );
-                }
-                _ => {
-                    // Read failed — remove entry. Buffers freed by ObjectContext Drop.
-                    // ObjectFile drops here → teardown if this was the last ref.
-                    storage::get_dram_pool().remove_object(&object_id);
-                    thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
-                }
+        let raw_fd = fd.as_raw_fd();
+        // All N DRAMPool buffers are allocated upfront by try_promote_object.
+        // max_sqes_per_batch throttles how many ReadFixed SQEs we submit per
+        // io_uring_submit() call — it does NOT control buffer count.
+        let max_sqes_per_batch = crate::max_buffers_per_op();
+        match &transport {
+            Transport::Tcp => {
+                crate::runtime_handle().spawn(async move {
+                    let _keep_alive = (file, fd);
+                    do_tiered_promote_and_serve_tcp(
+                        GetObjectInfo {
+                            object_id,
+                            obj_len,
+                            crc32c,
+                        },
+                        obj_ctx,
+                        raw_fd,
+                        blocked_client,
+                        chunk_size,
+                        max_sqes_per_batch,
+                    )
+                    .await;
+                });
             }
-        });
+            Transport::Efa {
+                session,
+                rkey,
+                remote_addr,
+            } => {
+                let session = session.clone();
+                let rkey = *rkey;
+                let remote_addr = *remote_addr;
+                crate::runtime_handle().spawn(async move {
+                    let _keep_alive = (file, fd);
+                    do_tiered_promote_and_serve_efa(
+                        GetObjectInfo {
+                            object_id,
+                            obj_len,
+                            crc32c,
+                        },
+                        obj_ctx,
+                        raw_fd,
+                        blocked_client,
+                        chunk_size,
+                        max_sqes_per_batch,
+                        EfaCtx {
+                            session,
+                            rkey,
+                            remote_addr,
+                        },
+                    )
+                    .await;
+                });
+            }
+        }
         return;
     }
-
-    // ─── NVMePool fallback (DRAMPool full) ───────────────────────────────
-    // Transient read: alloc NVMePool buffer, serve, free.
+    // ─── NVMePool fallback (promotion skipped) ───────────────────────────
+    // Reaches here when try_promote_object returns None: pool full, object
+    // exceeds max-promote-size, or another GET is already promoting this OID.
+    // Future: LRFU admission policy may also reject promotion here.
+    // Capture mutable configs once — alloc_n, ChunkBuilder, and the streaming
+    // loop must all use these same values. Do not re-read after this point.
+    let chunk_size = crate::buffer_size();
+    let max_buffers = crate::max_buffers_per_op();
+    let min_buffers = crate::streaming_min_buffers();
     let nvme_pool = storage::get_nvme_pool();
-    let seg_buf = match nvme_pool.alloc(obj_len as usize) {
-        Some(b) => b,
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    // alloc_n returns None if fewer than min_buffers could be allocated (freed internally).
+    let buffers = match nvme_pool.alloc_n(chunk_size, max_buffers, min_buffers) {
+        Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS)));
             return;
         }
     };
-
-    // Transient read StreamingContext owns only the NVMe buffer; the `ObjectFile`
-    // pin is held by the spawned task (see `_keep_alive` below).
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
-
+    let stream_ctx = storage::StreamingContext::new(buffers, obj_len, total_chunks);
     let fd_pool = storage::get_fd_pool();
     let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
         Some(fd) => fd,
@@ -294,93 +404,402 @@ fn execute_get_tiered(
             return;
         }
     };
-
-    let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
-    // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
-    let read_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
-        buf_ptr: buf_ptr_usize as *mut u8,
-        file_offset: 0,
-        len: obj_len,
-    };
-
-    // Spawn tokio task for NVMe read + serve (no caching — transient).
-    // stream_ctx is moved into the async block so its Drop (which returns the
-    // NVMe buffer to the pool) doesn't fire until the task completes.
-    crate::runtime_handle().spawn(async move {
-        // Pin the buffer (stream_ctx) and the `ObjectFile` (`file`) for the transfer's duration.
-        let _keep_alive = (stream_ctx, file);
-
-        let read_result = uring::submit_read(fd.as_raw_fd(), read_op).await;
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-        handle_nvme_read_result(read_result, transport, obj_len, buf_ptr_usize, thread_ctx).await;
-    });
-}
-
-/// Handle NVMe read result — reply to the blocked client based on the io_uring
-/// completion result and transport type. Shared across GET paths that read from NVMe.
-async fn handle_nvme_read_result(
-    read_result: Result<Result<u64, storage::StorageError>, tokio::sync::oneshot::error::RecvError>,
-    transport: Transport,
-    obj_len: u64,
-    buf_ptr_usize: usize,
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-) {
-    match read_result {
-        Ok(Ok(_bytes_read)) => match transport {
-            Transport::Tcp => {
-                if crate::bench_mode() {
-                    thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                } else {
-                    let data = unsafe {
-                        std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
-                            .to_vec()
-                    };
-                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
-                }
-            }
-            Transport::Efa {
-                session,
-                rkey,
-                remote_addr,
-            } => {
-                match efa_write_to_client(
-                    session,
-                    buf_ptr_usize,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
+    let raw_fd = fd.as_raw_fd();
+    match &transport {
+        Transport::Tcp => {
+            crate::runtime_handle().spawn(async move {
+                // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile
+                // pin and open fd are held alive for the read's duration.
+                let _keep_alive = (file, fd);
+                do_tiered_nvme_read_and_serve_tcp(
+                    object_id,
+                    obj_len,
+                    crc32c,
+                    stream_ctx,
+                    raw_fd,
+                    blocked_client,
+                    chunk_size,
                 )
-                .await
-                {
-                    Ok(()) => {
-                        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-                    }
-                    Err(e) => {
-                        thread_ctx.reply(Err(e));
-                    }
-                }
-            }
-        },
-        // io_uring read completed with an error (EIO, short read, etc.)
-        Ok(Err(e)) => {
-            thread_ctx.reply(Err(ValkeyError::String(format!(
-                "{}: {}",
-                errors::ERR_NVME_READ,
-                e
-            ))));
+                .await;
+            });
         }
-        // RecvError: io_uring poller thread dropped the oneshot sender.
-        // This means the poller panicked or shut down unexpectedly.
-        // TODO: Add error metric counter for poller channel failures.
-        Err(_) => {
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+        Transport::Efa {
+            session,
+            rkey,
+            remote_addr,
+        } => {
+            let session = session.clone();
+            let rkey = *rkey;
+            let remote_addr = *remote_addr;
+            crate::runtime_handle().spawn(async move {
+                // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile
+                // pin and open fd are held alive for the read's duration.
+                let _keep_alive = (file, fd);
+                do_tiered_nvme_read_and_serve_efa(
+                    GetObjectInfo {
+                        object_id,
+                        obj_len,
+                        crc32c,
+                    },
+                    stream_ctx,
+                    raw_fd,
+                    blocked_client,
+                    chunk_size,
+                    EfaCtx {
+                        session,
+                        rkey,
+                        remote_addr,
+                    },
+                )
+                .await;
+            });
         }
     }
 }
 
-// ─── SET Engine ──────────────────────────────────────────────────────────────
+/// TCP promotion — batched ReadFixed into DRAMPool, then accumulate and reply.
+async fn do_tiered_promote_and_serve_tcp(
+    get_info: GetObjectInfo,
+    obj_ctx: Arc<ObjectContext>,
+    fd: RawFd,
+    blocked_client: valkey_module::BlockedClient,
+    chunk_size: usize,
+    max_sqes_per_batch: usize,
+) {
+    let GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c: crc32c_expected,
+    } = get_info;
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let dram_pool = storage::get_dram_pool();
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    let bench = crate::bench_mode();
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    let hdr_buf = &obj_ctx.buffers[0];
+    let hdr_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
+    let hdr_iovec = dram_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    storage::read_and_verify_file_header(
+        fd,
+        hdr_iovec,
+        hdr_ptr,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
+    // Batch loop: ReadFixed into DRAMPool buffers.
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = max_sqes_per_batch.min((total_chunks - batch_start) as usize);
+        let mut ops = Vec::with_capacity(batch_count);
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &obj_ctx.buffers[chunk_idx as usize];
+            ops.push(uring::UringOp {
+                iovec_index: dram_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: dram_pool.buffer_ptr(buf),
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            });
+        }
+        let receivers = uring::submit_read_batch(fd, ops);
+        if let Err(_e) = uring::await_batch(receivers, "read").await {
+            dram_pool.remove_object(&object_id);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+            return;
+        }
+        obj_ctx.advance_chunks_ready(batch_count as u32);
+        // TODO: obj_ctx.notify_progress() for coalesced waiters.
+        batch_start += batch_count as u32;
+    }
+    // Post-loop: mark ready, serve from DRAMPool.
+    obj_ctx.mark_ready();
+    if bench {
+        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+    } else {
+        let data = collect_dram_bytes(dram_pool, &obj_ctx, obj_len);
+        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+    }
+}
+
+/// EFA promotion — batched ReadFixed into DRAMPool + parallelized EFA write per batch.
+async fn do_tiered_promote_and_serve_efa(
+    get_info: GetObjectInfo,
+    obj_ctx: Arc<ObjectContext>,
+    fd: RawFd,
+    blocked_client: valkey_module::BlockedClient,
+    chunk_size: usize,
+    max_sqes_per_batch: usize,
+    efa: EfaCtx,
+) {
+    let GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c: crc32c_expected,
+    } = get_info;
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let dram_pool = storage::get_dram_pool();
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    let hdr_buf = &obj_ctx.buffers[0];
+    let hdr_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
+    let hdr_iovec = dram_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    storage::read_and_verify_file_header(
+        fd,
+        hdr_iovec,
+        hdr_ptr,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
+    // Build client address mapping for single contiguous address.
+    let mut builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    builder
+        .map_client_addresses(&[(efa.remote_addr, obj_len as usize)])
+        .expect("single contiguous address always sufficient");
+    let total_chunks = builder.total_chunks();
+    // Batch loop: ReadFixed into DRAMPool buffers, then parallel EFA writes.
+    // On EFA transport failure: stop sending to THIS client but continue the
+    // ReadFixed loop so DRAMPool is fully filled for coalesced waiters.
+    let mut transport_err: Option<ValkeyError> = None;
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = max_sqes_per_batch.min((total_chunks - batch_start) as usize);
+        let mut ops = Vec::with_capacity(batch_count);
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &obj_ctx.buffers[chunk_idx as usize];
+            ops.push(uring::UringOp {
+                iovec_index: dram_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: dram_pool.buffer_ptr(buf),
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            });
+        }
+        let receivers = uring::submit_read_batch(fd, ops);
+        // Interleaved NVMe read → EFA write: as each read completes, immediately
+        // fire the EFA write for that chunk. This overlaps network transfer with
+        // disk I/O instead of waiting for the entire batch of reads to finish.
+        let mut completions = uring::into_completions(receivers);
+        let mut efa_in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut nvme_read_err = false;
+        while let Some((batch_idx, result)) = completions.next().await {
+            if let Err(_e) = result {
+                nvme_read_err = true;
+                break;
+            }
+            if transport_err.is_none() {
+                let chunk_idx = batch_start + batch_idx as u32;
+                let buf = &obj_ctx.buffers[chunk_idx as usize];
+                let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+                let regions = builder.client_regions(chunk_idx);
+                let session = efa.session.clone();
+                let rkey = efa.rkey;
+                let regions_owned: Vec<ClientRegion> = regions.to_vec();
+                efa_in_flight.push(async move {
+                    efa_write_start(&session, buf_ptr, &regions_owned, rkey).await
+                });
+            }
+        }
+        if nvme_read_err {
+            // Drain remaining completions so in-flight io_uring ops finish
+            // before DRAMPool buffers are freed.
+            while completions.next().await.is_some() {}
+            dram_pool.remove_object(&object_id);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+            return;
+        }
+        // Drain in-flight EFA writes.
+        while let Some(result) = efa_in_flight.next().await {
+            if let Err(e) = result {
+                transport_err = Some(e);
+                // Don't return — continue filling DRAMPool for coalesced waiters.
+                break;
+            }
+        }
+        obj_ctx.advance_chunks_ready(batch_count as u32);
+        // TODO: obj_ctx.notify_progress() for coalesced waiters.
+        batch_start += batch_count as u32;
+    }
+    obj_ctx.mark_ready();
+    match transport_err {
+        Some(e) => thread_ctx.reply(Err(e)),
+        None => thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))),
+    };
+}
+
+/// TCP serve-and-discard — batched ReadFixed from NVMe, accumulate into Vec.
+async fn do_tiered_nvme_read_and_serve_tcp(
+    object_id: ObjectId,
+    obj_len: u64,
+    crc32c_expected: u32,
+    stream_ctx: storage::StreamingContext,
+    fd: RawFd,
+    blocked_client: valkey_module::BlockedClient,
+    chunk_size: usize,
+) {
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    let batch_size = stream_ctx.batch_size();
+    let nvme_pool = storage::get_nvme_pool();
+    let bench = crate::bench_mode();
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    let hdr_buf = &stream_ctx.buffers[0];
+    let hdr_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
+    let hdr_iovec = nvme_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    storage::read_and_verify_file_header(
+        fd,
+        hdr_iovec,
+        hdr_ptr,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
+    // Batch loop: read chunks from NVMe, accumulate into reply_buf.
+    let mut reply_buf = if bench {
+        Vec::new()
+    } else {
+        Vec::with_capacity(obj_len as usize)
+    };
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = batch_size.min((total_chunks - batch_start) as usize);
+        let mut ops = Vec::with_capacity(batch_count);
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &stream_ctx.buffers[i];
+            ops.push(uring::UringOp {
+                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: nvme_pool.buffer_ptr(buf),
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            });
+        }
+        let receivers = uring::submit_read_batch(fd, ops);
+        if let Err(_e) = uring::await_batch(receivers, "read").await {
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+            return;
+        }
+        // Copy batch results into reply buffer.
+        if !bench {
+            for i in 0..batch_count {
+                let chunk_idx = batch_start + i as u32;
+                let data_len = builder.data_len(chunk_idx);
+                let buf = &stream_ctx.buffers[i];
+                let ptr = nvme_pool.buffer_ptr(buf);
+                let slice = unsafe { std::slice::from_raw_parts(ptr, data_len) };
+                reply_buf.extend_from_slice(slice);
+            }
+        }
+        batch_start += batch_count as u32;
+    }
+    // Post-loop: reply with accumulated data or bench integer.
+    // StreamingContext dropped on return → NVMe buffers freed.
+    if bench {
+        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+    } else {
+        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(reply_buf)));
+    }
+}
+
+/// EFA serve-and-discard — batched ReadFixed from NVMe, parallel EFA write per batch.
+async fn do_tiered_nvme_read_and_serve_efa(
+    get_info: GetObjectInfo,
+    stream_ctx: storage::StreamingContext,
+    fd: RawFd,
+    blocked_client: valkey_module::BlockedClient,
+    chunk_size: usize,
+    efa: EfaCtx,
+) {
+    let GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c: crc32c_expected,
+    } = get_info;
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let batch_size = stream_ctx.batch_size();
+    let nvme_pool = storage::get_nvme_pool();
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    let hdr_buf = &stream_ctx.buffers[0];
+    let hdr_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
+    let hdr_iovec = nvme_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    storage::read_and_verify_file_header(
+        fd,
+        hdr_iovec,
+        hdr_ptr,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
+    // Build client address mapping for single contiguous address.
+    let mut builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    builder
+        .map_client_addresses(&[(efa.remote_addr, obj_len as usize)])
+        .expect("single contiguous address always sufficient");
+    let total_chunks = builder.total_chunks();
+    // Batch loop: read chunks from NVMe, interleaved EFA write per completion.
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = batch_size.min((total_chunks - batch_start) as usize);
+        let mut ops = Vec::with_capacity(batch_count);
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &stream_ctx.buffers[i];
+            ops.push(uring::UringOp {
+                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: nvme_pool.buffer_ptr(buf),
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            });
+        }
+        let receivers = uring::submit_read_batch(fd, ops);
+        // Interleaved NVMe read → EFA write: as each read completes, immediately
+        // fire the EFA write for that chunk.
+        let mut completions = uring::into_completions(receivers);
+        let mut efa_in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        while let Some((batch_idx, result)) = completions.next().await {
+            if let Err(_e) = result {
+                // Drain remaining completions so io_uring ops finish before
+                // StreamingContext drop frees NVMe buffers.
+                while completions.next().await.is_some() {}
+                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_READ)));
+                return;
+            }
+            let chunk_idx = batch_start + batch_idx as u32;
+            let buf = &stream_ctx.buffers[batch_idx];
+            let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
+            let regions = builder.client_regions(chunk_idx);
+            let session = efa.session.clone();
+            let rkey = efa.rkey;
+            let regions_owned: Vec<ClientRegion> = regions.to_vec();
+            efa_in_flight.push(async move {
+                efa_write_start(&session, buf_ptr, &regions_owned, rkey).await
+            });
+        }
+        // Drain in-flight EFA writes before advancing to next batch (buffers reused).
+        while let Some(result) = efa_in_flight.next().await {
+            if let Err(e) = result {
+                thread_ctx.reply(Err(e));
+                return;
+            }
+        }
+        batch_start += batch_count as u32;
+    }
+    thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SET Engine
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Execute LO.SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
@@ -394,7 +813,6 @@ pub fn execute_set(
     // Assign object_id at command dispatch time (main thread) — establishes
     // ordering by arrival, not completion. Used for version checks on async paths.
     let object_id = ObjectId::next();
-
     match (mode, &data_source) {
         (OperatingMode::Dram, DataSource::Tcp(data)) => {
             // Fully sync — alloc + memcpy + create LoValue inline.
@@ -429,7 +847,9 @@ pub fn execute_set(
     }
 }
 
-/// Sync DRAM-only TCP SET: alloc + memcpy + create LoValue on main thread.
+// ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
+
+/// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
 fn serve_set_dram_tcp(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
@@ -438,21 +858,25 @@ fn serve_set_dram_tcp(
     object_id: ObjectId,
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
-
-    let seg_buf = match dram_pool.alloc(obj_len as usize) {
-        Some(b) => b,
+    let chunk_size = crate::buffer_size();
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    let buffers = match dram_pool.alloc_n(chunk_size, total_chunks as usize) {
+        Some(bufs) => bufs,
         None => return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)),
     };
-
-    let buf_ptr = dram_pool.buffer_ptr(&seg_buf);
-    let copy_len = data.len().min(obj_len as usize);
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
-
-    let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
-
+    let mut crc = 0u32;
+    for (i, buf) in buffers.iter().enumerate() {
+        let data_len = builder.data_len(i as u32);
+        let src_offset = i * chunk_size;
+        let src = &data[src_offset..src_offset + data_len];
+        let dst = dram_pool.buffer_ptr(buf);
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, data_len) };
+        crc = crc32c::crc32c_append(crc, src);
+    }
     // set_value BEFORE insert_object — sync path, no version check needed
     // (single-threaded main thread, our object_id is always the latest).
-    // If set_value fails, only the buffer needs freeing — no map entry to undo.
+    // If set_value fails, only the buffers need freeing — no map entry to undo.
     let key = ctx.open_key_writable(key_name);
     let lo_value = LoValue {
         object_id,
@@ -461,13 +885,11 @@ fn serve_set_dram_tcp(
         file: None,
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
-        dram_pool.free(&seg_buf);
+        dram_pool.free_n(&buffers);
         return Err(ValkeyError::Str("ERR failed to set key"));
     }
-
-    let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
+    let obj_ctx = Arc::new(ObjectContext::new_ready(buffers, obj_len));
     dram_pool.insert_object(object_id, obj_ctx);
-
     Ok(ValkeyValue::SimpleStringStatic("OK"))
 }
 
@@ -482,8 +904,9 @@ pub enum DataSource {
     },
 }
 
-/// DRAM-only SET: alloc in DRAMPool, fill, create ObjectContext + LoValue.
-/// No NVMe. Synchronous for TCP, tokio for EFA.
+// ─── DRAM-only EFA SET ───────────────────────────────────────────────────────
+
+/// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
 fn execute_set_dram_efa(
     key_name: Vec<u8>,
     obj_len: u64,
@@ -492,24 +915,21 @@ fn execute_set_dram_efa(
     object_id: ObjectId,
 ) {
     let dram_pool = storage::get_dram_pool();
-
+    let chunk_size = crate::buffer_size();
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-
-    // Alloc from DRAMPool (this IS the final storage).
-    let seg_buf = match dram_pool.alloc(obj_len as usize) {
-        Some(b) => b,
+    // DRAMPool::alloc_n: all-or-nothing.
+    let buffers = match dram_pool.alloc_n(chunk_size, total_chunks as usize) {
+        Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)));
             return;
         }
     };
-
-    let buf_ptr = dram_pool.buffer_ptr(&seg_buf);
-    let buf_ptr_usize = buf_ptr as usize;
-
     match data_source {
         DataSource::Tcp(_) => {
             unreachable!("Dram+TCP SET routed to sync path via EngineResult");
@@ -519,66 +939,83 @@ fn execute_set_dram_efa(
             rkey,
             remote_addr,
         } => {
-            // EFA: transport.read into DRAMPool buffer via tokio task.
+            // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-
-                match efa_read_from_client(
-                    session,
-                    buf_ptr_usize,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let crc = crc32c::crc32c(unsafe {
-                            std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
-                        });
-
-                        // Version check + set_value BEFORE insert_object.
-                        {
-                            let ctx = thread_ctx.lock();
-                            let key_str = ctx.create_string(key_name);
-                            let key = ctx.open_key_writable(&key_str);
-                            if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-                                if existing.object_id > object_id {
-                                    // Stale write — a newer SET already completed. Discard silently.
-                                    storage::get_dram_pool().free(&seg_buf);
-                                    thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-                                    return;
-                                }
-                            }
-                            let lo_value = LoValue {
-                                object_id,
-                                len: obj_len,
-                                crc32c: crc,
-                                file: None,
-                            };
-                            if key.set_value(&LO_TYPE, lo_value).is_err() {
-                                storage::get_dram_pool().free(&seg_buf);
-                                thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
-                                return;
-                            }
-                        }
-
-                        let obj_ctx = Arc::new(ObjectContext::new_ready(vec![seg_buf], obj_len));
-                        storage::get_dram_pool().insert_object(object_id, obj_ctx);
-                        thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-                    }
-                    Err(_) => {
-                        storage::get_dram_pool().free(&seg_buf);
+                let dram_pool = storage::get_dram_pool();
+                // Build client address mapping for parallel efa_read_start.
+                let mut builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+                builder
+                    .map_client_addresses(&[(remote_addr, obj_len as usize)])
+                    .expect("single contiguous address always sufficient");
+                // Parallel EFA reads for all chunks.
+                let mut efa_futures = FuturesUnordered::new();
+                for i in 0..total_chunks {
+                    let buf = &buffers[i as usize];
+                    let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+                    let regions = builder.client_regions(i);
+                    let session = session.clone();
+                    let regions_owned: Vec<ClientRegion> = regions.to_vec();
+                    efa_futures.push(async move {
+                        efa_read_start(&session, buf_ptr, &regions_owned, rkey).await
+                    });
+                }
+                while let Some(result) = efa_futures.next().await {
+                    if result.is_err() {
+                        dram_pool.free_n(&buffers);
                         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
+                        return;
                     }
                 }
+                // Post-hoc CRC pass (sequential over in-memory buffers, no I/O).
+                let mut crc = 0u32;
+                for i in 0..total_chunks {
+                    let data_len = builder.data_len(i);
+                    let buf = &buffers[i as usize];
+                    let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+                    let slice =
+                        unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
+                    crc = crc32c::crc32c_append(crc, slice);
+                }
+                // Insert ObjectContext BEFORE set_value so the key is never visible
+                // without its ObjectContext. On discard, remove the entry —
+                // ObjectContext::Drop returns buffers to DRAMPool automatically.
+                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers, obj_len));
+                dram_pool.insert_object(object_id, obj_ctx);
+                {
+                    let ctx = thread_ctx.lock();
+                    let key_str = ctx.create_string(key_name.clone());
+                    let key = ctx.open_key_writable(&key_str);
+                    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
+                        if existing.object_id > object_id {
+                            // Stale write — a newer SET already completed.
+                            dram_pool.remove_object(&object_id);
+                            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                            return;
+                        }
+                    }
+                    let lo_value = LoValue {
+                        object_id,
+                        len: obj_len,
+                        crc32c: crc,
+                        file: None,
+                    };
+                    if key.set_value(&LO_TYPE, lo_value).is_err() {
+                        dram_pool.remove_object(&object_id);
+                        thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                        return;
+                    }
+                }
+                thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
             });
         }
     }
 }
 
-/// Tiered SET: write to NVMe (invalidate DRAMPool entry if exists).
+// ─── Tiered SET ──────────────────────────────────────────────────────────────
+
+/// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
 fn execute_set_tiered(
     key_name: Vec<u8>,
     obj_len: u64,
@@ -586,42 +1023,33 @@ fn execute_set_tiered(
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
 ) {
+    let chunk_size = crate::buffer_size();
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    let max_buffers = crate::max_buffers_per_op();
+    let min_buffers = crate::streaming_min_buffers();
     let nvme_pool = storage::get_nvme_pool();
-
-    // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
-    // replaced LoValue, dropping its Arc<ObjectFile> which allows for a thread-safe
-    // fd close + old .dat unlink once inflight requests settle.
-
-    // Alloc NVMePool buffer for the write.
-    let seg_buf = match nvme_pool.alloc(obj_len as usize) {
-        Some(b) => b,
+    // alloc_n returns None if fewer than min_buffers could be allocated (freed internally).
+    let buffers = match nvme_pool.alloc_n(chunk_size, max_buffers, min_buffers) {
+        Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS)));
             return;
         }
     };
-
-    // StreamingContext owns the NVMePool buffer for this SET operation.
-    // Single buffer today; multi-batch streaming adds more buffers here.
-    let stream_ctx = storage::StreamingContext::new(vec![seg_buf], obj_len, 1);
-
-    let buf_ptr = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]);
-    let buf_ptr_usize = buf_ptr as usize;
-
+    let stream_ctx = storage::StreamingContext::new(buffers, obj_len, total_chunks);
     match data_source {
         DataSource::Tcp(data) => {
-            // TCP: memcpy into NVMePool buffer, then write to NVMe.
-            let copy_len = data.len().min(obj_len as usize);
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
             crate::runtime_handle().spawn(async move {
-                do_tiered_nvme_write(
-                    buf_ptr_usize,
+                do_tiered_nvme_write_tcp(
+                    data,
                     obj_len,
                     stream_ctx,
                     blocked_client,
                     key_name,
                     object_id,
+                    chunk_size,
                 )
                 .await;
             });
@@ -631,177 +1059,291 @@ fn execute_set_tiered(
             rkey,
             remote_addr,
         } => {
-            // EFA: transport.read into NVMePool buffer, then write to NVMe.
             crate::runtime_handle().spawn(async move {
-                match efa_read_from_client(
-                    session,
-                    buf_ptr_usize,
-                    obj_len as usize,
-                    rkey,
-                    remote_addr,
+                do_tiered_nvme_write_efa(
+                    obj_len,
+                    stream_ctx,
+                    blocked_client,
+                    key_name,
+                    object_id,
+                    chunk_size,
+                    EfaCtx {
+                        session,
+                        rkey,
+                        remote_addr,
+                    },
                 )
-                .await
-                {
-                    Ok(()) => {
-                        do_tiered_nvme_write(
-                            buf_ptr_usize,
-                            obj_len,
-                            stream_ctx,
-                            blocked_client,
-                            key_name,
-                            object_id,
-                        )
-                        .await;
-                    }
-                    Err(_) => {
-                        let thread_ctx =
-                            valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
-                    }
-                }
+                .await;
             });
         }
     }
 }
 
-/// Shared Tiered NVMe write: CRC → open tmp → WriteFixed → rename → create LoValue.
-/// Must be called from within a tokio task (awaits io_uring write).
-async fn do_tiered_nvme_write(
-    buf_ptr_usize: usize,
+/// TCP Tiered SET — CRC computed incrementally, data written in batches, FileHeader last.
+async fn do_tiered_nvme_write_tcp(
+    data: Vec<u8>,
     obj_len: u64,
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     key_name: Vec<u8>,
     object_id: ObjectId,
+    chunk_size: usize,
 ) {
-    // On-disk size for the reservation and verified by stat after the write completes.
+    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    let builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    let total_chunks = builder.total_chunks();
+    let batch_size = stream_ctx.batch_size();
+    let nvme_pool = storage::get_nvme_pool();
     let disk_len = storage::object_disk_len(obj_len);
-    // Atomically reserve the disk budget up-front. Reject if writing this object would
-    // exceed nvme-maxmemory. stream_ctx drop frees the buffer on return.
-    if !uring::try_reserve_nvme_disk_usage(disk_len) {
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED)));
         return;
     }
-    let buf_ptr = buf_ptr_usize as *mut u8;
-    let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
-
+    // FdPool not used on SET: this write fd is short-lived and never cached.
+    // FdPool caches read fds lazily on first GET via ensure_open.
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
-
-    let c_path = std::ffi::CString::new(file_path.as_str()).expect("file_path null");
-    let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
-    if crate::direct_io() {
-        write_flags |= libc::O_DIRECT;
+    let fd = match storage::open_nvme_file_for_write(&file_path) {
+        Ok(fd) => fd,
+        Err(()) => {
+            nvme::decrease_nvme_disk_usage(disk_len);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+            return;
+        }
+    };
+    // Batch loop: chunk data into NVMePool buffers, write to NVMe.
+    let mut crc = 0u32;
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = batch_size.min((total_chunks - batch_start) as usize);
+        let mut ops = Vec::with_capacity(batch_count);
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let src_offset = chunk_idx as usize * chunk_size;
+            let src = &data[src_offset..src_offset + data_len];
+            let buf = &stream_ctx.buffers[i];
+            let dst = nvme_pool.buffer_ptr(buf);
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, data_len) };
+            crc = crc32c::crc32c_append(crc, src);
+            ops.push(uring::UringOp {
+                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: dst,
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            });
+        }
+        let receivers = uring::submit_write_batch(fd, ops);
+        if let Err(_e) = uring::await_batch(receivers, "write").await {
+            unsafe { libc::close(fd) };
+            nvme::decrease_nvme_disk_usage(disk_len);
+            let _ = std::fs::remove_file(&file_path);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+            return;
+        }
+        batch_start += batch_count as u32;
     }
-    // FdPool intentionally not used on SET path — fd cached lazily on first GET via ensure_open.
-    let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };
-    if raw_fd < 0 {
-        uring::decrease_nvme_disk_usage(disk_len);
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    // Post-loop: write FileHeader using buffer[0] (reused after data loop).
+    if let Err(()) = storage::write_file_header(
+        fd,
+        object_id,
+        obj_len,
+        crc,
+        &stream_ctx.buffers[0],
+        nvme_pool,
+    )
+    .await
+    {
+        unsafe { libc::close(fd) };
+        nvme::decrease_nvme_disk_usage(disk_len);
+        let _ = std::fs::remove_file(&file_path);
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
         return;
     }
-    // OwnedFd closes on drop — no leak on early return.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    unsafe { libc::close(fd) };
+    match set_finalize(
+        &thread_ctx,
+        &key_name,
+        &NvmeWriteResult {
+            object_id,
+            obj_len,
+            crc,
+            disk_len,
+            file_path: &file_path,
+        },
+        || {
+            nvme::decrease_nvme_disk_usage(disk_len);
+            let _ = std::fs::remove_file(&file_path);
+        },
+    ) {
+        Ok(true) | Ok(false) => {
+            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+        }
+        Err(e) => {
+            thread_ctx.reply(Err(e));
+        }
+    }
+}
 
-    let nvme_pool = storage::get_nvme_pool();
-    // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
-    let write_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
-        buf_ptr: buf_ptr_usize as *mut u8,
-        file_offset: 0,
-        len: obj_len,
-    };
-
-    let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;
-    // fd (OwnedFd) drops when out of scope and close() is automatic.
-
+/// EFA Tiered SET — parallel EFA read per batch + post-hoc CRC + batched NVMe write.
+async fn do_tiered_nvme_write_efa(
+    obj_len: u64,
+    stream_ctx: storage::StreamingContext,
+    blocked_client: valkey_module::BlockedClient,
+    key_name: Vec<u8>,
+    object_id: ObjectId,
+    chunk_size: usize,
+    efa: EfaCtx,
+) {
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-
-    match write_result {
-        Ok(Ok(())) => {
-            // Version check + set_value. No DRAMPool involvement on Tiered SET.
-            {
-                let ctx = thread_ctx.lock();
-                let key_str = ctx.create_string(key_name);
-                let key = ctx.open_key_writable(&key_str);
-                if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-                    if existing.object_id > object_id {
-                        // Stale write — a newer SET already completed. Discard silently.
-                        // No ObjectFile was created, so release the reservation here.
-                        uring::decrease_nvme_disk_usage(disk_len);
-                        if let Err(e) = std::fs::remove_file(&file_path) {
-                            storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
-                        }
-                        thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
-                        return;
-                    }
+    let batch_size = stream_ctx.batch_size();
+    let nvme_pool = storage::get_nvme_pool();
+    let disk_len = storage::object_disk_len(obj_len);
+    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
+        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED)));
+        return;
+    }
+    // FdPool not used on SET: this write fd is short-lived and never cached.
+    // FdPool caches read fds lazily on first GET via ensure_open.
+    let dir = crate::nvme_dir();
+    let file_path = object_id.file_path(&dir);
+    let fd = match storage::open_nvme_file_for_write(&file_path) {
+        Ok(fd) => fd,
+        Err(()) => {
+            nvme::decrease_nvme_disk_usage(disk_len);
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+            return;
+        }
+    };
+    // Build client address mapping for single contiguous address.
+    let mut builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+    builder
+        .map_client_addresses(&[(efa.remote_addr, obj_len as usize)])
+        .expect("single contiguous address always sufficient");
+    let total_chunks = builder.total_chunks();
+    let mut crc = 0u32;
+    let mut batch_start: u32 = 0;
+    while batch_start < total_chunks {
+        let batch_count = batch_size.min((total_chunks - batch_start) as usize);
+        // Interleaved EFA read → NVMe write: as each EFA read completes,
+        // immediately submit the NVMe write for that chunk. This overlaps
+        // network and disk I/O within the batch.
+        let mut efa_futures = FuturesUnordered::new();
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let buf = &stream_ctx.buffers[i];
+            let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
+            let regions = builder.client_regions(chunk_idx);
+            let session = efa.session.clone();
+            let rkey = efa.rkey;
+            let regions_owned: Vec<ClientRegion> = regions.to_vec();
+            efa_futures.push(async move {
+                (
+                    i,
+                    efa_read_start(&session, buf_ptr, &regions_owned, rkey).await,
+                )
+            });
+        }
+        let mut nvme_write_receivers = Vec::new();
+        while let Some((batch_idx, result)) = efa_futures.next().await {
+            if result.is_err() {
+                // Drain remaining EFA reads so buffers aren't freed mid-transfer.
+                while efa_futures.next().await.is_some() {}
+                // Drain any NVMe writes already submitted.
+                for rx in nvme_write_receivers {
+                    let _ = rx.await;
                 }
-                // Winning branch (our OID ≥ any committed OID). Confirm the write
-                // produced exactly the size we accounted for.
-                let on_disk = std::fs::metadata(&file_path)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "NVMe accounting: cannot stat object {object_id:?} at {file_path} \
-                             to verify write size: {e}"
-                        )
-                    })
-                    .len();
-                assert_eq!(
-                    on_disk, disk_len,
-                    "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
-                     reserved {disk_len} B — write path and accounting have diverged"
-                );
-                // Create the new version's ObjectFile owning this file's existence,
-                // lazy read fd, and NVMe bytes. An overwrite triggers lo_free on the
-                // old LoValue, dropping its ObjectFile (teardown).
-                let lo_value = LoValue {
-                    object_id,
-                    len: obj_len,
-                    crc32c: crc,
-                    file: Some(Arc::new(ObjectFile::new(object_id, disk_len))),
-                };
-                if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
+                unsafe { libc::close(fd) };
+                nvme::decrease_nvme_disk_usage(disk_len);
+                let _ = std::fs::remove_file(&file_path);
+                thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
+                return;
+            }
+            // EFA read for this chunk complete — submit NVMe write immediately.
+            let chunk_idx = batch_start + batch_idx as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &stream_ctx.buffers[batch_idx];
+            let write_op = uring::UringOp {
+                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                buf_ptr: nvme_pool.buffer_ptr(buf),
+                file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
+                len: data_len as u64,
+            };
+            nvme_write_receivers.push(uring::submit_write(fd, write_op));
+        }
+        // Post-hoc CRC pass (sequential over in-memory buffers, no I/O).
+        // All EFA reads are done; buffers contain the data. CRC must be in
+        // chunk order (0, 1, 2...) regardless of EFA completion order.
+        for i in 0..batch_count {
+            let chunk_idx = batch_start + i as u32;
+            let data_len = builder.data_len(chunk_idx);
+            let buf = &stream_ctx.buffers[i];
+            let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
+            let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
+            crc = crc32c::crc32c_append(crc, slice);
+        }
+        // Drain NVMe writes (may already be done — they started during EFA reads).
+        for rx in nvme_write_receivers {
+            match rx.await {
+                Ok(Ok(())) => {}
+                _ => {
+                    unsafe { libc::close(fd) };
+                    nvme::decrease_nvme_disk_usage(disk_len);
+                    let _ = std::fs::remove_file(&file_path);
+                    thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
                     return;
                 }
             }
+        }
+        batch_start += batch_count as u32;
+    }
+    // Post-loop: write FileHeader.
+    if let Err(()) = storage::write_file_header(
+        fd,
+        object_id,
+        obj_len,
+        crc,
+        &stream_ctx.buffers[0],
+        nvme_pool,
+    )
+    .await
+    {
+        unsafe { libc::close(fd) };
+        nvme::decrease_nvme_disk_usage(disk_len);
+        let _ = std::fs::remove_file(&file_path);
+        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+        return;
+    }
+    unsafe { libc::close(fd) };
+    match set_finalize(
+        &thread_ctx,
+        &key_name,
+        &NvmeWriteResult {
+            object_id,
+            obj_len,
+            crc,
+            disk_len,
+            file_path: &file_path,
+        },
+        || {
+            nvme::decrease_nvme_disk_usage(disk_len);
+            let _ = std::fs::remove_file(&file_path);
+        },
+    ) {
+        Ok(true) | Ok(false) => {
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
-        Ok(Err(e)) => {
-            uring::decrease_nvme_disk_usage(disk_len);
-            if let Err(e) = std::fs::remove_file(&file_path) {
-                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
-            }
-            thread_ctx.reply(Err(ValkeyError::String(format!(
-                "{}: {}",
-                errors::ERR_NVME_WRITE,
-                e
-            ))));
-        }
-        // RecvError: io_uring poller thread dropped the oneshot sender.
-        // This means the poller panicked or shut down unexpectedly.
-        // TODO: Add error metric counter for poller channel failures.
-        Err(_) => {
-            uring::decrease_nvme_disk_usage(disk_len);
-            if let Err(e) = std::fs::remove_file(&file_path) {
-                storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
-            }
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
+        Err(e) => {
+            thread_ctx.reply(Err(e));
         }
     }
 }
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
-/// Serve a Ready object from DRAMPool buffers.
-///
-/// On the EFA path two pins are moved into the async write task and held for the
-/// whole RDMA transfer:
-///   - `obj_ctx` — owns the DRAM buffer the RDMA engine reads across the await.
-///   - `file` — the object's `ObjectFile` (Tiered only; `None` in Dram mode).
+/// Serve a Ready ObjectContext from DRAMPool. TCP accumulates into Vec;
+/// EFA writes per-chunk to client GPU (parallelized).
+/// On the EFA path, `obj_ctx` and `file` are pinned for the async transfer's duration.
 fn serve_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
@@ -825,22 +1367,40 @@ fn serve_from_dram(
             rkey,
             remote_addr,
         } => {
-            // EFA: write from DRAMPool buffer to client GPU.
-            // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
-            if obj_ctx.buffers.len() != 1 {
-                todo!("streaming and chunking not yet implemented");
-            }
-            let buf = &obj_ctx.buffers[0];
-            let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-            let obj_ctx = Arc::clone(obj_ctx);
+            // EFA: parallel write from DRAMPool buffers to client GPU.
+            let obj_ctx = obj_ctx.clone();
+            let chunk_size = crate::buffer_size();
             crate::runtime_handle().spawn(async move {
-                let _keep_alive = (obj_ctx, file); // pin the object and file for the transfer's duration
-                match efa_write_to_client(session, buf_ptr, obj_len as usize, rkey, remote_addr)
-                    .await
-                {
-                    Ok(()) => thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64))),
-                    Err(e) => thread_ctx.reply(Err(e)),
+                let _keep_alive = (&obj_ctx, file);
+                let dram_pool = storage::get_dram_pool();
+                // Build client address mapping.
+                let mut builder = storage::ChunkBuilder::new(obj_len, chunk_size);
+                builder
+                    .map_client_addresses(&[(remote_addr, obj_len as usize)])
+                    .expect("single contiguous address always sufficient");
+                let total_chunks = builder.total_chunks();
+                // Fire all EFA writes in parallel.
+                let mut efa_futures = FuturesUnordered::new();
+                for (i, buf) in obj_ctx.buffers.iter().enumerate() {
+                    let chunk_idx = i as u32;
+                    if chunk_idx >= total_chunks {
+                        break;
+                    }
+                    let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
+                    let regions = builder.client_regions(chunk_idx);
+                    let session = session.clone();
+                    let regions_owned: Vec<ClientRegion> = regions.to_vec();
+                    efa_futures.push(async move {
+                        efa_write_start(&session, buf_ptr, &regions_owned, rkey).await
+                    });
                 }
+                while let Some(result) = efa_futures.next().await {
+                    if let Err(e) = result {
+                        thread_ctx.reply(Err(e));
+                        return;
+                    }
+                }
+                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
             });
         }
     }
@@ -848,50 +1408,154 @@ fn serve_from_dram(
 
 // ─── EFA Transport Helpers ───────────────────────────────────────────────────
 
-/// Read from client GPU into local buffer via EFA. Must be awaited in a tokio task.
-async fn efa_read_from_client(
-    session: Arc<Session>,
+/// Multi-region-aware EFA write: submits one fi_write per region in the chunk's
+/// client address mapping. Returns a future that resolves when all regions complete.
+///
+/// Single-region fast path avoids Arc allocation overhead. Multi-region path
+/// coordinates via Arc countdown (see `submit_multi_region_efa`).
+async fn efa_write_start(
+    session: &Arc<Session>,
     buf_ptr: usize,
-    len: usize,
+    regions: &[ClientRegion],
     rkey: u64,
-    remote_addr: u64,
 ) -> Result<(), ValkeyError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    session.read(
-        buf_ptr as *mut u8,
-        len,
-        rkey,
-        remote_addr,
-        Box::new(move |_ptr, result| {
-            let _ = tx.send(result);
-        }),
-    );
-    match rx.await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(ValkeyError::Str(errors::ERR_EFA_READ)),
+    if regions.len() == 1 {
+        submit_single_efa_write(session, buf_ptr, &regions[0], rkey, tx);
+    } else {
+        submit_multi_region_efa(
+            session,
+            buf_ptr,
+            regions,
+            rkey,
+            tx,
+            errors::ERR_EFA_WRITE,
+            true,
+        );
     }
+    rx.await
+        .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_WRITE)))
 }
 
-/// Write from local buffer to client GPU via EFA. Must be awaited in a tokio task.
-async fn efa_write_to_client(
-    session: Arc<Session>,
+/// Multi-region-aware EFA read: submits one fi_read per region.
+///
+/// Single-region fast path avoids Arc allocation overhead. Multi-region path
+/// coordinates via Arc countdown (see `submit_multi_region_efa`).
+async fn efa_read_start(
+    session: &Arc<Session>,
     buf_ptr: usize,
-    len: usize,
+    regions: &[ClientRegion],
     rkey: u64,
-    remote_addr: u64,
 ) -> Result<(), ValkeyError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    if regions.len() == 1 {
+        submit_single_efa_read(session, buf_ptr, &regions[0], rkey, tx);
+    } else {
+        submit_multi_region_efa(
+            session,
+            buf_ptr,
+            regions,
+            rkey,
+            tx,
+            errors::ERR_EFA_READ,
+            false,
+        );
+    }
+    rx.await
+        .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_READ)))
+}
+
+// ─── EFA Submit Helpers ──────────────────────────────────────────────────────
+
+/// Fast path: single fi_write, zero coordination overhead.
+fn submit_single_efa_write(
+    session: &Arc<Session>,
+    buf_ptr: usize,
+    region: &ClientRegion,
+    rkey: u64,
+    tx: tokio::sync::oneshot::Sender<Result<(), ValkeyError>>,
+) {
     session.write(
         buf_ptr as *mut u8,
-        len,
+        region.len,
         rkey,
-        remote_addr,
+        region.remote_addr,
         Box::new(move |_ptr, result| {
-            let _ = tx.send(result);
+            let _ = tx.send(result.map_err(|_| ValkeyError::Str(errors::ERR_EFA_WRITE)));
         }),
     );
-    match rx.await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(ValkeyError::Str(errors::ERR_EFA_WRITE)),
+}
+
+/// Fast path: single fi_read, zero coordination overhead.
+fn submit_single_efa_read(
+    session: &Arc<Session>,
+    buf_ptr: usize,
+    region: &ClientRegion,
+    rkey: u64,
+    tx: tokio::sync::oneshot::Sender<Result<(), ValkeyError>>,
+) {
+    session.read(
+        buf_ptr as *mut u8,
+        region.len,
+        rkey,
+        region.remote_addr,
+        Box::new(move |_ptr, result| {
+            let _ = tx.send(result.map_err(|_| ValkeyError::Str(errors::ERR_EFA_READ)));
+        }),
+    );
+}
+
+/// Multi-region coordination: one fi_write or fi_read per region, Arc countdown.
+/// All operations are submitted non-blocking. The oneshot fires when all regions
+/// complete (or immediately on first error).
+/// `is_write` selects session.write vs session.read.
+fn submit_multi_region_efa(
+    session: &Arc<Session>,
+    buf_ptr: usize,
+    regions: &[ClientRegion],
+    rkey: u64,
+    tx: tokio::sync::oneshot::Sender<Result<(), ValkeyError>>,
+    err_str: &'static str,
+    is_write: bool,
+) {
+    let remaining = Arc::new(AtomicUsize::new(regions.len()));
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let mut buf_offset = 0usize;
+    for r in regions {
+        let remaining = remaining.clone();
+        let tx = tx.clone();
+        let callback = Box::new(
+            move |_ptr: *mut u8, result: Result<(), crate::transport::TransportError>| {
+                if result.is_err() {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Err(ValkeyError::Str(err_str)));
+                    }
+                    return;
+                }
+                if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+            },
+        );
+        if is_write {
+            session.write(
+                (buf_ptr + buf_offset) as *mut u8,
+                r.len,
+                rkey,
+                r.remote_addr,
+                callback,
+            );
+        } else {
+            session.read(
+                (buf_ptr + buf_offset) as *mut u8,
+                r.len,
+                rkey,
+                r.remote_addr,
+                callback,
+            );
+        }
+        buf_offset += r.len;
     }
 }

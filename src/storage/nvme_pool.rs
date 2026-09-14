@@ -27,6 +27,10 @@ impl NVMePool {
         self.pool.free(buf)
     }
 
+    pub fn free_n(&self, buffers: &[SegmentBuffer]) {
+        self.pool.free_n(buffers)
+    }
+
     pub fn alloc_n(
         &self,
         chunk_size: usize,

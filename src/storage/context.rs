@@ -26,7 +26,11 @@ pub struct SegmentBuffer {
     pub segment_idx: u16,
     /// Byte offset within that segment.
     pub offset: u64,
-    /// Size of this buffer allocation.
+    /// Allocation size in bytes. This is the unaligned chunk_size passed to alloc()
+    /// — the allocator internally rounds up to IO_ALIGN via align_up(). This value does
+    /// NOT represent the actual data length stored in the buffer — the last chunk of an
+    /// object may contain fewer valid bytes. Use ChunkBuilder::data_len() to compute actual
+    /// data boundaries.
     pub len: u32,
 }
 

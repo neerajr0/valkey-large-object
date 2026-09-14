@@ -32,6 +32,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
+            f" lo-buffer-size 4096"
         )
 
     @pytest.fixture(autouse=True)

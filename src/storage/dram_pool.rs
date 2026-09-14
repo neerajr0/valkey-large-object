@@ -36,6 +36,10 @@ impl DRAMPool {
         self.pool.free(buf)
     }
 
+    pub fn free_n(&self, buffers: &[SegmentBuffer]) {
+        self.pool.free_n(buffers)
+    }
+
     pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
         self.pool.alloc_n(chunk_size, count, count)
     }
@@ -94,21 +98,25 @@ impl DRAMPool {
 
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
+    /// On success returns (ObjectContext, chunk_size) — caller must use the
+    /// returned chunk_size for all subsequent operations on these buffers to
+    /// avoid a TOCTOU race if lo-buffer-size is changed via CONFIG SET between
+    /// this call and the streaming loop.
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
     /// with all-or-nothing semantics (min_required = total_chunks).
     /// chunk_size is captured here at allocation time so callers use the same
-    /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
+    /// value for streaming loops.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
         obj_len: u64,
-    ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
+    ) -> Option<(std::sync::Arc<super::context::ObjectContext>, usize)> {
         // Don't promote objects above the configured threshold.
         if obj_len > crate::max_promote_size() {
             return None;
         }
         let chunk_size = crate::buffer_size();
-        let total_chunks = super::chunk_count(obj_len, chunk_size);
+        let total_chunks = super::ChunkBuilder::new(obj_len, chunk_size).total_chunks();
         // All-or-nothing: alloc_n rolls back internally if pool can't satisfy all chunks.
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
@@ -120,9 +128,7 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
-            for buf in &buffers {
-                self.pool.free(buf);
-            }
+            self.free_n(&buffers);
             return None;
         }
         // buf.len stays chunk_size for all buffers — must match alloc size for free().
@@ -132,6 +138,6 @@ impl DRAMPool {
             total_chunks,
         ));
         objects.insert(oid, obj_ctx.clone());
-        Some(obj_ctx)
+        Some((obj_ctx, chunk_size))
     }
 }

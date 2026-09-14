@@ -20,6 +20,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
+            f" lo-buffer-size 4096"
         )
 
     def test_set_creates_nvme_file(self):
@@ -40,12 +41,35 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         )
 
     def test_get_after_set_roundtrip(self):
-        """Tiered mode: SET then GET returns correct data."""
+        """Tiered mode: SET then GET returns correct data, including multi-chunk objects.
+        Validates FileHeader presence and data offset in the .dat file."""
         client = self.server.get_new_client()
-        payload = b'A' * 4096
-        client.execute_command('LO.SET', 'rt_key', payload)
-        result = client.execute_command('LO.GET', 'rt_key')
-        assert result == payload, "GET should return the same data that was SET"
+        # lo-buffer-size is 4096 in this class.
+        # Single chunk: 4096 bytes.
+        payload_single = b'A' * 4096
+        client.execute_command('LO.SET', 'rt_single', payload_single)
+        assert client.execute_command('LO.GET', 'rt_single') == payload_single
+        # Multi-chunk with partial last chunk: 8192 + 1 = 8193 → 3 chunks.
+        payload_multi = b'M' * 8193
+        client.execute_command('LO.SET', 'rt_multi', payload_multi)
+        # GET via serve-and-discard (first GET triggers promotion, verify data).
+        result = client.execute_command('LO.GET', 'rt_multi')
+        assert result == payload_multi
+        # Second GET from DRAM after promotion.
+        assert client.execute_command('LO.GET', 'rt_multi') == payload_multi
+        # Validate FileHeader on disk: first 4 bytes should be b"LOBJ",
+        # data starts at offset 4096.
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        assert len(dat_files) >= 1, "Expected at least one .dat file"
+        # Check the most recent file (highest OID = last in sorted hex names).
+        with open(dat_files[-1], 'rb') as f:
+            header_page = f.read(4096)
+            assert header_page[:4] == b'LOBJ', "FileHeader magic mismatch"
+            assert header_page[4] == 1, "FileHeader version mismatch"
+            # Data starts at offset 4096.
+            f.seek(4096)
+            data_on_disk = f.read(len(payload_multi))
+            assert data_on_disk == payload_multi, "On-disk data at offset 4096 mismatch"
 
     def test_promotion_caches_in_dram(self):
         """After a GET miss, the object is promoted to DRAMPool.
@@ -132,6 +156,63 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
 
+    # ─── Streaming tests ─────────────────────────────────────────────────
+    # CRC integrity, delete-during-SET, nvme-maxmemory.
+    # These use the same config as the promotion tests above.
+
+    def test_tiered_delete_during_set(self):
+        """Concurrent DEL while multi-chunk SET is in flight. Verify no crash
+        and key state is consistent afterward."""
+        client = self.server.get_new_client()
+        # SET a multi-chunk object (lo-buffer-size=4096, payload=32768 → 8 chunks).
+        payload = b'D' * 32768
+        client.execute_command('LO.SET', 'delset_key', payload)
+        assert client.execute_command('LO.GET', 'delset_key') == payload
+        # Now SET a new value and immediately DEL. The SET is async (tiered),
+        # so DEL may race with the NVMe write.
+        payload2 = b'E' * 32768
+        # Use pipeline to fire SET + DEL back-to-back.
+        pipe = client.pipeline(transaction=False)
+        pipe.execute_command('LO.SET', 'delset_key', payload2)
+        pipe.execute_command('DEL', 'delset_key')
+        results = pipe.execute()
+        # SET should return OK (it completes before or after DEL processes).
+        # DEL returns 1 if key existed, 0 if SET hasn't committed yet.
+        # The key point: no crash.
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        # After both complete, key should be gone.
+        result = client.execute_command('LO.GET', 'delset_key')
+        # Result is either None (DEL won) or payload2 (SET won and DEL happened
+        # before SET committed). Either is valid — no crash is the assertion.
+        assert result is None or result == payload2, f"Unexpected result: {result}"
+
+    def test_zero_length_object_rejected(self):
+        """LO.SET with zero-length payload is rejected."""
+        client = self.server.get_new_client()
+        try:
+            client.execute_command('LO.SET', 'empty_key', b'')
+            assert False, "Expected error for zero-length object"
+        except ResponseError as e:
+            assert 'object length must be > 0' in str(e).lower(), f"Unexpected: {e}"
+
+    def test_nvme_maxmemory_exhaustion(self):
+        """SET that would exceed nvme-maxmemory is rejected."""
+        client = self.server.get_new_client()
+        # nvme-maxmemory minimum is 1MB. Set to 1MB.
+        client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', '1048576')
+        # Each 256KB object has disk_len = 4096 (header) + 256KB = 266240 bytes.
+        # Three fit (798720 < 1MB), fourth exceeds (1064960 > 1MB).
+        payload = b'A' * (256 * 1024)
+        for i in range(3):
+            result = client.execute_command('LO.SET', f'nvme_cap_{i}', payload)
+            assert result == b'OK'
+        # Fourth SET should fail (would exceed 1MB).
+        try:
+            client.execute_command('LO.SET', 'nvme_cap_3', payload)
+            assert False, "Expected capacity exceeded error from nvme-maxmemory"
+        except ResponseError as e:
+            assert 'nvme disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
+
     # ─── DEL semantics ────────────────────────────────────────────────────
 
     def test_delete_semantics(self):
@@ -161,9 +242,6 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
     # ─── Overwrite ────────────────────────────────────────────────────────
 
-    # TODO: Remove xfail once streaming implementation lands — multi-buffer tiered GET
-    # hits todo!() panic because chunked promotion isn't implemented yet.
-    @pytest.mark.xfail(reason="multi-buffer tiered GET not yet implemented (PR #54)", strict=False)
     def test_overwrite_semantics(self):
         """Overwriting a key commits a new object version and tears down the old
         one: GET returns the new payload and exactly one .dat remains per key.
@@ -200,9 +278,6 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
     # ─── GET result outlives a concurrent DEL (honor rule) ────────────────
 
-    # TODO: Remove xfail once streaming implementation lands — multi-buffer tiered GET
-    # hits todo!() panic because chunked promotion isn't implemented yet.
-    @pytest.mark.xfail(reason="multi-buffer tiered GET not yet implemented (PR #54)", strict=False)
     def test_get_result_correct_across_delete_churn(self):
         """A GET that resolves the key returns its full data even under delete
         churn: the honor-rule pin keeps the file alive for the read's duration.
@@ -259,6 +334,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
+            f" lo-buffer-size 4096"
         )
 
     def test_set_get_roundtrip_no_promotion(self):
@@ -279,11 +355,16 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             assert result == payload
 
     def test_nvme_staging_exhaustion(self):
-        """An object larger than nvme-staging-size should fail with staging buffer exhaustion."""
+        """With streaming, NVMePool holds a rotating window of X buffers, not
+        the full object. Exhaustion is detected when the pool cannot provide at
+        least lo-streaming-min-buffers. Test by setting min > max so alloc_n
+        can never satisfy the minimum."""
         client = self.server.get_new_client()
-        # nvme-staging-size is 4MB. An 8MB object cannot be staged.
-        obj_size = 8 * 1024 * 1024
-        payload = b'Z' * obj_size
+        # max-buffers-per-op=2 means alloc_n returns at most 2 buffers.
+        # min-buffers=3 means we need at least 3 to proceed → guaranteed rejection.
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-buffers-per-op', '2')
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-streaming-min-buffers', '3')
+        payload = b'Z' * 4096
         try:
             client.execute_command('LO.SET', 'toobig', payload)
             assert False, "Expected NVMe staging buffer exhaustion error"
@@ -382,10 +463,10 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
 class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
     """Capacity is reclaimed only when the file is truly unlinked."""
 
-    # 1 MiB cap = exactly four 256 KiB (already-aligned) objects. staging holds one
-    # object at a time, so 1 MiB is plenty for the per-write buffer.
-    CAP = 1024 * 1024
-    OBJ = 256 * 1024  # 262144, a 4096-multiple -> no padding effect here
+    # 2 MiB cap. Each 256 KiB object has disk_len = 4096 (header) + 256 KiB = 266240.
+    # Seven fit (1863680 < 2 MiB), eighth would exceed (2129920 > 2 MiB).
+    CAP = 2 * 1024 * 1024
+    OBJ = 256 * 1024
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -394,6 +475,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             f" nvme-maxmemory {self.CAP}"
             f" nvme-staging-size {self.CAP}"
             f" dram-segment-size 1048576"
+            f" lo-buffer-size {self.OBJ}"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -406,34 +488,34 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         client = self.server.get_new_client()
         payload = b"X" * self.OBJ
 
-        # Fill the cap exactly (4 * 256 KiB == 1 MiB); the fifth must be rejected.
-        for i in range(4):
+        # Fill the cap (7 * 266240 = 1863680 < 2 MiB); the eighth must be rejected.
+        for i in range(7):
             self._set_ok(client, f"k{i}", payload)
-        wait_for_equal(self._dat_count, 4)
-        assert client.execute_command("DBSIZE") == 4
+        wait_for_equal(self._dat_count, 7)
+        assert client.execute_command("DBSIZE") == 7
         # A rejected SET must not leave a phantom key in the keyspace.
-        self._set_rejected(client, "k4", payload)
-        assert client.execute_command("DBSIZE") == 4
+        self._set_rejected(client, "k7", payload)
+        assert client.execute_command("DBSIZE") == 7
 
         # DEL one object: the slot frees only after teardown unlinks the file, so
         # the previously-rejected SET fits once (and only once) the file is gone.
         client.execute_command("DEL", "k0")
-        assert client.execute_command("DBSIZE") == 3
+        assert client.execute_command("DBSIZE") == 6
         self._wait_free_settled(client)
-        wait_for_equal(self._dat_count, 3)
-        self._set_ok(client, "k4", payload)
-        assert client.execute_command("DBSIZE") == 4
-        wait_for_equal(self._dat_count, 4)
+        wait_for_equal(self._dat_count, 6)
+        self._set_ok(client, "k7", payload)
+        assert client.execute_command("DBSIZE") == 7
+        wait_for_equal(self._dat_count, 7)
 
         # FLUSHALL frees every object; the full cap becomes available again.
         client.execute_command("FLUSHALL")
         assert client.execute_command("DBSIZE") == 0
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
-        for i in range(4):
+        for i in range(7):
             self._set_ok(client, f"g{i}", payload)
-        assert client.execute_command("DBSIZE") == 4
-        wait_for_equal(self._dat_count, 4)
+        assert client.execute_command("DBSIZE") == 7
+        wait_for_equal(self._dat_count, 7)
 
     def test_overwrite_does_not_leak_capacity(self):
         client = self.server.get_new_client()
@@ -450,40 +532,117 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
 
 class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
     """O_DIRECT pads writes up to IO_ALIGN (4096); accounting must count the padded
-    on-disk size, not the logical length."""
+    on-disk size (FILE_HEADER_SIZE + align_up(logical_len)), not the logical length."""
 
-    # Cap chosen to be a 2 KiB multiple but NOT a 4 KiB multiple: 1 MiB + 2 KiB.
-    CAP = 1024 * 1024 + 2048  # 1050624; 1050624 / 4096 == 256.5
+    # Cap = FILE_HEADER_SIZE + 1 MiB = 1052672.
+    # An aligned 1 MiB object fits exactly: disk_len = 4096 + 1048576 = 1052672 == cap.
+    # A non-aligned object of 1048577 bytes does NOT fit:
+    #   disk_len = 4096 + align_up(1048577) = 4096 + 1052672 = 1056768 > cap.
+    #   The extra 4095 bytes of padding push it over — that IS the padding effect.
+    CAP = 4096 + 1024 * 1024  # 1052672
 
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-maxmemory {self.CAP}"
-            f" nvme-staging-size 2097152"
+            f" nvme-staging-size 4194304"
             f" dram-segment-size 1048576"
+            f" lo-buffer-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )
 
     def test_padding_accounting(self):
-        """O_DIRECT pads writes up to IO_ALIGN (4096); accounting must count the
-        padded on-disk size, not the logical length.
-
-        - Rejected: an object whose LOGICAL size fits under the cap
-          (1050624 <= 1050624) but whose ALIGNED size does not
-          (align_up(1050624) == 1052672 > cap). Disk is empty, so the rejection
-          is attributable to padding alone.
-        - Succeeds: a 1 MiB object is already 4096-aligned, so aligned == logical
-          == 1048576 <= cap -- proving the rejection above is padding-specific,
-          not just "large object rejected".
+        """Prove that alignment padding (not just the header) is accounted for.
+        - Aligned 1 MiB object fits exactly: disk_len = 4096 + 1048576 = cap.
+        - Non-aligned 1 MiB + 1 byte does NOT fit: align_up rounds up to the
+          next 4 KiB boundary, pushing disk_len past the cap. The rejection is
+          attributable to the padding bytes, not the header (both objects have
+          the same header overhead).
         """
         client = self.server.get_new_client()
-        # Padded-overflow SET is rejected (logical == cap; aligned == cap rounded up)
-        # and must not create a key.
-        self._set_rejected(client, "padkey", b"P" * self.CAP)
-        assert client.execute_command("DBSIZE") == 0
-        # Contrast case: aligned-fit SET succeeds.
-        self._set_ok(client, "fitkey", b"Q" * (1024 * 1024))
+        aligned_payload = b"Q" * (1024 * 1024)       # 1048576 — already 4096-aligned
+        unaligned_payload = b"P" * (1024 * 1024 + 1)  # 1048577 — needs padding
+        # Aligned case succeeds: disk_len = 4096 + 1048576 = 1052672 == cap.
+        self._set_ok(client, "fitkey", aligned_payload)
         assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
+        # Clean up so the unaligned case has full cap available.
+        client.execute_command("DEL", "fitkey")
+        self._wait_free_settled(client)
+        wait_for_equal(self._dat_count, 0)
+        # Unaligned case rejected: disk_len = 4096 + 1052672 = 1056768 > cap.
+        # Both objects differ by 1 byte logically, but 4095 bytes on disk (padding).
+        self._set_rejected(client, "padkey", unaligned_payload)
+        assert client.execute_command("DBSIZE") == 0
+
+
+# ─── Corruption Detection ─────────────────────────────────────────────────
+# Each test triggers a server panic by corrupting on-disk data, verified via
+# expect_crash. Separate class so the crash doesn't affect other tests.
+
+class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
+    """CRC mismatch: server must crash on corrupt data, not serve it."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" dram-segment-size 4194304"
+            f" max-promote-size 0"
+            f" lo-buffer-size 4096"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_tiered_file_header_crc_mismatch(self):
+        """Corrupt CRC in .dat header → GET triggers panic."""
+        client = self.server.get_new_client()
+        payload = b'X' * 4096
+        client.execute_command('LO.SET', 'crc_key', payload)
+        # Corrupt the CRC field in the FileHeader (bytes 21-24 in packed layout).
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        assert len(dat_files) >= 1, "Expected .dat file after SET"
+        with open(dat_files[-1], 'r+b') as f:
+            f.seek(21)
+            f.write(b'\xff\xff\xff\xff')
+        # GET should trigger panic (CRC mismatch in read_and_verify_file_header).
+        with self.server.expect_crash(self):
+            try:
+                client.execute_command('LO.GET', 'crc_key')
+            except Exception:
+                pass
+
+
+class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
+    """FileHeader magic corruption: server must crash on corrupt data."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" dram-segment-size 4194304"
+            f" max-promote-size 0"
+            f" lo-buffer-size 4096"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_tiered_file_header_magic_corruption(self):
+        """Corrupt magic bytes → GET triggers panic."""
+        client = self.server.get_new_client()
+        payload = b'Y' * 4096
+        client.execute_command('LO.SET', 'magic_key', payload)
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        assert len(dat_files) >= 1, "Expected .dat file after SET"
+        with open(dat_files[-1], 'r+b') as f:
+            f.seek(0)
+            f.write(b'BAAD')
+        with self.server.expect_crash(self):
+            try:
+                client.execute_command('LO.GET', 'magic_key')
+            except Exception:
+                pass

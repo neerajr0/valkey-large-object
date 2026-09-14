@@ -8,6 +8,7 @@
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
 //! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
+use std::io::{Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use valkey_module::digest::Digest;
@@ -125,7 +126,7 @@ impl LoValue {
         let data_dir = crate::nvme_dir();
         // On-disk size.
         let disk_len = crate::storage::object_disk_len(self.len);
-        if !crate::storage::uring::try_reserve_nvme_disk_usage(disk_len) {
+        if !crate::storage::nvme::try_reserve_nvme_disk_usage(disk_len) {
             return None;
         }
         let new_oid = ObjectId::next();
@@ -135,13 +136,38 @@ impl LoValue {
         // rather than aborting the node. Release the reservation we took above and
         // best-effort remove any partial destination.
         if let Err(e) = std::fs::copy(&src_path, &dst_path) {
-            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
+            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
             let _ = std::fs::remove_file(&dst_path);
             valkey_module::logging::log_warning(format!(
                 "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                 self.object_id
             ));
             return None;
+        }
+        // Rewrite the FileHeader with the new ObjectId so read_and_verify_file_header
+        // matches when this copy is later read via GET.
+        // fsync after writing to ensure data is on stable storage before the file
+        // is exposed to O_DIRECT reads via io_uring.
+        {
+            let header = crate::storage::FileHeader::new(new_oid, self.len, self.crc32c);
+            let header_page = header.to_page();
+            match std::fs::OpenOptions::new().write(true).open(&dst_path) {
+                Ok(mut f) => {
+                    if f.seek(std::io::SeekFrom::Start(0)).is_err()
+                        || f.write_all(&header_page).is_err()
+                        || f.sync_all().is_err()
+                    {
+                        let _ = std::fs::remove_file(&dst_path);
+                        crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+                        return None;
+                    }
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&dst_path);
+                    crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+                    return None;
+                }
+            }
         }
         Some(LoValue {
             object_id: new_oid,
