@@ -259,8 +259,7 @@ pub async fn read_and_verify_file_header(
 }
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
-#[allow(clippy::result_unit_err)]
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, ()> {
+pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, super::StorageError> {
     let c_path = std::ffi::CString::new(file_path).expect("file_path null");
     let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
@@ -268,7 +267,9 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, ()> {
     }
     let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644) };
     if fd < 0 {
-        Err(())
+        Err(super::StorageError::IoError {
+            code: std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO),
+        })
     } else {
         Ok(fd)
     }
@@ -284,7 +285,7 @@ pub async fn write_file_header(
     crc: u32,
     buf: &SegmentBuffer,
     nvme_pool: &NVMePool,
-) -> Result<(), ()> {
+) -> Result<(), super::StorageError> {
     debug_assert!(
         buf.len as u64 >= FILE_HEADER_SIZE,
         "NVMePool buffer too small for FileHeader"
@@ -304,7 +305,14 @@ pub async fn write_file_header(
     let hdr_rx = uring::submit_write(fd, hdr_op);
     match hdr_rx.await {
         Ok(Ok(())) => Ok(()),
-        _ => Err(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            crate::metrics::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
+            panic!(
+                "largeobj: io_uring poller dropped oneshot sender — poller is dead, \
+                 all NVMe I/O is unrecoverable"
+            );
+        }
     }
 }
 

@@ -1105,7 +1105,7 @@ async fn do_tiered_nvme_write_tcp(
     let file_path = object_id.file_path(&dir);
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
-        Err(()) => {
+        Err(_e) => {
             nvme::decrease_nvme_disk_usage(disk_len);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
             return;
@@ -1144,7 +1144,7 @@ async fn do_tiered_nvme_write_tcp(
         batch_start += batch_count as u32;
     }
     // Post-loop: write FileHeader using buffer[0] (reused after data loop).
-    if let Err(()) = storage::write_file_header(
+    if let Err(_e) = storage::write_file_header(
         fd,
         object_id,
         obj_len,
@@ -1209,7 +1209,7 @@ async fn do_tiered_nvme_write_efa(
     let file_path = object_id.file_path(&dir);
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
-        Err(()) => {
+        Err(_e) => {
             nvme::decrease_nvme_disk_usage(disk_len);
             thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_WRITE)));
             return;
@@ -1298,7 +1298,7 @@ async fn do_tiered_nvme_write_efa(
         batch_start += batch_count as u32;
     }
     // Post-loop: write FileHeader.
-    if let Err(()) = storage::write_file_header(
+    if let Err(_e) = storage::write_file_header(
         fd,
         object_id,
         obj_len,
