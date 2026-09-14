@@ -24,7 +24,7 @@ These two constraints drive every design decision:
 Any buffer used as source for `fi_write` must be pre-registered with the NIC. Registration pins physical pages and programs the NIC's translation table. Cost: ~300-500μs per call (measured ~333μs on i8ge EFA, not size-proportional). Must be done at startup or on rare resize events — never on the data path. Per-request registration destroys throughput by 45x (measured: 138K rps pre-registered vs 3K rps per-request at 4KB).
 
 **2. io_uring registration (IORING_REGISTER_BUFFERS):**
-Any buffer used for `ReadFixed`/`WriteFixed` must be pre-registered with the kernel's io_uring ring. Enables kernel-bypass I/O (no per-op address translation). Cost: one-time at startup. Kernel overhead scales with buffer count — keep ≤1000 per registration.
+Any buffer used for `ReadFixed`/`WriteFixed` must be pre-registered with the kernel's io_uring ring. Enables kernel-bypass I/O (no per-op address translation). Cost: one-time at startup. The kernel hard-caps the number of registered entries at `UIO_MAXIOV` = **1024** (`IORING_REGISTER_BUFFERS` returns `EINVAL` above it); the segment model keeps the count far below this (a handful of ≤1 GiB entries).
 
 **Consequence:** A buffer registered with both can serve NVMe I/O AND EFA transfers without copying. An unregistered buffer can only serve TCP replies.
 
@@ -44,7 +44,7 @@ ReadFixed:  buf_index=1, offset=0x5000, len=4MB
             → reads 4MB from NVMe into segment1 at byte offset 0x5000
 ```
 
-**Performance constraint:** The kernel's buffer lookup degrades with entry count. Measured on i8ge: 128 entries → 156K rps, 10000 entries → 52K rps. With segments (2-8 entries), this is not a concern.
+**Count ceiling:** `IORING_REGISTER_BUFFERS` accepts at most `UIO_MAXIOV` = 1024 entries — beyond that the kernel returns `EINVAL` (it is a hard limit, not a gradual slowdown). Registering many small buffers also degrades the kernel's per-op buffer lookup; the segment model sidesteps both by registering a handful of large entries (2–8), so neither the ceiling nor the lookup cost is a concern.
 
 **No alternative API:** There is no way to use `ReadFixed`/`WriteFixed` without `IORING_REGISTER_BUFFERS`. The registration is what gives the kernel pre-pinned page tables to avoid per-I/O `get_user_pages()`. Plain `read`/`write` ops work without registration but pay the page-pinning cost every time (~15-20% throughput loss).
 
@@ -166,7 +166,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 **What talc cannot do:**
 - Compaction (moving live objects to consolidate free space). Would invalidate all pointers/offsets.
 
-**Mitigation strategy:** Open question. Separate segments per layer (§4.5) prevents the worst case (short-lived NVMePool churn fragmenting long-lived DRAMPool). Within each layer, coalescing may be sufficient — needs production data to determine if active mitigation is required. See §9 Open Questions. Other mitigations include (1) banding into segments based on value size (2) scaling out and scaling in to delete fragmented segments.
+**Mitigation strategy:** Open question. Separate segments per layer (§4.5) prevents the worst case (short-lived NVMePool churn fragmenting long-lived DRAMPool). Within each layer, coalescing may be sufficient — needs production data to determine if active mitigation is required. See §10 Open Questions. Other mitigations include (1) banding into segments based on value size (2) scaling out and scaling in to delete fragmented segments.
 
 ### 4.4 Comparison
 
@@ -196,6 +196,15 @@ DRAMPool:    N segments (each ≤1GiB)   — own Mutex<Talc>, low churn, long-li
 io_uring registration: [iovec{seg, ≤1GiB}, iovec{seg, ≤1GiB}, ...] — every segment in one array, each ≤1GiB
 EFA registration:      fi_mr_reg per segment — enables fi_write from any buffer in either pool
 ```
+
+**Each segment is a separate `talc.claim` (never `talc.extend`).** A pool's talc
+manages its segments as independent claimed heaps, so every allocation lies wholly
+within exactly one segment — no allocation straddles a segment boundary. This
+single-segment-ownership invariant is what makes the addressing model valid: one
+allocation maps to one segment → one io_uring `buf_index`, one segment refcount, one
+EFA MR. Bridging two segments into one contiguous heap via `extend` would allow a
+straddling chunk with no single valid `buf_index`, so it is never used. (See §8.7
+for the address→segment lookup this enables.)
 
 **Both pools are io_uring registered (IORING_REGISTER_BUFFERS):**
 - NVMePool: ReadFixed/WriteFixed for NVMe I/O staging (primary use case)
@@ -918,55 +927,304 @@ Expanding and shrinking applies only to **DRAMPool segments**. NVMePool segments
 
 This will be solved using a cron job from the Module that monitors memory usage using existing Module APIs.
 
-### 8.1 When to Expand
+### 8.1 Memory Model (prerequisite)
+
+Scaling only makes sense against how the module's memory relates to Valkey's. Two
+facts drive everything in this section (and are referenced by the config semantics
+in §11):
+
+**1. One shared RAM budget.** **Every** module allocation goes through Valkey's
+allocator (zmalloc) — DRAMPool segments, NVMePool staging segments, the FdPool map,
+ObjectContext/StreamingContext metadata, the tracking HashMaps, all of it — so it
+all counts against the server's `used_memory` and shares the single server
+`maxmemory` ceiling with the core keyspace. The module and core data types
+**compete for the same RAM**: module memory + core keyspace draw from one pool under
+one ceiling. Within that shared budget, the *DRAMPool's* own effective cap is
+`dram-maxmemory` when set `>0`, otherwise the server `maxmemory` ceiling (§11.2) —
+but that DRAMPool cap sits underneath the whole-server ceiling that everything,
+module and core alike, is bounded by.
+
+**2. Two eviction actors.** "Eviction" means different things depending on who acts:
+
+| Actor | What it does | Data loss? | Modes |
+|---|---|---|---|
+| **Core maxmemory eviction** | Valkey's `maxmemory-policy` selects a victim key and deletes it (LO keys included), calling the module free callback. `noeviction` → `LO.SET` fails (OOM). | **Yes** — the object is gone | Both |
+| **Module cache eviction** | Drops a cached DRAM copy; the object persists on NVMe, next GET is an NVMe read. | No | **Tiered only** |
+
+The consequence: **a module-owned eviction policy is only meaningful in Tiered
+mode** — dropping a copy is safe only when a copy exists. In Dram mode the DRAMPool
+*is* the data, so the only reclaim is core deleting whole keys under its
+`maxmemory-policy`; the module does not give Dram-mode segment memory back on its own.
+
+Neither eviction is disabled by `dram-maxmemory=0`; that value only sets the trigger
+threshold to the shared server ceiling instead of a module-local cap.
+
+> **Open (pressure signal):** whether the module can *proactively* observe
+> "approaching `maxmemory`" to reclaim ahead of time, or only learns *reactively*
+> when a zmalloc-backed segment alloc fails, is unverified. It determines whether
+> eviction/scale-in is threshold-driven or alloc-failure-driven. To confirm against
+> core.
+
+### 8.2 When to Expand
+
+Expansion adds one `dram-segment-size` segment (≤1GiB, §2) to DRAMPool. The budget
+and what its values mean are defined in §11.1/§11.3; this is the *behavior* against
+that budget.
 
 | Trigger | Action |
 |---------|--------|
-| Allocation fails (no contiguous space in any segment) | Add segment immediately |
-| Segment Memory Utilization > 80% sustained | Add segment proactively |
+| DRAMPool allocation fails (no segment has contiguous room) | Add a segment immediately, then retry the alloc |
+| Segment utilization > 80% sustained | Add a segment proactively |
 
-### 8.2 When to Shrink
+Bounds by mode (config meaning in §11.3):
+- **`dram-maxmemory=0`:** start with 1 segment, grow one at a time up to the server
+  ceiling (§11.2). In Dram mode, exhausting the ceiling rejects `LO.SET` (OOM); in
+  Tiered mode the cache simply stops growing (data is on NVMe).
+- **`dram-maxmemory>0`:** grow up to `dram-maxmemory / dram-segment-size` segments.
 
-| Trigger | Action |
-|---------|--------|
-| Valkey `used_memory` approaching `maxmemory` | Shrink to give memory back. There are caveats explained in sections below |
+### 8.3 When to Shrink
 
-### 8.3 How Expansion Works
+Under memory pressure the module reclaims DRAMPool memory by **evicting the
+least-used segment** — this is the module cache eviction of §8.1, so it is
+**Tiered-mode only**: dropping a DRAM segment is not data loss because every object
+persists on NVMe (next GET is an NVMe read). We do **not** wait for a segment to
+become empty on its own; we actively pick a victim and release it.
 
-1. Allocate new segment (contiguous region, ≤1GiB per the §2 cap)
-2. Register with io_uring: `IORING_UNREGISTER_BUFFERS` → append new iovec → `IORING_REGISTER_BUFFERS`
-3. Add to allocator: `talc.claim(Span::new(base, base + size))`
-4. New allocations can immediately use the new segment
+| Trigger | Mode | Action |
+|---------|---|---|
+| Server `used_memory` rising past a threshold (approaching `maxmemory`) | Tiered | Pick the least-used DRAMPool segment (any position), evict its cached objects (they survive on NVMe), and release it (§8.5), dropping `used_memory`. |
+| Server `used_memory` rising past a threshold | Dram | No module reclaim — the DRAMPool *is* the data; core's `maxmemory-policy` evicts whole keys, or the SET fails (`noeviction`). |
 
-Cost: ~2-10ms (Need to validate through tests) for the unregister/re-register cycle. In-flight ReadFixed/WriteFixed ops already submitted are unaffected (kernel has their pages pinned). New submissions wait briefly.
+The victim is chosen by a per-segment usage measure (least-recently/least-frequently
+used — the eviction-policy input). The reclaimed unit is a **whole segment**: its
+still-live cached objects are dropped (ObjectContexts freed; the objects remain on
+NVMe), then the segment is released.
 
-### 8.4 How Shrinking Works
+**NVMe staging is never shrunk** — it is fixed-at-startup concurrency-sized I/O
+buffers, not a reclaimable cache (§11.4).
 
-**DRAM+NVMe mode:**
+### 8.4 How Expansion Works
+
+Expansion adds one segment incrementally — no full re-registration, no I/O pause on
+existing segments (verified: §8.6 R1/R2).
+
+1. Allocate a new segment (contiguous region, ≤1GiB per the §2 cap).
+2. Register with io_uring via a single sparse-table slot update
+   (`register_buffers_update` into a slot of the startup-allocated sparse table —
+   §8.6 R1). Other segments' registrations and their in-flight I/O are undisturbed;
+   no ring-idle stall.
+3. Register with EFA: a new `fi_mr_reg` for this segment only. Existing MRs and their
+   in-flight `fi_write`/`fi_read` are untouched (per-MR, incremental — §8.6 R2).
+4. Add the span to the allocator: `talc.claim(Span::new(base, base + size))`.
+
+The new segment is immediately usable. The only startup prerequisite is a sparse
+buffer table sized to the max segment count (§8.6 O2).
+
+### 8.5 How Shrinking Works (Evict + Swap-Remove)
+
+Shrink evicts the chosen victim segment and removes it from the registry with a
+**swap-remove**, so the registered array stays dense and exactly one other segment's
+index changes. (Tiered-mode only — §8.3.)
+
+> **[PENDING — race guard + registration migration; see §8.6 O1/O3/O4.]** Requires
+> `Segment.iovec_index` to become mutable (today it is write-once) and the io_uring
+> registration to move to the sparse-table update API.
+
+Protocol (victim at index `i`, current tail at index `n-1`):
+1. Mark the victim `draining` so no new allocation lands in it — **O1:** the
+   allocator must honor this (preferred: retract the victim's span from talc so
+   `malloc` cannot return into it).
+2. Evict the victim's cached objects: drop their ObjectContexts (`talc.free` each
+   buffer). The objects persist on NVMe; a later GET re-reads them. Wait for any
+   in-flight reader on the victim to finish (`refcount == 0`, Release/Acquire —
+   §8.6 R3).
+3. **Swap-remove in the registry**, under the IOVECS lock: move the tail segment
+   (`n-1`) into slot `i`, pop the tail. Only the moved segment's index changes —
+   set its `iovec_index = i`. No other segment is disturbed (contrast `Vec::remove`,
+   which would shift and invalidate every index after `i`).
+4. Re-register the reused slot: `register_buffers_update(i, moved_segment.iovec())`
+   (io_uring, single-slot — §8.6 R1). `fi_close` the victim's EFA MR; other MRs are
+   untouched (§8.6 R2).
+5. Release the victim's memory to the OS; `used_memory` drops.
+
+Steps 3–4 happen atomically under the registry lock, so no allocation can hand out a
+buffer referencing the stale index mid-swap.
+
+Why swap-remove over the alternatives: `Vec::remove` shifts every later element
+(O(n) index churn, re-register every shifted slot); a `Vec<Option<_>>` hole leaves a
+sparse array to scan. Swap-remove is O(1), keeps the array dense, and touches exactly
+one index.
+
+### 8.6 Research Findings & Open Items
+
+**R1 — io_uring re-registration on scale: RESOLVED.** Scaling does **not** require
+unregister-all + full re-register. On kernel ≥5.13, pre-register a *sparse* buffer
+table once at startup (sized to max segments; sparse slots are cheap, only real
+buffers pin pages), then add/remove a segment via `register_buffers_update` on a
+single slot — other slots stay valid, no ring-idle stall, and a removed slot's
+buffer is held alive by the kernel until its in-flight I/O completes (optional tag
+CQE signals safe-to-unmap). The tokio-rs `io-uring` crate exposes
+`register_buffers_sparse` + `register_buffers_update`. So there is **no "brief I/O
+pause on all segments" during resize** — that earlier claim was based on the classic
+all-or-nothing API and is superseded.
+> Kernel-floor caveat: `register_buffers_sparse` is annotated 5.13 in the crate but
+> 5.19 in the man page; `register_buffers_update` is 5.13. If the target kernel is
+> 5.13–5.19, register a full real table via `register_buffers2` and still update
+> per-slot. **To-do: smoke-test the i8ge kernel.**
+
+**R2 — EFA MR incrementality: RESOLVED.** MRs are fully independent. A new segment is
+a standalone `fi_mr_reg` (new key); existing MRs and their in-flight `fi_write`/
+`fi_read` are untouched. `fi_close` scopes to one MR. So EFA is naturally incremental
+— combined with R1, **both registration layers are per-segment on scale.**
+
+**R3 — draining quiescence in current code: PARTIALLY BUILT.** `Segment.refcount`
+(AtomicU32) is real and correctly wired (inc on alloc, dec on free, Release/Acquire
+ordering); `is_releasable()` = `draining && refcount==0` is correct. BUT
+`draining`/`is_releasable` are **zero-caller scaffolding** today, and the load-bearing
+gap is that **`SegmentPool::alloc` never checks `draining`** — talc owns one heap
+across all segments and picks the address itself, so a draining segment can still
+receive a fresh allocation mid-drain. The draining protocol must add a structural
+guard.
+
+**Open items:**
+- **O1 (blocks §8.5 draining) — race guard.** Prevent talc from allocating into a
+  draining segment. Preferred: **retract the segment's span from talc** so `malloc`
+  structurally cannot return into it (needs confirmation that talc supports clean
+  span retraction — `claim` exists; retract is unverified). Fallback: check
+  `draining` on the alloc path under the same lock as `inc_ref`.
+- **O2 — sparse-table sizing.** Size the startup sparse table to max segments =
+  `(dram budget + nvme budget) / min-segment-size`, capped at `UIO_MAXIOV` = 1024.
+- **O3 — i8ge kernel smoke test** for `register_buffers_sparse` (R1 caveat).
+- **O4 — registry migration (blocks §8.4/§8.5).** Current code is entirely on the
+  *classic* path: `append_iovec` (`storage/mod.rs`) is an append-only
+  `Mutex<Vec<(usize,usize)>>` that assigns `iovec_index = vec.len()` and never
+  removes, and `Segment.iovec_index` is write-once at creation; registration uses the
+  classic all-or-nothing `register_buffers`. Scaling requires: (a) move registration
+  to the sparse-table + `register_buffers_update` API (R1); (b) make
+  `Segment.iovec_index` mutable so swap-remove can rewrite the one moved segment's
+  index (§8.5); (c) perform the swap + index-write + slot re-register atomically
+  under the registry lock. Swap-remove keeps the array **dense**, so grow still
+  appends at the tail and no free-list / `Option`-hole scan is needed.
+- **O5 — OPEN SUB-DECISION: holes vs swap-remove for segment removal.** Two ways to
+  remove a segment from the registry, not yet chosen (§8.5 currently describes
+  swap-remove):
+  - **Swap-remove (dense):** move the tail segment into the victim's slot, pop the
+    tail. Array stays dense (grow just appends); exactly **one** surviving segment's
+    `iovec_index` changes, so that field must be **mutable** and updated atomically
+    under lock. Cost: a live index rewrite (correctness hazard if a stale index
+    escapes).
+  - **Hole (`Vec<Option<_>>`):** set the victim's slot to `None`; **no** surviving
+    segment's index ever changes (`iovec_index` stays **immutable for a segment's
+    life** — a stronger invariant). Grow scans for a `None` slot (≤1024, rare — cheap)
+    or appends. Empty sparse slots are free (only real buffers pin pages — §8.6 R1),
+    so holes cost nothing but a looser array. Native to the sparse-table API.
+  - Tradeoff: swap = dense array, one mutable index; holes = immutable index, a
+    scan-on-grow. Immutability is the safer invariant; density is a marginal win
+    since grow is rare. **To pick.**
+
+### 8.7 Fast Segment Lookup on Alloc
+
+Finding *free space* is not the scaling cost — that is talc's job. All segments are
+`claim`ed into **one** talc heap, so `alloc` = `talc.malloc(layout)`, which selects a
+free block from talc's internal free-list (not an O(segments) search). The cost is
+the step *after* malloc: mapping the returned pointer back to a segment index.
+
+Today `SegmentPool::find_segment(addr)` is a **linear scan** over all segments:
+
+```rust
+for (i, seg) in self.segments.iter().enumerate() {
+    if addr >= seg.base && addr < seg.base + seg.size { return Some((i, addr - base)); }
+}
 ```
-1. Pick segment with lowest utilization (live bytes allocated / segment capacity)
-2. Mark segment DRAINING (no new allocations from it)
-3. Wait for in-flight I/O targeting this segment to complete
-4. Evict DRAMPool objects in this segment (data safe on NVMe)
-   - Drop their ObjectContexts → Buffers logically freed
-5. IORING_UNREGISTER_BUFFERS → remove segment from iovec array → IORING_REGISTER_BUFFERS
-6. Release segment memory to OS
-```
-Eviction is cheap — objects survive on NVMe. Next GET is a DRAMPool miss.
 
-**DRAM-only mode:**
-```
-1. Pick segment with lowest utilization (live bytes allocated / segment capacity)
-2. Mark segment DRAINING
-3. Wait for in-flight I/O to complete
-4. Evacuate remaining live objects:
-   - For each live object: alloc in another segment, memcpy, update ObjectContext
-5. IORING_UNREGISTER → remove → IORING_REGISTER
-6. Release segment memory to OS
-```
-Evacuation is mandatory — data only exists in DRAM. Cannot shrink if remaining segments are too full to absorb evacuated objects (reject the shrink request).
+This runs on **every `alloc`**. With few segments it is negligible, but it is
+**O(N) in segment count** — on a 1 TB DRAMPool at 1 GiB/segment that is ~1000
+range-checks per allocation, on the hot path. That is the real scaling concern for
+allocation.
 
-Evacuation cost: proportional to live data in segment. 5% utilized 1GiB segment = ~50MB copy = ~5ms.
+Fix options (to pick when segment counts grow large enough to matter — measure
+first):
+- **Binary search on sorted segment base addresses → O(log N).** Segment bases are
+  fixed once allocated; keep them sorted and binary-search the pointer. ~1000
+  segments → ~10 comparisons. Works regardless of segment sizes. Straightforward.
+- **O(1) arithmetic** if segments were one contiguous equal-stride arena:
+  `seg_idx = (addr − arena_base) / segment_size`. But segments are separately
+  `alloc_zeroed`'d today (not one contiguous arena), so addresses have no clean
+  stride — this would require allocating the whole arena contiguously up front, which
+  conflicts with lazy per-segment growth. Not free.
+- **Per-segment talc instead of one shared heap:** malloc would then know its
+  segment, but you lose cross-segment free-block sharing and reintroduce "which
+  segment has room?" as the new scan. Likely worse.
+
+Recommended when needed: **binary search on sorted bases** (O(log N), no arena
+constraint, compatible with lazy growth). Not urgent at small segment counts —
+gate the change on a measured threshold rather than building it prematurely.
+
+**Why the mapping is ours, not talc's (verified in talc 4.4.3 source):** talc
+offers no channel to recover the owning segment from an allocation. `malloc` returns
+a bare `Result<NonNull<u8>, ()>` (pointer or failure) — no index, no owner. `Span`
+is `{ base, acme }` — two pointers with no metadata slot to tag — and talc does not
+even retain the claimed `Span`: `claim` dissolves it into the size-bucketed
+free-list and keeps only `bins` + `oom_handler`, not a list of spans. So the
+address→segment identity is metadata *we* hold (the segment bases) and must resolve
+ourselves; binary search on those bases is the mechanism.
+
+**Single-segment ownership invariant (load-bearing):** every allocation lies wholly
+within exactly one segment — no allocation ever straddles two. This holds because
+each segment is a **separate `claim`** (its own heap, bounded by a base tag), and
+talc only coalesces free chunks *within* one claimed heap. We must **never use
+`talc.extend`** to bridge two segments into one contiguous heap — that is the only
+operation that would allow a chunk to span a segment boundary. Single-segment
+ownership is what makes the whole addressing model valid: one allocation → one
+`buf_index` (io_uring ReadFixed/WriteFixed address a single registered buffer), one
+segment refcount, one EFA MR. A straddling allocation would have no single valid
+`buf_index` and would break I/O. So: always separate `claim` per segment, never
+`extend`; `find_segment` then always resolves to exactly one segment.
+
+### 8.8 NUMA Locality
+
+> **[WIP — NOT FINALIZED. Direction below is sound and sourced, but the exact
+> placement policy and its keyspace tradeoff are unsettled and need NUMA-aware
+> benchmarks on i8ge.]**
+
+Cross-NUMA-node memory access is a real cost on the multi-socket hosts this runs on
+(i8ge: node0 = CPU 0–95, node1 = CPU 96–191, EFA NIC on node1). An access that
+crosses the node boundary pays the inter-socket-link latency/bandwidth penalty. Three
+paths can go cross-node, and the levers to keep them local:
+
+**Governing rule — first-touch.** A page is homed on the node of the thread that
+*first writes* it (`set_mempolicy(2)`: policy applies "when the page is first touched
+by the thread"). `alloc_zeroed`'s zeroing store *is* that first touch, so the
+allocating thread's node wins — this only helps if that thread is pinned first.
+
+1. **Segment / buffer memory (controllable).** Home each DRAM/NVMe segment on the
+   right node: pin the creating thread (`sched_setaffinity(2)`) → `alloc_zeroed` →
+   `mbind(2)` the `[ptr,len)` with `MPOL_BIND` (per-range, overrides thread default;
+   `MPOL_MF_STRICT` during bring-up to prove placement) → touch → then `fi_mr_reg` /
+   `IORING_REGISTER_BUFFERS` (registration pins pages but does **not** move them, so
+   placement must precede it). Pin the tokio EFA/NVMe workers that stream a segment to
+   that segment's node.
+
+2. **EFA/NVMe DMA (co-locate with the NIC).** The device DMAs over PCIe; if the
+   buffer is on the far node, every transfer crosses the inter-socket link. Home
+   EFA-registered segments + their workers on the **EFA device's node** — read it at
+   runtime from `/sys/class/infiniband/<dev>/device/numa_node` (don't hardcode; i8ge
+   currently = node1). Rule of thumb: buffer node == worker node == NIC node.
+
+3. **Valkey keyspace lookup (the hard one).** The single main event loop first-touches
+   the entire dict / hashtable / `LoValue` allocations, homing all keyspace metadata
+   on the main thread's node. A worker on the other node chasing those pointers pays
+   remote latency **per lookup** (the pointer chase, not the payload, is the cost).
+   **Open tradeoff (to settle with benchmarks):** (a) pin workers to the main thread's
+   node — keeps latency-bound lookups local, accept cross-node bulk DMA; (b) bind the
+   whole server (main + workers + memory) to the NIC's node via
+   `numactl --cpunodebind=N --membind=N` — one coherent node, simplest; (c) interleave
+   (`MPOL_INTERLEAVE` / `numactl --interleave`) — averages latency, only wins if
+   bandwidth-bound. Leaning (a) or (b); metadata access is per-op latency-bound while
+   DMA is batched bandwidth-bound.
+
+Sources: `set_mempolicy(2)`, `mbind(2)`, `sched_setaffinity(2)`, `numa(3)`/`numa(7)`,
+`numactl(8)`, kernel sysfs `numa_node` ABI.
 
 ## 9. Concurrency, Refcounting, and Lifecycle
 
@@ -1056,7 +1314,7 @@ lo_free(LoValue):
 
 ### 9.5 Segment Draining Lifecycle
 
-When shrinking DRAMPool under memory pressure (§8.4):
+When shrinking DRAMPool under memory pressure (§8.5):
 
 ```
 1. segment.draining.store(true) — no new allocs from this segment
@@ -1074,5 +1332,85 @@ Between steps 2 and 3: in-flight readers may still be serving from buffers in th
 
 ## 10. Open Questions
 
-1. Segment size? 4GB (granular shrink) vs 16GB (fewer segments, less overhead)? Config knob — needs production data.
-2. Should we use Scale Out and Scale In to handle overly fragmented segments? Requires live transition (drain + evacuate). May be over-engineering — talc free-coalescing may be sufficient. Needs tests to determine fragmentation rate in practice.
+1. Should we use Scale Out and Scale In to handle overly fragmented segments? Requires live transition (drain + evacuate). May be over-engineering — talc free-coalescing may be sufficient. Needs tests to determine fragmentation rate in practice.
+
+---
+
+## 11. Configuration & Memory Model
+
+This section defines what each config knob *means as an operational experience* —
+what its values do, how they bound memory, and how they permit the pool to scale
+out and in. Mechanics of enforcement live in the sections cross-referenced below;
+this section owns the semantics.
+
+### 11.1 Config Catalog
+
+| Config | Default | Min | Max | Live/Immutable | Governs |
+|---|---|---|---|---|---|
+| `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
+| `dram-maxmemory` | `0` (grow-on-demand) | `0` | i64::MAX¹ | Live | Total DRAMPool budget. `0` = grow until the server ceiling (§11.2) |
+| `dram-segment-size` | `64MB` | `1MB` | `1GiB` | Immutable | DRAMPool growth unit — one segment added per scale-out step |
+| `nvme-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size (transient I/O buffers) |
+| `nvme-maxmemory` | `10GB` | `1MB` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
+| `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
+| `lo-max-object-size` | — | — | — | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
+| `lo-buffer-size` | `8MB` | — | — | Immutable | I/O chunk / allocation unit (detail: §7.2) |
+| `lo-max-buffers-per-op` / `lo-streaming-min-buffers` / `lo-max-streaming-ops` | 8 / 2 / 2 | — | — | — | Streaming pipeline depth (detail: §7.3.6) |
+| `worker-threads` | `2` | `1` | `32` | Immutable | tokio transport CQ-polling threads |
+
+¹ `dram-maxmemory` accepts up to i64::MAX but its *effective* ceiling is always the
+server's `maxmemory` / physical RAM (§11.2).
+
+**Segment size is capped at 1 GiB** for both `dram-segment-size` and
+`nvme-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
+NVMe staging is always io_uring-registered, and DRAMPool is io_uring-registered in
+Tiered mode (for promotion ReadFixed). Larger capacity comes from *more* segments,
+never bigger ones. (EFA `fi_mr_reg` itself has no such cap — a Dram-mode segment is
+EFA-only — but we cap uniformly at 1 GiB for a single mental model.)
+
+### 11.2 The Ceiling Is Always Valkey `maxmemory`
+
+DRAMPool segments count against the server's shared `used_memory` and compete with
+the core keyspace under one `maxmemory` ceiling (see §8.1 Memory Model for the full
+model). So `dram-maxmemory=0` never means unbounded — it means **bounded by the
+server's own `maxmemory`** (or physical RAM if `maxmemory=0` too). When the next
+segment allocation would exceed that ceiling, the outcome depends on mode (§11.3).
+
+### 11.3 What `0` Means, per Mode
+
+`dram-maxmemory` is the DRAMPool budget; `0` and `>0` mean different things by mode.
+This subsection defines the *meaning* of the value — the scale-out/scale-in
+*behavior* it drives lives in §8 (Expanding and Shrinking).
+
+| Mode | `dram-maxmemory` | Meaning |
+|---|---|---|
+| Dram | `0` | Grow on demand, bounded by the server ceiling (§11.2). DRAMPool *is* the store — there is no NVMe fallback, so exhausting the ceiling means `LO.SET` is rejected (OOM). |
+| Dram | `>0` | Hard cap on the DRAM store. |
+| Tiered | `0` | Elastic promotion cache, bounded by the server ceiling. Reclaimable under pressure (the object is safe on NVMe). |
+| Tiered | `>0` | Cache cap. |
+
+Segment **count** is always derived (`dram-maxmemory / dram-segment-size`), never a
+separate knob. Every segment is exactly `dram-segment-size`.
+
+> **Guard:** In Dram mode, if both `dram-maxmemory=0` and the server `maxmemory=0`
+> (both unlimited), the only bound is physical RAM and the OOM killer. Warn loudly
+> at startup so an operator does not run unbounded by accident.
+
+### 11.4 Budget Semantics: Soft vs Hard
+
+Whether `dram-maxmemory` is a *hard reservation* or a *soft, reclaimable target*
+depends on mode — this is a property of the config; it follows from the two-eviction-
+actor model in §8.1, and the reclaim *mechanics* live in §8.5:
+
+- **Tiered mode: soft.** DRAMPool is a cache; the budget is a target the pool can be
+  pushed below under memory pressure (data persists on NVMe).
+- **Dram mode: hard.** DRAMPool *is* the data, so the budget is a reservation the
+  module does not give back; under pressure, core's `maxmemory-policy` evicts whole
+  keys (or the SET fails under `noeviction`). The module never shrinks Dram-mode
+  segments itself.
+
+**NVMe staging is not a scalable budget.** `nvme-staging-size` sizes transient I/O
+buffers for concurrency, not a cache; it is fixed at startup and never shrinks under
+memory pressure.
+
+See §8 for when and how the pool actually expands and shrinks against these budgets.
