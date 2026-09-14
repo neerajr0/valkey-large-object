@@ -268,7 +268,9 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, super::Storage
     let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644) };
     if fd < 0 {
         Err(super::StorageError::IoError {
-            code: std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO),
+            code: std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
         })
     } else {
         Ok(fd)
