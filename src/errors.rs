@@ -42,6 +42,9 @@ define_errors! {
     // Streaming Errors
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
+
+    // Config Validation Errors
+    ERR_OBJECT_TOO_LARGE => "ERR object size exceeds lo-max-object-size limit",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

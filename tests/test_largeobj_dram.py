@@ -133,3 +133,45 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         # Nonexistent key returns nil digest
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
+
+    # ─── lo-max-object-size tests ─────────────────────────────────────────
+
+    def test_max_object_size(self):
+        """lo-max-object-size rejects oversized SETs, allows at-limit SETs,
+        and does not affect reads of already-stored objects."""
+        client = self.server.get_new_client()
+        limit = 8192
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit))
+        # Oversized SET is rejected.
+        try:
+            client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
+            assert False, "Expected max object size rejection"
+        except ResponseError as e:
+            assert 'lo-max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+        # Rejected SET must not leave a phantom key.
+        assert client.execute_command('DBSIZE') == 0
+        assert client.execute_command('LO.GET', 'bigkey') is None
+        # At-limit SET succeeds.
+        assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        # Lowering limit below stored object size does not affect reads.
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit // 2))
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+
+    def test_max_object_size_dram_warning(self):
+        """CONFIG SET lo-max-object-size > dram-maxmemory logs a warning but succeeds."""
+        client = self.server.get_new_client()
+        dram_limit = 1048576  # 1 MiB
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', str(dram_limit))
+        obj_limit = 2 * 1048576  # 2 MiB
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(obj_limit))
+        # CONFIG SET succeeded (not rejected).
+        cfg = client.execute_command('CONFIG', 'GET', 'largeobj.lo-max-object-size')
+        assert int(cfg[1]) == obj_limit
+        # Warning appears in the server log.
+        assert self.server.verify_string_in_logfile(
+            "lo-max-object-size"
+        ), "Expected warning about lo-max-object-size exceeding dram-maxmemory in server log"
+        assert self.server.verify_string_in_logfile(
+            "exceeds dram-maxmemory"
+        ), "Expected warning about exceeding dram-maxmemory in server log"

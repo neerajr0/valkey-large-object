@@ -245,6 +245,54 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
+    # ─── lo-max-object-size tests ─────────────────────────────────────────
+
+    def test_max_object_size_tiered(self):
+        """lo-max-object-size rejects oversized SETs in Tiered mode.
+        No .dat file created for rejected SET. Reads unaffected after lowering limit."""
+        client = self.server.get_new_client()
+        limit = 4096
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit))
+        # Oversized SET is rejected with max-object-size error (not NVMe capacity).
+        try:
+            client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
+            assert False, "Expected max object size rejection"
+        except ResponseError as e:
+            err = str(e).lower()
+            assert 'lo-max-object-size' in err, f"Unexpected error: {e}"
+            assert 'nvme' not in err, f"Should not hit NVMe error: {e}"
+        # Rejected SET must not leave a .dat file or phantom key.
+        assert self._dat_count() == 0
+        assert client.execute_command('DBSIZE') == 0
+        # At-limit SET succeeds and creates a .dat file.
+        assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
+        wait_for_equal(self._dat_count, 1)
+        # GET returns correct data (promotion path on first GET, DRAM on second).
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        # Lowering limit below stored object size does not affect reads.
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit // 2))
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+
+    def test_max_object_size_tiered_warning(self):
+        """CONFIG SET lo-max-object-size > nvme-maxmemory logs a warning but succeeds."""
+        client = self.server.get_new_client()
+        # Set nvme-maxmemory to a small value so we can exceed it.
+        nvme_limit = 1048576  # 1 MiB
+        client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', str(nvme_limit))
+        obj_limit = 2 * 1048576  # 2 MiB
+        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(obj_limit))
+        # CONFIG SET succeeded (not rejected).
+        cfg = client.execute_command('CONFIG', 'GET', 'largeobj.lo-max-object-size')
+        assert int(cfg[1]) == obj_limit
+        # Warning appears in the server log.
+        assert self.server.verify_string_in_logfile(
+            "lo-max-object-size"
+        ), "Expected warning about lo-max-object-size exceeding nvme-maxmemory in server log"
+        assert self.server.verify_string_in_logfile(
+            "exceeds nvme-maxmemory"
+        ), "Expected warning about exceeding nvme-maxmemory in server log"
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""

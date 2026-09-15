@@ -191,6 +191,12 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str("ERR object length must be > 0"));
     }
 
+    // Reject objects exceeding the configured max object size.
+    let max_obj_size = crate::max_object_size();
+    if obj_len > max_obj_size {
+        return Err(ValkeyError::Str(errors::ERR_OBJECT_TOO_LARGE));
+    }
+
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,
