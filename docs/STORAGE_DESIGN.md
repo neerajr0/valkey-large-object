@@ -8,7 +8,7 @@
 
 The module stores large objects (15KB to multi-GB (TBD)) and must serve them via two transports:
 - **TCP:** standard RESP reply
-- **EFA:** RDMA fi_write directly to client GPU memory
+- **EFA:** RDMA fi_write directly to client GPU memory (requires EFA NIC; detected at startup — if EFA init fails, EFA command paths are rejected and the module operates TCP-only)
 
 Two operating modes:
 - **DRAM-only:** All objects live in DRAM. No NVMe. Fastest reads. Limited by DRAM capacity.
@@ -206,13 +206,19 @@ EFA MR. Bridging two segments into one contiguous heap via `extend` would allow 
 straddling chunk with no single valid `buf_index`, so it is never used. (See §8.7
 for the address→segment lookup this enables.)
 
-**Both pools are io_uring registered (IORING_REGISTER_BUFFERS):**
+**Both pools are io_uring registered (IORING_REGISTER_BUFFERS) in Tiered mode:**
 - NVMePool: ReadFixed/WriteFixed for NVMe I/O staging (primary use case)
 - DRAMPool: ReadFixed during promotion (NVMe → DRAMPool direct fill, §7.3.4). Without registration, promotion falls back to plain `read` (~15-20% slower per chunk — acceptable but suboptimal).
 
-**Both pools are EFA registered (fi_mr_reg):**
+In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so neither pool is io_uring-registered.
+
+**Both pools are EFA registered (fi_mr_reg), if EFA is available:**
 - NVMePool: fi_write to client during serve-and-discard GET
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
+
+If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
+command paths (`LO.SET`/`LO.GET` with `[rkey remote_addr]`) are rejected with an
+error until EFA becomes available. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
 - Prevents lifetime-mixing fragmentation: NVMePool high-churn alloc/free cycles cannot create holes between long-lived DRAMPool objects
@@ -243,7 +249,9 @@ Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies
 
 ## 5. Operating Modes
 
-Both approaches follow the same command-level flow. "Alloc" and "free" refer to `talc.alloc`/`talc.free` from either NVMePool (transient I/O) or DRAMPool (cached objects). The resulting memory is pre-registered with io_uring and EFA.
+Both approaches follow the same command-level flow. "Alloc" and "free" refer to `talc.alloc`/`talc.free` from either NVMePool (transient I/O) or DRAMPool (cached objects). The resulting memory is pre-registered with io_uring and EFA (when available).
+
+**EFA availability:** EFA transport is detected at startup. If EFA init succeeds, the `EFA` command variants below are enabled; if not, they are rejected and only the `TCP` paths are available.
 
 ### 5.1 DRAM-Only Mode
 
@@ -925,8 +933,6 @@ Valkey's RESP command dispatch accumulates the full payload in `client->querybuf
 
 Expanding and shrinking applies only to **DRAMPool segments**. NVMePool segments are fixed at startup (sized for max concurrent I/O) and never resized — if NVMePool is exhausted, the module back-pressures new requests until buffers are freed.
 
-This will be solved using a cron job from the Module that monitors memory usage using existing Module APIs.
-
 ### 8.1 Memory Model (prerequisite)
 
 Scaling only makes sense against how the module's memory relates to Valkey's. Two
@@ -1034,7 +1040,7 @@ buffers, not a reclaimable cache (§11.4).
 ### 8.4 How Expansion Works
 
 Expansion adds one segment incrementally — no full re-registration, no I/O pause on
-existing segments (verified: §8.6 R1/R2).
+existing segments (§8.6 O3 covers the kernel-floor caveat for the sparse-table API).
 
 The first two steps are identical in both modes; registration diverges:
 
@@ -1042,17 +1048,17 @@ The first two steps are identical in both modes; registration diverges:
    `used_memory` via zmalloc (§8.1).
 2. **Register with talc:** `talc.claim(Span::new(base, base + size))` — makes the
    segment's memory available to the shared allocator.
-3. **Register with EFA** (`fi_mr_reg` for this segment only — both modes). Dram mode
+3. **Register with EFA** (`fi_mr_reg` for this segment only — both modes, **if EFA is available**). Dram mode
    uses EFA for direct client RDMA writes (§7.1); Tiered mode uses it for NVMe→client
    reads. Existing MRs and their in-flight operations are untouched (per-MR,
-   incremental — §8.6 R2).
+   incremental). If EFA init failed at startup, this step is skipped.
 4. **Register with io_uring** — **Tiered mode only.** Dram mode has no io_uring
    engine (NVMe I/O is Tiered-only). In Tiered mode: update a single sparse-table
-   slot (`register_buffers_update` — §8.6 R1). Other segments' registrations and
+   slot (`register_buffers_update` — §8.6 O3 covers the kernel-floor caveat). Other segments' registrations and
    their in-flight I/O are undisturbed; no ring-idle stall.
 
 The new segment is immediately usable. The only startup prerequisite (Tiered mode) is
-a sparse buffer table sized to the max segment count (§8.6 O2).
+a sparse buffer table pre-allocated at startup to 1024 slots (see §8.6 O3 for the kernel-floor caveat).
 
 ### 8.5 How Shrinking Works
 
@@ -1067,23 +1073,36 @@ The drain machinery (`Segment.draining`, `refcount`, `talc.truncate`) lives in
 shrink path. The fundamental problem: talc owns *one* heap spanning all claimed
 segments and picks allocations purely from free-list bins. Setting
 `segment.draining = true` does nothing on its own — talc can still hand out a buffer
-from that segment to the next `alloc` call. The drain guard must be structural.
+from that segment to the next `alloc` call, and new GETs can keep acquiring
+`Arc<ObjectContext>` references into it, preventing refcount from draining. The drain
+guard must stop both inflows.
 
-The plan:
+The plan — two concurrent inflows to stop:
 
-1. **Prevent new allocs into the victim.** Under the `SegmentPool` mutex: set
-   `segment.draining = true`. On every subsequent `alloc`, after talc returns a
-   pointer, check whether the owning segment is draining — if so, `talc.free` it
-   back and skip. Since both the draining flag write and the `inc_ref` in `alloc`
-   happen under the same mutex, once `draining` is set, no new `inc_ref` can succeed
-   for that segment. The check is one atomic load under the held lock; no retry loop
-   needed beyond trying the next free block.
+1. **Stop new allocations (promotions).** Under the `SegmentPool` mutex: set
+   `segment.draining = true`. The GET handler checks `segment.draining` *before*
+   initiating a promotion — if the target segment is draining, the promotion is
+   skipped entirely and the GET falls back to serving from NVMe. No alloc is
+   attempted on a draining segment; the guard lives at the caller, not inside
+   `alloc`.
 
-2. **Wait for in-flight readers to finish.** Spin/yield until
-   `segment.refcount.load(Acquire) == 0`. All outstanding `SegmentBuffer`s from this
-   segment have been freed. No live memory references into the victim remain.
+2. **Stop new refcount increments on cached objects.** Any GET that would normally
+   serve from a cached `ObjectContext` whose segment is draining must **not acquire
+   a new Arc reference** to it — doing so would prevent refcount from draining. Instead,
+   the GET handler checks `segment.draining` before cloning the `Arc<ObjectContext>`;
+   if draining, it defers to NVMe directly (re-issues the read from the NVMe segment)
+   rather than using the cached DRAM copy. It does not force-free the `ObjectContext`
+   — the existing `Arc` holders drop naturally as they complete. The effect: no new
+   callers pile onto a draining segment's objects, so the existing refcount drains
+   down to zero as current holders finish.
 
-3. **Release the address range from talc.** Call
+3. **Refcount drains event-driven.** Once steps 1 and 2 are active, no new
+   references enter the segment. Existing Arc holders drop their references as they
+   complete normally. When the last holder drops, the free path checks
+   `is_releasable()` (`draining && refcount == 0`) and triggers step 4. No spin, no
+   poll, no blocking wait.
+
+4. **Release the address range from talc.** Call
    `talc.truncate(old_heap, Span::empty())` — this deregisters the segment's entire
    address range from talc's free-lists. Safe here because `refcount == 0` (truncate
    panics if live allocations remain, but we just confirmed there are none). After
@@ -1124,17 +1143,31 @@ O(1)) before appending. Holes exist only between a scale-in and the next scale-o
 that fills them; steady-state growth is fully dense.
 
 **Unified protocol** (victim at slot `i` in `segments: Vec<Option<Segment>>`):
-1. Under the `SegmentPool` mutex: set `segment.draining = true`. Subsequent `alloc`
-   calls skip this segment (check after talc returns, free back and retry if draining).
-2. Drop the victim's cached objects: `talc.free` each `ObjectContext` buffer.
-   *(Tiered: objects persist on NVMe; a later GET re-reads them.
-   Dram: this path is never reached — §8.3.)*
-3. Wait until `segment.refcount.load(Acquire) == 0` — all in-flight readers done.
-4. `talc.truncate(victim_heap, Span::empty())` — remove the address range from talc.
-5. Under the registry lock: `segments[i] = None`; `fi_close` the victim's EFA MR
-   (both modes); `register_buffers_update(i, null)` for io_uring (**Tiered only** —
-   §8.6 R1). Other MRs and slots untouched.
-6. Dealloc the segment's memory; `used_memory` drops.
+1. Under the `SegmentPool` mutex: set `segment.draining = true`. GET handlers check
+   `segment.draining` before initiating a promotion — if draining, the promotion is
+   skipped and the GET falls back to NVMe. No alloc is attempted on a draining
+   segment.
+2. GET handlers check `segment.draining` before acquiring `Arc<ObjectContext>` on
+   this segment. If draining, they defer to NVMe rather than the cached DRAM copy —
+   no new Arc references are acquired, so no new refcount increments enter the
+   segment.
+3. Existing `Arc<ObjectContext>` holders on the draining segment complete their
+   operations and drop their references naturally — no forced free. Each drop
+   decrements `refcount`.
+4. **No blocking wait.** Steps 1–2 ensure no new refcounts enter. As existing Arc
+   holders complete and drop their references, `refcount` decrements. The **free
+   path** checks `is_releasable()` (`draining && refcount == 0`) on every decrement;
+   when the last holder drops, `is_releasable()` becomes true and the cleanup
+   (steps 5–7) can proceed. No spin, no poll, no blocking wait.
+5. `talc.truncate(victim_heap, Span::empty())` — remove the address range from talc.
+   `victim_heap` is the `Span` returned by `talc.claim` at segment creation and
+   stored in the `Segment` struct (talc word-aligns the span inward, so the stored
+   value may differ from `Span::new(base, base+size)` — must store the exact return
+   value from `claim`).
+6. Under the registry lock: `segments[i] = None`; `fi_close` the victim's EFA MR
+   (**if EFA is available** — both modes); `register_buffers_update(i, null)` for
+   io_uring (**Tiered only** — §8.6 O3 covers the kernel-floor caveat). Other MRs and slots untouched.
+7. Dealloc the segment's memory; `used_memory` drops.
 
 
 ### 8.6 Open Items
@@ -1159,8 +1192,8 @@ the step *after* malloc: mapping the returned pointer back to a segment index.
 Today `SegmentPool::find_segment(addr)` is a **linear scan** over all segments:
 
 ```rust
-for (i, seg) in self.segments.iter().enumerate() {
-    if addr >= seg.base && addr < seg.base + seg.size { return Some((i, addr - base)); }
+for (i, seg) in self.segments.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s))) {
+    if addr >= seg.base && addr < seg.base + seg.size { return Some((i, addr - seg.base)); }
 }
 ```
 
@@ -1266,7 +1299,7 @@ This section describes how shared state is protected, which structures are refco
 | SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
 | ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
 | Open fd | `Arc<OwnedFd>` (inside `FdEntry`) | FdPool map (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops. The strong count *is* the in-flight count — eviction removes an entry only when `strong_count == 1` (no separate refcount field) |
-| Segment | `AtomicU32` refcount + `AtomicBool draining` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: safe to IORING_UNREGISTER + dealloc |
+| Segment | `AtomicU32` refcount + `AtomicBool draining` + stored `Span` from `talc.claim` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: safe to `talc.truncate(claim_span, Span::empty())` + `register_buffers_update(i, null)` (Tiered) + `fi_close` EFA MR (if EFA) + dealloc. The exact `Span` returned by `talc.claim` must be stored — talc word-aligns it inward and `truncate` requires the exact value. |
 
 ### 9.2 Threading Model: Which Thread Does What
 
@@ -1341,19 +1374,32 @@ lo_free(LoValue):
 
 ### 9.5 Segment Draining Lifecycle
 
-When shrinking DRAMPool under memory pressure (§8.5):
+When shrinking DRAMPool under memory pressure (§8.5, Tiered mode only):
 
 ```
-1. segment.draining.store(true) — no new allocs from this segment
-2. Batch-evict ObjectContexts whose buffers are in this segment:
-   - Remove Arc from HashMap (1000 per command invocation)
-   - Each removal may or may not trigger Drop (depends on in-flight readers)
-3. Monitor segment.refcount — when it hits 0, all buffers have been freed
-4. IORING_UNREGISTER → remove from iovec array → IORING_REGISTER
-5. dealloc(segment) — returns memory to Valkey (used_memory decreases)
+1. segment.draining.store(true, SeqCst)
+   — GET handlers check draining before initiating a promotion:
+     if draining → skip promotion, serve GET directly from NVMe (no alloc attempted)
+   — GET handlers check draining before cloning Arc<ObjectContext>:
+     if draining → defer to NVMe, do not acquire a new Arc reference
+
+2. Existing Arc<ObjectContext> holders on the segment complete their operations
+   and drop their references naturally. No forced eviction from the HashMap.
+   Each drop decrements the segment refcount.
+
+3. The free path checks is_releasable() (draining && refcount == 0) on every
+   decrement. When the last holder drops, is_releasable() becomes true and
+   cleanup proceeds:
+     → talc.truncate(segment.claim_span, Span::empty())  — remove from talc free-lists
+     → register_buffers_update(i, null)                   — clear sparse table slot (Tiered)
+     → fi_close(segment.efa_mr)                           — if EFA available
+     → segments[i] = None                                 — null the registry slot
+     → dealloc(segment)                                   — used_memory decreases
 ```
 
-Between steps 2 and 3: in-flight readers may still be serving from buffers in the draining segment. This is safe — the buffers are valid until freed. The segment is not released until refcount == 0.
+No spin, no poll, no blocking wait. Steps 1 and 2 guarantee no new refcounts enter
+the segment; the existing holders drain naturally and cleanup is event-driven on the
+last drop.
 
 ---
 
