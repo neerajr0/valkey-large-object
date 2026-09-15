@@ -959,11 +959,10 @@ mode** — dropping a copy is safe only when a copy exists. In Dram mode the DRA
 Neither eviction is disabled by `dram-maxmemory=0`; that value only sets the trigger
 threshold to the shared server ceiling instead of a module-local cap.
 
-> **Open (pressure signal):** whether the module can *proactively* observe
-> "approaching `maxmemory`" to reclaim ahead of time, or only learns *reactively*
-> when a zmalloc-backed segment alloc fails, is unverified. It determines whether
-> eviction/scale-in is threshold-driven or alloc-failure-driven. To confirm against
-> core.
+**Detection (how the module learns it must act) differs by scenario:**
+expand is reactive-primary (grow when an alloc needs space); shrink is
+proactive-only (a cron job observes memory pressure, since nothing "fails" to prompt a
+shrink). The per-scenario reasoning is in §8.2 (expand) and §8.3 (shrink).
 
 ### 8.2 When to Expand
 
@@ -977,10 +976,24 @@ that budget.
 | Segment utilization > 80% sustained | Add a segment proactively |
 
 Bounds by mode (config meaning in §11.3):
-- **`dram-maxmemory=0`:** start with 1 segment, grow one at a time up to the server
-  ceiling (§11.2). In Dram mode, exhausting the ceiling rejects `LO.SET` (OOM); in
-  Tiered mode the cache simply stops growing (data is on NVMe).
+- **`dram-maxmemory=0`:** start with 1 segment, grow one at a time as demand arrives,
+  up to the server ceiling (§11.2).
+  - **Tiered mode:** when the current DRAMPool is full, a new segment is added and
+    promotions continue onto it — the cache grows elastically, segment by segment,
+    for as long as server memory allows. When the server ceiling is reached, the
+    shrink timer reclaims segments to stay under pressure; GETs that miss DRAM serve
+    directly from NVMe (no data loss — NVMe is always the source of truth).
+  - **Dram mode:** same demand-driven growth, but hitting the server ceiling is fatal
+    to new writes — `LO.SET` is rejected (OOM) since there is no NVMe fallback.
 - **`dram-maxmemory>0`:** grow up to `dram-maxmemory / dram-segment-size` segments.
+
+**Detection — reactive-primary.** Expand is naturally reactive: the alloc-fail row
+grows *because* a request just needed space and didn't have it. That is acceptable
+here because growth is cheap and safe (add a segment, retry, continue) — reacting
+costs only the one stalled alloc, nothing is lost. The utilization-watermark row is
+the *proactive* complement: grow ahead of need to remove even that one stall. So
+expand = reactive on alloc-miss, with an optional proactive watermark as a
+smoothing optimization.
 
 ### 8.3 When to Shrink
 
@@ -1000,6 +1013,21 @@ used — the eviction-policy input). The reclaimed unit is a **whole segment**: 
 still-live cached objects are dropped (ObjectContexts freed; the objects remain on
 NVMe), then the segment is released.
 
+**Detection — proactive only (Tiered mode only).** There is no module shrink in Dram
+mode — the DRAMPool is the data, so the module never reclaims it; core's
+`maxmemory-policy` handles pressure instead (see table above). In Tiered mode,
+shrink cannot be reactive: nothing "fails" to prompt a shrink (the trigger is
+*external* — the server approaching `maxmemory` — which the module only sees by
+looking). So the module must **proactively** observe pressure via an in-module timer
+that polls `used_memory` against the ceiling and reclaims at a watermark, ahead of
+the wall. If a spike outruns the timer and an alloc fails between ticks, that just
+takes the normal OOM path (§8.2 / core `maxmemory-policy`) — there is no separate
+reactive-shrink path, because reacting to a failure is already too late to reclaim
+gracefully. Open (tuning/verification, not design): the cheapest module API to read
+`used_memory`/`maxmemory` on the timer, and the watermark + polling cadence — to be
+settled with benchmarks so the timer keeps ahead of spikes without thrashing
+grow/shrink.
+
 **NVMe staging is never shrunk** — it is fixed-at-startup concurrency-sized I/O
 buffers, not a reclaimable cache (§11.4).
 
@@ -1008,119 +1036,118 @@ buffers, not a reclaimable cache (§11.4).
 Expansion adds one segment incrementally — no full re-registration, no I/O pause on
 existing segments (verified: §8.6 R1/R2).
 
-1. Allocate a new segment (contiguous region, ≤1GiB per the §2 cap).
-2. Register with io_uring via a single sparse-table slot update
-   (`register_buffers_update` into a slot of the startup-allocated sparse table —
-   §8.6 R1). Other segments' registrations and their in-flight I/O are undisturbed;
-   no ring-idle stall.
-3. Register with EFA: a new `fi_mr_reg` for this segment only. Existing MRs and their
-   in-flight `fi_write`/`fi_read` are untouched (per-MR, incremental — §8.6 R2).
-4. Add the span to the allocator: `talc.claim(Span::new(base, base + size))`.
+The first two steps are identical in both modes; registration diverges:
 
-The new segment is immediately usable. The only startup prerequisite is a sparse
-buffer table sized to the max segment count (§8.6 O2).
+1. **Allocate** a new segment (`alloc_zeroed`, ≤1GiB per the §2 cap). Counted in
+   `used_memory` via zmalloc (§8.1).
+2. **Register with talc:** `talc.claim(Span::new(base, base + size))` — makes the
+   segment's memory available to the shared allocator.
+3. **Register with EFA** (`fi_mr_reg` for this segment only — both modes). Dram mode
+   uses EFA for direct client RDMA writes (§7.1); Tiered mode uses it for NVMe→client
+   reads. Existing MRs and their in-flight operations are untouched (per-MR,
+   incremental — §8.6 R2).
+4. **Register with io_uring** — **Tiered mode only.** Dram mode has no io_uring
+   engine (NVMe I/O is Tiered-only). In Tiered mode: update a single sparse-table
+   slot (`register_buffers_update` — §8.6 R1). Other segments' registrations and
+   their in-flight I/O are undisturbed; no ring-idle stall.
 
-### 8.5 How Shrinking Works (Evict + Swap-Remove)
+The new segment is immediately usable. The only startup prerequisite (Tiered mode) is
+a sparse buffer table sized to the max segment count (§8.6 O2).
 
-Shrink evicts the chosen victim segment and removes it from the registry with a
-**swap-remove**, so the registered array stays dense and exactly one other segment's
-index changes. (Tiered-mode only — §8.3.)
+### 8.5 How Shrinking Works
 
-> **[PENDING — race guard + registration migration; see §8.6 O1/O3/O4.]** Requires
-> `Segment.iovec_index` to become mutable (today it is write-once) and the io_uring
-> registration to move to the sparse-table update API.
+Shrink evicts the chosen victim segment and removes it from the registry.
+**Tiered-mode only** — in Dram mode the DRAMPool is the data, so there is no module
+reclaim path; core's `maxmemory-policy` handles pressure instead (§8.3).
 
-Protocol (victim at index `i`, current tail at index `n-1`):
-1. Mark the victim `draining` so no new allocation lands in it — **O1:** the
-   allocator must honor this (preferred: retract the victim's span from talc so
-   `malloc` cannot return into it).
-2. Evict the victim's cached objects: drop their ObjectContexts (`talc.free` each
-   buffer). The objects persist on NVMe; a later GET re-reads them. Wait for any
-   in-flight reader on the victim to finish (`refcount == 0`, Release/Acquire —
-   §8.6 R3).
-3. **Swap-remove in the registry**, under the IOVECS lock: move the tail segment
-   (`n-1`) into slot `i`, pop the tail. Only the moved segment's index changes —
-   set its `iovec_index = i`. No other segment is disturbed (contrast `Vec::remove`,
-   which would shift and invalidate every index after `i`).
-4. Re-register the reused slot: `register_buffers_update(i, moved_segment.iovec())`
-   (io_uring, single-slot — §8.6 R1). `fi_close` the victim's EFA MR; other MRs are
-   untouched (§8.6 R2).
-5. Release the victim's memory to the OS; `used_memory` drops.
+**Part 1 — Draining the victim (the hard part)**
 
-Steps 3–4 happen atomically under the registry lock, so no allocation can hand out a
-buffer referencing the stale index mid-swap.
+The drain machinery (`Segment.draining`, `refcount`, `talc.truncate`) lives in
+`SegmentPool` and is mode-agnostic code, but it is only invoked from the Tiered
+shrink path. The fundamental problem: talc owns *one* heap spanning all claimed
+segments and picks allocations purely from free-list bins. Setting
+`segment.draining = true` does nothing on its own — talc can still hand out a buffer
+from that segment to the next `alloc` call. The drain guard must be structural.
 
-Why swap-remove over the alternatives: `Vec::remove` shifts every later element
-(O(n) index churn, re-register every shifted slot); a `Vec<Option<_>>` hole leaves a
-sparse array to scan. Swap-remove is O(1), keeps the array dense, and touches exactly
-one index.
+The plan:
 
-### 8.6 Research Findings & Open Items
+1. **Prevent new allocs into the victim.** Under the `SegmentPool` mutex: set
+   `segment.draining = true`. On every subsequent `alloc`, after talc returns a
+   pointer, check whether the owning segment is draining — if so, `talc.free` it
+   back and skip. Since both the draining flag write and the `inc_ref` in `alloc`
+   happen under the same mutex, once `draining` is set, no new `inc_ref` can succeed
+   for that segment. The check is one atomic load under the held lock; no retry loop
+   needed beyond trying the next free block.
 
-**R1 — io_uring re-registration on scale: RESOLVED.** Scaling does **not** require
-unregister-all + full re-register. On kernel ≥5.13, pre-register a *sparse* buffer
-table once at startup (sized to max segments; sparse slots are cheap, only real
-buffers pin pages), then add/remove a segment via `register_buffers_update` on a
-single slot — other slots stay valid, no ring-idle stall, and a removed slot's
-buffer is held alive by the kernel until its in-flight I/O completes (optional tag
-CQE signals safe-to-unmap). The tokio-rs `io-uring` crate exposes
-`register_buffers_sparse` + `register_buffers_update`. So there is **no "brief I/O
-pause on all segments" during resize** — that earlier claim was based on the classic
-all-or-nothing API and is superseded.
-> Kernel-floor caveat: `register_buffers_sparse` is annotated 5.13 in the crate but
-> 5.19 in the man page; `register_buffers_update` is 5.13. If the target kernel is
-> 5.13–5.19, register a full real table via `register_buffers2` and still update
-> per-slot. **To-do: smoke-test the i8ge kernel.**
+2. **Wait for in-flight readers to finish.** Spin/yield until
+   `segment.refcount.load(Acquire) == 0`. All outstanding `SegmentBuffer`s from this
+   segment have been freed. No live memory references into the victim remain.
 
-**R2 — EFA MR incrementality: RESOLVED.** MRs are fully independent. A new segment is
-a standalone `fi_mr_reg` (new key); existing MRs and their in-flight `fi_write`/
-`fi_read` are untouched. `fi_close` scopes to one MR. So EFA is naturally incremental
-— combined with R1, **both registration layers are per-segment on scale.**
+3. **Release the address range from talc.** Call
+   `talc.truncate(old_heap, Span::empty())` — this deregisters the segment's entire
+   address range from talc's free-lists. Safe here because `refcount == 0` (truncate
+   panics if live allocations remain, but we just confirmed there are none). After
+   this, talc structurally cannot hand out addresses from this segment.
 
-**R3 — draining quiescence in current code: PARTIALLY BUILT.** `Segment.refcount`
-(AtomicU32) is real and correctly wired (inc on alloc, dec on free, Release/Acquire
-ordering); `is_releasable()` = `draining && refcount==0` is correct. BUT
-`draining`/`is_releasable` are **zero-caller scaffolding** today, and the load-bearing
-gap is that **`SegmentPool::alloc` never checks `draining`** — talc owns one heap
-across all segments and picks the address itself, so a draining segment can still
-receive a fresh allocation mid-drain. The draining protocol must add a structural
-guard.
+**Part 2 — Removing the slot from the registry (Tiered mode; simpler)**
 
-**Open items:**
-- **O1 (blocks §8.5 draining) — race guard.** Prevent talc from allocating into a
-  draining segment. Preferred: **retract the segment's span from talc** so `malloc`
-  structurally cannot return into it (needs confirmation that talc supports clean
-  span retraction — `claim` exists; retract is unverified). Fallback: check
-  `draining` on the alloc path under the same lock as `inc_ref`.
-- **O2 — sparse-table sizing.** Size the startup sparse table to max segments =
-  `(dram budget + nvme budget) / min-segment-size`, capped at `UIO_MAXIOV` = 1024.
-- **O3 — i8ge kernel smoke test** for `register_buffers_sparse` (R1 caveat).
-- **O4 — registry migration (blocks §8.4/§8.5).** Current code is entirely on the
-  *classic* path: `append_iovec` (`storage/mod.rs`) is an append-only
-  `Mutex<Vec<(usize,usize)>>` that assigns `iovec_index = vec.len()` and never
-  removes, and `Segment.iovec_index` is write-once at creation; registration uses the
-  classic all-or-nothing `register_buffers`. Scaling requires: (a) move registration
-  to the sparse-table + `register_buffers_update` API (R1); (b) make
-  `Segment.iovec_index` mutable so swap-remove can rewrite the one moved segment's
-  index (§8.5); (c) perform the swap + index-write + slot re-register atomically
-  under the registry lock. Swap-remove keeps the array **dense**, so grow still
-  appends at the tail and no free-list / `Option`-hole scan is needed.
-- **O5 — OPEN SUB-DECISION: holes vs swap-remove for segment removal.** Two ways to
-  remove a segment from the registry, not yet chosen (§8.5 currently describes
-  swap-remove):
-  - **Swap-remove (dense):** move the tail segment into the victim's slot, pop the
-    tail. Array stays dense (grow just appends); exactly **one** surviving segment's
-    `iovec_index` changes, so that field must be **mutable** and updated atomically
-    under lock. Cost: a live index rewrite (correctness hazard if a stale index
-    escapes).
-  - **Hole (`Vec<Option<_>>`):** set the victim's slot to `None`; **no** surviving
-    segment's index ever changes (`iovec_index` stays **immutable for a segment's
-    life** — a stronger invariant). Grow scans for a `None` slot (≤1024, rare — cheap)
-    or appends. Empty sparse slots are free (only real buffers pin pages — §8.6 R1),
-    so holes cost nothing but a looser array. Native to the sparse-table API.
-  - Tradeoff: swap = dense array, one mutable index; holes = immutable index, a
-    scan-on-grow. Immutability is the safer invariant; density is a marginal win
-    since grow is rare. **To pick.**
+There are two parallel data structures that must stay in sync, both indexed by the
+same slot number `i`:
+
+- **Module side:** `segments: Vec<Option<Segment>>` — a fixed-capacity vector where
+  each slot is either `Some(segment)` (live) or `None` (empty/removed).
+- **io_uring side:** the sparse buffer table pre-registered at startup — a fixed array
+  of slots in the kernel, each either pointing to a real buffer (pages pinned) or null
+  (empty, costs nothing — no page pinning for null slots).
+
+Slot `i` in `segments` corresponds to slot `i` in the io_uring table. Adding a
+segment: find a `None` slot at index `i`, place the segment there, call
+`register_buffers_update(i, buffer)`. Removing: set `segments[i] = None`, call
+`register_buffers_update(i, null)`. `iovec_index` on every segment is just this index
+`i`, set write-once at birth.
+
+Each segment has an `iovec_index` — its slot index — stored write-once at birth in
+every `SegmentBuffer` handed out. The question is what happens to other segments'
+indices when this one is removed.
+
+**Swap-remove** would move the tail segment into the victim's slot, keeping the array
+dense, but requires `iovec_index` to become mutable — a stale-index race if any
+`SegmentBuffer` in flight holds the old value.
+
+**Holes (`Vec<Option<Segment>>`) [chosen]**: set the victim's slot to `None` in the
+module vector; call `register_buffers_update(i, null)` for the corresponding io_uring
+slot. No surviving segment's `iovec_index` ever changes — immutable for its entire
+lifetime, no race possible. This is why holes are natural here: the io_uring sparse
+table already works this way (null slots are free), so the module vector simply
+mirrors it. On the next expand, the grow path scans for a `None` slot first (≤1024,
+O(1)) before appending. Holes exist only between a scale-in and the next scale-out
+that fills them; steady-state growth is fully dense.
+
+**Unified protocol** (victim at slot `i` in `segments: Vec<Option<Segment>>`):
+1. Under the `SegmentPool` mutex: set `segment.draining = true`. Subsequent `alloc`
+   calls skip this segment (check after talc returns, free back and retry if draining).
+2. Drop the victim's cached objects: `talc.free` each `ObjectContext` buffer.
+   *(Tiered: objects persist on NVMe; a later GET re-reads them.
+   Dram: this path is never reached — §8.3.)*
+3. Wait until `segment.refcount.load(Acquire) == 0` — all in-flight readers done.
+4. `talc.truncate(victim_heap, Span::empty())` — remove the address range from talc.
+5. Under the registry lock: `segments[i] = None`; `fi_close` the victim's EFA MR
+   (both modes); `register_buffers_update(i, null)` for io_uring (**Tiered only** —
+   §8.6 R1). Other MRs and slots untouched.
+6. Dealloc the segment's memory; `used_memory` drops.
+
+
+### 8.6 Open Items
+
+- **O3 — i8ge kernel smoke test.** The io_uring sparse-table approach (used in
+  §8.4/§8.5) requires `register_buffers_sparse` + `register_buffers_update`.
+  `register_buffers_update` is confirmed kernel 5.13. `register_buffers_sparse` is
+  annotated 5.13 in the tokio-rs io-uring crate but 5.19 in the man page. If i8ge
+  runs 5.13–5.18, the startup path must use `register_buffers2` (full real table)
+  instead of `register_buffers_sparse`, then still use `register_buffers_update` for
+  per-slot updates — `register_buffers_update` works either way. Smoke-test on i8ge
+  to confirm which path applies.
+
 
 ### 8.7 Fast Segment Lookup on Alloc
 
