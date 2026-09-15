@@ -274,24 +274,19 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit // 2))
         assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
 
-    def test_max_object_size_tiered_warning(self):
-        """CONFIG SET lo-max-object-size > nvme-maxmemory logs a warning but succeeds."""
+    def test_max_object_size_tiered_rejection(self):
+        """CONFIG SET lo-max-object-size > nvme-maxmemory is rejected."""
         client = self.server.get_new_client()
         # Set nvme-maxmemory to a small value so we can exceed it.
         nvme_limit = 1048576  # 1 MiB
         client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', str(nvme_limit))
         obj_limit = 2 * 1048576  # 2 MiB
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(obj_limit))
-        # CONFIG SET succeeded (not rejected).
-        cfg = client.execute_command('CONFIG', 'GET', 'largeobj.lo-max-object-size')
-        assert int(cfg[1]) == obj_limit
-        # Warning appears in the server log.
-        assert self.server.verify_string_in_logfile(
-            "lo-max-object-size"
-        ), "Expected warning about lo-max-object-size exceeding nvme-maxmemory in server log"
-        assert self.server.verify_string_in_logfile(
-            "exceeds nvme-maxmemory"
-        ), "Expected warning about exceeding nvme-maxmemory in server log"
+        try:
+            client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(obj_limit))
+            assert False, "Expected CONFIG SET to be rejected"
+        except ResponseError as e:
+            assert 'lo-max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'nvme-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):

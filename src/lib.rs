@@ -223,8 +223,7 @@ pub fn max_object_size() -> u64 {
 // ─── Config Validation Callbacks ─────────────────────────────────────────────
 
 /// Cross-config validation for lo-max-object-size.
-/// Rejects on correctness violations (chunk count overflow), warns on unreachable
-/// configurations (max object exceeds storage budget).
+/// Rejects if the value would cause chunk count overflow or exceed the storage budget.
 fn validate_max_object_size(
     _ctx: &valkey_module::configuration::ConfigurationContext,
     _name: &str,
@@ -241,20 +240,16 @@ fn validate_max_object_size(
         OperatingMode::Dram => {
             let dram_max = dram_maxmemory();
             if dram_max > 0 && max_obj > dram_max {
-                valkey_module::logging::log_warning(format!(
-                    "lo-max-object-size ({}) exceeds dram-maxmemory ({}); \
-                     the largest allowed object cannot be stored",
-                    max_obj, dram_max,
+                return Err(valkey_module::ValkeyError::Str(
+                    "ERR lo-max-object-size exceeds dram-maxmemory",
                 ));
             }
         }
         OperatingMode::Tiered => {
             let nvme_max = nvme_maxmemory();
             if nvme_max > 0 && max_obj > nvme_max {
-                valkey_module::logging::log_warning(format!(
-                    "lo-max-object-size ({}) exceeds nvme-maxmemory ({}); \
-                     the largest allowed object cannot be stored",
-                    max_obj, nvme_max,
+                return Err(valkey_module::ValkeyError::Str(
+                    "ERR lo-max-object-size exceeds nvme-maxmemory",
                 ));
             }
         }
