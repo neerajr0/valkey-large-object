@@ -23,7 +23,7 @@ pub fn scaling_cron(ctx: &Context) {
     let pool = get_dram_pool();
 
     // 1. Complete draining of any segments whose refcount hit 0.
-    pool.complete_drained_segments();
+    pool.release_drained_segments();
 
     // 2. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
@@ -55,12 +55,20 @@ pub fn scaling_cron(ctx: &Context) {
     };
 
     let ratio = used as f64 / ceiling as f64;
-    if ratio > shrink_watermark && pool.try_shrink() {
-        ctx.log_notice(&format!(
-            "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",
-            ratio * 100.0,
-            shrink_watermark * 100.0
-        ));
+    if ratio > shrink_watermark {
+        // Skip shrink if a segment is already draining — its memory hasn't
+        // been freed yet. Draining completes asynchronously as Arc holders
+        // drop; firing another shrink now would drain a second segment before
+        // the first is even released. Check on the next tick after
+        // release_drained_segments() has had a chance to finish it.
+        let (_, draining, _) = pool.segment_counts();
+        if draining == 0 && pool.try_shrink() {
+            ctx.log_notice(&format!(
+                "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",
+                ratio * 100.0,
+                shrink_watermark * 100.0
+            ));
+        }
     }
 
     rearm_scaling_cron(ctx, poll_ms);

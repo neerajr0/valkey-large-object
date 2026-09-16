@@ -90,12 +90,6 @@ pub struct SegmentPool {
     allocator: Mutex<Talc<ErrOnOom>>,
     /// Size of each segment (uniform within a pool).
     pub segment_size: usize,
-    /// Pool-level allocated bytes. Used for utilization ratio (expand decisions).
-    /// Relaxed ordering is intentional: this counter drives a 5-second watermark
-    /// check, not a correctness invariant. A one-tick stale read is harmless —
-    /// the cron re-evaluates on the next tick. No dependent data is synchronized
-    /// through this atomic, so Acquire/Release would cost a fence with no benefit.
-    pub allocated_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl SegmentPool {
@@ -139,67 +133,27 @@ impl SegmentPool {
             }),
             allocator: Mutex::new(talc),
             segment_size,
-            allocated_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate a buffer. Returns None if pool is exhausted or the selected
-    /// segment is draining (caller should fall back to NVMe).
-    ///
-    /// Size is rounded up to IO_ALIGN (4 KiB) for O_DIRECT / io_uring.
+    /// Allocate a single buffer. Delegates to `alloc_n(size, 1, 1)`.
+    /// Returns None if pool is exhausted or the selected segment is draining.
     pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        let layout = Layout::from_size_align(super::align_up(size), super::IO_ALIGN).ok()?;
-        let ptr = unsafe {
-            self.allocator
-                .lock()
-                .expect("allocator lock unavailable")
-                .malloc(layout)
-        }
-        .ok()?;
-        let addr = ptr.as_ptr() as usize;
-
-        let (seg_idx, offset, is_draining) = {
-            let st = self.state.lock().expect("state lock unavailable");
-            let (seg_idx, offset) = st
-                .find_segment(addr)
-                .expect("talc returned ptr outside segments");
-            let seg = st.slots[seg_idx].as_ref().unwrap();
-            let draining = seg.draining.load(std::sync::atomic::Ordering::Acquire);
-            if !draining {
-                seg.inc_ref();
-                seg.allocated_bytes
-                    .fetch_add(super::align_up(size), std::sync::atomic::Ordering::Relaxed);
-            }
-            (seg_idx, offset, draining)
-        };
-
-        if is_draining {
-            // Segment is being evicted — free the allocation and tell caller to fall back.
-            let layout_free =
-                Layout::from_size_align(super::align_up(size), super::IO_ALIGN).expect("layout");
-            unsafe {
-                self.allocator
-                    .lock()
-                    .expect("allocator lock unavailable")
-                    .free(ptr, layout_free);
-            }
-            return None;
-        }
-
-        self.allocated_bytes
-            .fetch_add(super::align_up(size), std::sync::atomic::Ordering::Relaxed);
-        Some(SegmentBuffer {
-            segment_idx: seg_idx as u16,
-            offset: offset as u64,
-            len: size as u32,
-        })
+        self.alloc_n(size, 1, 1).map(|mut v| v.remove(0))
     }
 
-    /// Allocate `count` buffers of `chunk_size`, requiring at least `min_required`.
-    /// All-or-nothing: if fewer than `min_required` fit, all allocations are rolled back.
-    /// Adapted from main's alloc_n to use SegmentState binary-search lookup.
+    /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
+    /// `min_required`. Holds the allocator lock for the entire batch so that
+    /// partial rollback is atomic against concurrent allocations.
+    ///
+    /// Returns `None` if fewer than `min_required` could be allocated (partial
+    /// allocation freed internally). Callers never need cleanup logic.
+    ///
+    /// Draining check: if malloc returns a pointer in a draining segment, that
+    /// buffer is freed back and the loop breaks (treated as pool exhausted for
+    /// this allocation).
     pub fn alloc_n(
         &self,
         chunk_size: usize,
@@ -210,17 +164,29 @@ impl SegmentPool {
             .expect("alloc_n: invalid chunk_size layout");
         let mut talc = self.allocator.lock().expect("allocator lock unavailable");
         let mut buffers = Vec::with_capacity(count);
-        for _ in 0..count {
+        'outer: for _ in 0..count {
             let ptr = match unsafe { talc.malloc(layout) } {
                 Ok(p) => p,
                 Err(_) => break,
             };
             let addr = ptr.as_ptr() as usize;
+            // Binary-search lookup under state lock — O(log N), cache-hot.
             let st = self.state.lock().expect("state lock unavailable");
             let (seg_idx, offset) = st
                 .find_segment(addr)
                 .expect("talc returned ptr outside segments");
-            st.slots[seg_idx].as_ref().unwrap().inc_ref();
+            let seg = st.slots[seg_idx].as_ref().unwrap();
+            if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
+                // Segment is being evicted — free this allocation and stop.
+                drop(st);
+                unsafe { talc.free(ptr, layout) };
+                break 'outer;
+            }
+            seg.inc_ref();
+            seg.allocated_bytes.fetch_add(
+                super::align_up(chunk_size),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             drop(st);
             buffers.push(SegmentBuffer {
                 segment_idx: seg_idx as u16,
@@ -229,6 +195,7 @@ impl SegmentPool {
             });
         }
         if buffers.len() < min_required {
+            // Still under the same allocator lock — rollback is atomic.
             for buf in &buffers {
                 self.free_with_lock(&mut talc, buf, layout);
             }
@@ -238,26 +205,31 @@ impl SegmentPool {
     }
 
     /// Free a single buffer under an already-held allocator lock (used by alloc_n rollback).
+    /// Lock order: allocator lock is held by caller. We acquire state lock briefly
+    /// to dec_ref — this is safe because alloc_n also acquires state inside allocator.
     fn free_with_lock(
         &self,
         talc: &mut talc::Talc<talc::ErrOnOom>,
         buf: &SegmentBuffer,
         layout: Layout,
     ) {
-        let st = self.state.lock().expect("state lock unavailable");
-        let seg = st.slots[buf.segment_idx as usize]
-            .as_ref()
-            .expect("segment slot empty for live buffer — invariant broken");
-        let ptr = unsafe { seg.base.add(buf.offset as usize) };
-        drop(st);
+        // Get the base pointer and dec_ref under state lock.
+        let ptr = {
+            let st = self.state.lock().expect("state lock unavailable");
+            let seg = st.slots[buf.segment_idx as usize]
+                .as_ref()
+                .expect("segment slot empty for live buffer — invariant broken");
+            let ptr = unsafe { seg.base.add(buf.offset as usize) };
+            seg.dec_ref();
+            seg.allocated_bytes.fetch_sub(
+                super::align_up(buf.len as usize),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            ptr
+        };
         unsafe {
             talc.free(std::ptr::NonNull::new_unchecked(ptr), layout);
         }
-        let st = self.state.lock().expect("state lock unavailable");
-        st.slots[buf.segment_idx as usize]
-            .as_ref()
-            .expect("segment slot empty for live buffer — invariant broken")
-            .dec_ref();
     }
 
     /// Free a buffer back to the pool.
@@ -303,9 +275,6 @@ impl SegmentPool {
             seg.allocated_bytes
                 .fetch_sub(aligned_size, std::sync::atomic::Ordering::Relaxed);
         }
-
-        self.allocated_bytes
-            .fetch_sub(aligned_size, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
@@ -351,16 +320,13 @@ impl SegmentPool {
         Some(idx)
     }
 
-    /// Select the least-loaded non-draining segment as a drain victim and mark
-    /// it draining — all in one lock acquisition.
-    ///
-    /// Returns `(victim_slot_idx, allocated_bytes_on_victim)`, or `None` if no
-    /// live segments exist. The caller checks `allocated_bytes` to decide whether
-    /// eviction is safe (Dram mode: must be 0; Tiered mode: always safe).
-    pub fn select_and_drain_victim(&self) -> Option<(usize, usize)> {
-        let st = self.state.lock().expect("state lock unavailable");
-        let (victim_idx, victim_bytes) = st
-            .slots
+    /// Select the least-loaded non-draining segment as a shrink candidate.
+    /// Returns `(slot_idx, allocated_bytes)` without marking the segment draining.
+    /// The caller decides whether to proceed (based on mode / bytes) and calls
+    /// `mark_segment_draining` only if it will commit to the drain.
+    pub fn find_shrink_victim(&self) -> Option<(usize, usize)> {
+        let segs = self.state.lock().expect("state lock unavailable");
+        segs.slots
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
@@ -376,15 +342,7 @@ impl SegmentPool {
                     }
                 })
             })
-            .min_by_key(|&(_, bytes)| bytes)?;
-
-        st.slots[victim_idx]
-            .as_ref()
-            .unwrap()
-            .draining
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        Some((victim_idx, victim_bytes))
+            .min_by_key(|&(_, bytes)| bytes)
     }
 
     /// Returns the slot index of the live non-draining segment with the fewest
@@ -439,15 +397,6 @@ impl SegmentPool {
         }
     }
 
-    /// Clear the draining flag on a segment (used when shrink is aborted).
-    pub fn unmark_draining(&self, seg_idx: usize) {
-        let st = self.state.lock().expect("state lock unavailable");
-        if let Some(Some(seg)) = st.slots.get(seg_idx) {
-            seg.draining
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-    }
-
     /// Scan all segments and release any that are draining with refcount == 0.
     /// Called from the scaling cron on the main thread each tick.
     pub fn release_all_releasable(&self) {
@@ -468,7 +417,7 @@ impl SegmentPool {
     /// null the sparse slot, and dealloc its memory.
     ///
     /// Only called when `is_releasable()` is true (draining == true && refcount == 0).
-    /// Safe because refcount == 0 guarantees no live allocations remain in this segment.
+    /// Safe because refcount == 0 guarantees no live application allocations remain.
     fn release_drained(&self, seg_idx: usize) {
         let seg = {
             let mut st = self.state.lock().expect("state lock unavailable");
@@ -481,10 +430,15 @@ impl SegmentPool {
         };
 
         unsafe {
-            self.allocator
-                .lock()
-                .expect("allocator lock unavailable")
-                .truncate(seg.claim_span, Span::empty());
+            let mut talc = self.allocator.lock().expect("allocator lock unavailable");
+            // talc requires new_heap to contain all allocated memory (including its own
+            // bookkeeping bytes). Use get_allocated_span to find the minimal valid range.
+            // For a fully empty segment this is the talc metadata at the base.
+            // For a segment where all app allocs are freed, this is also the metadata.
+            // Truncating to the allocated span disables future allocations from this
+            // segment without panicking.
+            let allocated = talc.get_allocated_span(seg.claim_span);
+            talc.truncate(seg.claim_span, allocated);
         }
 
         super::clear_iovec(seg.iovec_index);
@@ -520,23 +474,20 @@ impl SegmentPool {
     /// One lock acquisition — live count and allocated bytes read together.
     pub fn utilization_ratio(&self) -> f64 {
         let st = self.state.lock().expect("state lock unavailable");
-        let live = st
-            .slots
-            .iter()
-            .filter(|s| {
-                s.as_ref()
-                    .map(|seg| !seg.draining.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(false)
-            })
-            .count();
-        drop(st);
+        let mut live = 0usize;
+        let mut allocated = 0usize;
+        for seg in st.slots.iter().flatten() {
+            if !seg.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                live += 1;
+                allocated += seg
+                    .allocated_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if live == 0 {
             return 0.0;
         }
         let capacity = live * self.segment_size;
-        let allocated = self
-            .allocated_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
         (allocated as f64) / (capacity as f64)
     }
 

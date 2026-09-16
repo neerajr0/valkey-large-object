@@ -17,27 +17,30 @@ from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
-class TestDramExpand(ValkeyLargeObjTestCaseBase):
-    """Dram mode: DRAMPool grows reactively when a segment fills.
+class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
+    """Dram mode: DRAMPool grows reactively when a segment fills (SET path).
 
-    Also covers data integrity under memory pressure — same server config.
+    scaling-poll-ms is set very high (60s) so the scaling cron cannot fire
+    during the test. Any expand observed must be from the reactive SET path.
     """
 
     def get_module_args(self, data_dir, direct_io):
         # segment-size=1MB, dram-maxmemory=0 → starts with 1 segment, grows on demand.
-        # scaling-poll-ms=1000 for the pressure test; harmless for expand tests.
+        # scaling-poll-ms=60000 → cron fires at most once per minute, won't interfere.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" dram-maxmemory 0"
-            f" scaling-poll-ms 1000"
+            f" scaling-poll-ms 60000"
             f" bench-mode no"
             f" direct-io no"
         )
 
     def test_expand_on_segment_full(self):
-        """Setting an object that fills the first segment triggers reactive expand.
-        Verified via scaling_expand_total in INFO largeobj.
+        """SET that fills a segment triggers reactive expand in serve_set_dram_tcp.
+
+        With the cron disabled (60s poll), the only source of expand is the
+        reactive path in the SET handler. Verified via scaling_expand_total.
         """
         client = self.server.get_new_client()
         obj_size = 900 * 1024
@@ -53,10 +56,10 @@ class TestDramExpand(ValkeyLargeObjTestCaseBase):
 
         after = info_largeobj(client)
         assert after.get('largeobj_scaling_expand_total', 0) > expand_before, \
-            "Expected scaling_expand_total to increase after filling a segment"
+            "Expected scaling_expand_total to increase — cron is disabled so this must be reactive"
 
     def test_expand_data_integrity(self):
-        """Data written before and after an expand is returned correctly."""
+        """Data written before and after a reactive expand is returned correctly."""
         client = self.server.get_new_client()
         obj_size = 800 * 1024
         keys_payloads = [(f'key_{i}', bytes([i % 256]) * obj_size) for i in range(4)]
@@ -100,6 +103,60 @@ class TestDramExpand(ValkeyLargeObjTestCaseBase):
             if client.execute_command('EXISTS', key) == 1:
                 got = client.execute_command('LO.GET', key)
                 assert got == payload, f"{key} data corrupted under pressure"
+
+
+
+class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
+    """Dram mode: DRAMPool grows proactively when the scaling cron sees utilization > watermark.
+
+    scaling-poll-ms=1000 so the cron fires every second. The test writes enough
+    data to push utilization above the expand watermark, then stops writing and
+    waits for the cron to add a segment.
+    """
+
+    EXPAND_TIMEOUT_S = 15
+
+    def get_module_args(self, data_dir, direct_io):
+        # segment-size=1MB, dram-maxmemory=0 (no cap so shrink never fires).
+        # scaling-expand-watermark=50 so filling half a segment triggers proactive expand.
+        # scaling-shrink-watermark=99 to ensure shrink never fires during this test.
+        # scaling-poll-ms=1000 so the cron fires frequently.
+        return (
+            f"operating-mode Dram"
+            f" segment-size 1048576"
+            f" dram-maxmemory 0"
+            f" scaling-expand-watermark 50"
+            f" scaling-shrink-watermark 99"
+            f" scaling-poll-ms 1000"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_proactive_expand_fires_when_watermark_exceeded(self):
+        """The scaling cron adds a segment when utilization exceeds the expand watermark.
+
+        Steps:
+        1. Write one 600KB object into a 1MB segment → utilization ≈ 60% > 50% watermark.
+        2. Stop writing. No new SETs happen.
+        3. Wait for cron to fire and increment scaling_expand_total.
+
+        Because cron is the only actor after step 1, any expand is definitively proactive.
+        """
+        client = self.server.get_new_client()
+
+        before = info_largeobj(client)
+        expand_before = before.get('largeobj_scaling_expand_total', 0)
+
+        # Fill >50% of one 1MB segment (600KB ≈ 59% of 1MB).
+        r = client.execute_command('LO.SET', 'probe', b'P' * (600 * 1024))
+        assert r == b'OK', "LO.SET failed"
+
+        # No more SETs. Wait for cron to observe utilization > 50% and expand.
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_scaling_expand_total', 0) > expand_before,
+            timeout=self.EXPAND_TIMEOUT_S,
+        )
+
 
 
 class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
@@ -206,6 +263,21 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f" direct-io no"
         )
 
+    def _assert_no_pressure(self, client):
+        """Guardrail: verify server is not under memory pressure before the test writes data.
+
+        maxmemory must be 0 (uncapped) at test start. If it's non-zero, the test
+        server was left in a bad state from a previous test run and results would
+        be unreliable.
+        """
+        mem_info = client.execute_command('INFO', 'memory')
+        maxmemory = int(mem_info.get(b'maxmemory') or mem_info.get('maxmemory', 0))
+        assert maxmemory == 0, (
+            f"Test server already has maxmemory={maxmemory} at start — "
+            f"server is under pressure before test data is written. "
+            f"Run 'CONFIG SET maxmemory 0' to reset."
+        )
+
     def _apply_shrink_pressure(self, client):
         """Set maxmemory below current used_memory so ratio > 0.80.
 
@@ -222,6 +294,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         obj_size = 900 * 1024
 
+        self._assert_no_pressure(client)
+
         keys = [f'shrink_key_{i}' for i in range(4)]
         for key in keys:
             r = client.execute_command('LO.SET', key, b'S' * obj_size)
@@ -237,6 +311,13 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             timeout=self.SHRINK_TIMEOUT_S,
         )
 
+        # Wait for the drained segment to be fully released (draining_segments back to 0).
+        # This verifies the complete shrink cycle including release_drained, not just initiation.
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_draining_segments', 1) == 0,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+
         for key in keys:
             assert client.execute_command('EXISTS', key) == 1, \
                 f"Key {key} disappeared from keyspace after shrink (data loss)"
@@ -245,6 +326,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         """After a shrink, new SETs succeed."""
         client = self.server.get_new_client()
         obj_size = 900 * 1024
+
+        self._assert_no_pressure(client)
 
         for i in range(4):
             client.execute_command('LO.SET', f'pre_shrink_{i}', b'P' * obj_size)
@@ -256,6 +339,13 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         wait_for_true(
             lambda: info_largeobj(client).get('largeobj_scaling_shrink_total', 0) > shrink_before,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+
+        # Wait for the drained segment to be fully released (draining_segments back to 0).
+        # This verifies the complete shrink cycle including release_drained, not just initiation.
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_draining_segments', 1) == 0,
             timeout=self.SHRINK_TIMEOUT_S,
         )
 

@@ -967,10 +967,13 @@ core's `maxmemory-policy` handles those via whole-key eviction. Empty segments
 Neither eviction is disabled by `dram-maxmemory=0`; that value only sets the trigger
 threshold to the shared server ceiling instead of a module-local cap.
 
-**Detection (how the module learns it must act) differs by scenario:**
-expand is reactive-primary (grow when an alloc needs space); shrink is
-proactive-only (a cron job observes memory pressure, since nothing "fails" to prompt a
-shrink). The per-scenario reasoning is in §8.2 (expand) and §8.3 (shrink).
+**Detection (how the module learns it must act) differs by scenario and mode:**
+
+- **Dram expand:** reactive (SET fails on alloc-miss → expand + retry inline) and proactive (cron fires when utilization > watermark)
+- **Tiered expand:** proactive-only (cron). In Tiered mode the TCP SET writes to NVMe, not DRAM. DRAM is a cache filled by GET promotion (`try_promote_object`), which returns None on pool-full rather than blocking — no inline expand on the GET hot path.
+- **Shrink (both modes):** proactive-only (cron observes memory pressure; nothing "fails" to trigger a shrink)
+
+The per-scenario reasoning is in §8.2 (expand) and §8.3 (shrink).
 
 **Module-vs-core memory competition and startup allocation.**
 
@@ -1013,13 +1016,17 @@ Bounds by mode (config meaning in §11.3):
     to new writes — `LO.SET` is rejected (OOM) since there is no NVMe fallback.
 - **`dram-maxmemory>0`:** grow up to `dram-maxmemory / segment-size` segments.
 
-**Detection — reactive-primary.** Expand is naturally reactive: the alloc-fail row
+**Detection — Dram mode: reactive-primary.** Expand is naturally reactive in Dram mode: the alloc-fail row
 grows *because* a request just needed space and didn't have it. That is acceptable
-here because growth is cheap and safe (add a segment, retry, continue) — reacting
+because growth is cheap and safe (add a segment, retry, continue) — reacting
 costs only the one stalled alloc, nothing is lost. The utilization-watermark row is
 the *proactive* complement: grow ahead of need to remove even that one stall. So
-expand = reactive on alloc-miss, with an optional proactive watermark as a
-smoothing optimization.
+for Dram mode: expand = reactive on alloc-miss + proactive watermark as a smoothing optimization.
+
+**Detection — Tiered mode: proactive-only.** In Tiered mode, TCP SETs go to NVMe — the DRAM pool is
+only populated by GET promotion (`try_promote_object`). Promotion returns None on pool-full and the
+GET falls back to NVMe, so there is no inline blocking expand on the hot path. Expansion is owned
+entirely by the scaling cron (utilization-watermark row).
 
 ### 8.3 When to Shrink
 

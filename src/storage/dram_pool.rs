@@ -123,7 +123,9 @@ impl DRAMPool {
     /// with all-or-nothing semantics (min_required = total_chunks).
     /// chunk_size is captured here at allocation time so callers use the same
     /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
-    /// Reactive expansion: if alloc_n fails, attempts one expand then retries.
+    ///
+    /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
+    /// Expansion is the scaling cron's responsibility, not the GET hot path.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -134,14 +136,7 @@ impl DRAMPool {
         }
         let chunk_size = crate::buffer_size();
         let total_chunks = super::chunk_count(obj_len, chunk_size);
-        // Reactive expansion: if alloc_n fails, try expand then retry once.
-        let buffers = match self.alloc_n(chunk_size, total_chunks as usize) {
-            Some(b) => b,
-            None => {
-                self.try_expand()?;
-                self.alloc_n(chunk_size, total_chunks as usize)?
-            }
-        };
+        let buffers = self.alloc_n(chunk_size, total_chunks as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -183,13 +178,16 @@ impl DRAMPool {
         self.pool.with_live_segment_slices(f);
     }
 
-    /// Complete the release of any draining segments whose refcount has reached 0.
+    /// Free segments that finished draining since the last cron tick.
     ///
-    /// Called from the scaling cron each tick. Segments are marked draining by
-    /// `try_shrink()`; their refcount drains as existing Arc holders finish.
-    /// When `is_releasable()` is true, completes the release:
-    /// talc.truncate → clear sparse slot → dealloc.
-    pub fn complete_drained_segments(&self) {
+    /// A segment marked draining is freed asynchronously: its memory is not
+    /// reclaimed until all in-flight Arc holders drop and refcount reaches 0.
+    /// This function scans for segments where `draining && refcount == 0` and
+    /// physically frees them: removes from talc's free-lists (`talc.truncate`),
+    /// clears the io_uring iovec slot (`clear_iovec`), and deallocates the memory.
+    ///
+    /// Must be called from the Valkey main event-loop thread only.
+    pub fn release_drained_segments(&self) {
         self.pool.release_all_releasable();
     }
 
@@ -224,17 +222,19 @@ impl DRAMPool {
     ///
     /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
-        let (victim_idx, victim_bytes) = match self.pool.select_and_drain_victim() {
+        let (victim_idx, victim_bytes) = match self.pool.find_shrink_victim() {
             Some(v) => v,
             None => return false,
         };
 
         if crate::operating_mode() == crate::OperatingMode::Dram && victim_bytes > 0 {
             // Can't evict — data would be lost with no NVMe fallback.
-            // Unmark draining since we're aborting.
-            self.pool.unmark_draining(victim_idx);
+            // No unmark needed: segment was never marked draining.
             return false;
         }
+
+        // Commit: mark draining only now that we know eviction is safe.
+        self.pool.mark_segment_draining(victim_idx);
 
         // Remove cached objects on the victim segment from the HashMap.
         // Tiered: data persists on NVMe. Dram: verified empty above.
