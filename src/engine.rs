@@ -444,11 +444,11 @@ fn serve_set_dram_tcp(
         None => {
             // Reactive expansion: pool exhausted — try adding one segment, then retry.
             if dram_pool.try_expand().is_none() {
-                return Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED));
+                return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
             }
             match dram_pool.alloc(obj_len as usize) {
                 Some(b) => b,
-                None => return Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)),
+                None => return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)),
             }
         }
     };
