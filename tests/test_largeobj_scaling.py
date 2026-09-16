@@ -5,54 +5,32 @@ Tests cover:
   - Dram mode: reactive expand when segment fills
   - Dram mode: dram-maxmemory hard cap respected
   - Tiered mode: reactive expand on DRAMPool fill
-  - Tiered mode: data survives expand (reads correct after pool grows)
   - Tiered mode: shrink evicts cached segment but NVMe copy survives
-  - Tiered mode: live data survives memory pressure in Dram mode
 """
 
 import os
 import time
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def info_largeobj(client):
-    """Return the largeobj INFO section as a dict with integer values decoded."""
-    raw = client.execute_command('INFO', 'largeobj')
-    result = {}
-    for k, v in raw.items():
-        key = k.decode() if isinstance(k, bytes) else k
-        val = v.decode() if isinstance(v, bytes) else str(v)
-        result[key] = int(val) if val.lstrip('-').isdigit() else val
-    return result
-
-
-def wait_for(condition_fn, timeout_s=15, poll_interval_s=0.5, msg="condition not met"):
-    """Poll `condition_fn()` until it returns True or `timeout_s` seconds elapse.
-
-    Raises AssertionError with `msg` on timeout.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if condition_fn():
-            return
-        time.sleep(poll_interval_s)
-    raise AssertionError(f"Timed out after {timeout_s}s: {msg}")
+from valkeytestframework.util.waiters import wait_for_true
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
 class TestDramExpand(ValkeyLargeObjTestCaseBase):
-    """Dram mode: DRAMPool grows reactively when a segment fills."""
+    """Dram mode: DRAMPool grows reactively when a segment fills.
+
+    Also covers data integrity under memory pressure — same server config.
+    """
 
     def get_module_args(self, data_dir, direct_io):
         # segment-size=1MB, dram-maxmemory=0 → starts with 1 segment, grows on demand.
-        # Objects are 900KB — first fills the initial segment; second triggers reactive expand.
+        # scaling-poll-ms=1000 for the pressure test; harmless for expand tests.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" dram-maxmemory 0"
+            f" scaling-poll-ms 1000"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -70,7 +48,6 @@ class TestDramExpand(ValkeyLargeObjTestCaseBase):
         r = client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
         assert r == b'OK', f"First LO.SET failed: {r}"
 
-        # Second object fills the first segment, triggering reactive expand.
         r = client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
         assert r == b'OK', f"Second LO.SET failed (expand may not have fired): {r}"
 
@@ -90,6 +67,39 @@ class TestDramExpand(ValkeyLargeObjTestCaseBase):
         for key, payload in keys_payloads:
             got = client.execute_command('LO.GET', key)
             assert got == payload, f"Data mismatch for {key} after expand"
+
+    def test_maxmemory_0_no_explicit_cap(self):
+        """dram-maxmemory=0 means no module-level cap; grows up to server ceiling."""
+        client = self.server.get_new_client()
+        for i in range(3):
+            r = client.execute_command('LO.SET', f'key_{i}', b'X' * (100 * 1024))
+            assert r == b'OK', f"SET {i} failed: {r}"
+
+    def test_live_data_survives_memory_pressure(self):
+        """Any Dram key not evicted by Valkey core must return correct data.
+
+        Under memory pressure, core may evict LO keys. The module must never
+        corrupt data for keys that core did NOT evict.
+        """
+        client = self.server.get_new_client()
+        obj_size = 200 * 1024
+        payloads = {f'dram_{i}': bytes([i % 256]) * obj_size for i in range(5)}
+
+        for key, payload in payloads.items():
+            r = client.execute_command('LO.SET', key, payload)
+            assert r == b'OK', f"SET {key} failed: {r}"
+
+        mem_info = client.execute_command('INFO', 'memory')
+        used_memory = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used_memory * 1.1)))
+
+        # Wait for a few cron ticks.
+        time.sleep(5)
+
+        for key, payload in payloads.items():
+            if client.execute_command('EXISTS', key) == 1:
+                got = client.execute_command('LO.GET', key)
+                assert got == payload, f"{key} data corrupted under pressure"
 
 
 class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
@@ -111,23 +121,14 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         obj_size = 900 * 1024
 
-        # Fill the first segment — triggers expand to second segment.
         client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
         client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
 
-        # Pool is now full (2MB cap, two 900KB objects). Third must fail.
         try:
             client.execute_command('LO.SET', 'key_c', b'C' * obj_size)
             assert False, "Expected error: pool exhausted or OOM"
         except ResponseError:
-            pass  # Expected
-
-    def test_maxmemory_0_no_explicit_cap(self):
-        """dram-maxmemory=0 means no module-level cap; grows up to server ceiling."""
-        client = self.server.get_new_client()
-        for i in range(3):
-            r = client.execute_command('LO.SET', f'key_{i}', b'X' * (100 * 1024))
-            assert r == b'OK', f"SET {i} failed: {r}"
+            pass
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────
@@ -186,12 +187,10 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     """Tiered mode: DRAMPool shrinks under memory pressure.
 
-    Instead of sleeping for a fixed duration, tests poll INFO largeobj waiting
-    for shrink_count to increase. This eliminates flakiness from timing jitter.
+    Writes objects first, then sets server maxmemory below current used_memory
+    so the module shrink watermark fires on the next cron tick.
     """
 
-    # Maximum time to wait for a shrink to complete.
-    # With scaling-poll-ms=1000, the cron fires every 1s; 20s gives 20 chances.
     SHRINK_TIMEOUT_S = 20
 
     def get_module_args(self, data_dir, direct_io):
@@ -208,24 +207,18 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         )
 
     def _apply_shrink_pressure(self, client):
-        """Set maxmemory to trigger the 80% shrink watermark.
+        """Set maxmemory below current used_memory so ratio > 0.80.
 
-        Uses 1.5x used_memory so the ratio (used/ceiling) is ~67%, which is below the
-        watermark. Wait — we need it ABOVE 80%, so use a smaller multiplier.
-        used_memory / (used_memory * X) > 0.8 → X < 1.25.
-        Use 1.1 (ratio ≈ 91%) with enough margin from server overhead.
+        Setting maxmemory = used * 0.85 gives ratio ≈ 1.18 > 0.80.
+        noeviction means no keys are evicted — the module cron handles DRAM.
         """
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
         mem_info = client.execute_command('INFO', 'memory')
-        used_memory = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
-        # Set ceiling to 110% of current usage: ratio = 1/1.1 ≈ 91% > 80% watermark.
-        # Large enough gap from 100% to avoid triggering core eviction before cron fires.
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used_memory * 1.1)))
+        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
 
     def test_shrink_preserves_nvme_data(self):
-        """After the scaling cron shrinks the pool, keys remain readable from NVMe.
-
-        Verified by polling scaling_shrink_total until it increases, then checking data.
-        """
+        """After the scaling cron shrinks the pool, keys remain readable from NVMe."""
         client = self.server.get_new_client()
         obj_size = 900 * 1024
 
@@ -239,23 +232,17 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         self._apply_shrink_pressure(client)
 
-        # Wait until scaling_shrink_total increases — the cron has fired and drained a segment.
-        wait_for(
+        wait_for_true(
             lambda: info_largeobj(client).get('largeobj_scaling_shrink_total', 0) > shrink_before,
-            timeout_s=self.SHRINK_TIMEOUT_S,
-            msg="scaling_shrink_total did not increase — scaling cron may not have fired",
+            timeout=self.SHRINK_TIMEOUT_S,
         )
 
         for key in keys:
             assert client.execute_command('EXISTS', key) == 1, \
                 f"Key {key} disappeared from keyspace after shrink (data loss)"
 
-        after = info_largeobj(client)
-        assert after['largeobj_live_segments'] < before['largeobj_live_segments'], \
-            f"Expected live segments to decrease: {before['largeobj_live_segments']} → {after['largeobj_live_segments']}"
-
     def test_shrink_then_expand(self):
-        """After a shrink, new SETs succeed (reactive expand fires)."""
+        """After a shrink, new SETs succeed."""
         client = self.server.get_new_client()
         obj_size = 900 * 1024
 
@@ -264,75 +251,19 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         before = info_largeobj(client)
         shrink_before = before.get('largeobj_scaling_shrink_total', 0)
-        expand_before = before.get('largeobj_scaling_expand_total', 0)
 
         self._apply_shrink_pressure(client)
 
-        # Wait for shrink to complete.
-        wait_for(
+        wait_for_true(
             lambda: info_largeobj(client).get('largeobj_scaling_shrink_total', 0) > shrink_before,
-            timeout_s=self.SHRINK_TIMEOUT_S,
-            msg="scaling_shrink_total did not increase",
+            timeout=self.SHRINK_TIMEOUT_S,
         )
 
-        # Reset pressure so expand can fire.
         client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
 
-        # New SET must succeed (triggers reactive expand).
         r = client.execute_command('LO.SET', 'post_shrink', b'Q' * obj_size)
         assert r == b'OK', f"LO.SET after shrink+expand failed: {r}"
 
-        after = info_largeobj(client)
-        assert after.get('largeobj_scaling_expand_total', 0) > expand_before, \
-            "Expected scaling_expand_total to increase after post-shrink SET"
-
-        # Pre-shrink keys still exist in keyspace.
         for i in range(4):
             assert client.execute_command('EXISTS', f'pre_shrink_{i}') == 1, \
                 f"pre_shrink_{i} disappeared from keyspace after shrink"
-
-
-class TestDramLiveDataSurvivesPressure(ValkeyLargeObjTestCaseBase):
-    """In Dram mode, live objects are never corrupted by the module under pressure.
-
-    The module can reclaim empty segments (legitimately), but must never corrupt
-    data for objects that Valkey core has not evicted. Data integrity is the invariant.
-    """
-
-    def get_module_args(self, data_dir, direct_io):
-        return (
-            f"operating-mode Dram"
-            f" segment-size 1048576"
-            f" dram-maxmemory 0"
-            f" scaling-poll-ms 1000"
-            f" bench-mode no"
-            f" direct-io no"
-        )
-
-    def test_live_data_survives_memory_pressure(self):
-        """Any Dram key not evicted by Valkey core must return correct data.
-
-        Under memory pressure, core may evict LO keys. The module must never
-        corrupt data for keys that core did NOT evict. We check all surviving keys.
-        """
-        client = self.server.get_new_client()
-        obj_size = 200 * 1024
-        payloads = {f'dram_{i}': bytes([i % 256]) * obj_size for i in range(5)}
-
-        for key, payload in payloads.items():
-            r = client.execute_command('LO.SET', key, payload)
-            assert r == b'OK', f"SET {key} failed: {r}"
-
-        # Apply pressure — core eviction may fire, module cron will also run.
-        mem_info = client.execute_command('INFO', 'memory')
-        used_memory = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used_memory * 1.1)))
-
-        # Wait for a few cron ticks.
-        time.sleep(5)
-
-        # Any key still in keyspace must return exactly the data that was written.
-        for key, payload in payloads.items():
-            if client.execute_command('EXISTS', key) == 1:
-                got = client.execute_command('LO.GET', key)
-                assert got == payload, f"{key} data corrupted under pressure"

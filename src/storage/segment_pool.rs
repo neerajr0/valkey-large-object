@@ -197,6 +197,69 @@ impl SegmentPool {
         })
     }
 
+    /// Allocate `count` buffers of `chunk_size`, requiring at least `min_required`.
+    /// All-or-nothing: if fewer than `min_required` fit, all allocations are rolled back.
+    /// Adapted from main's alloc_n to use SegmentState binary-search lookup.
+    pub fn alloc_n(
+        &self,
+        chunk_size: usize,
+        count: usize,
+        min_required: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
+        let layout = Layout::from_size_align(super::align_up(chunk_size), super::IO_ALIGN)
+            .expect("alloc_n: invalid chunk_size layout");
+        let mut talc = self.allocator.lock().expect("allocator lock unavailable");
+        let mut buffers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let ptr = match unsafe { talc.malloc(layout) } {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let addr = ptr.as_ptr() as usize;
+            let st = self.state.lock().expect("state lock unavailable");
+            let (seg_idx, offset) = st
+                .find_segment(addr)
+                .expect("talc returned ptr outside segments");
+            st.slots[seg_idx].as_ref().unwrap().inc_ref();
+            drop(st);
+            buffers.push(SegmentBuffer {
+                segment_idx: seg_idx as u16,
+                offset: offset as u64,
+                len: chunk_size as u32,
+            });
+        }
+        if buffers.len() < min_required {
+            for buf in &buffers {
+                self.free_with_lock(&mut talc, buf, layout);
+            }
+            return None;
+        }
+        Some(buffers)
+    }
+
+    /// Free a single buffer under an already-held allocator lock (used by alloc_n rollback).
+    fn free_with_lock(
+        &self,
+        talc: &mut talc::Talc<talc::ErrOnOom>,
+        buf: &SegmentBuffer,
+        layout: Layout,
+    ) {
+        let st = self.state.lock().expect("state lock unavailable");
+        let seg = st.slots[buf.segment_idx as usize]
+            .as_ref()
+            .expect("segment slot empty for live buffer — invariant broken");
+        let ptr = unsafe { seg.base.add(buf.offset as usize) };
+        drop(st);
+        unsafe {
+            talc.free(std::ptr::NonNull::new_unchecked(ptr), layout);
+        }
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots[buf.segment_idx as usize]
+            .as_ref()
+            .expect("segment slot empty for live buffer — invariant broken")
+            .dec_ref();
+    }
+
     /// Free a buffer back to the pool.
     /// Decrements the segment refcount. If the segment becomes releasable
     /// (draining + refcount == 0), the scaling cron detects it on the next tick

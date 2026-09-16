@@ -50,6 +50,10 @@ impl DRAMPool {
         self.pool.free(buf)
     }
 
+    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_n(chunk_size, count, count)
+    }
+
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
         self.pool.buffer_ptr(buf)
     }
@@ -114,37 +118,47 @@ impl DRAMPool {
     }
 
     /// Try to allocate space and create an ObjectContext for this object.
-    ///
-    /// Reactive expansion: if alloc fails (pool exhausted), attempts one expand
-    /// then retries. Returns None if at cap or object exceeds max-promote-size.
-    pub fn try_promote_object(&self, oid: ObjectId, obj_len: u64) -> Option<Arc<ObjectContext>> {
+    /// Returns None if pool is full or object exceeds max-promote-size.
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
+    /// with all-or-nothing semantics (min_required = total_chunks).
+    /// chunk_size is captured here at allocation time so callers use the same
+    /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
+    /// Reactive expansion: if alloc_n fails, attempts one expand then retries.
+    pub fn try_promote_object(
+        &self,
+        oid: ObjectId,
+        obj_len: u64,
+    ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-
-        let seg_buf = match self.alloc(obj_len as usize) {
-            Some(buf) => buf,
+        let chunk_size = crate::buffer_size();
+        let total_chunks = super::chunk_count(obj_len, chunk_size);
+        // Reactive expansion: if alloc_n fails, try expand then retry once.
+        let buffers = match self.alloc_n(chunk_size, total_chunks as usize) {
+            Some(b) => b,
             None => {
-                // Reactive expansion: try adding one segment, then retry alloc.
                 self.try_expand()?;
-                self.alloc(obj_len as usize)?
+                self.alloc_n(chunk_size, total_chunks as usize)?
             }
         };
-
-        // Check-and-insert under write lock to prevent TOCTOU race
-        // (concurrent GETs promoting the same OID simultaneously — only one wins).
+        // Atomic check-and-insert under write lock to prevent TOCTOU race
+        // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
             .objects
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
-            self.free(&seg_buf);
+            for buf in &buffers {
+                self.pool.free(buf);
+            }
             return None;
         }
-        let obj_ctx = Arc::new(ObjectContext::new_filling(
-            vec![seg_buf],
+        // buf.len stays chunk_size for all buffers — must match alloc size for free().
+        let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(
+            buffers,
             obj_len,
-            1, // TODO: Single chunk today; streaming will pass actual chunk count.
+            total_chunks,
         ));
         objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)
