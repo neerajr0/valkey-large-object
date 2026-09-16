@@ -216,7 +216,7 @@ fn execute_get_tiered(
         let seg_buf = &obj_ctx.buffers[0];
         let buf_ptr_usize = dram_pool.buffer_ptr(seg_buf) as usize;
         let read_op = uring::UringOp {
-            iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
+            iovec_index: dram_pool.iovec_index_for_buf(seg_buf),
             buf_ptr: buf_ptr_usize as *mut u8,
             file_offset: 0,
             len: obj_len,
@@ -299,7 +299,7 @@ fn execute_get_tiered(
     // Single-chunk today: one UringOp for the entire object.
     // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let read_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,
@@ -709,7 +709,7 @@ async fn do_tiered_nvme_write(
     // Single-chunk today: one UringOp for the entire object.
     // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let write_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,

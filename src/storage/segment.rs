@@ -10,25 +10,35 @@
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use talc::Span;
+
 /// A contiguous registered memory region.
 pub struct Segment {
     /// Base pointer (4KB-aligned, allocated via ValkeyAlloc).
     pub base: *mut u8,
     /// Total size in bytes.
     pub size: usize,
-    /// Index in the io_uring iovec registration array (for ReadFixed/WriteFixed).
+    /// Index into the sparse iovec table (io_uring ReadFixed/WriteFixed) and
+    /// into the SegmentPool's `segments: Vec<Option<Segment>>` vector.
+    /// Write-once at creation; immutable for the segment's lifetime (holes model).
     pub iovec_index: u16,
+    /// The exact Span returned by talc.claim() at creation time.
+    /// Required for talc.truncate() during drain — talc word-aligns the span
+    /// inward and truncate requires the exact recorded value.
+    pub claim_span: Span,
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
-    /// When true, no new allocations from this segment. Set during shrink/drain.
+    /// When true, no new promotions target this segment. Set during shrink/drain.
+    /// GET handlers check this before acquiring Arc<ObjectContext> on this segment;
+    /// if draining they defer to NVMe so no new Arc refs are acquired.
     pub draining: AtomicBool,
 }
 
 impl Segment {
     /// Allocate a new segment via ValkeyAlloc (alloc_zeroed).
     /// Visible in Valkey's used_memory immediately.
-    /// Allocate a new segment. iovec_index is assigned later via append_iovec().
+    /// `iovec_index` and `claim_span` are set after claiming in talc (see SegmentPool::new / expand).
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -37,7 +47,8 @@ impl Segment {
         Self {
             base,
             size,
-            iovec_index: 0, // assigned by append_iovec() after creation
+            iovec_index: 0,            // set by caller after talc.claim()
+            claim_span: Span::empty(), // set by caller after talc.claim()
             refcount: AtomicU32::new(0),
             draining: AtomicBool::new(false),
         }

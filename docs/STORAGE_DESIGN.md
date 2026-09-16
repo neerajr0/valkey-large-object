@@ -970,9 +970,27 @@ expand is reactive-primary (grow when an alloc needs space); shrink is
 proactive-only (a cron job observes memory pressure, since nothing "fails" to prompt a
 shrink). The per-scenario reasoning is in §8.2 (expand) and §8.3 (shrink).
 
+**Module-vs-core memory competition and startup allocation.**
+
+Because the module and core keyspace share one `maxmemory` ceiling, a customer
+who loads the module but uses only standard Valkey data types (strings, hashes,
+lists, etc.) still pays the cost of the module's initial DRAMPool segment. This
+reduces the memory available to core. Three startup allocation options exist:
+
+| Option | Description | Overhead for non-users | First LO.SET cost |
+|---|---|---|---|
+| **A — Lazy** | Start with 0 segments. Allocate the first segment on the first `LO.SET`. | Zero | EFA `fi_mr_reg` (~333µs) + segment alloc |
+| **B — Eager** `[CURRENT]` | Pre-allocate at startup: if `dram-maxmemory=0` → 1 segment; if `dram-maxmemory>0` → all `dram-maxmemory / segment-size` segments. | `segment-size` bytes (64MB default) up to full `dram-maxmemory` | None — already registered |
+
+**Option B is the current implementation.** It guarantees the first LO command
+is fast (no registration stall) and simplifies startup logic. Option A is the
+better production choice for deployments where ValkeyLargeObj usage is optional, but it
+requires implementing a "0-segment" init path and deferring EFA registration to
+the first command. This is a pre-ship decision point for the feature.
+
 ### 8.2 When to Expand
 
-Expansion adds one `dram-segment-size` segment (≤1GiB, §2) to DRAMPool. The budget
+Expansion adds one `segment-size` segment (≤1GiB, §2) to DRAMPool. The budget
 and what its values mean are defined in §11.1/§11.3; this is the *behavior* against
 that budget.
 
@@ -991,7 +1009,7 @@ Bounds by mode (config meaning in §11.3):
     directly from NVMe (no data loss — NVMe is always the source of truth).
   - **Dram mode:** same demand-driven growth, but hitting the server ceiling is fatal
     to new writes — `LO.SET` is rejected (OOM) since there is no NVMe fallback.
-- **`dram-maxmemory>0`:** grow up to `dram-maxmemory / dram-segment-size` segments.
+- **`dram-maxmemory>0`:** grow up to `dram-maxmemory / segment-size` segments.
 
 **Detection — reactive-primary.** Expand is naturally reactive: the alloc-fail row
 grows *because* a request just needed space and didn't have it. That is acceptable
@@ -1241,50 +1259,50 @@ segment refcount, one EFA MR. A straddling allocation would have no single valid
 `buf_index` and would break I/O. So: always separate `claim` per segment, never
 `extend`; `find_segment` then always resolves to exactly one segment.
 
-### 8.8 NUMA Locality
-
-> **[WIP — NOT FINALIZED. Direction below is sound and sourced, but the exact
-> placement policy and its keyspace tradeoff are unsettled and need NUMA-aware
-> benchmarks on i8ge.]**
+### 8.8 NUMA Locality - Will be addressed later. Skip for now.
 
 Cross-NUMA-node memory access is a real cost on the multi-socket hosts this runs on
-(i8ge: node0 = CPU 0–95, node1 = CPU 96–191, EFA NIC on node1). An access that
-crosses the node boundary pays the inter-socket-link latency/bandwidth penalty. Three
-paths can go cross-node, and the levers to keep them local:
+(i8ge: node0 = CPU 0–95, node1 = CPU 96–191, EFA NIC on node1). The hardware numbers
+(measured on i8ge):
 
-**Governing rule — first-touch.** A page is homed on the node of the thread that
-*first writes* it (`set_mempolicy(2)`: policy applies "when the page is first touched
-by the thread"). `alloc_zeroed`'s zeroing store *is* that first touch, so the
-allocating thread's node wins — this only helps if that thread is pinned first.
+| Path | Latency | Bandwidth |
+|---|---|---|
+| Local (CPU node1 → mem node1) | 123 ns | ~412 GB/s |
+| Remote (CPU node1 → mem node0) | 260 ns | ~77 GB/s |
+| Cross-socket bandwidth penalty | 2x latency | **5x bandwidth** |
 
-1. **Segment / buffer memory (controllable).** Home each DRAM/NVMe segment on the
-   right node: pin the creating thread (`sched_setaffinity(2)`) → `alloc_zeroed` →
-   `mbind(2)` the `[ptr,len)` with `MPOL_BIND` (per-range, overrides thread default;
-   `MPOL_MF_STRICT` during bring-up to prove placement) → touch → then `fi_mr_reg` /
-   `IORING_REGISTER_BUFFERS` (registration pins pages but does **not** move them, so
-   placement must precede it). Pin the tokio EFA/NVMe workers that stream a segment to
-   that segment's node.
+**Two separate NUMA concerns — one settled, one open:**
 
-2. **EFA/NVMe DMA (co-locate with the NIC).** The device DMAs over PCIe; if the
-   buffer is on the far node, every transfer crosses the inter-socket link. Home
-   EFA-registered segments + their workers on the **EFA device's node** — read it at
-   runtime from `/sys/class/infiniband/<dev>/device/numa_node` (don't hardcode; i8ge
-   currently = node1). Rule of thumb: buffer node == worker node == NIC node.
+**1. EFA/NVMe segment placement — settled.**
+EFA DMA accesses the registered segment memory directly over PCIe. If segments live on
+the far NUMA node, every DMA transfer crosses the inter-socket link at 77 GB/s instead
+of 412 GB/s. For EFA bulk streaming at current scale (100K rps 4KB, 50K rps 1MB),
+this cross-socket bandwidth cap does not bite — EFA does not approach 77 GB/s at these
+object sizes. Kevin confirmed: "doesn't really matter for the NIC streaming."
 
-3. **Valkey keyspace lookup (the hard one).** The single main event loop first-touches
-   the entire dict / hashtable / `LoValue` allocations, homing all keyspace metadata
-   on the main thread's node. A worker on the other node chasing those pointers pays
-   remote latency **per lookup** (the pointer chase, not the payload, is the cost).
-   **Open tradeoff (to settle with benchmarks):** (a) pin workers to the main thread's
-   node — keeps latency-bound lookups local, accept cross-node bulk DMA; (b) bind the
-   whole server (main + workers + memory) to the NIC's node via
-   `numactl --cpunodebind=N --membind=N` — one coherent node, simplest; (c) interleave
-   (`MPOL_INTERLEAVE` / `numactl --interleave`) — averages latency, only wins if
-   bandwidth-bound. Leaning (a) or (b); metadata access is per-op latency-bound while
-   DMA is batched bandwidth-bound.
+**Action:** Preferentially allocate DRAMPool/NVMe segments on node1 (the NIC's node).
+Mechanism: pin the creating thread to node1 CPUs before `alloc_zeroed` (first-touch
+on node1), then `mbind(MPOL_BIND, node1)` the segment range. Read the EFA device's
+node at runtime from `/sys/class/infiniband/<dev>/device/numa_node`. Low effort, worth
+doing proactively even if not currently a bottleneck — other instance types or higher
+QPS may hit the cap.
 
-Sources: `set_mempolicy(2)`, `mbind(2)`, `sched_setaffinity(2)`, `numa(3)`/`numa(7)`,
-`numactl(8)`, kernel sysfs `numa_node` ABI.
+**2. Valkey core data structures — open.**
+The Valkey main thread first-touches all core allocations (dict, hashtable, LoValue
+structs), homing them on the main thread's node. Workers on node1 chasing those
+pointers pay 260ns per pointer dereference. Whether this materially hurts QPS at
+scale has not been measured. Kevin raised this explicitly as unsettled.
+
+One approach discussed: allocate a large enough DRAMPool upfront (>50% of RAM) so
+core Valkey data structures are naturally pushed onto node0, while segment memory
+stays on node1 — workers do DRAM access locally, EFA DMA is local to the NIC. Kevin
+also raised a "two DRAM tiers" idea (segment memory on node1, core structures on
+node0, EFA offloads the transfer so CPU doesn't touch it). Neither has been
+benchmarked.
+
+> **[Open — needs NUMA-aware benchmark on i8ge to determine whether the 260ns
+> cross-node keyspace lookup penalty materially affects QPS at production scale.
+> The EFA streaming side is settled; the core data structure side is not.]**
 
 ## 9. Concurrency, Refcounting, and Lifecycle
 
@@ -1422,8 +1440,8 @@ this section owns the semantics.
 |---|---|---|---|---|---|
 | `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
 | `dram-maxmemory` | `0` (grow-on-demand) | `0` | i64::MAX¹ | Live | Total DRAMPool budget. `0` = grow until the server ceiling (§11.2) |
-| `dram-segment-size` | `64MB` | `1MB` | `1GiB` | Immutable | DRAMPool growth unit — one segment added per scale-out step |
-| `nvme-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size (transient I/O buffers) |
+| `segment-size` | `64MB` | `1MB` | `1GiB` | Immutable | Uniform segment size for DRAMPool. Growth unit; DRAM segment count = `dram-maxmemory / segment-size` |
+| `nvme-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size. Single segment of this size; sized for max concurrent I/O, not object capacity |
 | `nvme-maxmemory` | `10GB` | `1MB` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `lo-max-object-size` | — | — | — | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
@@ -1434,7 +1452,7 @@ this section owns the semantics.
 ¹ `dram-maxmemory` accepts up to i64::MAX but its *effective* ceiling is always the
 server's `maxmemory` / physical RAM (§11.2).
 
-**Segment size is capped at 1 GiB** for both `dram-segment-size` and
+**Segment size is capped at 1 GiB** for both `segment-size` and
 `nvme-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
 NVMe staging is always io_uring-registered, and DRAMPool is io_uring-registered in
 Tiered mode (for promotion ReadFixed). Larger capacity comes from *more* segments,
@@ -1462,8 +1480,8 @@ This subsection defines the *meaning* of the value — the scale-out/scale-in
 | Tiered | `0` | Elastic promotion cache, bounded by the server ceiling. Reclaimable under pressure (the object is safe on NVMe). |
 | Tiered | `>0` | Cache cap. |
 
-Segment **count** is always derived (`dram-maxmemory / dram-segment-size`), never a
-separate knob. Every segment is exactly `dram-segment-size`.
+Segment **count** is always derived (`dram-maxmemory / segment-size`), never a
+separate knob. Every segment is exactly `segment-size`.
 
 > **Guard:** In Dram mode, if both `dram-maxmemory=0` and the server `maxmemory=0`
 > (both unlimited), the only bound is physical RAM and the OOM killer. Warn loudly

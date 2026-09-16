@@ -28,7 +28,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
-            f" dram-segment-size 1048576"
+            f" segment-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )

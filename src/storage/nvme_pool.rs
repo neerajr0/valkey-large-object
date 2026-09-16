@@ -32,7 +32,12 @@ impl NVMePool {
     }
 
     /// Access segments (needed by engine for buf_index lookup).
-    pub fn segments(&self) -> &[Segment] {
+    pub fn segments(&self) -> &[Option<Segment>] {
         &self.pool.segments
+    }
+
+    /// Return the io_uring iovec_index for the segment owning `buf`.
+    pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
+        self.pool.iovec_index_for_buf(buf)
     }
 }

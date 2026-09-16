@@ -9,7 +9,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
+            f" segment-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -46,9 +46,9 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_dram_pool_exhaustion(self):
-        """An object larger than dram-segment-size fails with pool exhausted."""
+        """An object larger than segment-size fails with pool exhausted."""
         client = self.server.get_new_client()
-        # dram-segment-size is 1MB. A 2MB object cannot be allocated.
+        # segment-size is 1MB. A 2MB object cannot be allocated.
         obj_size = 2 * 1024 * 1024
         payload = b'D' * obj_size
         try:
