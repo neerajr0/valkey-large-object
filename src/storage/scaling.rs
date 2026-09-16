@@ -40,14 +40,8 @@ pub fn scaling_cron(ctx: &Context) {
     // try_shrink() is safe in both modes: in Dram mode it only drains segments
     // with zero allocated bytes, so no live data is ever lost.
     let info = ctx.server_info("memory");
-    let used: u64 = info
-        .field_c("used_memory")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let maxmemory: u64 = info
-        .field_c("maxmemory")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let used: u64 = info.field_unsigned("used_memory").unwrap_or(0);
+    let maxmemory: u64 = info.field_unsigned("maxmemory").unwrap_or(0);
 
     let dram_max = crate::dram_maxmemory();
     let ceiling = if dram_max > 0 {
@@ -61,11 +55,6 @@ pub fn scaling_cron(ctx: &Context) {
     };
 
     let ratio = used as f64 / ceiling as f64;
-    if used > 0 || maxmemory > 0 || dram_max > 0 {
-        ctx.log_notice(&format!(
-            "largeobj: shrink check used={used} maxmemory={maxmemory} dram_max={dram_max} ceiling={ceiling} ratio={ratio:.3} watermark={shrink_watermark:.2}"
-        ));
-    }
     if ratio > shrink_watermark && pool.try_shrink() {
         ctx.log_notice(&format!(
             "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",
