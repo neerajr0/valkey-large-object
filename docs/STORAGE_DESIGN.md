@@ -956,11 +956,13 @@ module and core alike, is bounded by.
 |---|---|---|---|
 | **Core maxmemory eviction** | Valkey's `maxmemory-policy` selects a victim key and deletes it (LO keys included), calling the module free callback. `noeviction` → `LO.SET` fails (OOM). | **Yes** — the object is gone | Both |
 | **Module cache eviction** | Drops a cached DRAM copy; the object persists on NVMe, next GET is an NVMe read. | No | **Tiered only** |
+| **Module empty-segment reclaim** | When memory pressure crosses the shrink watermark, the module reclaims DRAM segments with zero live allocations. | No | Both |
 
-The consequence: **a module-owned eviction policy is only meaningful in Tiered
-mode** — dropping a copy is safe only when a copy exists. In Dram mode the DRAMPool
-*is* the data, so the only reclaim is core deleting whole keys under its
-`maxmemory-policy`; the module does not give Dram-mode segment memory back on its own.
+The consequence: **dropping live object copies is only meaningful in Tiered
+mode** — dropping a copy is safe only when a copy exists on NVMe. In Dram mode the
+DRAMPool *is* the data, so the module never reclaims segments with live objects;
+core's `maxmemory-policy` handles those via whole-key eviction. Empty segments
+(all objects deleted by the client) are reclaimed by the scaling cron in both modes.
 
 Neither eviction is disabled by `dram-maxmemory=0`; that value only sets the trigger
 threshold to the shared server ceiling instead of a module-local cap.
@@ -1037,17 +1039,19 @@ used — the eviction-policy input). The reclaimed unit is a **whole segment**: 
 still-live cached objects are dropped (ObjectContexts freed; the objects remain on
 NVMe), then the segment is released.
 
-**Detection — proactive only (Tiered mode only).** There is no module shrink in Dram
-mode — the DRAMPool is the data, so the module never reclaims it; core's
-`maxmemory-policy` handles pressure instead (see table above). In Tiered mode,
-shrink cannot be reactive: nothing "fails" to prompt a shrink (the trigger is
-*external* — the server approaching `maxmemory` — which the module only sees by
-looking). So the module must **proactively** observe pressure via an in-module timer
-that polls `used_memory` against the ceiling and reclaims at a watermark, ahead of
-the wall. If a spike outruns the timer and an alloc fails between ticks, that just
-takes the normal OOM path (§8.2 / core `maxmemory-policy`) — there is no separate
-reactive-shrink path, because reacting to a failure is already too late to reclaim
-gracefully. Open (tuning/verification, not design): the cheapest module API to read
+**Detection — proactive only (both modes).** In Tiered mode, shrink cannot be
+reactive: nothing "fails" to prompt a shrink (the trigger is *external* — the
+server approaching `maxmemory` — which the module only sees by looking). So the
+module must **proactively** observe pressure via an in-module timer that polls
+`used_memory` against the ceiling and reclaims at a watermark, ahead of the wall.
+In Dram mode the same timer fires, but `try_shrink` only succeeds when the victim
+segment has zero live allocations — if all objects have been deleted by the client,
+the empty segment is reclaimed; otherwise the shrink is a no-op and core's
+`maxmemory-policy` handles pressure instead. If a spike outruns the timer and an
+alloc fails between ticks, that just takes the normal OOM path (§8.2 / core
+`maxmemory-policy`) — there is no separate reactive-shrink path, because reacting
+to a failure is already too late to reclaim gracefully. Open (tuning/verification,
+not design): the cheapest module API to read
 `used_memory`/`maxmemory` on the timer, and the watermark + polling cadence — to be
 settled with benchmarks so the timer keeps ahead of spikes without thrashing
 grow/shrink.
@@ -1081,15 +1085,17 @@ a sparse buffer table pre-allocated at startup to 1024 slots (see §8.6 O3 for t
 ### 8.5 How Shrinking Works
 
 Shrink evicts the chosen victim segment and removes it from the registry.
-**Tiered-mode only** — in Dram mode the DRAMPool is the data, so there is no module
-reclaim path; core's `maxmemory-policy` handles pressure instead (§8.3).
-
-**Part 1 — Draining the victim (the hard part)**
+Runs in **both modes**, but with different constraints:
+- **Tiered mode:** always safe — the victim's cached objects are dropped and GETs
+  fall back to NVMe. The segment is drained and released.
+- **Dram mode:** only reclaims segments with zero live allocations. If the victim
+  has live objects (client data), the shrink is skipped — there is no fallback
+  storage. Core's `maxmemory-policy` handles pressure on live keys instead (§8.3).
 
 The drain machinery (`Segment.draining`, `refcount`, `talc.truncate`) lives in
-`SegmentPool` and is mode-agnostic code, but it is only invoked from the Tiered
-shrink path. The fundamental problem: talc owns *one* heap spanning all claimed
-segments and picks allocations purely from free-list bins. Setting
+`SegmentPool` and is mode-agnostic. The mode-specific guard is in
+`DRAMPool::try_shrink()` — it aborts and unmarks draining if `victim_bytes > 0`
+in Dram mode.
 `segment.draining = true` does nothing on its own — talc can still hand out a buffer
 from that segment to the next `alloc` call, and new GETs can keep acquiring
 `Arc<ObjectContext>` references into it, preventing refcount from draining. The drain
@@ -1207,36 +1213,29 @@ Finding *free space* is not the scaling cost — that is talc's job. All segment
 free block from talc's internal free-list (not an O(segments) search). The cost is
 the step *after* malloc: mapping the returned pointer back to a segment index.
 
-Today `SegmentPool::find_segment(addr)` is a **linear scan** over all segments:
+Today `SegmentPool` uses a `SegmentState` struct (behind one `Mutex`) that maintains
+two parallel structures: `slots: Vec<Option<Segment>>` (the segment registry) and
+`sorted_bases: Vec<(usize, usize)>` (base addresses sorted for binary search, paired
+with their slot index). The reverse lookup on every `alloc` is:
 
 ```rust
-for (i, seg) in self.segments.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s))) {
-    if addr >= seg.base && addr < seg.base + seg.size { return Some((i, addr - seg.base)); }
-}
+// O(log N) binary search on sorted base addresses
+let pos = self.sorted_bases.partition_point(|&(base, _)| base <= addr);
+let (base, slot_idx) = self.sorted_bases[pos - 1];
 ```
 
-This runs on **every `alloc`**. With few segments it is negligible, but it is
-**O(N) in segment count** — on a 1 TB DRAMPool at 1 GiB/segment that is ~1000
-range-checks per allocation, on the hot path. That is the real scaling concern for
-allocation.
+This is **O(log N)** — at 1000 segments, ~10 comparisons on ~80 bytes of data,
+always hot in L1 cache. `sorted_bases` is maintained incrementally: `insert_sorted`
+on `expand`, `remove_sorted` on `release_drained`. Both are infrequent (seconds-scale),
+so the O(N) insert cost is negligible.
 
-Fix options (to pick when segment counts grow large enough to matter — measure
-first):
-- **Binary search on sorted segment base addresses → O(log N).** Segment bases are
-  fixed once allocated; keep them sorted and binary-search the pointer. ~1000
-  segments → ~10 comparisons. Works regardless of segment sizes. Straightforward.
-- **O(1) arithmetic** if segments were one contiguous equal-stride arena:
-  `seg_idx = (addr − arena_base) / segment_size`. But segments are separately
-  `alloc_zeroed`'d today (not one contiguous arena), so addresses have no clean
-  stride — this would require allocating the whole arena contiguously up front, which
-  conflicts with lazy per-segment growth. Not free.
-- **Per-segment talc instead of one shared heap:** malloc would then know its
-  segment, but you lose cross-segment free-block sharing and reintroduce "which
-  segment has room?" as the new scan. Likely worse.
-
-Recommended when needed: **binary search on sorted bases** (O(log N), no arena
-constraint, compatible with lazy growth). Not urgent at small segment counts —
-gate the change on a measured threshold rather than building it prematurely.
+The previous O(N) linear scan was the approach before the sorted index was added.
+The per-segment talc and arithmetic stride options were evaluated and rejected:
+- **Per-segment talc:** moves the scan from after malloc to before it (must find a
+  non-full segment). Same O(N) cost, different location. Loses cross-segment
+  best-fit packing.
+- **O(1) stride arithmetic:** requires a contiguous arena (`alloc_zeroed` once for
+  the whole pool), which conflicts with lazy per-segment growth.
 
 **Why the mapping is ours, not talc's (verified in talc 4.4.3 source):** talc
 offers no channel to recover the owning segment from an allocation. `malloc` returns
@@ -1448,6 +1447,9 @@ this section owns the semantics.
 | `lo-buffer-size` | `8MB` | — | — | Immutable | I/O chunk / allocation unit (detail: §7.2) |
 | `lo-max-buffers-per-op` / `lo-streaming-min-buffers` / `lo-max-streaming-ops` | 8 / 2 / 2 | — | — | — | Streaming pipeline depth (detail: §7.3.6) |
 | `worker-threads` | `2` | `1` | `32` | Immutable | tokio transport CQ-polling threads |
+| `scaling-poll-ms` | `5000` | `500` | — | Live | Scaling cron interval in milliseconds. How often the cron checks utilization and memory pressure to expand or shrink the pool |
+| `scaling-expand-watermark` | `80` | `1` | `99` | Live | Pool utilization % above which the cron adds a segment proactively. Prevents alloc failures on the hot path |
+| `scaling-shrink-watermark` | `80` | `1` | `99` | Live | Server memory pressure % (used\_memory / ceiling) above which the cron evicts the least-loaded segment |
 
 ¹ `dram-maxmemory` accepts up to i64::MAX but its *effective* ceiling is always the
 server's `maxmemory` / physical RAM (§11.2).
@@ -1495,10 +1497,11 @@ actor model in §8.1, and the reclaim *mechanics* live in §8.5:
 
 - **Tiered mode: soft.** DRAMPool is a cache; the budget is a target the pool can be
   pushed below under memory pressure (data persists on NVMe).
-- **Dram mode: hard.** DRAMPool *is* the data, so the budget is a reservation the
-  module does not give back; under pressure, core's `maxmemory-policy` evicts whole
-  keys (or the SET fails under `noeviction`). The module never shrinks Dram-mode
-  segments itself.
+- **Dram mode: hard for live data, soft for empty segments.** DRAMPool *is* the
+  data — the module never reclaims segments with live objects. Under pressure,
+  core's `maxmemory-policy` evicts whole keys (or SETs fail under `noeviction`).
+  However, empty segments (all objects deleted by the client) are reclaimed by the
+  scaling cron when memory pressure crosses the shrink watermark.
 
 **NVMe staging is not a scalable budget.** `nvme-staging-size` sizes transient I/O
 buffers for concurrency, not a cache; it is fixed at startup and never shrinks under

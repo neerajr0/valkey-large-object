@@ -70,7 +70,8 @@ use std::sync::{Mutex, OnceLock};
 /// `None` = empty slot (no page pinned, no buffer registered at this index).
 /// `Some((ptr, len))` = live segment registered at this index.
 ///
-/// Pre-allocated at startup to 1024 slots (UIO_MAXIOV hard cap).
+/// Grows as segments are added via `append_iovec`. Bounded by `u16::MAX` (65535)
+/// since iovec_index is u16 — in practice a handful of entries.
 /// Per-slot updates via `clear_iovec` mirror the io_uring sparse table model:
 /// nulling a slot costs nothing (no page pinning for null entries).
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
@@ -140,7 +141,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         return Err(format!(
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
-             Increase dram-segment-size or decrease dram-maxmemory",
+             Increase segment-size or decrease dram-maxmemory",
             dram_segment_count,
             nvme_segments,
             total_segments,
@@ -258,12 +259,12 @@ pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
     if let Some(nvme_pool) = NVME_POOL.get() {
-        for seg in nvme_pool.segments().iter().flatten() {
-            slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
-        }
+        nvme_pool.with_live_segment_slices(|base, size| {
+            slices.push(unsafe { std::slice::from_raw_parts(base, size) });
+        });
     }
-    for seg in get_dram_pool().segments().iter().flatten() {
-        slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
-    }
+    get_dram_pool().with_live_segment_slices(|base, size| {
+        slices.push(unsafe { std::slice::from_raw_parts(base, size) });
+    });
     slices
 }

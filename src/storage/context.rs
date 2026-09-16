@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 /// A buffer that is a sub-allocation within a registered segment.
 /// Segment-agnostic: works for both DRAMPool and NVMePool segments.
 /// `segment_idx` identifies which registered iovec entry (io_uring buf_index).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SegmentBuffer {
     /// Which segment this slice lives in (local index into the owning pool's segments vec).
     /// NOT the global io_uring iovec index - that is on Segment.iovec_index.

@@ -8,7 +8,7 @@
 //! produce zero change to used_memory — only segment creation/destruction does.
 
 use std::alloc::Layout;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use talc::Span;
 
@@ -29,6 +29,11 @@ pub struct Segment {
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
+    /// Bytes currently allocated from this segment (sum of align_up(alloc sizes)).
+    /// +N on alloc, -N on free. Used for victim selection (prefer least loaded)
+    /// and per-segment utilization in INFO largeobj.
+    /// Relaxed ordering is intentional — see SegmentPool.allocated_bytes comment.
+    pub allocated_bytes: AtomicUsize,
     /// When true, no new promotions target this segment. Set during shrink/drain.
     /// GET handlers check this before acquiring Arc<ObjectContext> on this segment;
     /// if draining they defer to NVMe so no new Arc refs are acquired.
@@ -50,6 +55,7 @@ impl Segment {
             iovec_index: 0,            // set by caller after talc.claim()
             claim_span: Span::empty(), // set by caller after talc.claim()
             refcount: AtomicU32::new(0),
+            allocated_bytes: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
         }
     }

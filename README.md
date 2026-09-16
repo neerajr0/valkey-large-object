@@ -39,7 +39,7 @@ valkey-server --port 7380 \
     --loadmodule ./target/release/libvalkey_largeobj.so \
         operating-mode Dram \
         dram-maxmemory 1gb \
-        dram-segment-size 64mb
+        segment-size 64mb
 ```
 
 ### Tiered mode (DRAM cache + NVMe persistence)
@@ -49,7 +49,7 @@ valkey-server --port 7380 \
         operating-mode Tiered \
         nvme-dir /mnt/nvme-data \
         dram-maxmemory 1gb \
-        dram-segment-size 64mb \
+        segment-size 64mb \
         nvme-maxmemory 10gb \
         nvme-staging-size 64mb
 ```
@@ -61,7 +61,7 @@ valkey-server --port 7380 \
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
 | `nvme-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
 | `dram-maxmemory` | 0 (unlimited) | Yes | Total DRAM budget. 0 = grow on demand (one segment at a time). |
-| `dram-segment-size` | 64mb | Immutable | Size of each DRAMPool segment. Min 1mb. |
+| `segment-size` | 64mb | Immutable | Size of each DRAMPool segment. Min 1mb. |
 | `nvme-maxmemory` | 10gb | Yes | Max NVMe disk usage. Min 1mb. |
 | `nvme-staging-size` | 64mb | Immutable | Size of NVMe staging buffer (1 segment). Min 1mb. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
