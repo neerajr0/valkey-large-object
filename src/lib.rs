@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, Status, ValkeyString};
+use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -44,8 +44,11 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod info;
 pub mod storage;
 pub mod transport;
+
+use info::lo_info;
 
 use crate::data_type::LO_TYPE;
 use crate::transport::config::FabricProvider;
@@ -73,18 +76,20 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Size of the single NVMe staging segment (DRAM for I/O buffers).
-    /// Used in Tiered mode for read/write staging. Default: 64MB.
-    /// Immutable after load. Always 1 segment of this size.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Used in Tiered mode for read/write staging. Split into uniform
+    /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
+    /// (ceiling so actual staging is never less than requested). Immutable after load.
     static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Total DRAM budget for cached objects. 0 = no limit (grow on demand).
     /// In Dram mode: all objects live here. In Tiered mode: promotion cache.
     static ref CFG_DRAM_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
-    /// Size of each DRAMPool segment. Growth unit when dram-maxmemory=0.
+    /// Uniform segment size for all pools (DRAMPool and NVMePool).
+    /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
     /// Default: 64MB. Immutable after load.
-    static ref CFG_DRAM_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Max disk usage in nvme-dir. Default: 10GB.
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(10 * 1024 * 1024 * 1024);
@@ -94,8 +99,22 @@ lazy_static::lazy_static! {
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
-    /// Default: 256MB. Supports memory notation (e.g., "256mb").
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
+    /// Must be < segment-size (an object is staged as one contiguous buffer in one
+    /// segment). Default: 64MB, matching the default segment-size. Supports memory
+    /// notation (e.g., "64mb").
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+
+    /// Scaling cron poll interval in milliseconds. Controls how often the scaling
+    /// timer fires to check utilization and memory pressure. Default: 5000ms.
+    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
+    /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
+    static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
+
+    /// Shrink watermark (0.0–1.0). When used_memory/maxmemory exceeds this ratio,
+    /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
+    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
@@ -188,7 +207,12 @@ pub fn dram_maxmemory() -> u64 {
 }
 
 pub fn dram_segment_size() -> usize {
-    CFG_DRAM_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Alias for symmetry — both pools use the same segment size.
+pub fn segment_size() -> usize {
+    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn nvme_maxmemory() -> u64 {
@@ -205,6 +229,46 @@ pub fn max_promote_size() -> u64 {
 
 pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn scaling_poll_ms() -> u64 {
+    CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn scaling_expand_watermark() -> f64 {
+    CFG_SCALING_EXPAND_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+pub fn scaling_shrink_watermark() -> f64 {
+    CFG_SCALING_SHRINK_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+/// Read the server-wide memory figures from Valkey via `INFO memory`.
+/// Returns `(used_memory, maxmemory)` in bytes. `maxmemory == 0` means the
+/// server has no configured limit (unbounded). This is the SERVER-scoped
+/// signal (all data types + overhead), not the module's own pool usage —
+/// used by both the scaling cron's shrink check and the expand OOM guard so
+/// the two decisions share one source of truth. Must be called on the main
+/// event-loop thread (module API).
+pub fn server_memory(ctx: &Context) -> (u64, u64) {
+    let info = ctx.server_info("memory");
+    let used = info.field_unsigned("used_memory").unwrap_or(0);
+    let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
+    (used, maxmemory)
+}
+
+/// Whether allocating `extra_bytes` more would push server memory to/over the
+/// shrink watermark fraction of `maxmemory`. Returns `false` when `maxmemory`
+/// is 0 (no server limit configured — the caller falls back to allocation
+/// success as the only bound). Used to gate expand so we never grow into
+/// memory the shrink path would immediately try to reclaim.
+pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
+    let (used, maxmemory) = server_memory(ctx);
+    if maxmemory == 0 {
+        return false;
+    }
+    let ceiling = (maxmemory as f64 * scaling_shrink_watermark()) as u64;
+    used.saturating_add(extra_bytes) >= ceiling
 }
 
 pub fn direct_io() -> bool {
@@ -343,6 +407,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         "largeobj: initialized {storage_summary}, fabric services: {fabric_services}"
     ));
 
+    // Start the scaling cron (both modes — handles expand and shrink based on mode).
+    storage::scaling::rearm_scaling_cron(ctx, scaling_poll_ms());
+
     Status::Ok
 }
 
@@ -381,6 +448,7 @@ valkey_module! {
     data_types: [LO_TYPE],
     init: initialize,
     deinit: deinitialize,
+    info: lo_info,
     commands: [
         ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
         ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
@@ -390,21 +458,27 @@ valkey_module! {
         i64: [
             ["dram-maxmemory", &*CFG_DRAM_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
-            ["dram-segment-size", &*CFG_DRAM_SEGMENT_SIZE, 67_108_864, 1_048_576, i64::MAX,
+            ["segment-size", &*CFG_SEGMENT_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, i64::MAX,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
             ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::MEMORY, None, None],
             ["lo-max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
              ConfigurationFlags::DEFAULT, None, None],
             ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
              ConfigurationFlags::IMMUTABLE, None, None],

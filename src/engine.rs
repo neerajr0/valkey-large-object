@@ -1,7 +1,7 @@
 //! Command Engine — routes GET/SET through the correct path based on
 //! operating mode (DRAM-only vs Tiered) and transport (TCP vs EFA).
 //!
-//! Architecture (STORAGE_DESIGN.md §9.2):
+//! Architecture:
 //!   TCP GET, DRAMPool hit       → serve inline (no tokio)
 //!   TCP GET, DRAMPool miss      → tokio task (Tiered: NVMe read; DRAM-only: impossible)
 //!   TCP SET, DRAM-only          → inline (alloc + memcpy, no NVMe)
@@ -210,14 +210,14 @@ fn execute_get_tiered(
     // `file` (captured by the promotion task below) pins the ObjectFile across the
     // NVMe read and transfer — see the in-flight pin invariant at the top of file.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
-        // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+        // TODO: Multi-buffer streaming/chunking.
         if obj_ctx.buffers.len() != 1 {
             todo!("streaming and chunking not yet implemented");
         }
         let seg_buf = &obj_ctx.buffers[0];
         let buf_ptr_usize = dram_pool.buffer_ptr(seg_buf) as usize;
         let read_op = uring::UringOp {
-            iovec_index: dram_pool.segments()[seg_buf.segment_idx as usize].iovec_index,
+            iovec_index: dram_pool.iovec_index_for_buf(seg_buf),
             buf_ptr: buf_ptr_usize as *mut u8,
             file_offset: 0,
             len: obj_len,
@@ -298,9 +298,9 @@ fn execute_get_tiered(
 
     let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let read_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,
@@ -442,7 +442,16 @@ fn serve_set_dram_tcp(
 
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
         Some(b) => b,
-        None => return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)),
+        None => {
+            // Reactive expansion: pool exhausted — try adding one segment, then retry.
+            if dram_pool.try_expand(ctx).is_none() {
+                return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+            }
+            match dram_pool.alloc(obj_len as usize) {
+                Some(b) => b,
+                None => return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)),
+            }
+        }
     };
 
     let buf_ptr = dram_pool.buffer_ptr(&seg_buf);
@@ -708,9 +717,9 @@ async fn do_tiered_nvme_write(
 
     let nvme_pool = storage::get_nvme_pool();
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let write_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[stream_ctx.buffers[0].segment_idx as usize].iovec_index,
+        iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,
@@ -827,7 +836,7 @@ fn serve_from_dram(
             remote_addr,
         } => {
             // EFA: write from DRAMPool buffer to client GPU.
-            // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+            // TODO: Multi-buffer streaming/chunking.
             if obj_ctx.buffers.len() != 1 {
                 todo!("streaming and chunking not yet implemented");
             }

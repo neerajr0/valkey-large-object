@@ -1,11 +1,11 @@
 //! NVMePool — short-lived transient I/O buffers.
 //!
 //! Thin wrapper around SegmentPool. No object map, no draining.
-//! Segments are fixed at startup, never resized.
+//! Sized at startup to ceil(nvme-staging-size / segment-size) uniform segments,
+//! fixed thereafter — never expanded or shrunk (unlike DRAMPool).
 //! StreamingContexts allocate from here and free on request completion.
 
 use super::context::SegmentBuffer;
-use super::segment::Segment;
 use super::segment_pool::SegmentPool;
 
 pub struct NVMePool {
@@ -40,8 +40,20 @@ impl NVMePool {
         self.pool.buffer_ptr(buf)
     }
 
-    /// Access segments (needed by engine for buf_index lookup).
-    pub fn segments(&self) -> &[Segment] {
-        &self.pool.segments
+    pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
+        self.pool.iovec_index_for_buf(buf)
+    }
+
+    /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
+    pub fn segment_counts(&self) -> (usize, usize, usize) {
+        self.pool.segment_counts()
+    }
+
+    /// Call `f` with each segment's base pointer and size. Used for EFA registration.
+    pub fn with_live_segment_slices<F>(&self, f: F)
+    where
+        F: FnMut(*const u8, usize),
+    {
+        self.pool.with_live_segment_slices(f);
     }
 }

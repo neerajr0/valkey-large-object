@@ -9,8 +9,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" segment-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -47,16 +46,16 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_dram_pool_exhaustion(self):
-        """An object larger than dram-segment-size fails with DRAM pool exhaustion."""
+        """An object larger than segment-size fails with pool exhausted."""
         client = self.server.get_new_client()
-        # dram-segment-size is 1MB. A 2MB object cannot be allocated.
+        # segment-size is 1MB. A 2MB object cannot be allocated.
         obj_size = 2 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected DRAM pool exhaustion error"
+            assert False, "Expected pool exhausted error"
         except ResponseError as e:
-            assert 'dram buffer pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -103,7 +102,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         # COPY needs another 900KB — pool is only 1MB total.
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail with DRAM pool exhaustion"
+            assert False, "Expected COPY to fail with pool exhausted"
         except ResponseError:
             pass  # Expected — pool cannot fit two 900KB objects
 
