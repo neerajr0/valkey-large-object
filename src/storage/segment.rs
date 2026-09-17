@@ -1,59 +1,65 @@
-//! Segment — a contiguous registered memory region.
+//! Segment — a contiguous registered memory region with its own talc allocator.
 //!
 //! Allocated via std::alloc::alloc_zeroed (ValkeyAlloc/zmalloc) so Valkey's
 //! used_memory correctly reflects the allocation. Registered with io_uring
 //! (one iovec entry) and EFA (one fi_mr_reg call).
 //!
-//! talc sub-allocates within segments. Individual talc.malloc/free calls
-//! produce zero change to used_memory — only segment creation/destruction does.
+//! Each Segment carries its OWN `Talc<>` instance covering exactly its own
+//! memory range. This eliminates the reverse-lookup pointer→segment path and
+//! the shared-allocator lock: allocations are routed to a segment at the
+//! picker level (SegmentPool::alloc_n), and the segment's local talc handles
+//! only its own address range.
 
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use talc::Span;
+use talc::{ErrOnOom, Span, Talc};
 
-/// A contiguous registered memory region.
+/// A contiguous registered memory region with an owned talc allocator.
 pub struct Segment {
     /// Base pointer (4KB-aligned, allocated via ValkeyAlloc).
     pub base: *mut u8,
     /// Total size in bytes.
     pub size: usize,
     /// Index into the sparse iovec table (io_uring ReadFixed/WriteFixed) and
-    /// into the SegmentPool's `segments: Vec<Option<Segment>>` vector.
-    /// Write-once at creation; immutable for the segment's lifetime (holes model).
+    /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector.
+    /// Write-once at creation; immutable for the segment's lifetime.
     pub iovec_index: u16,
-    /// The exact Span returned by talc.claim() at creation time.
-    /// Required for talc.truncate() during drain — talc word-aligns the span
-    /// inward and truncate requires the exact recorded value.
-    pub claim_span: Span,
+    /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
+    /// Each alloc/free on this segment locks THIS mutex — never contends with
+    /// other segments' allocators.
+    pub talc: Mutex<Talc<ErrOnOom>>,
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
     /// Bytes currently allocated from this segment (sum of align_up(alloc sizes)).
-    /// +N on alloc, -N on free. Used for victim selection (prefer least loaded)
-    /// and per-segment utilization in INFO largeobj.
-    /// Relaxed ordering is intentional — see SegmentPool.allocated_bytes comment.
+    /// Used for picker (max-loaded packing) and INFO utilization.
+    /// Relaxed ordering — advisory, not correctness.
     pub allocated_bytes: AtomicUsize,
-    /// When true, no new promotions target this segment. Set during shrink/drain.
-    /// GET handlers check this before acquiring Arc<ObjectContext> on this segment;
-    /// if draining they defer to NVMe so no new Arc refs are acquired.
+    /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
 }
 
 impl Segment {
-    /// Allocate a new segment via ValkeyAlloc (alloc_zeroed).
-    /// Visible in Valkey's used_memory immediately.
-    /// `iovec_index` and `claim_span` are set after claiming in talc (see SegmentPool::new / expand).
+    /// Allocate a new segment via ValkeyAlloc, create its talc, claim its range.
+    /// `iovec_index` is set to 0 initially; caller assigns after `append_iovec`.
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
 
+        let mut talc = Talc::new(ErrOnOom);
+        let span = Span::from_base_size(base, size);
+        // Safety: memory was just allocated exclusively for this Segment; nothing
+        // else references [base, base+size), so claim's non-overlap invariant holds.
+        unsafe { talc.claim(span).expect("talc.claim failed for new segment") };
+
         Self {
             base,
             size,
-            iovec_index: 0,            // set by caller after talc.claim()
-            claim_span: Span::empty(), // set by caller after talc.claim()
+            iovec_index: 0, // set by caller after append_iovec
+            talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -62,21 +68,14 @@ impl Segment {
 
     /// Check if safe to release (draining + no live allocations).
     pub fn is_releasable(&self) -> bool {
-        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
-        // all buffer writes from prior users are guaranteed visible, making
-        // it safe to deallocate the segment.
         self.draining.load(Ordering::Acquire) && self.refcount.load(Ordering::Acquire) == 0
     }
 
     pub fn inc_ref(&self) {
-        // Relaxed is fine since we are claiming the segment before doing any work,
-        // so there are no prior writes that need to be visible to others.
         self.refcount.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn dec_ref(&self) {
-        // Release ensures any data written to this segment's buffers is visible
-        // before another thread sees refcount == 0 and deallocates the segment.
         self.refcount.fetch_sub(1, Ordering::Release);
     }
 
@@ -91,11 +90,15 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // Dropping the Talc first is not required — its metadata lives inside
+        // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
+        // memory (talc has no external state). Then dealloc the backing memory.
         let layout = Layout::from_size_align(self.size, 4096).expect("Segment layout");
         unsafe { std::alloc::dealloc(self.base, layout) };
     }
 }
 
-// SAFETY: Segment memory is stable for its lifetime. Accessed through Mutex<Talc>.
+// SAFETY: Segment memory is stable for its lifetime.
+// Talc mutex protects concurrent alloc/free on this segment.
 unsafe impl Send for Segment {}
 unsafe impl Sync for Segment {}
