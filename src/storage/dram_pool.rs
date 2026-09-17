@@ -190,19 +190,33 @@ impl DRAMPool {
     /// A segment marked draining is freed asynchronously: its memory is not
     /// reclaimed until all in-flight Arc holders drop and refcount reaches 0.
     /// This function scans for segments where `draining && refcount == 0` and
-    /// physically frees them: removes from talc's free-lists (`talc.truncate`),
-    /// clears the io_uring iovec slot (`clear_iovec`), and deallocates the memory.
+    /// physically frees them: takes the Segment out of its slot, clears the
+    /// io_uring iovec slot (`clear_iovec`), and drops it. Each segment owns its
+    /// own talc whose metadata lives inside the segment's memory, so dropping
+    /// the Segment deallocates that memory and the talc vanishes with it — no
+    /// `talc.truncate` or free-list surgery is needed (unlike the old shared
+    /// allocator).
     ///
     /// Must be called from the Valkey main event-loop thread only.
     pub fn release_drained_segments(&self) {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, respecting the dram-maxmemory cap.
+    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
+    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
+    /// module-local `dram-maxmemory` sub-budget if set.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, None if at cap.
-    pub fn try_expand(&self) -> Option<u16> {
+    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// crossed. Must be called on the main event-loop thread (reads server memory).
+    pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
+        // Server-wide OOM guard: never grow into memory the shrink path would
+        // immediately reclaim. No-op when the server has no maxmemory configured.
+        if crate::would_cross_memory_watermark(ctx, self.pool.segment_size as u64) {
+            return None;
+        }
+
+        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
         let dram_max = crate::dram_maxmemory();
         if dram_max > 0 {
             let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;

@@ -131,11 +131,13 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 ```
 
 **How it works:**
-- One `talc` allocator instance manages multiple segments (each added via `talc.claim(span)`)
-- Alloc = `talc.malloc(Layout::from_size_align(len, 4096))`. Finds contiguous free block.
-- Free = `talc.free(ptr, layout)`. Returns space, coalesces with adjacent free blocks.
-- Realloc = `talc.realloc()`. Grows in-place if possible, else alloc+copy+free.
-- Objects tracked as `(segment_idx, offset, len)` in HashMap — offsets, not raw pointers.
+- Each segment owns its own `talc` allocator, claiming exactly that segment's range
+  (`talc.claim(span)` at segment creation). Alloc picks a target segment first, then
+  mallocs from that segment's talc. (Earlier drafts used one shared talc across all
+  segments; §8.7 explains why per-segment was chosen.)
+- Alloc = `talc.malloc(Layout::from_size_align(len, 4096))`. Finds contiguous free block within the chosen segment.
+- Free = `talc.free(ptr, layout)`. Returns space, coalesces with adjacent free blocks in that segment.
+- Objects tracked as `(segment_idx, offset, len)` — `segment_idx` known at alloc time, so no pointer→segment reverse lookup.
 
 **Registration:**
 - io_uring: Yes — register each segment as one large buffer (`buf_index = segment_idx`, use offset within it for each I/O). Enables `ReadFixed`/`WriteFixed`.
@@ -187,24 +189,25 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 
 We use Approach B (talc arena). Object sizes are unknown at design time — talc provides exact-fit allocation regardless of what sizes production traffic produces.
 
-**Two separate talc instances, each with their own segments:**
+**Per-segment talc — each segment owns its own allocator (see §8.7 for the full
+rationale):**
 
 ```
-NVMePool:    N segments (each ≤1GiB)   — own Mutex<Talc>, high churn, short-lived StreamingContexts
-DRAMPool:    N segments (each ≤1GiB)   — own Mutex<Talc>, low churn, long-lived ObjectContexts
+NVMePool:    N segments (each ≤1GiB)   — each segment: own Mutex<Talc>, high churn, short-lived StreamingContexts
+DRAMPool:    N segments (each ≤1GiB)   — each segment: own Mutex<Talc>, low churn, long-lived ObjectContexts
 
 io_uring registration: [iovec{seg, ≤1GiB}, iovec{seg, ≤1GiB}, ...] — every segment in one array, each ≤1GiB
 EFA registration:      fi_mr_reg per segment — enables fi_write from any buffer in either pool
 ```
 
-**Each segment is a separate `talc.claim` (never `talc.extend`).** A pool's talc
-manages its segments as independent claimed heaps, so every allocation lies wholly
-within exactly one segment — no allocation straddles a segment boundary. This
-single-segment-ownership invariant is what makes the addressing model valid: one
-allocation maps to one segment → one io_uring `buf_index`, one segment refcount, one
-EFA MR. Bridging two segments into one contiguous heap via `extend` would allow a
-straddling chunk with no single valid `buf_index`, so it is never used. (See §8.7
-for the address→segment lookup this enables.)
+**Each segment carries its own `Talc` that `claim`s exactly its own `[base, base+size)`
+range (never `talc.extend`).** There is no shared allocator across segments and no
+pointer→segment reverse lookup: alloc picks the target segment first (least-loaded)
+and mallocs from that segment's own talc, so every allocation lies wholly within
+exactly one segment. This single-segment-ownership invariant is what makes the
+addressing model valid: one allocation maps to one segment → one io_uring `buf_index`,
+one segment refcount, one EFA MR. (See §8.7 for why per-segment talc was chosen over a
+single shared heap with reverse lookup.)
 
 **Both pools are io_uring registered (IORING_REGISTER_BUFFERS) in Tiered mode:**
 - NVMePool: ReadFixed/WriteFixed for NVMe I/O staging (primary use case)
@@ -222,7 +225,7 @@ error until EFA becomes available. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
 - Prevents lifetime-mixing fragmentation: NVMePool high-churn alloc/free cycles cannot create holes between long-lived DRAMPool objects
-- Each layer's talc instance only sees objects of similar lifetime — fragmentation is self-healing (NVMePool: FIFO churn reclaims space naturally; DRAMPool: infrequent evictions don't leave Swiss-cheese)
+- Each layer's segments only see objects of similar lifetime — fragmentation is self-healing (NVMePool: FIFO churn reclaims space naturally; DRAMPool: infrequent evictions don't leave Swiss-cheese)
 - Independent sizing: NVMePool sized for max concurrent I/O, DRAMPool sized for working set
 - Independent scaling: expand/shrink one layer without affecting the other
 
@@ -352,7 +355,7 @@ module-internal structures:
 - **FdPool:** `HashMap<ObjectId, FdEntry>` (each entry wraps an `Arc<OwnedFd>` plus LFRU scoring) — rebuilt on load, not serialized (§6.4)
 - **DRAMPool:** `HashMap<ObjectId, ObjectContext>` — buffers in DRAMPool segments, populated on GET hits, evicted independently
 - **NVMePool inflight:** transient `StreamingContext` per in-flight request — buffers in NVMePool segments, dropped on completion
-- **Allocators:** `Mutex<Talc>` per layer — `dram_pool_talc` for DRAMPool, `nvme_pool_talc` for NVMePool (§4.5)
+- **Allocators:** one `Mutex<Talc>` **per segment** (inside each `Segment`), in both pools — no shared cross-segment allocator (§4.5, §8.7)
 
 ### 6.2 ObjectContext, StreamingContext, and SegmentBuffer
 
@@ -517,16 +520,16 @@ ObjectContext exists in two layers with different lifetimes. Same struct, same S
 
 **DRAMPool (long-lived):**
 - ObjectContext created on cache promotion (LO.GET hit policy admits it)
-- Buffers allocated from DRAMPool segment(s) via `dram_pool_talc.lock().alloc()`
+- Buffers allocated from a DRAMPool segment via `dram_pool.alloc()` (picks a segment, mallocs from that segment's own talc)
 - Held in `HashMap<ObjectId, ObjectContext>` for the object's entire cached lifetime
 - Buffers remain allocated and serve repeated LO.GET hits directly
-- On DRAMPool eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → `dram_pool_talc.lock().free()` for each buffer
+- On DRAMPool eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → `dram_pool.free()` for each buffer (frees into the owning segment's talc)
 - Object survives on NVMe. Next GET is a cache miss (NVMePool serves it).
 
 **NVMePool (short-lived):**
 - StreamingContext created per in-flight I/O request
-- Buffers allocated from NVMePool segment(s) via `nvme_pool_talc.lock().alloc()`
-- On request completion: StreamingContext dropped → `nvme_pool_talc.lock().free()` for each buffer
+- Buffers allocated from an NVMePool segment via `nvme_pool.alloc()` (segment's own talc)
+- On request completion: StreamingContext dropped → `nvme_pool.free()` for each buffer
 - If promotion policy says yes: separate ReadFixed directly into DRAMPool buffers (§7.3.4). No memcpy from NVMePool. NVMePool buffers freed independently after serving the current request.
 
 ### 6.6 Relationship Diagram
@@ -1075,8 +1078,9 @@ The first two steps are identical in both modes; registration diverges:
 
 1. **Allocate** a new segment (`alloc_zeroed`, ≤1GiB per the §2 cap). Counted in
    `used_memory` via zmalloc (§8.1).
-2. **Register with talc:** `talc.claim(Span::new(base, base + size))` — makes the
-   segment's memory available to the shared allocator.
+2. **Create the segment's talc:** the new `Segment` builds its own `Talc` and
+   `claim`s exactly its own `[base, base+size)` range — no interaction with any other
+   segment's allocator.
 3. **Register with EFA** (`fi_mr_reg` for this segment only — both modes, **if EFA is available**). Dram mode
    uses EFA for direct client RDMA writes (§7.1); Tiered mode uses it for NVMe→client
    reads. Existing MRs and their in-flight operations are untouched (per-MR,
@@ -1099,12 +1103,12 @@ Runs in **both modes**, but with different constraints:
   has live objects (client data), the shrink is skipped — there is no fallback
   storage. Core's `maxmemory-policy` handles pressure on live keys instead (§8.3).
 
-The drain machinery (`Segment.draining`, `refcount`, `talc.truncate`) lives in
+The drain machinery (`Segment.draining`, `refcount`, and per-segment release) lives in
 `SegmentPool` and is mode-agnostic. The mode-specific guard is in
-`DRAMPool::try_shrink()` — it aborts and unmarks draining if `victim_bytes > 0`
+`DRAMPool::try_shrink()` — it aborts (never marks draining) if `victim_bytes > 0`
 in Dram mode.
-`segment.draining = true` does nothing on its own — talc can still hand out a buffer
-from that segment to the next `alloc` call, and new GETs can keep acquiring
+`segment.draining = true` does nothing on its own — the picker can still hand out a
+buffer from that segment to the next `alloc` call, and new GETs can keep acquiring
 `Arc<ObjectContext>` references into it, preventing refcount from draining. The drain
 guard must stop both inflows.
 
@@ -1133,11 +1137,12 @@ The plan — two concurrent inflows to stop:
    `is_releasable()` (`draining && refcount == 0`) and triggers step 4. No spin, no
    poll, no blocking wait.
 
-4. **Release the address range from talc.** Call
-   `talc.truncate(old_heap, Span::empty())` — this deregisters the segment's entire
-   address range from talc's free-lists. Safe here because `refcount == 0` (truncate
-   panics if live allocations remain, but we just confirmed there are none). After
-   this, talc structurally cannot hand out addresses from this segment.
+4. **Release the segment.** With `refcount == 0`, take the `Segment` out of its slot
+   and drop it. Because each segment owns its own talc *inside its own memory*,
+   dropping the `Segment` (`Segment::drop` → `std::alloc::dealloc`) frees the backing
+   memory and the talc metadata vanishes with it. No `talc.truncate`, no free-list
+   surgery, no shared-allocator interaction — the per-segment talc design makes
+   release a plain drop.
 
 **Part 2 — Removing the slot from the registry (Tiered mode; simpler)**
 
@@ -1190,15 +1195,17 @@ that fills them; steady-state growth is fully dense.
    path** checks `is_releasable()` (`draining && refcount == 0`) on every decrement;
    when the last holder drops, `is_releasable()` becomes true and the cleanup
    (steps 5–7) can proceed. No spin, no poll, no blocking wait.
-5. `talc.truncate(victim_heap, Span::empty())` — remove the address range from talc.
-   `victim_heap` is the `Span` returned by `talc.claim` at segment creation and
-   stored in the `Segment` struct (talc word-aligns the span inward, so the stored
-   value may differ from `Span::new(base, base+size)` — must store the exact return
-   value from `claim`).
-6. Under the registry lock: `segments[i] = None`; `fi_close` the victim's EFA MR
-   (**if EFA is available** — both modes); `register_buffers_update(i, null)` for
-   io_uring (**Tiered only** — §8.6 O3 covers the kernel-floor caveat). Other MRs and slots untouched.
-7. Dealloc the segment's memory; `used_memory` drops.
+5. Under the registry lock: `segments[i].take()` — this both removes the segment from
+   the registry (leaving a `None` hole) and hands ownership of the `Segment` to the
+   release path. Then, still on the main thread: `clear_iovec(i)` /
+   `register_buffers_update(i, null)` for io_uring (**Tiered only** — §8.6 O3 covers
+   the kernel-floor caveat, and this per-slot update is the deferred follow-up noted
+   in §8.4); `fi_close` the victim's EFA MR (**if EFA is available** — both modes).
+   Other MRs and slots untouched.
+6. Drop the taken `Segment` — `Segment::drop` runs `std::alloc::dealloc` on the
+   backing memory; its per-segment talc metadata lived inside that memory and vanishes
+   with it. `used_memory` drops. No `talc.truncate`, no stored-`Span` needed for
+   release.
 
 
 ### 8.6 Open Items
@@ -1215,55 +1222,77 @@ that fills them; steady-state growth is fully dense.
 
 ### 8.7 Fast Segment Lookup on Alloc
 
-Finding *free space* is not the scaling cost — that is talc's job. All segments are
-`claim`ed into **one** talc heap, so `alloc` = `talc.malloc(layout)`, which selects a
-free block from talc's internal free-list (not an O(segments) search). The cost is
-the step *after* malloc: mapping the returned pointer back to a segment index.
+### 8.7 Segment Selection on Alloc (Per-Segment talc — Chosen)
 
-Today `SegmentPool` uses a `SegmentState` struct (behind one `Mutex`) that maintains
-two parallel structures: `slots: Vec<Option<Segment>>` (the segment registry) and
-`sorted_bases: Vec<(usize, usize)>` (base addresses sorted for binary search, paired
-with their slot index). The reverse lookup on every `alloc` is:
+**Design chosen: one talc allocator per segment**, not one shared talc across all
+segments. Each `Segment` owns a `Mutex<Talc<ErrOnOom>>` that claims exactly its own
+`[base, base+size)` range. `SegmentPool` no longer has a shared allocator, a
+reverse-lookup index, or `sorted_bases`.
+
+Alloc picks a target segment *before* calling malloc:
 
 ```rust
-// O(log N) binary search on sorted base addresses
-let pos = self.sorted_bases.partition_point(|&(base, _)| base <= addr);
-let (base, slot_idx) = self.sorted_bases[pos - 1];
+// Least-loaded live, non-draining segment (single O(N) min pass, no sort).
+// N = segment count (≤1024), not objects. Two relaxed atomic loads per segment.
+let seg_idx = slots.iter().enumerate()
+    .filter(|(_, s)| eligible(s))          // live, not draining, passes fast byte filter
+    .min_by_key(|(_, s)| s.allocated_bytes)?;
+// Then lock THAT segment's own talc and malloc from it.
+let ptr = seg.talc.lock().malloc(layout)?;
 ```
 
-This is **O(log N)** — at 1000 segments, ~10 comparisons on ~80 bytes of data,
-always hot in L1 cache. `sorted_bases` is maintained incrementally: `insert_sorted`
-on `expand`, `remove_sorted` on `release_drained`. Both are infrequent (seconds-scale),
-so the O(N) insert cost is negligible.
+Because the segment is known *before* malloc, the returned pointer's owner is known
+by construction — `segment_idx` is stamped directly into the `SegmentBuffer`. **There
+is no pointer→segment reverse lookup at all.** `free` uses `buf.segment_idx` directly.
 
-The previous O(N) linear scan was the approach before the sorted index was added.
-The per-segment talc and arithmetic stride options were evaluated and rejected:
-- **Per-segment talc:** moves the scan from after malloc to before it (must find a
-  non-full segment). Same O(N) cost, different location. Loses cross-segment
-  best-fit packing.
-- **O(1) stride arithmetic:** requires a contiguous arena (`alloc_zeroed` once for
-  the whole pool), which conflicts with lazy per-segment growth.
+**Why per-segment talc was chosen (this reverses the earlier recommendation in this
+section — the reasons that flipped it):**
 
-**Why the mapping is ours, not talc's (verified in talc 4.4.3 source):** talc
-offers no channel to recover the owning segment from an allocation. `malloc` returns
-a bare `Result<NonNull<u8>, ()>` (pointer or failure) — no index, no owner. `Span`
-is `{ base, acme }` — two pointers with no metadata slot to tag — and talc does not
-even retain the claimed `Span`: `claim` dissolves it into the size-bucketed
-free-list and keeps only `bins` + `oom_handler`, not a list of spans. So the
-address→segment identity is metadata *we* hold (the segment bases) and must resolve
-ourselves; binary search on those bases is the mechanism.
+1. **It eliminates the reverse-lookup problem entirely, not just optimizes it.** The
+   shared-heap design had to map a bare `malloc`-returned pointer back to a segment
+   (talc exposes no owner — verified in talc 4.4.3: `malloc` returns a bare
+   `NonNull<u8>`, `claim` dissolves the `Span` into free-list bins and keeps no span
+   list). That forced an O(log N) binary search over a `sorted_bases` index
+   maintained on every expand/release. Per-segment talc makes the owner known *before*
+   malloc, so the entire index and its maintenance disappear. Net **−128 lines**.
 
-**Single-segment ownership invariant (load-bearing):** every allocation lies wholly
-within exactly one segment — no allocation ever straddles two. This holds because
-each segment is a **separate `claim`** (its own heap, bounded by a base tag), and
-talc only coalesces free chunks *within* one claimed heap. We must **never use
-`talc.extend`** to bridge two segments into one contiguous heap — that is the only
-operation that would allow a chunk to span a segment boundary. Single-segment
-ownership is what makes the whole addressing model valid: one allocation → one
-`buf_index` (io_uring ReadFixed/WriteFixed address a single registered buffer), one
-segment refcount, one EFA MR. A straddling allocation would have no single valid
-`buf_index` and would break I/O. So: always separate `claim` per segment, never
-`extend`; `find_segment` then always resolves to exactly one segment.
+2. **Lock parallelism.** The shared talc was one `Mutex<Talc>` serializing every
+   alloc/free across all segments. Per-segment talc gives each segment its own lock,
+   so concurrent allocs on different segments never contend. (Microbench: per-segment
+   is slower at low thread counts by a small constant but scales — 1.3× @24 threads,
+   2.7× @64, 5.2× @500 — purely from lock parallelism.)
+
+3. **`claim`/release symmetry — no `talc.truncate` at all.** With per-segment talc,
+   each segment's talc metadata lives *inside that segment's own memory*. Releasing a
+   drained segment is just `slots[i].take()` + drop — `Segment::drop` deallocs the
+   backing memory and the talc vanishes with it. The shared design required
+   `talc.truncate(claim_span, Span::empty())` to carve the range out of the shared
+   free-list, which needs the exact `claim`-returned `Span` and panics if any live
+   allocation remains. Per-segment talc removes that hazard entirely.
+
+**Costs accepted (why they're fine):**
+- **Least-loaded pick is O(N) over segments** (N ≤ 1024, two relaxed atomic loads
+  each, no allocation, L1-resident). It is dwarfed by the malloc it precedes and the
+  NVMe I/O that follows. A heap keyed on load would be O(log N) but must re-sift on
+  every free (tokio threads) behind its own lock — reintroducing the contention
+  per-segment talc just removed, to optimize a microsecond-scale advisory pick. Not
+  worth it. Fewer/larger segments (bigger `segment-size`) is the real lever if N ever
+  matters.
+- **Loses cross-segment best-fit packing.** talc can only best-fit *within* one
+  segment now. Acceptable: chunks are fixed-size (`buffer_size`, 4 KiB-aligned) and
+  segments are uniform, so intra-segment packing is regular; the least-loaded picker
+  spreads load evenly.
+
+**The `claim_span` is still stored per segment** — not for truncate (gone), but for
+the alloc-time precheck: `talc.get_allocated_span(claim_span)` returns the tight
+range covering all live allocations, letting alloc verify room (overhead included)
+before calling malloc, so malloc after a passing precheck cannot fail.
+
+**Single-segment ownership invariant (still load-bearing):** every allocation lies
+wholly within exactly one segment — trivially guaranteed now, since each segment has
+its own talc claiming only its own range and `extend` is never used. One allocation →
+one `buf_index` (io_uring ReadFixed/WriteFixed address a single registered buffer),
+one segment refcount, one EFA MR. This is what makes the addressing model valid.
 
 ### 8.8 NUMA Locality - Will be addressed later. Skip for now.
 
@@ -1323,7 +1352,7 @@ This section describes how shared state is protected, which structures are refco
 | SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
 | ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
 | Open fd | `Arc<OwnedFd>` (inside `FdEntry`) | FdPool map (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops. The strong count *is* the in-flight count — eviction removes an entry only when `strong_count == 1` (no separate refcount field) |
-| Segment | `AtomicU32` refcount + `AtomicBool draining` + stored `Span` from `talc.claim` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: safe to `talc.truncate(claim_span, Span::empty())` + `register_buffers_update(i, null)` (Tiered) + `fi_close` EFA MR (if EFA) + dealloc. The exact `Span` returned by `talc.claim` must be stored — talc word-aligns it inward and `truncate` requires the exact value. |
+| Segment | `AtomicU32` refcount + `AtomicBool draining` + own `Mutex<Talc>` (+ stored `claim_span` for the alloc-time precheck) | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | If draining && refcount==0: `slots[i].take()` + `register_buffers_update(i, null)` (Tiered) + `fi_close` EFA MR (if EFA), then drop the `Segment` — `Segment::drop` deallocs the backing memory and the segment's own talc (metadata inside that memory) vanishes with it. No `talc.truncate`; the stored `claim_span` is only for `get_allocated_span` at alloc time, not release. |
 
 ### 9.2 Threading Model: Which Thread Does What
 
@@ -1353,17 +1382,21 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | Global | Type | Lock | Threads that access |
 |---|---|---|---|
 | DRAMPool object map | `HashMap<ObjectId, Arc<ObjectContext>>` | `RwLock` | Main (read on GET hit, remove on free callback), tokio (read for coalesce check, write for promotion insert + Filling state update) |
-| DRAMPool allocator | `Mutex<Talc>` (dram_pool_talc) | Mutex | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc) |
-| NVMePool allocator | `Mutex<Talc>` (nvme_pool_talc) | Mutex | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
+| DRAMPool allocators | one `Mutex<Talc>` **per segment** (inside each `Segment`) | Mutex (per segment) | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc). Allocs on different segments never contend. |
+| NVMePool allocators | one `Mutex<Talc>` **per segment** (inside each `Segment`) | Mutex (per segment) | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
 | FdPool | `HashMap<ObjectId, FdEntry>` (entry = `Arc<OwnedFd>` + LFRU scoring) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFRU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
-| Segment metadata | `Vec<Segment>` (per pool) | Read-only after init (no lock needed) | All threads (read segment base/size/buf_index). Draining flag is AtomicBool. |
+| Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Mutated only by expand/release on the main thread. Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
 
 **Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
 
-**Why Mutex for talc:** Allocator operations modify internal free-list state — no concurrent access possible. Hold time ~10-50ns. Negligible contention.
+**Why Mutex for talc, and why per-segment:** Allocator operations modify internal
+free-list state — no concurrent access to one talc is possible. Giving each segment
+its own talc Mutex means allocs/frees on *different* segments proceed in parallel;
+only same-segment operations serialize. Hold time ~10-50ns. Negligible contention.
+(See §8.7 for why per-segment talc was chosen over one shared allocator.)
 
-**Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call talc.free if last ref).
+**Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
 **NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `nvme-maxmemory` and fails the SET if it would exceed the cap (`nvme-maxmemory` of 0 = unlimited). This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
 
@@ -1414,11 +1447,13 @@ When shrinking DRAMPool under memory pressure (§8.5, Tiered mode only):
 3. The free path checks is_releasable() (draining && refcount == 0) on every
    decrement. When the last holder drops, is_releasable() becomes true and
    cleanup proceeds:
-     → talc.truncate(segment.claim_span, Span::empty())  — remove from talc free-lists
-     → register_buffers_update(i, null)                   — clear sparse table slot (Tiered)
+     → segments[i].take()                                 — null the registry slot, take ownership of the Segment
+     → clear_iovec(i) / register_buffers_update(i, null)  — clear sparse table slot (Tiered)
      → fi_close(segment.efa_mr)                           — if EFA available
-     → segments[i] = None                                 — null the registry slot
-     → dealloc(segment)                                   — used_memory decreases
+     → drop(segment)                                      — Segment::drop deallocs backing memory;
+                                                            its own talc (metadata inside that memory)
+                                                            vanishes with it. used_memory decreases.
+                                                            No talc.truncate needed (per-segment talc).
 ```
 
 No spin, no poll, no blocking wait. Steps 1 and 2 guarantee no new refcounts enter

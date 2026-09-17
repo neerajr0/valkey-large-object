@@ -73,9 +73,10 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Size of the single NVMe staging segment (DRAM for I/O buffers).
-    /// Used in Tiered mode for read/write staging. Default: 64MB.
-    /// NVMe segment count is derived: nvme-staging-size / segment-size.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Used in Tiered mode for read/write staging. Split into uniform
+    /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
+    /// (ceiling so actual staging is never less than requested). Immutable after load.
     static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Total DRAM budget for cached objects. 0 = no limit (grow on demand).
@@ -107,8 +108,8 @@ lazy_static::lazy_static! {
     static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
 
     /// Shrink watermark (0.0–1.0). When used_memory/maxmemory exceeds this ratio,
-    /// the scaling cron evicts the least-used DRAM segment. Default: 0.80 (80%).
-    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
+    /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
+    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
@@ -221,6 +222,34 @@ pub fn scaling_expand_watermark() -> f64 {
 
 pub fn scaling_shrink_watermark() -> f64 {
     CFG_SCALING_SHRINK_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+/// Read the server-wide memory figures from Valkey via `INFO memory`.
+/// Returns `(used_memory, maxmemory)` in bytes. `maxmemory == 0` means the
+/// server has no configured limit (unbounded). This is the SERVER-scoped
+/// signal (all data types + overhead), not the module's own pool usage —
+/// used by both the scaling cron's shrink check and the expand OOM guard so
+/// the two decisions share one source of truth. Must be called on the main
+/// event-loop thread (module API).
+pub fn server_memory(ctx: &Context) -> (u64, u64) {
+    let info = ctx.server_info("memory");
+    let used = info.field_unsigned("used_memory").unwrap_or(0);
+    let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
+    (used, maxmemory)
+}
+
+/// Whether allocating `extra_bytes` more would push server memory to/over the
+/// shrink watermark fraction of `maxmemory`. Returns `false` when `maxmemory`
+/// is 0 (no server limit configured — the caller falls back to allocation
+/// success as the only bound). Used to gate expand so we never grow into
+/// memory the shrink path would immediately try to reclaim.
+pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
+    let (used, maxmemory) = server_memory(ctx);
+    if maxmemory == 0 {
+        return false;
+    }
+    let ceiling = (maxmemory as f64 * scaling_shrink_watermark()) as u64;
+    used.saturating_add(extra_bytes) >= ceiling
 }
 
 pub fn direct_io() -> bool {
@@ -394,7 +423,7 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 80, 50, 95,
+            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
         ],
         string: [

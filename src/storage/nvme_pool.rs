@@ -1,7 +1,8 @@
 //! NVMePool — short-lived transient I/O buffers.
 //!
 //! Thin wrapper around SegmentPool. No object map, no draining.
-//! Segments are fixed at startup, never resized.
+//! Sized at startup to ceil(nvme-staging-size / segment-size) uniform segments,
+//! fixed thereafter — never expanded or shrunk (unlike DRAMPool).
 //! StreamingContexts allocate from here and free on request completion.
 
 use super::context::SegmentBuffer;

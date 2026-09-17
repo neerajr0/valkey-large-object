@@ -29,11 +29,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let seg_size = crate::dram_segment_size();
     let capacity = live * seg_size;
     let allocated = dram.allocated_bytes();
-    let util_pct = if capacity > 0 {
-        (allocated * 100 / capacity) as i64
-    } else {
-        0
-    };
+    let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
     ctx.builder()
         .add_section("largeobj_dram")

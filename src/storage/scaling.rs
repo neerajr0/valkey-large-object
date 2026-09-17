@@ -28,7 +28,7 @@ pub fn scaling_cron(ctx: &Context) {
     // 2. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
     let util = pool.utilization_ratio();
-    if util > expand_watermark && pool.try_expand().is_some() {
+    if util > expand_watermark && pool.try_expand(ctx).is_some() {
         ctx.log_notice(&format!(
             "largeobj: scaling — pool utilization {:.1}% > {:.0}%, added one DRAM segment",
             util * 100.0,
@@ -39,15 +39,13 @@ pub fn scaling_cron(ctx: &Context) {
     // 3. Proactive shrink: yield memory back to core when server is under pressure.
     // try_shrink() is safe in both modes: in Dram mode it only drains segments
     // with zero allocated bytes, so no live data is ever lost.
-    let info = ctx.server_info("memory");
-    let used: u64 = info.field_unsigned("used_memory").unwrap_or(0);
-    let maxmemory: u64 = info.field_unsigned("maxmemory").unwrap_or(0);
-
-    // Shrink signal is SERVER-scoped: we release DRAM segments when Valkey overall
-    // is under memory pressure, giving space back to core data types. The module's
-    // own pool utilization drives EXPAND (in try_expand); it must not gate SHRINK,
-    // or a module with a low dram-maxmemory would shrink itself under module-local
-    // pressure that has nothing to do with server-wide pressure.
+    //
+    // Shrink signal is SERVER-scoped (crate::server_memory): we release DRAM
+    // segments when Valkey overall is under memory pressure, giving space back to
+    // core data types. The module's own pool utilization drives EXPAND; it must
+    // not gate SHRINK, or a module with a low dram-maxmemory would shrink itself
+    // under module-local pressure unrelated to server-wide pressure.
+    let (used, maxmemory) = crate::server_memory(ctx);
     if maxmemory == 0 {
         // No server-wide maxmemory configured — no shrink pressure signal exists.
         rearm_scaling_cron(ctx, poll_ms);

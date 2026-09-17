@@ -1,7 +1,7 @@
 //! Command Engine — routes GET/SET through the correct path based on
 //! operating mode (DRAM-only vs Tiered) and transport (TCP vs EFA).
 //!
-//! Architecture (STORAGE_DESIGN.md §9.2):
+//! Architecture:
 //!   TCP GET, DRAMPool hit       → serve inline (no tokio)
 //!   TCP GET, DRAMPool miss      → tokio task (Tiered: NVMe read; DRAM-only: impossible)
 //!   TCP SET, DRAM-only          → inline (alloc + memcpy, no NVMe)
@@ -443,7 +443,7 @@ fn serve_set_dram_tcp(
         Some(b) => b,
         None => {
             // Reactive expansion: pool exhausted — try adding one segment, then retry.
-            if dram_pool.try_expand().is_none() {
+            if dram_pool.try_expand(ctx).is_none() {
                 return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
             }
             match dram_pool.alloc(obj_len as usize) {

@@ -152,8 +152,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     };
 
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
+    //
+    // NVMe staging is split into uniform `segment_size` segments (the io_uring/EFA
+    // per-buffer cap is 1 GiB, and segment-size is bounded to ≤1 GiB). Ceiling division
+    // so total NVMe staging capacity is never less than the requested nvme-staging-size
+    // (floor would under-provision: e.g. 100MB staging / 64MB segment = 1 segment = 64MB,
+    // 36MB short).
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
-        1
+        (nvme_staging.div_ceil(dram_seg_size)).max(1)
     } else {
         0
     };
@@ -174,7 +180,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
 
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
-        Some(NVMePool::new(1, nvme_staging))
+        Some(NVMePool::new(nvme_segments, dram_seg_size))
     } else {
         None
     };
