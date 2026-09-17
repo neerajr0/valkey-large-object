@@ -118,10 +118,20 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// One allocation: walk live non-draining segments (least-loaded first)
-    /// under the state lock, precheck each via `talc.get_allocated_span`,
-    /// allocate from the first that passes. Returns None if no segment has
-    /// real talc room.
+    /// One allocation: pick the least-loaded live, non-draining segment that
+    /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
+    /// candidate Vec), then exact-precheck it via `talc.get_allocated_span` and
+    /// allocate. Returns None if there is no eligible segment, or the picked
+    /// segment's exact precheck fails.
+    ///
+    /// Why not fall back to the next-least-loaded on a failed precheck: the fast
+    /// filter already guaranteed `cur + aligned_size <= seg.size`, so the exact
+    /// precheck can only fail by talc's per-chunk boundary-tag overhead tipping
+    /// it over the edge. Since all segments are the same size, if the emptiest
+    /// eligible segment can't fit the alloc by that overhead sliver, none can —
+    /// the correct answer is "pool full", which the caller handles via reactive
+    /// expand. A fallback loop would add machinery for a case that yields the
+    /// same result.
     fn alloc_one(
         &self,
         aligned_size: usize,
@@ -130,59 +140,57 @@ impl SegmentPool {
     ) -> Option<SegmentBuffer> {
         let st = self.state.lock().expect("state lock unavailable");
 
-        // Collect (load, slot_idx) for eligible segments, sorted least-loaded first.
-        // We do this pass under state lock so slots are stable throughout the
-        // subsequent malloc.
-        let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(st.slots.len());
-        for (i, opt) in st.slots.iter().enumerate() {
-            let Some(seg) = opt else { continue };
-            if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
-                continue;
-            }
-            let cur = seg
-                .allocated_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            // Fast filter — allocated_bytes doesn't account for talc's per-chunk
-            // overhead, so we still precheck with get_allocated_span below.
-            if cur + aligned_size > seg.size {
-                continue;
-            }
-            candidates.push((cur, i));
+        // Single O(N) pass: least-loaded eligible segment. Done under the state
+        // lock so slots stay stable through the subsequent malloc.
+        let (_, seg_idx) = st
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| {
+                let seg = opt.as_ref()?;
+                if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                let cur = seg
+                    .allocated_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                // Fast filter — allocated_bytes ignores talc's per-chunk overhead,
+                // so the exact precheck below still runs on the winner.
+                if cur + aligned_size > seg.size {
+                    return None;
+                }
+                Some((cur, i))
+            })
+            .min_by_key(|&(cur, _)| cur)?;
+
+        let seg = st.slots[seg_idx].as_ref().unwrap();
+        let seg_base = seg.base;
+        let claim_span = seg.claim_span;
+        let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
+
+        // Exact precheck: does talc have room for this alloc? Uses talc's
+        // own accounting (get_allocated_span returns the tight range
+        // covering all live allocations, so overhead is baked in).
+        let allocated = unsafe { talc.get_allocated_span(claim_span) };
+        if allocated.size() + aligned_size > claim_span.size() {
+            return None;
         }
-        candidates.sort_by_key(|&(cur, _)| cur);
 
-        for (_, seg_idx) in candidates {
-            let seg = st.slots[seg_idx].as_ref().unwrap();
-            let seg_base = seg.base;
-            let claim_span = seg.claim_span;
-            let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
-
-            // Exact precheck: does talc have room for this alloc? Uses talc's
-            // own accounting (get_allocated_span returns the tight range
-            // covering all live allocations, so overhead is baked in).
-            let allocated = unsafe { talc.get_allocated_span(claim_span) };
-            if allocated.size() + aligned_size > claim_span.size() {
-                drop(talc);
-                continue;
-            }
-
-            let ptr = unsafe {
-                talc.malloc(layout)
-                    .expect("talc.malloc after passing precheck must succeed")
-            };
-            let offset = ptr.as_ptr() as usize - seg_base as usize;
-            seg.inc_ref();
-            seg.allocated_bytes
-                .fetch_add(aligned_size, std::sync::atomic::Ordering::Relaxed);
-            drop(talc);
-            drop(st);
-            return Some(SegmentBuffer {
-                segment_idx: seg_idx as u16,
-                offset: offset as u64,
-                len: chunk_size as u32,
-            });
-        }
-        None
+        let ptr = unsafe {
+            talc.malloc(layout)
+                .expect("talc.malloc after passing precheck must succeed")
+        };
+        let offset = ptr.as_ptr() as usize - seg_base as usize;
+        seg.inc_ref();
+        seg.allocated_bytes
+            .fetch_add(aligned_size, std::sync::atomic::Ordering::Relaxed);
+        drop(talc);
+        drop(st);
+        Some(SegmentBuffer {
+            segment_idx: seg_idx as u16,
+            offset: offset as u64,
+            len: chunk_size as u32,
+        })
     }
 
     /// Free a buffer back to its owning segment.
@@ -322,6 +330,22 @@ impl SegmentPool {
             .as_ref()
             .expect("segment slot empty for live buffer")
             .iovec_index
+    }
+
+    /// Total allocated bytes across live (non-draining) segments.
+    /// Sums the per-segment atomics directly — the exact figure INFO reports,
+    /// with no ratio round-trip.
+    pub fn allocated_bytes(&self) -> usize {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots
+            .iter()
+            .flatten()
+            .filter(|seg| !seg.draining.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|seg| {
+                seg.allocated_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum()
     }
 
     /// Utilization ratio: allocated_bytes / total_live_capacity.

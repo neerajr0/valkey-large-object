@@ -136,6 +136,8 @@ impl DRAMPool {
         }
         let chunk_size = crate::buffer_size();
         let total_chunks = super::chunk_count(obj_len, chunk_size);
+        // Alloc BEFORE taking the write lock — a talc scan under memory pressure
+        // must not block GET readers waiting on get_object().
         let buffers = self.alloc_n(chunk_size, total_chunks as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
@@ -163,6 +165,11 @@ impl DRAMPool {
 
     pub fn utilization_ratio(&self) -> f64 {
         self.pool.utilization_ratio()
+    }
+
+    /// Total allocated bytes across live segments. Used by INFO largeobj.
+    pub fn allocated_bytes(&self) -> usize {
+        self.pool.allocated_bytes()
     }
 
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.

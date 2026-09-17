@@ -28,16 +28,19 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let (live, draining, unused) = dram.segment_counts();
     let seg_size = crate::dram_segment_size();
     let capacity = live * seg_size;
-    let util = dram.utilization_ratio();
-    let allocated = (util * capacity as f64) as i64;
-    let util_pct = (util * 100.0) as i64;
+    let allocated = dram.allocated_bytes();
+    let util_pct = if capacity > 0 {
+        (allocated * 100 / capacity) as i64
+    } else {
+        0
+    };
 
     ctx.builder()
         .add_section("largeobj_dram")
         .field("live_segments", live as i64)?
         .field("draining_segments", draining as i64)?
         .field("unused_segments", unused as i64)?
-        .field("allocated_bytes", allocated)?
+        .field("allocated_bytes", allocated as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
         .field("cached_objects", dram.object_count() as i64)?

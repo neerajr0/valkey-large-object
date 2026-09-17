@@ -76,14 +76,21 @@ impl Segment {
 
     /// Check if safe to release (draining + no live allocations).
     pub fn is_releasable(&self) -> bool {
+        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
+        // all buffer writes from prior users are guaranteed visible, making
+        // it safe to deallocate the segment.
         self.draining.load(Ordering::Acquire) && self.refcount.load(Ordering::Acquire) == 0
     }
 
     pub fn inc_ref(&self) {
+        // Relaxed is fine since we are claiming the segment before doing any work,
+        // so there are no prior writes that need to be visible to others.
         self.refcount.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn dec_ref(&self) {
+        // Release ensures any data written to this segment's buffers is visible
+        // before another thread sees refcount == 0 and deallocates the segment.
         self.refcount.fetch_sub(1, Ordering::Release);
     }
 
