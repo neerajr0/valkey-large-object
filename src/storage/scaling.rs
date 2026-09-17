@@ -43,18 +43,17 @@ pub fn scaling_cron(ctx: &Context) {
     let used: u64 = info.field_unsigned("used_memory").unwrap_or(0);
     let maxmemory: u64 = info.field_unsigned("maxmemory").unwrap_or(0);
 
-    let dram_max = crate::dram_maxmemory();
-    let ceiling = if dram_max > 0 {
-        dram_max
-    } else if maxmemory > 0 {
-        maxmemory
-    } else {
-        // No ceiling configured — nothing to shrink against.
+    // Shrink signal is SERVER-scoped: we release DRAM segments when Valkey overall
+    // is under memory pressure, giving space back to core data types. The module's
+    // own pool utilization drives EXPAND (in try_expand); it must not gate SHRINK,
+    // or a module with a low dram-maxmemory would shrink itself under module-local
+    // pressure that has nothing to do with server-wide pressure.
+    if maxmemory == 0 {
+        // No server-wide maxmemory configured — no shrink pressure signal exists.
         rearm_scaling_cron(ctx, poll_ms);
         return;
-    };
-
-    let ratio = used as f64 / ceiling as f64;
+    }
+    let ratio = used as f64 / maxmemory as f64;
     if ratio > shrink_watermark {
         // Skip shrink if a segment is already draining — its memory hasn't
         // been freed yet. Draining completes asynchronously as Arc holders

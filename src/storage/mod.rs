@@ -80,12 +80,30 @@ use std::sync::{Mutex, OnceLock};
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
 /// Called by SegmentPool when creating each segment.
-/// Appends to the sparse table and returns the assigned iovec_index (slot position).
+/// Fills the first `None` hole in the sparse table (or appends if no hole).
+/// This matches the "first None hole, else append" policy used by
+/// `SegmentPool::expand` when placing the new segment in `slots`, so the
+/// returned `iovec_index` always equals the segment's slot index. Callers
+/// depend on `segment.iovec_index == slot_idx`; using a different policy here
+/// would silently violate that invariant when the two Vecs have holes in
+/// different positions.
+///
+/// Only invoked from the main event-loop thread — no cross-thread contention
+/// over which hole to fill.
 pub fn append_iovec(iov: libc::iovec) -> u16 {
     let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
-    let idx = u16::try_from(iovecs.len()).expect("iovec index overflow (>65535)");
-    iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
-    idx
+    let entry = Some((iov.iov_base as usize, iov.iov_len));
+    match iovecs.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            iovecs[i] = entry;
+            u16::try_from(i).expect("iovec index overflow (>65535)")
+        }
+        None => {
+            let i = iovecs.len();
+            iovecs.push(entry);
+            u16::try_from(i).expect("iovec index overflow (>65535)")
+        }
+    }
 }
 
 /// Called by SegmentPool during segment drain completion.
