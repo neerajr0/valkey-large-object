@@ -26,6 +26,11 @@ pub struct Segment {
     /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector.
     /// Write-once at creation; immutable for the segment's lifetime.
     pub iovec_index: u16,
+    /// The exact Span returned by `talc.claim()` at creation. Passed back to
+    /// `talc.get_allocated_span()` for the alloc-time precheck (which returns
+    /// the range containing all live allocations, so we can tell in O(1)
+    /// whether talc has room for a new alloc before actually calling malloc).
+    pub claim_span: Span,
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with
     /// other segments' allocators.
@@ -53,12 +58,15 @@ impl Segment {
         let span = Span::from_base_size(base, size);
         // Safety: memory was just allocated exclusively for this Segment; nothing
         // else references [base, base+size), so claim's non-overlap invariant holds.
-        unsafe { talc.claim(span).expect("talc.claim failed for new segment") };
+        // Talc word-aligns the span inward and returns the exact span it recorded —
+        // we must keep this value for `get_allocated_span` and future `truncate`.
+        let claim_span = unsafe { talc.claim(span).expect("talc.claim failed for new segment") };
 
         Self {
             base,
             size,
             iovec_index: 0, // set by caller after append_iovec
+            claim_span,
             talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),

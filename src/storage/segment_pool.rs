@@ -11,9 +11,11 @@
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
-//! Allocations pick a segment via `pick_alloc_target`, then lock only that
-//! segment's talc. Per-segment locking means concurrent allocs on different
-//! segments never contend.
+//! `alloc_one` walks live non-draining segments in least-loaded-first order
+//! under one state lock, prechecks each with `talc.get_allocated_span`, and
+//! allocates from the first that passes — talc.malloc after a passing
+//! precheck is guaranteed to succeed. Per-segment locking means concurrent
+//! allocs on different segments never contend.
 //!
 //! ## Draining / shrink protocol
 //!
@@ -81,8 +83,11 @@ impl SegmentPool {
     }
 
     /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
-    /// `min_required`. Each chunk picks a segment independently via the picker,
-    /// then locks only that segment's talc for its own malloc.
+    /// `min_required`. Each iteration walks the live non-draining segments in
+    /// LEAST-LOADED-first order under one state lock, and for the first one
+    /// that passes an exact talc `get_allocated_span` precheck, allocates from
+    /// its own talc allocator. talc.malloc after a passing precheck is
+    /// guaranteed to succeed. No retries, no poisoning.
     ///
     /// Returns `None` if fewer than `min_required` could be allocated (partial
     /// allocation freed internally). Callers never need cleanup logic.
@@ -95,18 +100,16 @@ impl SegmentPool {
         let aligned_size = super::align_up(chunk_size);
         let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
             .expect("alloc_n: invalid chunk_size layout");
-
         let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
 
         for _ in 0..count {
-            match self.try_alloc_one(chunk_size, aligned_size, layout) {
-                Some(buf) => buffers.push(buf),
-                None => break,
-            }
+            let Some(buf) = self.alloc_one(aligned_size, chunk_size, layout) else {
+                break;
+            };
+            buffers.push(buf);
         }
 
         if buffers.len() < min_required {
-            // Rollback — free each partial buffer via its owning segment's talc.
             for buf in &buffers {
                 self.free(buf);
             }
@@ -115,49 +118,57 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// Pick a target segment and allocate one chunk from it.
-    /// Picker: least-loaded non-draining segment that has room.
-    /// Returns None only when no segment can serve.
-    fn try_alloc_one(
+    /// One allocation: walk live non-draining segments (least-loaded first)
+    /// under the state lock, precheck each via `talc.get_allocated_span`,
+    /// allocate from the first that passes. Returns None if no segment has
+    /// real talc room.
+    fn alloc_one(
         &self,
-        chunk_size: usize,
         aligned_size: usize,
+        chunk_size: usize,
         layout: Layout,
     ) -> Option<SegmentBuffer> {
-        // Try up to 8 candidate segments (in case one loses to a race and its
-        // talc.malloc fails despite the picker's optimistic capacity read).
-        for _attempt in 0..8 {
-            let seg_idx = self.pick_alloc_target(aligned_size)?;
+        let st = self.state.lock().expect("state lock unavailable");
 
-            // Extract pointer we need to compute offset; do allocation under
-            // the segment's own talc mutex.
-            let st = self.state.lock().expect("state lock unavailable");
-            let Some(seg) = st.slots.get(seg_idx).and_then(|s| s.as_ref()) else {
-                // Segment was removed between picker and here; retry.
-                drop(st);
-                continue;
-            };
-            // Re-check draining under lock — the picker's atomic read may have
-            // been stale.
+        // Collect (load, slot_idx) for eligible segments, sorted least-loaded first.
+        // We do this pass under state lock so slots are stable throughout the
+        // subsequent malloc.
+        let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(st.slots.len());
+        for (i, opt) in st.slots.iter().enumerate() {
+            let Some(seg) = opt else { continue };
             if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
-                drop(st);
                 continue;
             }
+            let cur = seg
+                .allocated_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // Fast filter — allocated_bytes doesn't account for talc's per-chunk
+            // overhead, so we still precheck with get_allocated_span below.
+            if cur + aligned_size > seg.size {
+                continue;
+            }
+            candidates.push((cur, i));
+        }
+        candidates.sort_by_key(|&(cur, _)| cur);
+
+        for (_, seg_idx) in candidates {
+            let seg = st.slots[seg_idx].as_ref().unwrap();
             let seg_base = seg.base;
+            let claim_span = seg.claim_span;
             let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
-            let ptr = match unsafe { talc.malloc(layout) } {
-                Ok(p) => p,
-                Err(_) => {
-                    // This segment's talc rejected the alloc (fragmentation or
-                    // near-full). Mark it saturated so picker skips it next time.
-                    // Not a persistent poison — a future free() decrements
-                    // allocated_bytes and it becomes eligible again.
-                    seg.allocated_bytes
-                        .fetch_max(self.segment_size, std::sync::atomic::Ordering::Relaxed);
-                    drop(talc);
-                    drop(st);
-                    continue;
-                }
+
+            // Exact precheck: does talc have room for this alloc? Uses talc's
+            // own accounting (get_allocated_span returns the tight range
+            // covering all live allocations, so overhead is baked in).
+            let allocated = unsafe { talc.get_allocated_span(claim_span) };
+            if allocated.size() + aligned_size > claim_span.size() {
+                drop(talc);
+                continue;
+            }
+
+            let ptr = unsafe {
+                talc.malloc(layout)
+                    .expect("talc.malloc after passing precheck must succeed")
             };
             let offset = ptr.as_ptr() as usize - seg_base as usize;
             seg.inc_ref();
@@ -165,7 +176,6 @@ impl SegmentPool {
                 .fetch_add(aligned_size, std::sync::atomic::Ordering::Relaxed);
             drop(talc);
             drop(st);
-            let _ = chunk_size; // used only via alignment above
             return Some(SegmentBuffer {
                 segment_idx: seg_idx as u16,
                 offset: offset as u64,
@@ -173,33 +183,6 @@ impl SegmentPool {
             });
         }
         None
-    }
-
-    /// Picker: return the slot index of a segment that likely has room for
-    /// `aligned_size` bytes. Strategy: LEAST-loaded non-draining segment first
-    /// (spread allocations so no segment saturates prematurely, giving the
-    /// shrink path more room). Returns None if no segment has capacity.
-    fn pick_alloc_target(&self, aligned_size: usize) -> Option<usize> {
-        let st = self.state.lock().expect("state lock unavailable");
-        let mut best: Option<(usize, usize)> = None; // (allocated, idx)
-        for (i, opt) in st.slots.iter().enumerate() {
-            let Some(seg) = opt else { continue };
-            if seg.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                continue;
-            }
-            let cur = seg
-                .allocated_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if cur + aligned_size > seg.size {
-                continue;
-            }
-            match best {
-                None => best = Some((cur, i)),
-                Some((b, _)) if cur < b => best = Some((cur, i)),
-                _ => {}
-            }
-        }
-        best.map(|(_, i)| i)
     }
 
     /// Free a buffer back to its owning segment.
