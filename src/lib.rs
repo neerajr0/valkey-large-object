@@ -96,8 +96,10 @@ lazy_static::lazy_static! {
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
-    /// Default: 256MB. Supports memory notation (e.g., "256mb").
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
+    /// Must be < segment-size (an object is staged as one contiguous buffer in one
+    /// segment). Default: 64MB, matching the default segment-size. Supports memory
+    /// notation (e.g., "64mb").
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
@@ -411,7 +413,7 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, None],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
             ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::MEMORY, None, None],

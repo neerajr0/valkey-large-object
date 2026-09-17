@@ -209,7 +209,7 @@ fn execute_get_tiered(
     // `file` (captured by the promotion task below) pins the ObjectFile across the
     // NVMe read and transfer — see the in-flight pin invariant at the top of file.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
-        // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+        // TODO: Multi-buffer streaming/chunking.
         if obj_ctx.buffers.len() != 1 {
             todo!("streaming and chunking not yet implemented");
         }
@@ -297,7 +297,7 @@ fn execute_get_tiered(
 
     let buf_ptr_usize = nvme_pool.buffer_ptr(&stream_ctx.buffers[0]) as usize;
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let read_op = uring::UringOp {
         iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
@@ -716,7 +716,7 @@ async fn do_tiered_nvme_write(
 
     let nvme_pool = storage::get_nvme_pool();
     // Single-chunk today: one UringOp for the entire object.
-    // Streaming (STORAGE_DESIGN.md §7.3) will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
+    // Streaming will iterate stream_ctx.buffers and submit per-chunk ops in a loop.
     let write_op = uring::UringOp {
         iovec_index: nvme_pool.iovec_index_for_buf(&stream_ctx.buffers[0]),
         buf_ptr: buf_ptr_usize as *mut u8,
@@ -835,7 +835,7 @@ fn serve_from_dram(
             remote_addr,
         } => {
             // EFA: write from DRAMPool buffer to client GPU.
-            // TODO: Multi-buffer streaming/chunking (STORAGE_DESIGN.md §7.3).
+            // TODO: Multi-buffer streaming/chunking.
             if obj_ctx.buffers.len() != 1 {
                 todo!("streaming and chunking not yet implemented");
             }

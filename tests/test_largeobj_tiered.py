@@ -446,12 +446,15 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
     CAP = 1024 * 1024 + 2048  # 1050624; 1050624 / 4096 == 256.5
 
     def get_module_args(self, data_dir, direct_io):
+        # segment-size must exceed the largest staged object (object < segment):
+        # this test stages 1 MiB and ~1 MiB+2KiB objects, so use 2 MiB segments.
+        # nvme-staging-size 4 MiB -> ceil(4MiB / 2MiB) = 2 NVMe staging segments.
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-maxmemory {self.CAP}"
             f" nvme-staging-size 4194304"
-            f" segment-size 1048576"
+            f" segment-size 2097152"
             f" bench-mode no"
             f" direct-io no"
         )

@@ -200,7 +200,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
             f" dram-maxmemory 4194304"
-            f" max-promote-size 268435456"
+            f" max-promote-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -257,7 +257,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
             f" dram-maxmemory 0"
-            f" max-promote-size 268435456"
+            f" max-promote-size 1048576"
             f" scaling-poll-ms 1000"
             f" bench-mode no"
             f" direct-io no"
