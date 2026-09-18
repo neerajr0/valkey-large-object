@@ -12,20 +12,18 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             f" segment-size 2097152"
             f" bench-mode no"
             f" direct-io no"
-            f" lo-buffer-size 65536"
+            f" lo-chunk-size 4096"
         )
 
     def test_set_get_roundtrip(self):
         """Basic SET + GET in Dram mode, including multi-chunk objects."""
         client = self.server.get_new_client()
-        # Single-chunk: 4096 bytes with lo-buffer-size=65536 → 1 chunk.
+        # Single-chunk: 4096 bytes with lo-chunk-size=4096 → 1 chunk.
         payload = b'A' * 4096
         result = client.execute_command('LO.SET', 'dramkey', payload)
         assert result == b'OK'
         data = client.execute_command('LO.GET', 'dramkey')
         assert data == payload
-        # Multi-chunk: override lo-buffer-size to 4096 to force multi-chunk on smaller objects.
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-buffer-size', '4096')
         # Partial last chunk: 4096 + 1 = 4097 → 2 chunks (second chunk is 1 byte).
         payload_partial = b'B' * 4097
         client.execute_command('LO.SET', 'partial_key', payload_partial)

@@ -82,7 +82,10 @@ impl SegmentPool {
         self.alloc_n(size, 1, 1).map(|mut v| v.remove(0))
     }
 
-    /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
+    /// Allocate up to `count` uniform buffers. Used directly for StreamingContext
+    /// (rotating window of reusable buffers), and internally by `alloc_for_object`.
+    ///
+    /// Allocates up to `count` buffers of `chunk_size` each, requiring at least
     /// `min_required`. Each iteration walks the live non-draining segments in
     /// LEAST-LOADED-first order under one state lock, and for the first one
     /// that passes an exact talc `get_allocated_span` precheck, allocates from
@@ -103,7 +106,7 @@ impl SegmentPool {
         let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
 
         for _ in 0..count {
-            let Some(buf) = self.alloc_one(aligned_size, chunk_size, layout) else {
+            let Some(buf) = self.alloc_one(aligned_size, layout) else {
                 break;
             };
             buffers.push(buf);
@@ -115,6 +118,39 @@ impl SegmentPool {
             }
             return None;
         }
+        Some(buffers)
+    }
+
+    /// Allocate all buffers for an ObjectContext (DRAM cache), where the last
+    /// chunk may be smaller. All-or-nothing.
+    /// Derives chunk geometry from `obj_len` and `crate::chunk_size()`.
+    pub fn alloc_for_object(&self, obj_len: u64) -> Option<Vec<SegmentBuffer>> {
+        let chunk_size = crate::chunk_size();
+        let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
+        let n = total_chunks as usize;
+        let last_chunk_size = {
+            let rem = (obj_len % chunk_size as u64) as usize;
+            if rem == 0 {
+                chunk_size
+            } else {
+                rem
+            }
+        };
+        let full_count = if n > 1 { n - 1 } else { 0 };
+        // Allocate the first N-1 uniform-sized buffers (all-or-nothing).
+        let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
+        // Allocate the last (possibly smaller) buffer.
+        let aligned_last = super::align_up(last_chunk_size);
+        let last_layout = Layout::from_size_align(aligned_last, super::IO_ALIGN)
+            .expect("alloc_for_object: invalid last_chunk_size layout");
+        let Some(last_buf) = self.alloc_one(aligned_last, last_layout) else {
+            // All-or-nothing: free the uniform buffers we already got.
+            for buf in &buffers {
+                self.free(buf);
+            }
+            return None;
+        };
+        buffers.push(last_buf);
         Some(buffers)
     }
 
@@ -132,12 +168,7 @@ impl SegmentPool {
     /// the correct answer is "pool full", which the caller handles via reactive
     /// expand. A fallback loop would add machinery for a case that yields the
     /// same result.
-    fn alloc_one(
-        &self,
-        aligned_size: usize,
-        chunk_size: usize,
-        layout: Layout,
-    ) -> Option<SegmentBuffer> {
+    fn alloc_one(&self, aligned_size: usize, layout: Layout) -> Option<SegmentBuffer> {
         let st = self.state.lock().expect("state lock unavailable");
 
         // Single O(N) pass: least-loaded eligible segment. Done under the state
@@ -182,7 +213,7 @@ impl SegmentPool {
         Some(SegmentBuffer {
             segment_idx: seg_idx as u16,
             offset: offset as u64,
-            len: chunk_size as u32,
+            len: aligned_size as u32,
         })
     }
 
@@ -196,8 +227,8 @@ impl SegmentPool {
     pub fn free_n(&self, buffers: &[SegmentBuffer]) {
         for buf in buffers {
             let seg_idx = buf.segment_idx as usize;
-            let aligned_size = super::align_up(buf.len as usize);
-            let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
+            // No align_up needed — buf.len is already the aligned size talc allocated.
+            let layout = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
                 .expect("SegmentBuffer layout");
             let st = self.state.lock().expect("state lock unavailable");
             let seg = st.slots[seg_idx]
@@ -212,7 +243,7 @@ impl SegmentPool {
             }
             seg.dec_ref();
             seg.allocated_bytes
-                .fetch_sub(aligned_size, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(buf.len as usize, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

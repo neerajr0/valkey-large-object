@@ -253,120 +253,161 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
     slices
 }
 
-// ─── ChunkBuilder ────────────────────────────────────────────────────────────
+// ─── Chunk / ChunkIterator ───────────────────────────────────────────────────
 
-/// One region of client-visible memory for a chunk (EFA transfer target).
-/// In the single-address case, every chunk has exactly one region.
-/// In the multi-address case, chunks straddling a client buffer boundary
-/// will have two regions.
-#[derive(Debug, Clone)]
-pub struct ClientRegion {
-    pub remote_addr: u64,
-    pub len: usize,
+/// A client EFA memory address: (remote_addr, size, rkey).
+/// Each registered memory region on the client has its own rkey.
+/// ChunkIterator consumes these sequentially, splitting across chunk boundaries.
+pub type ClientAddress = (u64, usize, u64);
+
+/// A piece of the overall object. Pure metadata — does not own the underlying buffer.
+/// Created by ChunkIterator and returned by next_chunk().
+#[derive(Debug)]
+pub struct Chunk {
+    /// Absolute chunk index within the object (0-based).
+    pub index: u32,
+    /// Exact user data bytes in this chunk.
+    pub user_len: usize,
+    /// Index into the owning context's Vec<SegmentBuffer>.
+    /// For ObjectContext: buffer_idx == chunk_index (1:1).
+    /// For StreamingContext: buffer_idx == chunk_index % num_buffers (rotating).
+    pub buffer_idx: usize,
+    /// Per-chunk EFA transfer addresses. Empty for TCP paths.
+    /// Each entry is (remote_addr, len, rkey) — one fi_write/fi_read per entry.
+    /// Populated incrementally by ChunkIterator::next_chunk().
+    pub addrs: Vec<(u64, usize, u64)>,
 }
 
-/// Builds chunk descriptors for an object. Encapsulates chunking geometry
-/// and client address mapping. Decoupled from buffer ownership — callers
-/// index into their own buffer collections using chunk indices from this builder.
-pub struct ChunkBuilder {
-    obj_len: u64,
-    chunk_size: usize,
-    total_chunks: u32,
-    /// Per-chunk client address mappings. Populated by map_client_addresses().
-    mappings: Vec<Vec<ClientRegion>>,
+/// Task-local iterator over chunks. One per tokio task.
+/// Handles chunk geometry, buffer index rotation, and incremental client
+/// address mapping. Does NOT own buffers — indexes into the owning context's
+/// Vec<SegmentBuffer>.
+pub struct ChunkIterator {
+    /// Pre-computed chunk metadata (user_len, buffer_idx). Addresses populated lazily.
+    chunks: Vec<Chunk>,
+    /// Next chunk to return.
+    cursor: usize,
+    /// Number of buffers in the owning context (for rotation).
+    num_buffers: usize,
+    // Incremental client address mapping state.
+    /// Sequential (addr, size, rkey) entries for EFA consumption.
+    flat_addrs: Vec<ClientAddress>,
+    /// Index into flat_addrs for the current address being consumed.
+    addr_idx: usize,
+    /// Byte offset within the current flat_addrs entry.
+    addr_offset: usize,
 }
 
-impl ChunkBuilder {
-    /// Create a new ChunkBuilder.
-    /// Panics on zero obj_len or zero chunk_size (callers must reject these earlier).
-    pub fn new(obj_len: u64, chunk_size: usize) -> Self {
-        debug_assert!(obj_len > 0, "ChunkBuilder: obj_len must be > 0");
-        debug_assert!(chunk_size > 0, "ChunkBuilder: chunk_size must be > 0");
+impl ChunkIterator {
+    /// Create a new ChunkIterator.
+    /// - `obj_len`: total object size in bytes (must be > 0).
+    /// - `chunk_size`: lo-chunk-size config value (must be > 0).
+    /// - `num_buffers`: number of buffers in the owning context.
+    ///   For ObjectContext (all buffers upfront): num_buffers == total_chunks.
+    ///   For StreamingContext (rotating window): num_buffers == window size.
+    /// - `client_addrs`: Flattened EFA (addr, size, rkey) entries. None for TCP.
+    ///
+    /// Creates all Chunk metadata upfront (user_len, buffer_idx).
+    /// Client address mapping is deferred to next_chunk() calls.
+    pub fn new(
+        obj_len: u64,
+        chunk_size: usize,
+        num_buffers: usize,
+        client_addrs: Option<Vec<ClientAddress>>,
+    ) -> Self {
+        debug_assert!(obj_len > 0, "ChunkIterator: obj_len must be > 0");
+        debug_assert!(chunk_size > 0, "ChunkIterator: chunk_size must be > 0");
+        debug_assert!(num_buffers > 0, "ChunkIterator: num_buffers must be > 0");
         let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
-        Self {
-            obj_len,
-            chunk_size,
-            total_chunks,
-            mappings: Vec::new(),
-        }
-    }
-
-    pub fn total_chunks(&self) -> u32 {
-        self.total_chunks
-    }
-
-    pub fn chunk_size(&self) -> usize {
-        self.chunk_size
-    }
-
-    /// Data length for chunk i (last chunk may be shorter).
-    pub fn data_len(&self, i: u32) -> usize {
-        debug_assert!(
-            i < self.total_chunks,
-            "chunk index {} >= total_chunks {}",
-            i,
-            self.total_chunks
-        );
-        if i == self.total_chunks - 1 {
-            let rem = (self.obj_len % self.chunk_size as u64) as usize;
-            if rem == 0 {
-                self.chunk_size
-            } else {
-                rem
-            }
-        } else {
-            self.chunk_size
-        }
-    }
-
-    /// Compute client address mapping for all chunks (single-pass).
-    /// Returns Err if total client address space is insufficient.
-    pub fn map_client_addresses(
-        &mut self,
-        client_addrs: &[(u64, usize)],
-    ) -> Result<(), &'static str> {
-        let mut mappings = Vec::with_capacity(self.total_chunks as usize);
-        let mut current_addr_idx: usize = 0;
-        let mut current_offset: usize = 0;
-        for chunk_idx in 0..self.total_chunks {
-            let mut remaining = self.data_len(chunk_idx);
-            let mut regions = Vec::new();
-            // Consume client address space until this chunk is fully covered.
-            while remaining > 0 {
-                // No more client addresses — total address space is insufficient.
-                if current_addr_idx >= client_addrs.len() {
-                    return Err("insufficient client address space");
+        let mut chunks = Vec::with_capacity(total_chunks as usize);
+        for i in 0..total_chunks {
+            let user_len = if i == total_chunks - 1 {
+                let rem = (obj_len % chunk_size as u64) as usize;
+                if rem == 0 {
+                    chunk_size
+                } else {
+                    rem
                 }
-                // Bytes remaining in the current client address region.
-                let avail = client_addrs[current_addr_idx].1 - current_offset;
-                // Current region exhausted — advance to the next one.
+            } else {
+                chunk_size
+            };
+            chunks.push(Chunk {
+                index: i,
+                user_len,
+                buffer_idx: i as usize % num_buffers,
+                addrs: Vec::new(),
+            });
+        }
+        Self {
+            chunks,
+            cursor: 0,
+            num_buffers,
+            flat_addrs: client_addrs.unwrap_or_default(),
+            addr_idx: 0,
+            addr_offset: 0,
+        }
+    }
+
+    /// Total number of chunks for the object.
+    pub fn total_chunks(&self) -> u32 {
+        self.chunks.len() as u32
+    }
+
+    /// Number of buffers (for callers that need batch sizing).
+    pub fn num_buffers(&self) -> usize {
+        self.num_buffers
+    }
+
+    /// Advance to the next chunk, populating its client regions if EFA.
+    /// Returns None when all chunks have been consumed.
+    pub fn next_chunk(&mut self) -> Option<&Chunk> {
+        if self.cursor >= self.chunks.len() {
+            return None;
+        }
+        let idx = self.cursor;
+        self.cursor += 1;
+        // Incremental client address mapping (EFA only).
+        if !self.flat_addrs.is_empty() {
+            let mut remaining = self.chunks[idx].user_len;
+            let mut addrs = Vec::new();
+            while remaining > 0 {
+                if self.addr_idx >= self.flat_addrs.len() {
+                    // TODO: Fail the request with an error instead of silently
+                    // producing a partial chunk.
+                    debug_assert!(false,
+                        "ChunkIterator: client addresses exhausted with {} bytes remaining in chunk {}",
+                        remaining, idx
+                    );
+                    break;
+                }
+                let (base_addr, total_size, rkey) = self.flat_addrs[self.addr_idx];
+                let avail = total_size - self.addr_offset;
                 if avail == 0 {
-                    current_addr_idx += 1;
-                    current_offset = 0;
+                    self.addr_idx += 1;
+                    self.addr_offset = 0;
                     continue;
                 }
-                // Take as much as we need (or as much as is available).
                 let take = remaining.min(avail);
-                regions.push(ClientRegion {
-                    remote_addr: client_addrs[current_addr_idx].0 + current_offset as u64,
-                    len: take,
-                });
-                current_offset += take;
+                addrs.push((base_addr + self.addr_offset as u64, take, rkey));
+                self.addr_offset += take;
                 remaining -= take;
             }
-            mappings.push(regions);
+            self.chunks[idx].addrs = addrs;
         }
-        self.mappings = mappings;
-        Ok(())
+        Some(&self.chunks[idx])
     }
 
-    /// Get the client regions for chunk i. Panics if map_client_addresses not called.
-    pub fn client_regions(&self, i: u32) -> &[ClientRegion] {
-        assert!(
-            !self.mappings.is_empty(),
-            "client_regions called before map_client_addresses"
-        );
-        &self.mappings[i as usize]
+    /// Random access to a chunk by absolute index. Does NOT advance cursor.
+    /// Used by completion handlers to look up chunk metadata (buffer_idx, addrs)
+    /// after next_chunk() populated it during batch submission.
+    pub fn peek_chunk(&self, idx: u32) -> &Chunk {
+        &self.chunks[idx as usize]
+    }
+
+    /// Reset cursor to the beginning. Used when re-iterating (e.g. CRC pass after reads).
+    /// Does NOT reset client address mapping state — addresses already populated stay.
+    pub fn reset_cursor(&mut self) {
+        self.cursor = 0;
     }
 }
 
@@ -376,125 +417,138 @@ impl ChunkBuilder {
 mod tests {
     use super::*;
 
-    // ─── ChunkBuilder: geometry ──────────────────────────────────────────
+    // ─── ChunkIterator: geometry ─────────────────────────────────────────
 
     #[test]
-    fn test_chunk_builder_single_chunk_exact() {
-        // obj_len == chunk_size → exactly 1 full chunk.
-        let b = ChunkBuilder::new(4096, 4096);
-        assert_eq!(b.total_chunks(), 1);
-        assert_eq!(b.data_len(0), 4096);
+    fn test_chunk_iter_single_chunk_exact() {
+        // obj_len == chunk_size -> exactly 1 full chunk.
+        let mut it = ChunkIterator::new(4096, 4096, 1, None);
+        assert_eq!(it.total_chunks(), 1);
+        let c = it.next_chunk().unwrap();
+        assert_eq!(c.user_len, 4096);
+        assert_eq!(c.buffer_idx, 0);
+        assert!(it.next_chunk().is_none());
     }
 
     #[test]
-    fn test_chunk_builder_single_byte() {
-        // Smallest possible object: 1 byte → 1 chunk of 1 byte.
-        let b = ChunkBuilder::new(1, 4096);
-        assert_eq!(b.total_chunks(), 1);
-        assert_eq!(b.data_len(0), 1);
+    fn test_chunk_iter_single_byte() {
+        // Smallest possible object: 1 byte -> 1 chunk of 1 byte.
+        let mut it = ChunkIterator::new(1, 4096, 1, None);
+        assert_eq!(it.total_chunks(), 1);
+        let c = it.next_chunk().unwrap();
+        assert_eq!(c.user_len, 1);
     }
 
     #[test]
-    fn test_chunk_builder_exact_multiple() {
-        // obj_len is an exact multiple of chunk_size → all chunks are full.
-        let b = ChunkBuilder::new(16384, 4096);
-        assert_eq!(b.total_chunks(), 4);
+    fn test_chunk_iter_exact_multiple() {
+        // obj_len is an exact multiple of chunk_size -> all chunks are full.
+        let mut it = ChunkIterator::new(16384, 4096, 4, None);
+        assert_eq!(it.total_chunks(), 4);
         for i in 0..4 {
-            assert_eq!(b.data_len(i), 4096);
+            let c = it.next_chunk().unwrap();
+            assert_eq!(c.user_len, 4096);
+            assert_eq!(c.buffer_idx, i);
         }
+        assert!(it.next_chunk().is_none());
     }
 
     #[test]
-    fn test_chunk_builder_partial_last_chunk() {
-        // obj_len = 3 * chunk_size + 1 → last chunk has 1 byte.
-        let b = ChunkBuilder::new(12289, 4096);
-        assert_eq!(b.total_chunks(), 4);
-        assert_eq!(b.data_len(0), 4096);
-        assert_eq!(b.data_len(1), 4096);
-        assert_eq!(b.data_len(2), 4096);
-        assert_eq!(b.data_len(3), 1);
+    fn test_chunk_iter_partial_last_chunk() {
+        // obj_len = 3 * chunk_size + 1 -> last chunk has 1 byte.
+        let mut it = ChunkIterator::new(12289, 4096, 4, None);
+        assert_eq!(it.total_chunks(), 4);
+        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_len, 1);
     }
 
     #[test]
-    fn test_chunk_builder_large_object() {
-        // 50 MB object with 8 MB chunks → 7 chunks, last has 50%8=2 MB.
+    fn test_chunk_iter_large_object() {
+        // 50 MB object with 8 MB chunks -> 7 chunks, last has 2 MB.
         let obj_len = 50 * 1024 * 1024u64;
         let chunk_size = 8 * 1024 * 1024;
-        let b = ChunkBuilder::new(obj_len, chunk_size);
-        assert_eq!(b.total_chunks(), 7);
-        for i in 0..6 {
-            assert_eq!(b.data_len(i), chunk_size);
+        let mut it = ChunkIterator::new(obj_len, chunk_size, 7, None);
+        assert_eq!(it.total_chunks(), 7);
+        for _ in 0..6 {
+            assert_eq!(it.next_chunk().unwrap().user_len, chunk_size);
         }
-        assert_eq!(b.data_len(6), 2 * 1024 * 1024);
+        assert_eq!(it.next_chunk().unwrap().user_len, 2 * 1024 * 1024);
     }
 
-    // ─── ChunkBuilder: map_client_addresses ──────────────────────────────
+    #[test]
+    fn test_chunk_iter_buffer_rotation() {
+        // 5 chunks but only 2 buffers -> rotating indices.
+        let mut it = ChunkIterator::new(20480, 4096, 2, None);
+        assert_eq!(it.total_chunks(), 5);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 1);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 1);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+    }
+
+    // ─── ChunkIterator: incremental client region mapping ────────────────
 
     #[test]
     fn test_map_single_contiguous_address() {
         // Single client address covering the full object.
-        let mut b = ChunkBuilder::new(8193, 4096);
-        assert_eq!(b.total_chunks(), 3);
-        b.map_client_addresses(&[(0x1000, 8193)]).unwrap();
-        // Chunk 0: one region covering full chunk_size.
-        let r0 = b.client_regions(0);
-        assert_eq!(r0.len(), 1);
-        assert_eq!(r0[0].remote_addr, 0x1000);
-        assert_eq!(r0[0].len, 4096);
-        // Chunk 1: one region covering full chunk_size.
-        let r1 = b.client_regions(1);
-        assert_eq!(r1.len(), 1);
-        assert_eq!(r1[0].remote_addr, 0x1000 + 4096);
-        assert_eq!(r1[0].len, 4096);
-        // Chunk 2: one region covering partial last chunk (1 byte).
-        let r2 = b.client_regions(2);
-        assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0].remote_addr, 0x1000 + 8192);
-        assert_eq!(r2[0].len, 1);
+        let cr = vec![(0x1000u64, 8193usize, 42u64)];
+        let mut it = ChunkIterator::new(8193, 4096, 3, Some(cr));
+        assert_eq!(it.total_chunks(), 3);
+        // Chunk 0: full chunk.
+        let c0 = it.next_chunk().unwrap();
+        assert_eq!(c0.addrs.len(), 1);
+        assert_eq!(c0.addrs[0], (0x1000, 4096, 42));
+        // Chunk 1: full chunk.
+        let c1 = it.next_chunk().unwrap();
+        assert_eq!(c1.addrs.len(), 1);
+        assert_eq!(c1.addrs[0], (0x1000 + 4096, 4096, 42));
+        // Chunk 2: partial last chunk (1 byte).
+        let c2 = it.next_chunk().unwrap();
+        assert_eq!(c2.addrs.len(), 1);
+        assert_eq!(c2.addrs[0], (0x1000 + 8192, 1, 42));
     }
 
     #[test]
     fn test_map_multiple_addresses_chunk_straddling() {
-        // Two client addresses: first covers 5000 bytes, second covers 3193.
-        // Object is 8193 bytes with chunk_size=4096 → 3 chunks.
-        // Chunk 0 (4096 bytes): entirely in address 0.
-        // Chunk 1 (4096 bytes): 904 bytes from address 0 + 3192 bytes from address 1.
-        // Chunk 2 (1 byte): from address 1.
-        let mut b = ChunkBuilder::new(8193, 4096);
-        b.map_client_addresses(&[(0x1000, 5000), (0x2000, 3193)])
-            .unwrap();
-        // Chunk 0: single region.
-        let r0 = b.client_regions(0);
-        assert_eq!(r0.len(), 1);
-        assert_eq!(r0[0].remote_addr, 0x1000);
-        assert_eq!(r0[0].len, 4096);
+        // Two addresses under one rkey: 5000 + 3193 bytes.
+        // Object is 8193 bytes with chunk_size=4096 -> 3 chunks.
+        // Chunk 1 straddles both addresses.
+        let cr = vec![(0x1000u64, 5000usize, 7u64), (0x2000, 3193, 7)];
+        let mut it = ChunkIterator::new(8193, 4096, 3, Some(cr));
+        // Chunk 0: single address from first entry.
+        let c0 = it.next_chunk().unwrap();
+        assert_eq!(c0.addrs.len(), 1);
+        assert_eq!(c0.addrs[0], (0x1000, 4096, 7));
         // Chunk 1: straddles two addresses.
-        let r1 = b.client_regions(1);
-        assert_eq!(r1.len(), 2);
-        assert_eq!(r1[0].remote_addr, 0x1000 + 4096); // remaining 904 bytes of addr 0
-        assert_eq!(r1[0].len, 904);
-        assert_eq!(r1[1].remote_addr, 0x2000); // 3192 bytes from addr 1
-        assert_eq!(r1[1].len, 3192);
-        // Chunk 2: single region from address 1.
-        let r2 = b.client_regions(2);
-        assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0].remote_addr, 0x2000 + 3192);
-        assert_eq!(r2[0].len, 1);
+        let c1 = it.next_chunk().unwrap();
+        assert_eq!(c1.addrs.len(), 2);
+        assert_eq!(c1.addrs[0], (0x1000 + 4096, 904, 7)); // remaining from addr 0
+        assert_eq!(c1.addrs[1], (0x2000, 3192, 7)); // from addr 1
+                                                    // Chunk 2: single address from second entry.
+        let c2 = it.next_chunk().unwrap();
+        assert_eq!(c2.addrs.len(), 1);
+        assert_eq!(c2.addrs[0], (0x2000 + 3192, 1, 7));
     }
 
     #[test]
-    fn test_map_insufficient_address_space() {
-        // Client address space is smaller than obj_len.
-        let mut b = ChunkBuilder::new(8192, 4096);
-        let result = b.map_client_addresses(&[(0x1000, 4096)]);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "insufficient client address space");
+    fn test_tcp_path_no_addrs() {
+        // TCP path: no client addresses configured.
+        let mut it = ChunkIterator::new(8192, 4096, 2, None);
+        let c0 = it.next_chunk().unwrap();
+        assert!(c0.addrs.is_empty());
+        let c1 = it.next_chunk().unwrap();
+        assert!(c1.addrs.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "client_regions called before map_client_addresses")]
-    fn test_client_regions_panics_without_mapping() {
-        let b = ChunkBuilder::new(4096, 4096);
-        let _ = b.client_regions(0);
+    fn test_reset_cursor() {
+        let mut it = ChunkIterator::new(8192, 4096, 2, None);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 1);
+        assert!(it.next_chunk().is_none());
+        it.reset_cursor();
+        assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
     }
 }

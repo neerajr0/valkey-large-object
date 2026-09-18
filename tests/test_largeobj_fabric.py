@@ -17,7 +17,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" lo-chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
         )
@@ -63,7 +63,7 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" lo-chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces no-such-interface"
         )

@@ -159,7 +159,7 @@ lazy_static::lazy_static! {
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
     /// Determines allocation unit for all I/O operations.
-    static ref CFG_BUFFER_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
+    static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
 
     /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
     static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
@@ -285,8 +285,8 @@ pub fn operating_mode() -> OperatingMode {
         .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
-pub fn buffer_size() -> usize {
-    CFG_BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn chunk_size() -> usize {
+    CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_buffers_per_op() -> usize {
@@ -480,8 +480,8 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
-            ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
-             ConfigurationFlags::MEMORY, None, None],
+            ["lo-chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["lo-max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
              ConfigurationFlags::DEFAULT, None, None],
             ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
