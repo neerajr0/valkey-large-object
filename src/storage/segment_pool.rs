@@ -165,20 +165,16 @@ impl SegmentPool {
 
         let seg = st.slots[seg_idx].as_ref().unwrap();
         let seg_base = seg.base;
-        let claim_span = seg.claim_span;
         let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
 
-        // Exact precheck: does talc have room for this alloc? Uses talc's
-        // own accounting (get_allocated_span returns the tight range
-        // covering all live allocations, so overhead is baked in).
-        let allocated = unsafe { talc.get_allocated_span(claim_span) };
-        if allocated.size() + aligned_size > claim_span.size() {
-            return None;
-        }
-
-        let ptr = unsafe {
-            talc.malloc(layout)
-                .expect("talc.malloc after passing precheck must succeed")
+        // talc.malloc IS the exact all-or-nothing check: it returns Err on OOM
+        // without committing anything. alloc_one commits to a single segment (the
+        // least-loaded winner above) and never falls through to another, so a
+        // failure here is simply "no room" — return None. No separate precheck is
+        // needed; talc's own bin lookup already answers "does this fit?".
+        let ptr = match unsafe { talc.malloc(layout) } {
+            Ok(p) => p,
+            Err(_) => return None,
         };
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
