@@ -87,7 +87,7 @@ New leaf crate to glide-core that contains the components needed for establishin
         direction TB
         FC["FabricConfig + Provider<br/>which card to open and how"]
         ADV["RegionRef<br/>where to write and the key that permits it"]
-        CMD["LargeObjectCommand<br/>the request as words on the wire"]
+        CMD["RdmaCommand<br/>the request as words on the wire"]
         PROTO["protocol<br/>the request as redis-rs speaks it"]
         RCPT["TransferReceipt<br/>how many bytes moved and the server's checksum"]
       end
@@ -120,7 +120,7 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 Build `glide-core` with large object RDMA capability using `--features rdma`. Alternately, `--features rdma-vendored` builds libfabric from source and allows `--all-features` to continue working in CI/CD.
 
-RDMA transfers are only between the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. 
+RDMA writes are only between the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards). RDMA reads are between the client and both primary and replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
 RDMA handshakes occur at construction time, during reconnects, and when cluster topology changes.
 
