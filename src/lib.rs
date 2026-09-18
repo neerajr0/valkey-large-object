@@ -15,7 +15,9 @@
 // Module init proceeds in strict order. Commands are safe to call ONLY after
 // all steps complete:
 //
-//   1. transport::init()       — discover EFA devices, create fabric/domain.
+//   1. Fabric::start()         — one libfabric service per domain. On missing
+//                                fabric, the EFA path is unavailable and LO.HELLO
+//                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
 //                                io_uring engine (Tiered only). All resources are
@@ -33,7 +35,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyError, ValkeyString};
+use valkey_module::{
+    valkey_module, Context, InfoContext, Status, ValkeyError, ValkeyResult, ValkeyString,
+};
 use valkey_module_macros::info_command_handler;
 use valkey_module_macros::shutdown_event_handler;
 
@@ -43,11 +47,15 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod info;
 pub mod metrics;
 pub mod storage;
 pub mod transport;
 
+use info::lo_info;
+
 use crate::data_type::LO_TYPE;
+use crate::transport::config::FabricProvider;
 
 use valkey_module::enum_configuration;
 
@@ -72,18 +80,20 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Size of the single NVMe staging segment (DRAM for I/O buffers).
-    /// Used in Tiered mode for read/write staging. Default: 64MB.
-    /// Immutable after load. Always 1 segment of this size.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Used in Tiered mode for read/write staging. Split into uniform
+    /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
+    /// (ceiling so actual staging is never less than requested). Immutable after load.
     static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Total DRAM budget for cached objects. 0 = no limit (grow on demand).
     /// In Dram mode: all objects live here. In Tiered mode: promotion cache.
     static ref CFG_DRAM_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
-    /// Size of each DRAMPool segment. Growth unit when dram-maxmemory=0.
+    /// Uniform segment size for all pools (DRAMPool and NVMePool).
+    /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
     /// Default: 64MB. Immutable after load.
-    static ref CFG_DRAM_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
     /// Max disk usage in nvme-dir. Default: 10GB.
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(10 * 1024 * 1024 * 1024);
@@ -93,8 +103,22 @@ lazy_static::lazy_static! {
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
-    /// Default: 256MB. Supports memory notation (e.g., "256mb").
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
+    /// Must be < segment-size (an object is staged as one contiguous buffer in one
+    /// segment). Default: 64MB, matching the default segment-size. Supports memory
+    /// notation (e.g., "64mb").
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+
+    /// Scaling cron poll interval in milliseconds. Controls how often the scaling
+    /// timer fires to check utilization and memory pressure. Default: 5000ms.
+    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
+    /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
+    static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
+
+    /// Shrink watermark (0.0–1.0). When used_memory/maxmemory exceeds this ratio,
+    /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
+    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
@@ -116,6 +140,20 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    // ─── Fabric Configs ──────────────────────────────────────────────────
+
+    /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
+    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Emulated);
+
+    /// Comma-separated fabric domains to open a service on. Default: All domains.
+    static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
+
+    /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
+    static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+
+    /// Threads hashing checksummed transfers off the fabric workers. Default: one.
+    static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -173,7 +211,12 @@ pub fn dram_maxmemory() -> u64 {
 }
 
 pub fn dram_segment_size() -> usize {
-    CFG_DRAM_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Alias for symmetry — both pools use the same segment size.
+pub fn segment_size() -> usize {
+    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn nvme_maxmemory() -> u64 {
@@ -190,6 +233,46 @@ pub fn max_promote_size() -> u64 {
 
 pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn scaling_poll_ms() -> u64 {
+    CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn scaling_expand_watermark() -> f64 {
+    CFG_SCALING_EXPAND_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+pub fn scaling_shrink_watermark() -> f64 {
+    CFG_SCALING_SHRINK_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+/// Read the server-wide memory figures from Valkey via `INFO memory`.
+/// Returns `(used_memory, maxmemory)` in bytes. `maxmemory == 0` means the
+/// server has no configured limit (unbounded). This is the SERVER-scoped
+/// signal (all data types + overhead), not the module's own pool usage —
+/// used by both the scaling cron's shrink check and the expand OOM guard so
+/// the two decisions share one source of truth. Must be called on the main
+/// event-loop thread (module API).
+pub fn server_memory(ctx: &Context) -> (u64, u64) {
+    let info = ctx.server_info("memory");
+    let used = info.field_unsigned("used_memory").unwrap_or(0);
+    let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
+    (used, maxmemory)
+}
+
+/// Whether allocating `extra_bytes` more would push server memory to/over the
+/// shrink watermark fraction of `maxmemory`. Returns `false` when `maxmemory`
+/// is 0 (no server limit configured — the caller falls back to allocation
+/// success as the only bound). Used to gate expand so we never grow into
+/// memory the shrink path would immediately try to reclaim.
+pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
+    let (used, maxmemory) = server_memory(ctx);
+    if maxmemory == 0 {
+        return false;
+    }
+    let ceiling = (maxmemory as f64 * scaling_shrink_watermark()) as u64;
+    used.saturating_add(extra_bytes) >= ceiling
 }
 
 pub fn direct_io() -> bool {
@@ -212,6 +295,31 @@ pub fn max_buffers_per_op() -> usize {
 
 pub fn streaming_min_buffers() -> usize {
     CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn fabric_provider() -> FabricProvider {
+    *CFG_FABRIC_PROVIDER
+        .lock()
+        .expect("CFG_FABRIC_PROVIDER lock unavailable")
+}
+
+pub fn fabric_interfaces() -> Vec<String> {
+    CFG_FABRIC_INTERFACES
+        .lock()
+        .expect("CFG_FABRIC_INTERFACES lock unavailable")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn fabric_max_in_flight() -> usize {
+    CFG_FABRIC_MAX_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn fabric_crc_pool_threads() -> usize {
+    CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -256,8 +364,16 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .build()
         .expect("failed to build tokio runtime");
 
-    // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
-    transport::init();
+    // Step 1: open the fabric.
+    let mut fabric = match transport::Fabric::start(&transport::config::configuration()) {
+        Ok(fabric) => Some(fabric),
+        Err(error) => {
+            ctx.log_warning(&format!(
+                "largeobj: fabric unavailable, EFA path disabled: {error}. Only Large Object Commands of the TCP variant will be supported"
+            ));
+            None
+        }
+    };
 
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
@@ -270,26 +386,33 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     };
 
-    // Step 3: Transport::register_buffers() — fi_mr_reg per segment (EFA).
-    let slices = storage::all_segment_slices();
-    let slice_refs: Vec<&[u8]> = slices.to_vec();
-    if let Err(e) = transport::register_buffers(&slice_refs) {
-        ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
-        // storage::init() already committed pools/engine to OnceLock.
-        // EFA registration failure after storage commit is fatal — panic.
-        // The admin must fix the EFA environment and restart.
-        panic!(
-            "largeobj: EFA buffer registration failed after storage init: {}",
-            e
-        );
+    // Step 3: Fabric::register_buffers() — fi_mr_reg per segment per server.
+    if let Some(fabric) = &mut fabric {
+        if let Err(e) = fabric.register_buffers(&storage::all_segment_slices()) {
+            ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
+            // storage::init() already committed pools/engine to OnceLock.
+            // EFA registration failure after storage commit is fatal.
+            // The user must fix the EFA environment and restart.
+            panic!(
+                "largeobj: EFA buffer registration failed after storage init: {}",
+                e
+            );
+        }
     }
+    let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
+    transport::commit(fabric);
 
     // All init succeeded — commit runtime to OnceLock.
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
 
-    ctx.log_notice(&format!("largeobj: initialized {}", storage_summary));
+    ctx.log_notice(&format!(
+        "largeobj: initialized {storage_summary}, fabric services: {fabric_services}"
+    ));
+
+    // Start the scaling cron (both modes — handles expand and shrink based on mode).
+    storage::scaling::rearm_scaling_cron(ctx, scaling_poll_ms());
 
     Status::Ok
 }
@@ -313,14 +436,13 @@ fn info_handler(ctx: &InfoContext, for_crash_report: bool) -> Result<(), ValkeyE
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// signal the io_uring poller to stop, deregister EFA buffers, and — in Tiered
+/// drop the fabric services, signal the io_uring poller to stop, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
 /// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
-    transport::deregister_buffers();
     transport::shutdown();
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
@@ -338,6 +460,7 @@ valkey_module! {
     data_types: [LO_TYPE],
     init: initialize,
     deinit: deinitialize,
+    info: lo_info,
     commands: [
         ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
         ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
@@ -347,15 +470,15 @@ valkey_module! {
         i64: [
             ["dram-maxmemory", &*CFG_DRAM_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
-            ["dram-segment-size", &*CFG_DRAM_SEGMENT_SIZE, 67_108_864, 1_048_576, i64::MAX,
+            ["segment-size", &*CFG_SEGMENT_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, i64::MAX,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
             ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::MEMORY, None, None],
@@ -363,9 +486,20 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
+             ConfigurationFlags::IMMUTABLE, None, None],
+            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, 1, 1, 1024,
+             ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
             ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
@@ -373,6 +507,8 @@ valkey_module! {
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
+             ConfigurationFlags::IMMUTABLE, None],
+            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::Emulated,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

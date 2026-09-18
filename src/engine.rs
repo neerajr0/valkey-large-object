@@ -1,7 +1,7 @@
 //! Command Engine — routes GET/SET through the correct path based on
 //! operating mode (DRAM-only vs Tiered) and transport (TCP vs EFA).
 //!
-//! Architecture (STORAGE_DESIGN.md §9.2):
+//! Architecture:
 //!   TCP GET, DRAMPool hit       → serve inline (no tokio)
 //!   TCP GET, DRAMPool miss      → tokio task (Tiered: NVMe read; DRAM-only: impossible)
 //!   TCP SET, DRAM-only          → inline (alloc + memcpy, no NVMe)
@@ -514,7 +514,7 @@ async fn do_tiered_promote_and_serve_tcp(
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &obj_ctx.buffers[0];
     let hdr_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_iovec = dram_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    let hdr_iovec = dram_pool.iovec_index_for_buf(hdr_buf);
     storage::read_and_verify_file_header(
         fd,
         hdr_iovec,
@@ -534,7 +534,7 @@ async fn do_tiered_promote_and_serve_tcp(
             let data_len = builder.data_len(chunk_idx);
             let buf = &obj_ctx.buffers[chunk_idx as usize];
             ops.push(uring::UringOp {
-                iovec_index: dram_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: dram_pool.iovec_index_for_buf(buf),
                 buf_ptr: dram_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -587,7 +587,7 @@ async fn do_tiered_promote_and_serve_efa(
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &obj_ctx.buffers[0];
     let hdr_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_iovec = dram_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    let hdr_iovec = dram_pool.iovec_index_for_buf(hdr_buf);
     storage::read_and_verify_file_header(
         fd,
         hdr_iovec,
@@ -616,7 +616,7 @@ async fn do_tiered_promote_and_serve_efa(
             let data_len = builder.data_len(chunk_idx);
             let buf = &obj_ctx.buffers[chunk_idx as usize];
             ops.push(uring::UringOp {
-                iovec_index: dram_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: dram_pool.iovec_index_for_buf(buf),
                 buf_ptr: dram_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -702,7 +702,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &stream_ctx.buffers[0];
     let hdr_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_iovec = nvme_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    let hdr_iovec = nvme_pool.iovec_index_for_buf(hdr_buf);
     storage::read_and_verify_file_header(
         fd,
         hdr_iovec,
@@ -727,7 +727,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
             let data_len = builder.data_len(chunk_idx);
             let buf = &stream_ctx.buffers[i];
             ops.push(uring::UringOp {
-                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: nvme_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -787,7 +787,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &stream_ctx.buffers[0];
     let hdr_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_iovec = nvme_pool.segments()[hdr_buf.segment_idx as usize].iovec_index;
+    let hdr_iovec = nvme_pool.iovec_index_for_buf(hdr_buf);
     storage::read_and_verify_file_header(
         fd,
         hdr_iovec,
@@ -813,7 +813,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
             let data_len = builder.data_len(chunk_idx);
             let buf = &stream_ctx.buffers[i];
             ops.push(uring::UringOp {
-                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: nvme_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -929,19 +929,30 @@ fn serve_set_dram_tcp(
     let buffers = match dram_pool.alloc_n(chunk_size, total_chunks as usize) {
         Some(bufs) => bufs,
         None => {
-            metrics::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+            // Reactive expansion: pool exhausted — try adding one segment, then retry.
+            if dram_pool.try_expand(ctx).is_none() {
+                metrics::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+            }
+            match dram_pool.alloc_n(chunk_size, total_chunks as usize) {
+                Some(bufs) => bufs,
+                None => {
+                    metrics::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+                }
+            }
         }
     };
-    let mut crc = 0u32;
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     for (i, buf) in buffers.iter().enumerate() {
         let data_len = builder.data_len(i as u32);
         let src_offset = i * chunk_size;
         let src = &data[src_offset..src_offset + data_len];
         let dst = dram_pool.buffer_ptr(buf);
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, data_len) };
-        crc = crc32c::crc32c_append(crc, src);
+        digest.update(src);
     }
+    let crc = digest.finalize() as u32;
     // set_value BEFORE insert_object — sync path, no version check needed
     // (single-threaded main thread, our object_id is always the latest).
     // If set_value fails, only the buffers need freeing — no map entry to undo.
@@ -1046,15 +1057,16 @@ fn execute_set_dram_efa(
                     }
                 }
                 // Post-hoc CRC pass (sequential over in-memory buffers, no I/O).
-                let mut crc = 0u32;
+                let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
                 for i in 0..total_chunks {
                     let data_len = builder.data_len(i);
                     let buf = &buffers[i as usize];
                     let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
                     let slice =
                         unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
-                    crc = crc32c::crc32c_append(crc, slice);
+                    digest.update(slice);
                 }
+                let crc = digest.finalize() as u32;
                 // Insert ObjectContext BEFORE set_value so the key is never visible
                 // without its ObjectContext. On discard, remove the entry —
                 // ObjectContext::Drop returns buffers to DRAMPool automatically.
@@ -1206,7 +1218,7 @@ async fn do_tiered_nvme_write_tcp(
         }
     };
     // Batch loop: chunk data into NVMePool buffers, write to NVMe.
-    let mut crc = 0u32;
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     let mut batch_start: u32 = 0;
     while batch_start < total_chunks {
         let batch_count = batch_size.min((total_chunks - batch_start) as usize);
@@ -1219,9 +1231,9 @@ async fn do_tiered_nvme_write_tcp(
             let buf = &stream_ctx.buffers[i];
             let dst = nvme_pool.buffer_ptr(buf);
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, data_len) };
-            crc = crc32c::crc32c_append(crc, src);
+            digest.update(src);
             ops.push(uring::UringOp {
-                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: dst,
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -1241,6 +1253,7 @@ async fn do_tiered_nvme_write_tcp(
         }
         batch_start += batch_count as u32;
     }
+    let crc = digest.finalize() as u32;
     // Post-loop: write FileHeader using buffer[0] (reused after data loop).
     if let Err(_e) = storage::write_file_header(
         fd,
@@ -1335,7 +1348,7 @@ async fn do_tiered_nvme_write_efa(
         .map_client_addresses(&[(efa.remote_addr, obj_len as usize)])
         .expect("single contiguous address always sufficient");
     let total_chunks = builder.total_chunks();
-    let mut crc = 0u32;
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     let mut batch_start: u32 = 0;
     while batch_start < total_chunks {
         let batch_count = batch_size.min((total_chunks - batch_start) as usize);
@@ -1374,7 +1387,7 @@ async fn do_tiered_nvme_write_efa(
             let data_len = builder.data_len(chunk_idx);
             let buf = &stream_ctx.buffers[batch_idx];
             let write_op = uring::UringOp {
-                iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+                iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: nvme_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk_idx as u64 * chunk_size as u64,
                 len: data_len as u64,
@@ -1390,7 +1403,7 @@ async fn do_tiered_nvme_write_efa(
             let buf = &stream_ctx.buffers[i];
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
             let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
-            crc = crc32c::crc32c_append(crc, slice);
+            digest.update(slice);
         }
         // Drain NVMe writes (may already be done — they started during EFA reads).
         for rx in nvme_write_receivers {
@@ -1411,6 +1424,7 @@ async fn do_tiered_nvme_write_efa(
         }
         batch_start += batch_count as u32;
     }
+    let crc = digest.finalize() as u32;
     // Post-loop: write FileHeader.
     if let Err(_e) = storage::write_file_header(
         fd,

@@ -299,7 +299,7 @@ pub async fn write_file_header(
         std::ptr::copy_nonoverlapping(header_page.as_ptr(), hdr_ptr, header_page.len());
     }
     let hdr_op = uring::UringOp {
-        iovec_index: nvme_pool.segments()[buf.segment_idx as usize].iovec_index,
+        iovec_index: nvme_pool.iovec_index_for_buf(buf),
         buf_ptr: hdr_ptr,
         file_offset: 0,
         len: FILE_HEADER_SIZE,

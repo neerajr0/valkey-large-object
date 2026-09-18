@@ -9,6 +9,7 @@ pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
+pub mod scaling;
 pub mod segment;
 pub mod segment_pool;
 pub mod uring;
@@ -71,19 +72,51 @@ impl std::fmt::Display for StorageError {
 
 use std::sync::{Mutex, OnceLock};
 
-/// Global iovec registry. Segments append here at creation time.
-/// Array position = iovec_index used by io_uring ReadFixed/WriteFixed.
-/// register_buffers() passes this directly to the kernel — no reordering.
-/// Stored as (ptr, len) pairs because libc::iovec contains raw pointers (not Send).
-static IOVECS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// Global sparse iovec table. Slot `i` = iovec_index for io_uring ReadFixed/WriteFixed.
+/// `None` = empty slot (no page pinned, no buffer registered at this index).
+/// `Some((ptr, len))` = live segment registered at this index.
+///
+/// Grows as segments are added via `append_iovec`. Bounded by `u16::MAX` (65535)
+/// since iovec_index is u16 — in practice a handful of entries.
+/// Per-slot updates via `clear_iovec` mirror the io_uring sparse table model:
+/// nulling a slot costs nothing (no page pinning for null entries).
+static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
-/// Called by SegmentPool::new() when creating each segment.
-/// Returns the assigned iovec_index (= current array length before push).
+/// Called by SegmentPool when creating each segment.
+/// Fills the first `None` hole in the sparse table (or appends if no hole).
+/// This matches the "first None hole, else append" policy used by
+/// `SegmentPool::expand` when placing the new segment in `slots`, so the
+/// returned `iovec_index` always equals the segment's slot index. Callers
+/// depend on `segment.iovec_index == slot_idx`; using a different policy here
+/// would silently violate that invariant when the two Vecs have holes in
+/// different positions.
+///
+/// Only invoked from the main event-loop thread — no cross-thread contention
+/// over which hole to fill.
 pub fn append_iovec(iov: libc::iovec) -> u16 {
     let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
-    let idx = u16::try_from(iovecs.len()).expect("iovec index overflow (>65535)");
-    iovecs.push((iov.iov_base as usize, iov.iov_len));
-    idx
+    let entry = Some((iov.iov_base as usize, iov.iov_len));
+    match iovecs.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            iovecs[i] = entry;
+            u16::try_from(i).expect("iovec index overflow (>65535)")
+        }
+        None => {
+            let i = iovecs.len();
+            iovecs.push(entry);
+            u16::try_from(i).expect("iovec index overflow (>65535)")
+        }
+    }
+}
+
+/// Called by SegmentPool during segment drain completion.
+/// Nulls the sparse slot so the io_uring registration can be cleared.
+pub fn clear_iovec(iovec_index: u16) {
+    let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
+    let idx = iovec_index as usize;
+    if idx < iovecs.len() {
+        iovecs[idx] = None;
+    }
 }
 
 pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
@@ -120,8 +153,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         ((dram_max as usize) / dram_seg_size).max(1)
     };
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
+    //
+    // NVMe staging is split into uniform `segment_size` segments (the io_uring/EFA
+    // per-buffer cap is 1 GiB, and segment-size is bounded to ≤1 GiB). Ceiling division
+    // so total NVMe staging capacity is never less than the requested nvme-staging-size
+    // (floor would under-provision: e.g. 100MB staging / 64MB segment = 1 segment = 64MB,
+    // 36MB short).
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
-        1
+        (nvme_staging.div_ceil(dram_seg_size)).max(1)
     } else {
         0
     };
@@ -130,7 +169,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         return Err(format!(
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
-             Increase dram-segment-size or decrease dram-maxmemory",
+             Increase segment-size or decrease dram-maxmemory",
             dram_segment_count,
             nvme_segments,
             total_segments,
@@ -140,7 +179,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
-        Some(NVMePool::new(1, nvme_staging))
+        Some(NVMePool::new(nvme_segments, dram_seg_size))
     } else {
         None
     };
@@ -157,9 +196,11 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
         let iovecs: Vec<libc::iovec> = pairs
             .iter()
-            .map(|&(ptr, len)| libc::iovec {
-                iov_base: ptr as *mut libc::c_void,
-                iov_len: len,
+            .filter_map(|opt| {
+                opt.map(|(ptr, len)| libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: len,
+                })
             })
             .collect();
         let engine = uring::UringNvmeEngine::new(iovecs).map_err(|e| {
@@ -202,13 +243,13 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
     if let Some(nvme_pool) = NVME_POOL.get() {
-        for seg in nvme_pool.segments() {
-            slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
-        }
+        nvme_pool.with_live_segment_slices(|base, size| {
+            slices.push(unsafe { std::slice::from_raw_parts(base, size) });
+        });
     }
-    for seg in get_dram_pool().segments() {
-        slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
-    }
+    get_dram_pool().with_live_segment_slices(|base, size| {
+        slices.push(unsafe { std::slice::from_raw_parts(base, size) });
+    });
     slices
 }
 

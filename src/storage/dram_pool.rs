@@ -1,13 +1,21 @@
 //! DRAMPool — long-lived cached objects.
 //!
 //! SegmentPool + RwLock<HashMap<ObjectId, Arc<ObjectContext>>>.
-//! Uses alloc (segment pool allocator). Segments can expand/shrink.
+//!
+//! Expand: triggered reactively when alloc fails (pool full), or proactively
+//! by the scaling cron when utilization exceeds the expand watermark.
+//! Adds one `segment-size` segment via `try_expand()`.
+//!
+//! Shrink (Tiered-mode only): triggered proactively by the scaling cron when
+//! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks
+//! it draining, and removes its cached objects from the HashMap so GET handlers
+//! fall back to NVMe. The segment releases on the next cron tick when refcount hits 0.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::context::{ObjectContext, SegmentBuffer};
-use super::segment::Segment;
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
@@ -16,6 +24,10 @@ pub struct DRAMPool {
     /// Cached objects: ObjectId → Arc<ObjectContext>.
     /// RwLock: main thread reads (GET hit), tokio writes (promotion insert).
     objects: RwLock<HashMap<ObjectId, Arc<ObjectContext>>>,
+    /// Cumulative count of successful expand operations since module load.
+    pub expand_count: AtomicU64,
+    /// Cumulative count of successful shrink operations since module load.
+    pub shrink_count: AtomicU64,
 }
 
 impl DRAMPool {
@@ -23,10 +35,12 @@ impl DRAMPool {
         Self {
             pool: SegmentPool::new(segment_count, segment_size),
             objects: RwLock::new(HashMap::new()),
+            expand_count: AtomicU64::new(0),
+            shrink_count: AtomicU64::new(0),
         }
     }
 
-    // ─── Allocator (draining-aware) ──────────────────────────────────────
+    // ─── Allocator ───────────────────────────────────────────────────────────
 
     pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
         self.pool.alloc(size)
@@ -48,20 +62,31 @@ impl DRAMPool {
         self.pool.buffer_ptr(buf)
     }
 
-    /// Access segments (needed by engine for buf_index lookup).
-    pub fn segments(&self) -> &[Segment] {
-        &self.pool.segments
+    pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
+        self.pool.iovec_index_for_buf(buf)
     }
 
-    // ─── Object Map ──────────────────────────────────────────────────────
+    // ─── Object Map ──────────────────────────────────────────────────────────
 
-    /// Lookup a cached object. Returns Arc clone (safe to use after releasing lock).
+    /// Lookup a cached object.
+    ///
+    /// Returns None if the object is not cached, or if its segment is draining
+    /// (caller should fall back to NVMe to prevent new Arc refs on a draining segment).
     pub fn get_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        self.objects
+        let arc = self
+            .objects
             .read()
             .expect("DRAMPool.objects lock unavailable")
             .get(oid)
-            .cloned()
+            .cloned()?;
+
+        // If any buffer of this object lives in a draining segment, refuse the
+        // Arc — forces the caller to NVMe and lets the refcount drain to zero.
+        let is_draining = self.pool.is_any_buffer_draining(&arc.buffers);
+        if is_draining {
+            return None;
+        }
+        Some(arc)
     }
 
     /// Insert an ObjectContext (promotion path).
@@ -105,7 +130,10 @@ impl DRAMPool {
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
     /// with all-or-nothing semantics (min_required = total_chunks).
     /// chunk_size is captured here at allocation time so callers use the same
-    /// value for streaming loops.
+    /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
+    ///
+    /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
+    /// Expansion is the scaling cron's responsibility, not the GET hot path.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -139,5 +167,116 @@ impl DRAMPool {
         ));
         objects.insert(oid, obj_ctx.clone());
         Some((obj_ctx, chunk_size))
+    }
+
+    // ─── Expand / Shrink ─────────────────────────────────────────────────────
+
+    pub fn utilization_ratio(&self) -> f64 {
+        self.pool.utilization_ratio()
+    }
+
+    /// Total allocated bytes across live segments. Used by INFO largeobj.
+    pub fn allocated_bytes(&self) -> usize {
+        self.pool.allocated_bytes()
+    }
+
+    /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
+    pub fn segment_counts(&self) -> (usize, usize, usize) {
+        self.pool.segment_counts()
+    }
+
+    /// Call `f` with each segment's base pointer and size. Used for EFA registration.
+    pub fn with_live_segment_slices<F>(&self, f: F)
+    where
+        F: FnMut(*const u8, usize),
+    {
+        self.pool.with_live_segment_slices(f);
+    }
+
+    /// Free segments that finished draining since the last cron tick.
+    ///
+    /// A segment marked draining is freed asynchronously: its memory is not
+    /// reclaimed until all in-flight Arc holders drop and refcount reaches 0.
+    /// This function scans for segments where `draining && refcount == 0` and
+    /// physically frees them: takes the Segment out of its slot, clears the
+    /// io_uring iovec slot (`clear_iovec`), and drops it. Each segment owns its
+    /// own talc whose metadata lives inside the segment's memory, so dropping
+    /// the Segment deallocates that memory and the talc vanishes with it — no
+    /// `talc.truncate` or free-list surgery is needed (unlike the old shared
+    /// allocator).
+    ///
+    /// Must be called from the Valkey main event-loop thread only.
+    pub fn release_drained_segments(&self) {
+        self.pool.release_all_releasable();
+    }
+
+    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
+    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
+    /// module-local `dram-maxmemory` sub-budget if set.
+    ///
+    /// Called reactively when alloc fails, or proactively when utilization > watermark.
+    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// crossed. Must be called on the main event-loop thread (reads server memory).
+    pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
+        // Server-wide OOM guard: never grow into memory the shrink path would
+        // immediately reclaim. No-op when the server has no maxmemory configured.
+        if crate::would_cross_memory_watermark(ctx, self.pool.segment_size as u64) {
+            return None;
+        }
+
+        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
+        let dram_max = crate::dram_maxmemory();
+        if dram_max > 0 {
+            let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;
+            if current_bytes as u64 >= dram_max {
+                return None;
+            }
+        }
+        let result = self.pool.expand();
+        if result.is_some() {
+            self.expand_count.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Mark the segment with the least cached bytes draining and remove its objects.
+    ///
+    /// Victim selection: the non-draining segment with the fewest allocated bytes.
+    /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
+    /// This minimises NVMe fallback work after eviction — clients re-read the least data.
+    ///
+    /// **Tiered mode:** always safe — data persists on NVMe; GETs fall back.
+    /// **Dram mode:** only allowed when the victim segment has zero allocated bytes.
+    ///   If it has live data, shrink is skipped — there is no NVMe fallback.
+    ///
+    /// Returns true if a victim was selected, false if nothing to shrink.
+    pub fn try_shrink(&self) -> bool {
+        let (victim_idx, victim_bytes) = match self.pool.find_shrink_victim() {
+            Some(v) => v,
+            None => return false,
+        };
+
+        if crate::operating_mode() == crate::OperatingMode::Dram && victim_bytes > 0 {
+            // Can't evict — data would be lost with no NVMe fallback.
+            // No unmark needed: segment was never marked draining.
+            return false;
+        }
+
+        // Commit: mark draining only now that we know eviction is safe.
+        self.pool.mark_segment_draining(victim_idx);
+
+        // Remove cached objects on the victim segment from the HashMap.
+        // Tiered: data persists on NVMe. Dram: verified empty above.
+        self.objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .retain(|_oid, ctx| {
+                ctx.buffers
+                    .iter()
+                    .all(|b| b.segment_idx as usize != victim_idx)
+            });
+
+        self.shrink_count.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
