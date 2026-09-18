@@ -28,7 +28,8 @@ pub fn scaling_cron(ctx: &Context) {
     // 2. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
     let util = pool.utilization_ratio();
-    if util > expand_watermark && pool.try_expand(ctx).is_some() {
+    let expanded = util > expand_watermark && pool.try_expand(ctx).is_some();
+    if expanded {
         ctx.log_notice(&format!(
             "largeobj: scaling — pool utilization {:.1}% > {:.0}%, added one DRAM segment",
             util * 100.0,
@@ -45,6 +46,20 @@ pub fn scaling_cron(ctx: &Context) {
     // core data types. The module's own pool utilization drives EXPAND; it must
     // not gate SHRINK, or a module with a low dram-maxmemory would shrink itself
     // under module-local pressure unrelated to server-wide pressure.
+    //
+    // Expand takes PRIORITY over shrink within a single tick. The two signals use
+    // different denominators (expand = module pool utilization; shrink = server
+    // used/maxmemory), so both can cross their watermarks on the same tick — pool
+    // at 80% while the server is at 90%. Firing both would add an empty segment
+    // and immediately drain the least-loaded one: pure churn. We err to EXPAND and
+    // suppress shrink for this tick. Gating on expand-SUCCEEDED (not merely
+    // expand-wanted) is deliberate: if expand was capped or failed, shrink is
+    // still allowed to give memory back, so we never deadlock under pressure with
+    // a pool that cannot grow.
+    if expanded {
+        rearm_scaling_cron(ctx, poll_ms);
+        return;
+    }
     let (used, maxmemory) = crate::server_memory(ctx);
     if maxmemory == 0 {
         // No server-wide maxmemory configured — no shrink pressure signal exists.
