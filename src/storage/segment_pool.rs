@@ -165,20 +165,13 @@ impl SegmentPool {
 
         let seg = st.slots[seg_idx].as_ref().unwrap();
         let seg_base = seg.base;
-        let claim_span = seg.claim_span;
         let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
-
-        // Exact precheck: does talc have room for this alloc? Uses talc's
-        // own accounting (get_allocated_span returns the tight range
-        // covering all live allocations, so overhead is baked in).
-        let allocated = unsafe { talc.get_allocated_span(claim_span) };
-        if allocated.size() + aligned_size > claim_span.size() {
-            return None;
-        }
-
-        let ptr = unsafe {
-            talc.malloc(layout)
-                .expect("talc.malloc after passing precheck must succeed")
+        // TODO: add a precheck that accounts for per-allocation overhead
+        // (tag + alignment padding) to avoid the malloc attempt when the
+        // segment is clearly full. For now, rely on malloc's own Err.
+        let ptr = match unsafe { talc.malloc(layout) } {
+            Ok(p) => p,
+            Err(_) => return None,
         };
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
