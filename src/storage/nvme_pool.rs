@@ -44,6 +44,17 @@ impl NVMePool {
         self.pool.iovec_index_for_buf(buf)
     }
 
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
+    pub fn is_segment_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_segment_registered_for_buf(buf)
+    }
+
+    /// Mark all current segments io_uring-registered (startup, post-register).
+    pub fn mark_all_registered(&self) {
+        self.pool.mark_all_registered();
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()

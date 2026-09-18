@@ -221,6 +221,7 @@ fn execute_get_tiered(
             buf_ptr: buf_ptr_usize as *mut u8,
             file_offset: 0,
             len: obj_len,
+            use_fixed: dram_pool.is_segment_registered_for_buf(seg_buf),
         };
 
         let fd_pool = storage::get_fd_pool();
@@ -304,6 +305,7 @@ fn execute_get_tiered(
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,
+        use_fixed: nvme_pool.is_segment_registered_for_buf(&stream_ctx.buffers[0]),
     };
 
     // Spawn tokio task for NVMe read + serve (no caching — transient).
@@ -723,6 +725,7 @@ async fn do_tiered_nvme_write(
         buf_ptr: buf_ptr_usize as *mut u8,
         file_offset: 0,
         len: obj_len,
+        use_fixed: nvme_pool.is_segment_registered_for_buf(&stream_ctx.buffers[0]),
     };
 
     let write_result = uring::submit_write(fd.as_raw_fd(), write_op).await;

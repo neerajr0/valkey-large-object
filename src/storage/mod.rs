@@ -233,6 +233,19 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     }
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
+        // The engine's constructor ran IORING_REGISTER_BUFFERS over every startup
+        // segment's iovec, so those segments ARE in the kernel buffer table: mark
+        // them registered so their I/O uses the fixed (ReadFixed/WriteFixed) path.
+        // Segments added later by expand() stay unregistered (non-fixed) until a
+        // future register_buffers_update path flips them. Tiered-only — Dram mode
+        // has no io_uring engine, so the flag is never consulted there.
+        DRAM_POOL
+            .get()
+            .expect("DRAMPool set above")
+            .mark_all_registered();
+        if let Some(pool) = NVME_POOL.get() {
+            pool.mark_all_registered();
+        }
     }
 
     Ok(format!(

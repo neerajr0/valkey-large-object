@@ -12,10 +12,10 @@
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
 //! `alloc_one` walks live non-draining segments in least-loaded-first order
-//! under one state lock, prechecks each with `talc.get_allocated_span`, and
-//! allocates from the first that passes — talc.malloc after a passing
-//! precheck is guaranteed to succeed. Per-segment locking means concurrent
-//! allocs on different segments never contend.
+//! under one state lock, picks the least-loaded that clears a fast byte
+//! filter, and allocates from its own talc — `talc.malloc` itself is the exact
+//! all-or-nothing check (returns Err on OOM without committing). Per-segment
+//! locking means concurrent allocs on different segments never contend.
 //!
 //! ## Draining / shrink protocol
 //!
@@ -84,10 +84,9 @@ impl SegmentPool {
 
     /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
     /// `min_required`. Each iteration walks the live non-draining segments in
-    /// LEAST-LOADED-first order under one state lock, and for the first one
-    /// that passes an exact talc `get_allocated_span` precheck, allocates from
-    /// its own talc allocator. talc.malloc after a passing precheck is
-    /// guaranteed to succeed. No retries, no poisoning.
+    /// LEAST-LOADED-first order under one state lock and allocates from the
+    /// least-loaded segment's own talc allocator (`talc.malloc` is the exact
+    /// fit check). No retries, no poisoning.
     ///
     /// Returns `None` if fewer than `min_required` could be allocated (partial
     /// allocation freed internally). Callers never need cleanup logic.
@@ -120,16 +119,15 @@ impl SegmentPool {
 
     /// One allocation: pick the least-loaded live, non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
-    /// candidate Vec), then exact-precheck it via `talc.get_allocated_span` and
-    /// allocate. Returns None if there is no eligible segment, or the picked
-    /// segment's exact precheck fails.
+    /// candidate Vec), then allocate from its talc. Returns None if there is no
+    /// eligible segment, or the picked segment's `talc.malloc` returns Err.
     ///
-    /// Why not fall back to the next-least-loaded on a failed precheck: the fast
-    /// filter already guaranteed `cur + aligned_size <= seg.size`, so the exact
-    /// precheck can only fail by talc's per-chunk boundary-tag overhead tipping
-    /// it over the edge. Since all segments are the same size, if the emptiest
-    /// eligible segment can't fit the alloc by that overhead sliver, none can —
-    /// the correct answer is "pool full", which the caller handles via reactive
+    /// Why not fall back to the next-least-loaded on a failed malloc: the fast
+    /// filter already guaranteed `cur + aligned_size <= seg.size`, so malloc can
+    /// only fail by talc's per-chunk boundary-tag overhead tipping it over the
+    /// edge. Since all segments are the same size, if the emptiest eligible
+    /// segment can't fit the alloc by that overhead sliver, none can — the
+    /// correct answer is "pool full", which the caller handles via reactive
     /// expand. A fallback loop would add machinery for a case that yields the
     /// same result.
     fn alloc_one(
@@ -155,7 +153,7 @@ impl SegmentPool {
                     .allocated_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
                 // Fast filter — allocated_bytes ignores talc's per-chunk overhead,
-                // so the exact precheck below still runs on the winner.
+                // so talc.malloc below is still the authoritative fit check.
                 if cur + aligned_size > seg.size {
                     return None;
                 }
@@ -326,6 +324,31 @@ impl SegmentPool {
             .as_ref()
             .expect("segment slot empty for live buffer")
             .iovec_index
+    }
+
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table. Callers use this to pick ReadFixed/WriteFixed (true) vs
+    /// plain Read/Write (false). An expanded segment not yet kernel-registered
+    /// returns false so its I/O never issues a fixed op against an unregistered
+    /// iovec_index (which would EFAULT).
+    pub fn is_segment_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots[buf.segment_idx as usize]
+            .as_ref()
+            .expect("segment slot empty for live buffer")
+            .is_io_uring_registered()
+    }
+
+    /// Mark every currently-live segment as io_uring-registered. Called once at
+    /// startup after the initial IORING_REGISTER_BUFFERS succeeds, since those
+    /// segments' iovecs are in the kernel table.
+    pub fn mark_all_registered(&self) {
+        let st = self.state.lock().expect("state lock unavailable");
+        for slot in st.slots.iter() {
+            if let Some(seg) = slot.as_ref() {
+                seg.mark_io_uring_registered();
+            }
+        }
     }
 
     /// Total allocated bytes across live (non-draining) segments.

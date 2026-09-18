@@ -39,6 +39,16 @@ pub struct Segment {
     pub allocated_bytes: AtomicUsize,
     /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
+    /// Whether this segment's buffer is registered with the io_uring kernel
+    /// buffer table (IORING_REGISTER_BUFFERS). Startup segments are registered
+    /// in the initial batch and set `true`. A segment added later by `expand()`
+    /// is NOT in the kernel table, so it starts `false` and its I/O uses plain
+    /// Read/Write instead of ReadFixed/WriteFixed — issuing a fixed op against
+    /// an unregistered iovec_index would EFAULT. This decouples the fixed/non-fixed
+    /// choice from the single startup-time decision: each segment carries its own.
+    /// Only ever transitions false→true (never back), so Relaxed is sufficient —
+    /// a stale `false` read merely takes the always-correct non-fixed path.
+    pub io_uring_registered: AtomicBool,
 }
 
 impl Segment {
@@ -66,12 +76,32 @@ impl Segment {
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
+            // A freshly-created segment is NOT in the io_uring kernel buffer table.
+            // Startup segments are marked registered after the initial
+            // IORING_REGISTER_BUFFERS; expand()-added segments stay false and use
+            // plain (non-fixed) Read/Write.
+            io_uring_registered: AtomicBool::new(false),
         }
     }
 
+    /// Whether this segment's buffer is registered in the io_uring kernel table.
+    /// A `false` result routes the segment's I/O through plain Read/Write; a
+    /// `true` result allows ReadFixed/WriteFixed. Relaxed: the flag only ever
+    /// goes false→true, and a stale `false` just takes the always-safe path.
+    pub fn is_io_uring_registered(&self) -> bool {
+        self.io_uring_registered.load(Ordering::Relaxed)
+    }
+
+    /// Mark this segment as registered in the io_uring kernel table. Called only
+    /// after a confirmed-successful registration (the initial startup
+    /// IORING_REGISTER_BUFFERS today; a future register_buffers_update for
+    /// expanded segments). Never un-set while the segment is live.
+    pub fn mark_io_uring_registered(&self) {
+        self.io_uring_registered.store(true, Ordering::Relaxed);
+    }
+
     /// Check if safe to release (draining + no live allocations).
-    pub fn is_releasable(&self) -> bool {
-        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
+    pub fn is_releasable(&self) -> bool {        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
         // all buffer writes from prior users are guaranteed visible, making
         // it safe to deallocate the segment.
         self.draining.load(Ordering::Acquire) && self.refcount.load(Ordering::Acquire) == 0
