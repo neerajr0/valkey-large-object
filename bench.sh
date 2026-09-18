@@ -284,21 +284,25 @@ for BENCH_MODE in $MODES_STR; do
             EFFECTIVE_KEYS=100  # 4MB: 100 keys
         fi
 
-        # NVMe staging must hold concurrent reads: clients × obj_size.
-        # Cap at 1GB — kernel hard limit per registered buffer (IORING_REGISTER_BUFFERS).
-        # Reduce effective clients for very large objects if staging would exceed cap.
-        # Use 80% of cap for actual buffers (20% reserved for talc metadata).
+        # NVMe staging must hold all concurrent in-flight reads: each client holds
+        # one contiguous obj_size buffer for the full GET (NVMe read + serve). A
+        # buffer cannot span two segments, so every 64MB segment wastes its tail
+        # (~obj_size - talc_overhead per segment). A flat 20% aggregate reserve is
+        # not enough once the pool spans several segments — the per-segment loss
+        # scales with segment count. Size to 2x the concurrent buffer bytes so the
+        # pool survives per-segment tail waste. Cap at 1GB (kernel per-buffer limit,
+        # IORING_REGISTER_BUFFERS); reduce effective clients if 2x would exceed it.
         STAGING_CAP=1073741824  # 1GB
         USABLE_CAP=$(( STAGING_CAP * 80 / 100 ))  # 80% usable after talc overhead
-        STAGING_NEEDED=$(( CLIENTS * BYTES ))
+        STAGING_NEEDED=$(( CLIENTS * BYTES * 2 ))
         EFFECTIVE_CLIENTS=$CLIENTS
         if [ $STAGING_NEEDED -gt $USABLE_CAP ]; then
-            EFFECTIVE_CLIENTS=$(( USABLE_CAP / BYTES ))
+            EFFECTIVE_CLIENTS=$(( USABLE_CAP / (BYTES * 2) ))
             if [ $EFFECTIVE_CLIENTS -lt 1 ]; then
                 EFFECTIVE_CLIENTS=1
             fi
         fi
-        STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES + EFFECTIVE_CLIENTS * BYTES / 5 ))
+        STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES * 2 ))
         if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
             STAGING_NEEDED=$STAGING_CAP
         fi

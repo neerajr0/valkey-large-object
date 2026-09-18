@@ -134,7 +134,13 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        let chunk_size = crate::buffer_size();
+        // TODO(streaming/batching PR): chunk the object into lo-buffer-size buffers
+        // once the multi-buffer read/write path is implemented. Until then, using
+        // lo-buffer-size here produces >1 buffer for large objects, which the
+        // single-buffer promotion read path cannot consume (hits the todo!() in the
+        // GET path). Promote as ONE buffer sized to the whole object instead.
+        //   let chunk_size = crate::buffer_size();
+        let chunk_size = obj_len as usize;
         let total_chunks = super::chunk_count(obj_len, chunk_size);
         // Alloc BEFORE taking the write lock — a talc scan under memory pressure
         // must not block GET readers waiting on get_object().
