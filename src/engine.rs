@@ -234,10 +234,7 @@ pub fn execute_get(
 
 /// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
 /// Multi-buffer: collect_dram_bytes iterates all buffers, copying up to obj_len total.
-fn serve_get_dram_tcp(
-    object_id: ObjectId,
-    obj_len: u64,
-) -> Result<ValkeyValue, ValkeyError> {
+fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
@@ -609,8 +606,9 @@ async fn do_tiered_promote_and_serve_efa(
                 let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
                 let addrs_owned = chunk.addrs.clone();
                 let session = session.clone();
-                efa_in_flight
-                    .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await });
+                efa_in_flight.push(async move {
+                    efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
+                });
             }
         }
         if nvme_read_err {
@@ -798,8 +796,9 @@ async fn do_tiered_nvme_read_and_serve_efa(
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
             let addrs_owned = chunk.addrs.clone();
             let session = session.clone();
-            efa_in_flight
-                .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await });
+            efa_in_flight.push(async move {
+                efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
+            });
         }
         // Drain in-flight EFA writes before advancing to next batch (buffers reused).
         while let Some(result) = efa_in_flight.next().await {
@@ -987,8 +986,10 @@ fn execute_set_dram_efa(
                     let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
                     let addrs_owned = chunk.addrs.clone();
                     let session = session.clone();
-                    efa_futures
-                        .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await });
+                    efa_futures.push(async move {
+                        efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read)
+                            .await
+                    });
                 }
                 while let Some(result) = efa_futures.next().await {
                     if result.is_err() {
@@ -1310,8 +1311,12 @@ async fn do_tiered_nvme_write_efa(
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
             let addrs_owned = chunk.addrs.clone();
             let session = session.clone();
-            efa_futures
-                .push(async move { (i, efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await) });
+            efa_futures.push(async move {
+                (
+                    i,
+                    efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await,
+                )
+            });
         }
         // As each EFA read completes, submit the NVMe write.
         let mut nvme_write_receivers = Vec::new();
@@ -1461,7 +1466,8 @@ fn serve_from_dram(
                     let addrs_owned = chunk.addrs.clone();
                     let session = session.clone();
                     efa_futures.push(async move {
-                        efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
+                        efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write)
+                            .await
                     });
                 }
                 while let Some(result) = efa_futures.next().await {
@@ -1504,9 +1510,11 @@ async fn efa_transfer_addrs(
     let (tx, rx) = tokio::sync::oneshot::channel();
     if addrs.len() == 1 {
         let (addr, len, rkey) = addrs[0];
-        let callback = Box::new(move |_ptr: *mut u8, result: Result<(), crate::transport::TransportError>| {
-            let _ = tx.send(result.map_err(|_| ValkeyError::Str(err_str)));
-        });
+        let callback = Box::new(
+            move |_ptr: *mut u8, result: Result<(), crate::transport::TransportError>| {
+                let _ = tx.send(result.map_err(|_| ValkeyError::Str(err_str)));
+            },
+        );
         match direction {
             EfaDirection::Write => session.write(buf_ptr as *mut u8, len, rkey, addr, callback),
             EfaDirection::Read => session.read(buf_ptr as *mut u8, len, rkey, addr, callback),
