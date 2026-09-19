@@ -124,10 +124,10 @@ fn collect_dram_bytes(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &ObjectContext,
     obj_len: u64,
+    chunk_iter: &mut ChunkIterator,
 ) -> Vec<u8> {
+    chunk_iter.reset_cursor();
     let mut data = Vec::with_capacity(obj_len as usize);
-    let chunk_size = crate::chunk_size();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), None);
     while let Some(chunk) = chunk_iter.next_chunk() {
         let buf = &obj_ctx.buffers[chunk.buffer_idx];
         let ptr = dram_pool.buffer_ptr(buf);
@@ -241,8 +241,10 @@ fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, 
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
+                let mut chunk_iter =
+                    ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
                 Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool, &obj_ctx, obj_len,
+                    dram_pool, &obj_ctx, obj_len, &mut chunk_iter,
                 )))
             }
         }
@@ -532,7 +534,7 @@ async fn do_tiered_promote_and_serve_tcp(
     if bench {
         thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
     } else {
-        let data = collect_dram_bytes(dram_pool, &obj_ctx, obj_len);
+        let data = collect_dram_bytes(dram_pool, &obj_ctx, obj_len, &mut chunk_iter);
         thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
     }
 }
@@ -1440,8 +1442,10 @@ fn serve_from_dram(
             if crate::bench_mode() {
                 thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
             } else {
+                let mut chunk_iter =
+                    ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
                 thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool, obj_ctx, obj_len,
+                    dram_pool, obj_ctx, obj_len, &mut chunk_iter,
                 ))));
             }
         }
