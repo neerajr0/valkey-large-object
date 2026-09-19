@@ -85,12 +85,9 @@ impl SegmentPool {
     /// Allocate up to `count` uniform buffers. Used directly for StreamingContext
     /// (rotating window of reusable buffers), and internally by `alloc_for_object`.
     ///
-    /// Allocates up to `count` buffers of `chunk_size` each, requiring at least
-    /// `min_required`. Each iteration walks the live non-draining segments in
-    /// LEAST-LOADED-first order under one state lock, and for the first one
-    /// that passes an exact talc `get_allocated_span` precheck, allocates from
-    /// its own talc allocator. talc.malloc after a passing precheck is
-    /// guaranteed to succeed. No retries, no poisoning.
+    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
+    /// order under one state lock and attempts `talc.malloc`. Allocation may
+    /// return `None` when the segment allocator cannot satisfy the request.
     ///
     /// Returns `None` if fewer than `min_required` could be allocated (partial
     /// allocation freed internally). Callers never need cleanup logic.
@@ -156,14 +153,13 @@ impl SegmentPool {
 
     /// One allocation: pick the least-loaded live, non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
-    /// candidate Vec), then exact-precheck it via `talc.get_allocated_span` and
-    /// allocate. Returns None if there is no eligible segment, or the picked
-    /// segment's exact precheck fails.
+    /// candidate Vec), then attempt `talc.malloc`. Returns `None` if no segment
+    /// is eligible or malloc fails.
     ///
-    /// Why not fall back to the next-least-loaded on a failed precheck: the fast
-    /// filter already guaranteed `cur + aligned_size <= seg.size`, so the exact
-    /// precheck can only fail by talc's per-chunk boundary-tag overhead tipping
-    /// it over the edge. Since all segments are the same size, if the emptiest
+    /// Why not fall back to the next-least-loaded on a failed malloc: the fast
+    /// filter already guaranteed `cur + aligned_size <= seg.size`, so malloc
+    /// can only fail due to talc's per-chunk boundary-tag overhead tipping it
+    /// over the edge. Since all segments are the same size, if the emptiest
     /// eligible segment can't fit the alloc by that overhead sliver, none can —
     /// the correct answer is "pool full", which the caller handles via reactive
     /// expand. A fallback loop would add machinery for a case that yields the
