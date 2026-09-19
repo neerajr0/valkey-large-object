@@ -175,7 +175,7 @@ pub fn into_completions<T: Send + 'static>(
                 // sending a result. The poller has panicked or exited — all NVMe I/O
                 // is broken and this is unrecoverable. Increment the metric and abort.
                 Err(_) => {
-                    crate::metrics::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    crate::info::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
                     panic!("largeobj: io_uring poller dropped oneshot sender — poller is dead");
                 }
             }

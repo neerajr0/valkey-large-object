@@ -29,7 +29,7 @@ use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::metrics;
+use crate::info;
 use crate::storage::{self, nvme, uring, ChunkIterator, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
@@ -322,7 +322,7 @@ fn execute_get_tiered(
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 reply_err(
                     &thread_ctx,
-                    &metrics::NVME_READ_ERRORS,
+                    &info::NVME_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_NVME_READ),
                 );
                 return;
@@ -395,7 +395,7 @@ fn execute_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_BUFFER_EXHAUSTED,
+                &info::NVME_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
             );
             return;
@@ -409,7 +409,7 @@ fn execute_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_READ_ERRORS,
+                &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
             return;
@@ -512,7 +512,7 @@ async fn do_tiered_promote_and_serve_tcp(
             dram_pool.remove_object(&object_id);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_READ_ERRORS,
+                &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
             return;
@@ -614,7 +614,7 @@ async fn do_tiered_promote_and_serve_efa(
             dram_pool.remove_object(&object_id);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_READ_ERRORS,
+                &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
             return;
@@ -633,7 +633,7 @@ async fn do_tiered_promote_and_serve_efa(
     }
     obj_ctx.mark_ready();
     match transport_err {
-        Some(e) => reply_err(&thread_ctx, &metrics::EFA_WRITE_ERRORS, e),
+        Some(e) => reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e),
         None => {
             thread_ctx.reply(Ok(ValkeyValue::Array(vec![
                 ValkeyValue::Integer(obj_len as i64),
@@ -695,7 +695,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
         if let Err(_e) = uring::await_batch(receivers, "read").await {
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_READ_ERRORS,
+                &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
             return;
@@ -785,7 +785,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
                 while completions.next().await.is_some() {}
                 reply_err(
                     &thread_ctx,
-                    &metrics::NVME_READ_ERRORS,
+                    &info::NVME_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_NVME_READ),
                 );
                 return;
@@ -801,7 +801,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
         // Drain in-flight EFA writes before advancing to next batch (buffers reused).
         while let Some(result) = efa_in_flight.next().await {
             if let Err(e) = result {
-                reply_err(&thread_ctx, &metrics::EFA_WRITE_ERRORS, e);
+                reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e);
                 return;
             }
         }
@@ -881,13 +881,13 @@ fn serve_set_dram_tcp(
         None => {
             // Reactive expansion: pool exhausted — try adding one segment, then retry.
             if dram_pool.try_expand(ctx).is_none() {
-                metrics::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
             }
             match dram_pool.alloc_for_object(obj_len) {
                 Some(bufs) => bufs,
                 None => {
-                    metrics::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                     return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
                 }
             }
@@ -915,7 +915,7 @@ fn serve_set_dram_tcp(
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.free_n(&buffers);
-        metrics::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
     let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
@@ -956,7 +956,7 @@ fn execute_set_dram_efa(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &metrics::DRAM_POOL_EXHAUSTED,
+                &info::DRAM_POOL_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
             );
             return;
@@ -991,7 +991,7 @@ fn execute_set_dram_efa(
                     if result.is_err() {
                         reply_err(
                             &thread_ctx,
-                            &metrics::EFA_READ_ERRORS,
+                            &info::EFA_READ_ERRORS,
                             ValkeyError::Str(errors::ERR_EFA_READ),
                         );
                         dram_pool.free_n(&buffers);
@@ -1021,7 +1021,7 @@ fn execute_set_dram_efa(
                     if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
                         if existing.object_id > object_id {
                             // Stale write — a newer SET already completed.
-                            metrics::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
+                            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
                             dram_pool.remove_object(&object_id);
                             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
                             return;
@@ -1037,7 +1037,7 @@ fn execute_set_dram_efa(
                         dram_pool.remove_object(&object_id);
                         reply_err(
                             &thread_ctx,
-                            &metrics::SET_VALUE_FAILURES,
+                            &info::SET_VALUE_FAILURES,
                             ValkeyError::Str(errors::ERR_SET_VALUE),
                         );
                         return;
@@ -1070,7 +1070,7 @@ fn execute_set_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_BUFFER_EXHAUSTED,
+                &info::NVME_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
             );
             return;
@@ -1132,7 +1132,7 @@ async fn do_tiered_nvme_write_tcp(
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
-            &metrics::NVME_CAPACITY_EXCEEDED,
+            &info::NVME_CAPACITY_EXCEEDED,
             ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
         );
         return;
@@ -1147,7 +1147,7 @@ async fn do_tiered_nvme_write_tcp(
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_WRITE_ERRORS,
+                &info::NVME_WRITE_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_WRITE),
             );
             return;
@@ -1181,7 +1181,7 @@ async fn do_tiered_nvme_write_tcp(
             let _ = std::fs::remove_file(&file_path);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_WRITE_ERRORS,
+                &info::NVME_WRITE_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_WRITE),
             );
             return;
@@ -1205,7 +1205,7 @@ async fn do_tiered_nvme_write_tcp(
         let _ = std::fs::remove_file(&file_path);
         reply_err(
             &thread_ctx,
-            &metrics::NVME_WRITE_ERRORS,
+            &info::NVME_WRITE_ERRORS,
             ValkeyError::Str(errors::ERR_NVME_WRITE),
         );
         return;
@@ -1230,11 +1230,11 @@ async fn do_tiered_nvme_write_tcp(
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(false) => {
-            metrics::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
+            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Err(e) => {
-            reply_err(&thread_ctx, &metrics::SET_VALUE_FAILURES, e);
+            reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
         }
     }
 }
@@ -1258,7 +1258,7 @@ async fn do_tiered_nvme_write_efa(
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
-            &metrics::NVME_CAPACITY_EXCEEDED,
+            &info::NVME_CAPACITY_EXCEEDED,
             ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
         );
         return;
@@ -1273,7 +1273,7 @@ async fn do_tiered_nvme_write_efa(
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
-                &metrics::NVME_WRITE_ERRORS,
+                &info::NVME_WRITE_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_WRITE),
             );
             return;
@@ -1306,7 +1306,7 @@ async fn do_tiered_nvme_write_efa(
             if result.is_err() {
                 reply_err(
                     &thread_ctx,
-                    &metrics::EFA_READ_ERRORS,
+                    &info::EFA_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_EFA_READ),
                 );
                 // Move buffer ownership and remaining futures to cleanup task.
@@ -1343,7 +1343,7 @@ async fn do_tiered_nvme_write_efa(
                     let _ = std::fs::remove_file(&file_path);
                     reply_err(
                         &thread_ctx,
-                        &metrics::NVME_WRITE_ERRORS,
+                        &info::NVME_WRITE_ERRORS,
                         ValkeyError::Str(errors::ERR_NVME_WRITE),
                     );
                     return;
@@ -1369,7 +1369,7 @@ async fn do_tiered_nvme_write_efa(
         let _ = std::fs::remove_file(&file_path);
         reply_err(
             &thread_ctx,
-            &metrics::NVME_WRITE_ERRORS,
+            &info::NVME_WRITE_ERRORS,
             ValkeyError::Str(errors::ERR_NVME_WRITE),
         );
         return;
@@ -1394,11 +1394,11 @@ async fn do_tiered_nvme_write_efa(
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Ok(false) => {
-            metrics::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
+            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         Err(e) => {
-            reply_err(&thread_ctx, &metrics::SET_VALUE_FAILURES, e);
+            reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
         }
     }
 }
@@ -1456,7 +1456,7 @@ fn serve_from_dram(
                 }
                 while let Some(result) = efa_futures.next().await {
                     if let Err(e) = result {
-                        reply_err(&thread_ctx, &metrics::EFA_WRITE_ERRORS, e);
+                        reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e);
                         return;
                     }
                 }

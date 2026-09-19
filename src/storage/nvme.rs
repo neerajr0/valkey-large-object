@@ -222,14 +222,14 @@ pub async fn read_and_verify_file_header(
     match hdr_rx.await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            crate::metrics::HEADER_READ_FAILURES.fetch_add(1, Ordering::Relaxed);
+            crate::info::HEADER_READ_FAILURES.fetch_add(1, Ordering::Relaxed);
             panic!(
                 "largeobj: file header read I/O error for object {:?}: {}",
                 expected_object_id, e
             );
         }
         Err(_) => {
-            crate::metrics::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
+            crate::info::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
             panic!(
                 "largeobj: io_uring poller dropped oneshot sender — poller is dead, \
                  all NVMe I/O is unrecoverable"
@@ -242,7 +242,7 @@ pub async fn read_and_verify_file_header(
     // from_page panics on corrupt magic/version (unrecoverable on-disk corruption).
     let header = FileHeader::from_page(hdr_slice);
     if header.object_id != expected_object_id.0 || header.len != expected_len {
-        crate::metrics::HEADER_INVALID_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::info::HEADER_INVALID_COUNT.fetch_add(1, Ordering::Relaxed);
         panic!(
             "largeobj: file header mismatch for object {:?}: \
              header_oid={} expected_oid={}, header_len={} expected_len={}",
@@ -250,7 +250,7 @@ pub async fn read_and_verify_file_header(
         );
     }
     if header.crc32c != crc32c_expected {
-        crate::metrics::CRC_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::info::CRC_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         panic!(
             "largeobj: CRC mismatch for object {:?}: file={} expected={}",
             expected_object_id, header.crc32c, crc32c_expected
@@ -309,7 +309,7 @@ pub async fn write_file_header(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_) => {
-            crate::metrics::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
+            crate::info::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
             panic!(
                 "largeobj: io_uring poller dropped oneshot sender — poller is dead, \
                  all NVMe I/O is unrecoverable"
