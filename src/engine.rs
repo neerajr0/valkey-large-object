@@ -490,14 +490,17 @@ async fn do_tiered_promote_and_serve_tcp(
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), None);
     let total_chunks = chunk_iter.total_chunks();
     let bench = crate::bench_mode();
-    // Submit header read — verified after the data batch loop completes.
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &obj_ctx.buffers[0];
-    let hdr_buf_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_rx = storage::submit_file_header_read(
+    storage::read_and_verify_file_header(
         fd,
         dram_pool.iovec_index_for_buf(hdr_buf),
-        hdr_buf_ptr,
-    );
+        dram_pool.buffer_ptr(hdr_buf) as usize,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
     // Batch loop: ReadFixed into DRAMPool buffers.
     let mut chunks_done: u32 = 0;
     while chunks_done < total_chunks {
@@ -527,10 +530,6 @@ async fn do_tiered_promote_and_serve_tcp(
         // TODO: obj_ctx.notify_progress() for coalesced waiters.
         chunks_done += batch_count as u32;
     }
-    // Verify file header now that all data reads are done.
-    // On the TCP path we serve data synchronously, so we can
-    // just verify file header at the end.
-    storage::verify_file_header(hdr_rx, hdr_buf_ptr, object_id, obj_len, crc32c_expected).await;
     // Post-loop: mark ready, serve from DRAMPool.
     obj_ctx.mark_ready();
     if bench {
@@ -560,14 +559,17 @@ async fn do_tiered_promote_and_serve_efa(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    // Submit header read, verify before entering the data batch loop.
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &obj_ctx.buffers[0];
-    let hdr_buf_ptr = dram_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_rx = storage::submit_file_header_read(
+    storage::read_and_verify_file_header(
         fd,
         dram_pool.iovec_index_for_buf(hdr_buf),
-        hdr_buf_ptr,
-    );
+        dram_pool.buffer_ptr(hdr_buf) as usize,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
     let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
     let mut chunk_iter =
         ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
@@ -576,7 +578,6 @@ async fn do_tiered_promote_and_serve_efa(
     // On EFA failure: stop sending but continue ReadFixed for coalesced waiters.
     let mut transport_err: Option<ValkeyError> = None;
     let mut chunks_done: u32 = 0;
-    let mut pending_hdr_rx = Some(hdr_rx);
     while chunks_done < total_chunks {
         let batch_count = max_sqes_per_batch.min((total_chunks - chunks_done) as usize);
         let batch_start = chunks_done;
@@ -592,14 +593,6 @@ async fn do_tiered_promote_and_serve_efa(
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
-        // On the first batch, verify the header between submit and completion
-        // drain — the header I/O has been in flight since before the loop.
-        // Prevents blocking on header read before submitting data reads,
-        // while also validating the header before writing to client via EFA.
-        if let Some(rx) = pending_hdr_rx.take() {
-            storage::verify_file_header(rx, hdr_buf_ptr, object_id, obj_len, crc32c_expected)
-                .await;
-        }
         // Interleaved NVMe read -> EFA write: as each read completes,
         // immediately fire the EFA write for that chunk.
         let mut completions = uring::into_completions(receivers);
@@ -672,14 +665,17 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     let bench = crate::bench_mode();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
     let total_chunks = chunk_iter.total_chunks();
-    // Submit header read — verified after the data batch loop completes.
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &stream_ctx.buffers[0];
-    let hdr_buf_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_rx = storage::submit_file_header_read(
+    storage::read_and_verify_file_header(
         fd,
         nvme_pool.iovec_index_for_buf(hdr_buf),
-        hdr_buf_ptr,
-    );
+        nvme_pool.buffer_ptr(hdr_buf) as usize,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
     // Batch loop: read chunks from NVMe, accumulate into reply_buf.
     let mut reply_buf = if bench {
         Vec::new()
@@ -722,10 +718,6 @@ async fn do_tiered_nvme_read_and_serve_tcp(
         }
         chunks_done += batch_count as u32;
     }
-    // Verify file header now that all data reads are done.
-    // On the TCP path we serve data synchronously, so we can
-    // just verify file header at the end.
-    storage::verify_file_header(hdr_rx, hdr_buf_ptr, object_id, obj_len, crc32c_expected).await;
     // Post-loop: reply with accumulated data or bench integer.
     // StreamingContext dropped on return → NVMe buffers freed.
     if bench {
@@ -757,17 +749,19 @@ async fn do_tiered_nvme_read_and_serve_efa(
     let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let total_chunks = chunk_iter.total_chunks();
-    // Submit header read, verify before entering the data batch loop.
+    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
     let hdr_buf = &stream_ctx.buffers[0];
-    let hdr_buf_ptr = nvme_pool.buffer_ptr(hdr_buf) as usize;
-    let hdr_rx = storage::submit_file_header_read(
+    storage::read_and_verify_file_header(
         fd,
         nvme_pool.iovec_index_for_buf(hdr_buf),
-        hdr_buf_ptr,
-    );
+        nvme_pool.buffer_ptr(hdr_buf) as usize,
+        object_id,
+        obj_len,
+        crc32c_expected,
+    )
+    .await;
     // Batch loop: read chunks from NVMe, interleaved EFA write.
     let mut chunks_done: u32 = 0;
-    let mut pending_hdr_rx = Some(hdr_rx);
     while chunks_done < total_chunks {
         let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
         let batch_start = chunks_done;
@@ -783,14 +777,6 @@ async fn do_tiered_nvme_read_and_serve_efa(
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
-        // On the first batch, verify the header between submit and completion
-        // drain — the header I/O has been in flight since before the loop.
-        // Prevents blocking on header read before submitting data reads,
-        // while also validating the header before writing to client via EFA.
-        if let Some(rx) = pending_hdr_rx.take() {
-            storage::verify_file_header(rx, hdr_buf_ptr, object_id, obj_len, crc32c_expected)
-                .await;
-        }
         // Interleaved NVMe read → EFA write: as each read completes, immediately
         // fire the EFA write for that chunk.
         let mut completions = uring::into_completions(receivers);

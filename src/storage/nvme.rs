@@ -9,11 +9,9 @@ use std::mem::size_of;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::oneshot;
-
 use super::context::SegmentBuffer;
 use super::uring;
-use super::{NVMePool, StorageError};
+use super::NVMePool;
 use crate::data_type::ObjectId;
 
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
@@ -189,23 +187,25 @@ pub fn object_disk_len(logical_len: u64) -> u64 {
 
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
 
-/// Submit an io_uring read for the FileHeader at offset 0 of an NVMe file.
-/// Returns the oneshot receiver that will deliver the read result. Call
-/// `verify_file_header` to await and validate the result.
-/// Splitting submit from verify lets callers overlap the header I/O with
-/// data-chunk submissions (the header is verified before data results are
-/// consumed).
+/// Read FileHeader from offset 0 of an NVMe file into a pool buffer, parse and
+/// validate against expected values. Checks magic, version, object_id, len, and CRC.
+/// Panics on corrupt headers (unrecoverable on-disk corruption). Panics on CRC
+/// mismatch (serving corrupt data is worse than crashing). Panics on poller failure
+/// (RecvError means the io_uring poller is dead).
 /// `pool_buffer_ptr` passed as usize for Send safety (raw pointer is not Send).
 /// lo-chunk-size config enforces min 4096, so every pool buffer can hold a full
 /// FileHeader page.
-pub fn submit_file_header_read(
+pub async fn read_and_verify_file_header(
     fd: RawFd,
     iovec_index: u16,
     pool_buffer_ptr: usize,
-) -> oneshot::Receiver<Result<u64, StorageError>> {
+    expected_object_id: ObjectId,
+    expected_len: u64,
+    crc32c_expected: u32,
+) {
     debug_assert!(
         pool_buffer_ptr != 0,
-        "submit_file_header_read: null buffer pointer"
+        "read_and_verify_file_header: null buffer pointer"
     );
     let hdr_op = uring::UringOp {
         iovec_index,
@@ -213,20 +213,7 @@ pub fn submit_file_header_read(
         file_offset: 0,
         len: FILE_HEADER_SIZE,
     };
-    uring::submit_read(fd, hdr_op)
-}
-
-/// Await a previously submitted header read, then parse and validate the
-/// FileHeader against expected values. Checks magic, version, object_id,
-/// len, and CRC. Panics on corrupt headers (unrecoverable on-disk corruption),
-/// CRC mismatch, or poller failure.
-pub async fn verify_file_header(
-    hdr_rx: oneshot::Receiver<Result<u64, StorageError>>,
-    pool_buffer_ptr: usize,
-    expected_object_id: ObjectId,
-    expected_len: u64,
-    crc32c_expected: u32,
-) {
+    let hdr_rx = uring::submit_read(fd, hdr_op);
     // RecvError: the io_uring poller dropped the oneshot sender without calling
     // send(). This only happens if the poller thread panicked or exited — the
     // poller owns all senders in its pending HashMap. Since the poller is a
