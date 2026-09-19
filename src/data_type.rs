@@ -8,7 +8,6 @@
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
 //! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
-use std::io::{Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use valkey_module::digest::Digest;
@@ -121,59 +120,14 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded.
+    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
-        let data_dir = crate::nvme_dir();
-        // On-disk size.
-        let disk_len = crate::storage::object_disk_len(self.len);
-        if !crate::storage::nvme::try_reserve_nvme_disk_usage(disk_len) {
-            return None;
-        }
-        let new_oid = ObjectId::next();
-        let src_path = self.object_id.file_path(&data_dir);
-        let dst_path = new_oid.file_path(&data_dir);
-        // A copy failure (ENOSPC, EIO, ...) fails the COPY (lo_copy maps None -> null)
-        // rather than aborting the node. Release the reservation we took above and
-        // best-effort remove any partial destination.
-        if let Err(e) = std::fs::copy(&src_path, &dst_path) {
-            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&dst_path);
-            valkey_module::logging::log_warning(format!(
-                "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
-                self.object_id
-            ));
-            return None;
-        }
-        // Rewrite the FileHeader with the new ObjectId so read_and_verify_file_header
-        // matches when this copy is later read via GET.
-        // fsync after writing to ensure data is on stable storage before the file
-        // is exposed to O_DIRECT reads via io_uring.
-        {
-            let header = crate::storage::FileHeader::new(new_oid, self.len, self.crc32c);
-            let header_page = header.to_page();
-            match std::fs::OpenOptions::new().write(true).open(&dst_path) {
-                Ok(mut f) => {
-                    if f.seek(std::io::SeekFrom::Start(0)).is_err()
-                        || f.write_all(&header_page).is_err()
-                        || f.sync_all().is_err()
-                    {
-                        let _ = std::fs::remove_file(&dst_path);
-                        crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
-                        return None;
-                    }
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&dst_path);
-                    crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
-                    return None;
-                }
-            }
-        }
+        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
         Some(LoValue {
-            object_id: new_oid,
+            object_id: file.object_id(),
             len: self.len,
             crc32c: self.crc32c,
-            file: Some(Arc::new(ObjectFile::new(new_oid, disk_len))),
+            file: Some(Arc::new(file)),
         })
     }
 }
