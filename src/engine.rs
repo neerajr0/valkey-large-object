@@ -210,7 +210,7 @@ pub fn execute_get(
     match (mode, &transport) {
         (OperatingMode::Dram, Transport::Tcp) => {
             // Fully sync — serve from DRAMPool, return directly.
-            EngineResult::Sync(serve_get_dram_tcp(object_id, obj_len, crc32c))
+            EngineResult::Sync(serve_get_dram_tcp(object_id, obj_len))
         }
         _ => {
             // Async — block client, dispatch to tokio.
@@ -237,16 +237,12 @@ pub fn execute_get(
 fn serve_get_dram_tcp(
     object_id: ObjectId,
     obj_len: u64,
-    crc32c: u32,
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             if crate::bench_mode() {
-                Ok(ValkeyValue::Array(vec![
-                    ValkeyValue::Integer(obj_len as i64),
-                    ValkeyValue::Integer(crc32c as i64),
-                ]))
+                Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
                 Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
                     dram_pool, &obj_ctx, obj_len,
@@ -538,10 +534,7 @@ async fn do_tiered_promote_and_serve_tcp(
     // Post-loop: mark ready, serve from DRAMPool.
     obj_ctx.mark_ready();
     if bench {
-        thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-            ValkeyValue::Integer(obj_len as i64),
-            ValkeyValue::Integer(crc32c_expected as i64),
-        ])));
+        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
     } else {
         let data = collect_dram_bytes(dram_pool, &obj_ctx, obj_len);
         thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
@@ -736,10 +729,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     // Post-loop: reply with accumulated data or bench integer.
     // StreamingContext dropped on return → NVMe buffers freed.
     if bench {
-        thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-            ValkeyValue::Integer(obj_len as i64),
-            ValkeyValue::Integer(crc32c_expected as i64),
-        ])));
+        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
     } else {
         thread_ctx.reply(Ok(ValkeyValue::StringBuffer(reply_buf)));
     }
@@ -1457,10 +1447,7 @@ fn serve_from_dram(
     match transport {
         Transport::Tcp => {
             if crate::bench_mode() {
-                thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-                    ValkeyValue::Integer(obj_len as i64),
-                    ValkeyValue::Integer(crc32c as i64),
-                ])));
+                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
             } else {
                 thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
                     dram_pool, obj_ctx, obj_len,
