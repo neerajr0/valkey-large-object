@@ -52,8 +52,9 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         client.execute_command('LO.SET', 'key', b'A' * 4096)
         self.verify_error_response(client, 'LO.GET key 1 0', 'no DMA session (call LO.HELLO first)')
         client.execute_command('LO.HELLO', PEER_ADDRESS)
-        # Still the stubbed data path: it completes without moving bytes and replies the length.
-        assert client.execute_command('LO.GET', 'key', 1, 0) == 4096
+        # EFA GET returns [obj_len, crc32c].
+        result = client.execute_command('LO.GET', 'key', 1, 0)
+        assert isinstance(result, list) and result[0] == 4096
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):

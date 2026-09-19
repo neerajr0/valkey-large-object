@@ -244,7 +244,10 @@ fn serve_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, 
                 let mut chunk_iter =
                     ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
                 Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool, &obj_ctx, obj_len, &mut chunk_iter,
+                    dram_pool,
+                    &obj_ctx,
+                    obj_len,
+                    &mut chunk_iter,
                 )))
             }
         }
@@ -1445,7 +1448,10 @@ fn serve_from_dram(
                 let mut chunk_iter =
                     ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
                 thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool, obj_ctx, obj_len, &mut chunk_iter,
+                    dram_pool,
+                    obj_ctx,
+                    obj_len,
+                    &mut chunk_iter,
                 ))));
             }
         }

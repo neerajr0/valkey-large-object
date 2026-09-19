@@ -287,8 +287,6 @@ pub struct ChunkIterator {
     chunks: Vec<Chunk>,
     /// Next chunk to return.
     cursor: usize,
-    /// Number of buffers in the owning context (for rotation).
-    num_buffers: usize,
     // Incremental client address mapping state.
     /// Sequential (addr, size, rkey) entries for EFA consumption.
     flat_addrs: Vec<ClientAddress>,
@@ -341,7 +339,6 @@ impl ChunkIterator {
         Self {
             chunks,
             cursor: 0,
-            num_buffers,
             flat_addrs: client_addrs.unwrap_or_default(),
             addr_idx: 0,
             addr_offset: 0,
@@ -351,11 +348,6 @@ impl ChunkIterator {
     /// Total number of chunks for the object.
     pub fn total_chunks(&self) -> u32 {
         self.chunks.len() as u32
-    }
-
-    /// Number of buffers (for callers that need batch sizing).
-    pub fn num_buffers(&self) -> usize {
-        self.num_buffers
     }
 
     /// Advance to the next chunk, populating its client regions if EFA.
