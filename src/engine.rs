@@ -83,6 +83,13 @@ struct GetObjectInfo {
     crc32c: u32,
 }
 
+/// Object identity for SET operations — shared fields passed to async write tasks.
+struct SetObjectInfo {
+    object_id: ObjectId,
+    obj_len: u64,
+    key_name: Vec<u8>,
+}
+
 // ─── Engine Result ────────────────────────────────────────────────────────────
 
 /// Result of an engine dispatch. Command handler matches on this.
@@ -1096,11 +1103,13 @@ fn execute_set_tiered(
             crate::runtime_handle().spawn(async move {
                 do_tiered_nvme_write_tcp(
                     data,
-                    obj_len,
+                    SetObjectInfo {
+                        object_id,
+                        obj_len,
+                        key_name,
+                    },
                     stream_ctx,
                     blocked_client,
-                    key_name,
-                    object_id,
                 )
                 .await;
             });
@@ -1112,11 +1121,13 @@ fn execute_set_tiered(
         } => {
             crate::runtime_handle().spawn(async move {
                 do_tiered_nvme_write_efa(
-                    obj_len,
+                    SetObjectInfo {
+                        object_id,
+                        obj_len,
+                        key_name,
+                    },
                     stream_ctx,
                     blocked_client,
-                    key_name,
-                    object_id,
                     session,
                     rkey,
                     remote_addr,
@@ -1130,12 +1141,15 @@ fn execute_set_tiered(
 /// TCP Tiered SET — CRC computed incrementally, data written in batches, FileHeader last.
 async fn do_tiered_nvme_write_tcp(
     data: Vec<u8>,
-    obj_len: u64,
+    set_info: SetObjectInfo,
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
-    key_name: Vec<u8>,
-    object_id: ObjectId,
 ) {
+    let SetObjectInfo {
+        object_id,
+        obj_len,
+        key_name,
+    } = set_info;
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
@@ -1255,15 +1269,18 @@ async fn do_tiered_nvme_write_tcp(
 
 /// EFA Tiered SET — parallel EFA read per batch + post-hoc CRC + batched NVMe write.
 async fn do_tiered_nvme_write_efa(
-    obj_len: u64,
+    set_info: SetObjectInfo,
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
-    key_name: Vec<u8>,
-    object_id: ObjectId,
     session: Arc<Session>,
     rkey: u64,
     remote_addr: u64,
 ) {
+    let SetObjectInfo {
+        object_id,
+        obj_len,
+        key_name,
+    } = set_info;
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
