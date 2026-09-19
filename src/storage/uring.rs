@@ -1,4 +1,4 @@
-//! io_uring Transport — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//! NVMe io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
 //!
 //! Only used in Tiered mode. Dram-only mode has no io_uring engine.
 //!
