@@ -1507,6 +1507,8 @@ async fn efa_transfer_addrs(
     addrs: &[(u64, usize, u64)],
     direction: EfaDirection,
 ) -> Result<(), ValkeyError> {
+    // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
+    // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
     let err_str = match direction {
         EfaDirection::Write => errors::ERR_EFA_WRITE,
         EfaDirection::Read => errors::ERR_EFA_READ,
