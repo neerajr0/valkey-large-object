@@ -173,9 +173,8 @@ pub fn into_completions<T: Send + 'static>(
                 Ok(result) => (i, result),
                 // RecvError: the io_uring poller dropped the oneshot sender without
                 // sending a result. The poller has panicked or exited — all NVMe I/O
-                // is broken and this is unrecoverable. Increment the metric and abort.
+                // is broken and this is unrecoverable.
                 Err(_) => {
-                    crate::info::POLLER_FAILURES.fetch_add(1, Ordering::Relaxed);
                     panic!("largeobj: io_uring poller dropped oneshot sender — poller is dead");
                 }
             }
