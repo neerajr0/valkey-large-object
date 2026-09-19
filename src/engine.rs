@@ -75,6 +75,12 @@ pub enum Transport {
     },
 }
 
+/// Direction for EFA multi-address transfers.
+enum EfaDirection {
+    Read,
+    Write,
+}
+
 /// Resolved object identity for GET operations — the subset of LoValue fields
 /// needed by async read tasks.
 struct GetObjectInfo {
@@ -1530,7 +1536,7 @@ async fn efa_write_addrs(
             }),
         );
     } else {
-        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_WRITE, true);
+        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_WRITE, EfaDirection::Write);
     }
     rx.await
         .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_WRITE)))
@@ -1555,7 +1561,7 @@ async fn efa_read_addrs(
             }),
         );
     } else {
-        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_READ, false);
+        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_READ, EfaDirection::Read);
     }
     rx.await
         .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_READ)))
@@ -1568,7 +1574,7 @@ fn submit_multi_addr_efa(
     addrs: &[(u64, usize, u64)],
     tx: tokio::sync::oneshot::Sender<Result<(), ValkeyError>>,
     err_str: &'static str,
-    is_write: bool,
+    direction: EfaDirection,
 ) {
     let remaining = Arc::new(AtomicUsize::new(addrs.len()));
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -1591,10 +1597,13 @@ fn submit_multi_addr_efa(
                 }
             },
         );
-        if is_write {
-            session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr, callback);
-        } else {
-            session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr, callback);
+        match direction {
+            EfaDirection::Write => {
+                session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr, callback);
+            }
+            EfaDirection::Read => {
+                session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr, callback);
+            }
         }
         buf_offset += len;
     }
