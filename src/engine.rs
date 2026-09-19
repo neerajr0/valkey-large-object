@@ -624,7 +624,7 @@ async fn do_tiered_promote_and_serve_efa(
                 let addrs_owned = chunk.addrs.clone();
                 let session = session.clone();
                 efa_in_flight
-                    .push(async move { efa_write_addrs(&session, buf_ptr, &addrs_owned).await });
+                    .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await });
             }
         }
         if nvme_read_err {
@@ -823,7 +823,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
             let addrs_owned = chunk.addrs.clone();
             let session = session.clone();
             efa_in_flight
-                .push(async move { efa_write_addrs(&session, buf_ptr, &addrs_owned).await });
+                .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await });
         }
         // Drain in-flight EFA writes before advancing to next batch (buffers reused).
         while let Some(result) = efa_in_flight.next().await {
@@ -1012,7 +1012,7 @@ fn execute_set_dram_efa(
                     let addrs_owned = chunk.addrs.clone();
                     let session = session.clone();
                     efa_futures
-                        .push(async move { efa_read_addrs(&session, buf_ptr, &addrs_owned).await });
+                        .push(async move { efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await });
                 }
                 while let Some(result) = efa_futures.next().await {
                     if result.is_err() {
@@ -1335,7 +1335,7 @@ async fn do_tiered_nvme_write_efa(
             let addrs_owned = chunk.addrs.clone();
             let session = session.clone();
             efa_futures
-                .push(async move { (i, efa_read_addrs(&session, buf_ptr, &addrs_owned).await) });
+                .push(async move { (i, efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await) });
         }
         // As each EFA read completes, submit the NVMe write.
         let mut nvme_write_receivers = Vec::new();
@@ -1488,7 +1488,7 @@ fn serve_from_dram(
                     let addrs_owned = chunk.addrs.clone();
                     let session = session.clone();
                     efa_futures.push(async move {
-                        efa_write_addrs(&session, buf_ptr, &addrs_owned).await
+                        efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
                     });
                 }
                 while let Some(result) = efa_futures.next().await {
@@ -1516,55 +1516,32 @@ fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::C
     vec![(remote_addr, obj_len as usize, rkey)]
 }
 
-/// EFA write for a chunk's addresses. Each address is (remote_addr, len, rkey).
+/// EFA transfer for a chunk's addresses. Each address is (remote_addr, len, rkey).
 /// Single-address fast path avoids Arc overhead. Multi-address uses Arc countdown.
-async fn efa_write_addrs(
+async fn efa_transfer_addrs(
     session: &Arc<Session>,
     buf_ptr: usize,
     addrs: &[(u64, usize, u64)],
+    direction: EfaDirection,
 ) -> Result<(), ValkeyError> {
+    let err_str = match direction {
+        EfaDirection::Write => errors::ERR_EFA_WRITE,
+        EfaDirection::Read => errors::ERR_EFA_READ,
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     if addrs.len() == 1 {
         let (addr, len, rkey) = addrs[0];
-        session.write(
-            buf_ptr as *mut u8,
-            len,
-            rkey,
-            addr,
-            Box::new(move |_ptr, result| {
-                let _ = tx.send(result.map_err(|_| ValkeyError::Str(errors::ERR_EFA_WRITE)));
-            }),
-        );
+        let callback = Box::new(move |_ptr: *mut u8, result: Result<(), crate::transport::TransportError>| {
+            let _ = tx.send(result.map_err(|_| ValkeyError::Str(err_str)));
+        });
+        match direction {
+            EfaDirection::Write => session.write(buf_ptr as *mut u8, len, rkey, addr, callback),
+            EfaDirection::Read => session.read(buf_ptr as *mut u8, len, rkey, addr, callback),
+        }
     } else {
-        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_WRITE, EfaDirection::Write);
+        submit_multi_addr_efa(session, buf_ptr, addrs, tx, err_str, direction);
     }
-    rx.await
-        .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_WRITE)))
-}
-
-/// EFA read for a chunk's addresses.
-async fn efa_read_addrs(
-    session: &Arc<Session>,
-    buf_ptr: usize,
-    addrs: &[(u64, usize, u64)],
-) -> Result<(), ValkeyError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if addrs.len() == 1 {
-        let (addr, len, rkey) = addrs[0];
-        session.read(
-            buf_ptr as *mut u8,
-            len,
-            rkey,
-            addr,
-            Box::new(move |_ptr, result| {
-                let _ = tx.send(result.map_err(|_| ValkeyError::Str(errors::ERR_EFA_READ)));
-            }),
-        );
-    } else {
-        submit_multi_addr_efa(session, buf_ptr, addrs, tx, errors::ERR_EFA_READ, EfaDirection::Read);
-    }
-    rx.await
-        .unwrap_or(Err(ValkeyError::Str(errors::ERR_EFA_READ)))
+    rx.await.unwrap_or(Err(ValkeyError::Str(err_str)))
 }
 
 /// Multi-address coordination: one fi_write or fi_read per address, Arc countdown.
