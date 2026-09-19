@@ -120,9 +120,9 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 Build `glide-core` with large object RDMA capability using `--features rdma`. Alternately, `--features rdma-vendored` builds libfabric from source and allows `--all-features` to continue working in CI/CD.
 
-RDMA writes are only between the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards). RDMA reads are between the client and both primary and replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
+RDMA transfers are only between the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
-RDMA handshakes occur at construction time, during reconnects, and when cluster topology changes.
+RDMA handshakes occur at construction time, during reconnects, and when cluster topology changes. There should be only one `LO.HELLO` per RESP connection.
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 
