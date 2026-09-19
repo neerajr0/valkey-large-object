@@ -20,9 +20,9 @@ pub use object_file::ObjectFile;
 
 // Re-exports from nvme.rs
 pub use nvme::{
-    object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_nvme_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
-    FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
+    object_disk_len, open_nvme_file_for_write, submit_file_header_read,
+    validate_and_clean_nvme_dir, verify_file_header, write_file_header, FileHeader,
+    FILE_HEADER_MAGIC, FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
 };
 
 // Re-export for crate-internal use only.
