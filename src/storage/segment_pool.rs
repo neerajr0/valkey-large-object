@@ -64,7 +64,8 @@ impl SegmentPool {
         let mut slots: Vec<Option<Segment>> = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
             let mut seg = Segment::new(segment_size);
-            let idx = super::append_iovec(seg.iovec());
+            let idx = super::append_iovec(seg.iovec())
+                .expect("startup segment count exceeds MAX_SEGMENTS — init validation bypassed");
             seg.iovec_index = idx;
             slots.push(Some(seg));
         }
@@ -221,7 +222,12 @@ impl SegmentPool {
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
     pub fn expand(&self) -> Option<u16> {
         let mut seg = Segment::new(self.segment_size);
-        let idx = super::append_iovec(seg.iovec());
+        // Register the iovec first. Returns None if the sparse table is already
+        // at MAX_SEGMENTS — the single runtime cap check. On None we drop `seg`
+        // here (freeing its just-allocated backing memory) and report expand
+        // failure; nothing is inserted into `slots`, so the two Vecs stay in
+        // lockstep and the caller (scaling cron / reactive expand) holds size.
+        let idx = super::append_iovec(seg.iovec())?;
         seg.iovec_index = idx;
 
         let mut st = self.state.lock().expect("state lock unavailable");

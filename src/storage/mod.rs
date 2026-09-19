@@ -73,14 +73,24 @@ use std::sync::{Mutex, OnceLock};
 /// `None` = empty slot (no page pinned, no buffer registered at this index).
 /// `Some((ptr, len))` = live segment registered at this index.
 ///
-/// Grows as segments are added via `append_iovec`. Bounded by `u16::MAX` (65535)
-/// since iovec_index is u16 — in practice a handful of entries.
-/// Per-slot updates via `clear_iovec` mirror the io_uring sparse table model:
-/// nulling a slot costs nothing (no page pinning for null entries).
+/// Grows as segments are added via `append_iovec`, bounded by `MAX_SEGMENTS`
+/// (the single cap enforced at both startup and runtime expand). iovec_index is
+/// u16, so the table can never exceed `u16::MAX + 1` entries — in practice a
+/// handful. Per-slot updates via `clear_iovec` mirror the io_uring sparse table
+/// model: nulling a slot costs nothing (no page pinning for null entries).
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
+/// Maximum number of registered segments (DRAM + NVMe combined), across the
+/// whole module. The `iovec_index` handed to io_uring ReadFixed/WriteFixed is a
+/// `u16`, so the sparse `IOVECS` table can hold at most `u16::MAX + 1` (65536)
+/// entries. This is the SINGLE cap: `init()` validates the startup segment count
+/// against it, and `append_iovec` enforces it on every runtime growth so a
+/// runaway `expand()` fails cleanly instead of panicking.
+pub const MAX_SEGMENTS: usize = u16::MAX as usize + 1;
+
 /// Called by SegmentPool when creating each segment.
-/// Fills the first `None` hole in the sparse table (or appends if no hole).
+/// Fills the first `None` hole in the sparse table (or appends if no hole),
+/// returning the slot index as the segment's `iovec_index`.
 /// This matches the "first None hole, else append" policy used by
 /// `SegmentPool::expand` when placing the new segment in `slots`, so the
 /// returned `iovec_index` always equals the segment's slot index. Callers
@@ -88,20 +98,31 @@ static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 /// would silently violate that invariant when the two Vecs have holes in
 /// different positions.
 ///
+/// Returns `None` when the table is already at `MAX_SEGMENTS` and has no hole to
+/// reuse — this is the single runtime cap check. `expand()` propagates the
+/// `None` (expand fails cleanly, pool holds its size); the old code panicked via
+/// `u16::try_from(...).expect(...)`, which would abort the server.
+///
 /// Only invoked from the main event-loop thread — no cross-thread contention
 /// over which hole to fill.
-pub fn append_iovec(iov: libc::iovec) -> u16 {
+pub fn append_iovec(iov: libc::iovec) -> Option<u16> {
     let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
     let entry = Some((iov.iov_base as usize, iov.iov_len));
     match iovecs.iter().position(|s| s.is_none()) {
+        // Reusing an existing hole never grows the table, so it is always within
+        // the cap (the index already fit in u16 when the slot was created).
         Some(i) => {
             iovecs[i] = entry;
-            u16::try_from(i).expect("iovec index overflow (>65535)")
+            Some(i as u16)
         }
+        // Appending grows the table — reject once it would exceed the cap.
         None => {
+            if iovecs.len() >= MAX_SEGMENTS {
+                return None;
+            }
             let i = iovecs.len();
             iovecs.push(entry);
-            u16::try_from(i).expect("iovec index overflow (>65535)")
+            Some(i as u16)
         }
     }
 }
@@ -164,7 +185,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         0
     };
     let total_segments = dram_segment_count + nvme_segments;
-    if total_segments > u16::MAX as usize + 1 {
+    if total_segments > MAX_SEGMENTS {
         return Err(format!(
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
@@ -172,7 +193,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
             dram_segment_count,
             nvme_segments,
             total_segments,
-            u16::MAX as usize + 1,
+            MAX_SEGMENTS,
         ));
     }
 
