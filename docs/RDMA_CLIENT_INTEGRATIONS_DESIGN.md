@@ -53,22 +53,59 @@ GLIDE_SYNC_RDMA=1 RELEASE_MODE=1 \
 
 ### Usage
 
+The caller owns the registered memory buffer for its entire lifetime. The `GlideClient` pins it in place and tells the server where it is.
 The example is for a non-cluster client, but cluster mode will be supported as well.
 
-```bash
+```python
 config = GlideClientConfiguration(
     addresses=[NodeAddress("...")],
     rdma=RdmaConfiguration(provider=EfaDirect()),
 )
 client = GlideClient.create(config)
 
-# provide a window of the region with each get/set call
+# provide a window of the registered region with each get/set call
 region = client.register_rdma_region(slab)
 
-receipt = client.rdma_get(b"key", region.window(offset, capacity))
-client.rdma_set(b"key", region.window(offset, length))
+# set value
+# step 1: the app stages its own bytes, e.g. copy from GPU memory
+window = region.window(offset, len(payload))
+window.memoryview()[:] = payload
+# step 2: server reads them via DRMA
+client.rdma_set(b"key", window)
 
+# get value
+receipt = client.rdma_get(b"key", region.window(offset, capacity))
+if receipt is not None:
+    data = region.window(0, receipt.bytes_written).memoryview()
+
+# once all transfers are complete
 region.close()
+```
+
+Here's an example of what a `store_kv_chunk` method could look like using PyTorch and GLIDE:
+
+```python
+import torch
+
+  # One time setup: register PINNED host memory, not a plain bytearray.
+  KV_CHUNK_BYTES = 256 << 10
+  NUM_SLOTS = 16
+  staging = torch.empty(NUM_SLOTS * CHUNK_BYTES, dtype=torch.uint8, pin_memory=True)  
+  region = client.register_rdma_region(staging.numpy())
+
+  def store_kv_chunk(
+      gpu_tensor: torch.Tensor, key: bytes, slot: int, stream: torch.cuda.Stream
+  ):
+      src = gpu_tensor.contiguous().view(torch.uint8).flatten()   # reinterpret as raw bytes
+      nbytes = src.numel()
+      offset = slot * CHUNK_BYTES
+      dst = staging[offset : offset + nbytes]
+
+      with torch.cuda.stream(stream):
+          dst.copy_(src, non_blocking=True)   # step 1: copy from GPU to host
+      stream.synchronize()                    # must finish before rdma_set reads dst
+
+      client.rdma_set(key, region.window(offset, nbytes))
 ```
 
 ## Implementation
@@ -194,9 +231,9 @@ vllm serve Qwen/Qwen3-14B --kv-transfer-config \
 
 ## Implementation
 
-Write a RDMA-capable L2 adapter based on the [existing valkey one](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l2_adapters/valkey_l2_adapter.py).
+Write a RDMA-capable L2 adapter based on the [existing valkey one](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l2_adapters/valkey_l2_adapter.py). A separate adapter file that subclasses the existing adapter may be nice for working out the rough edges we may not yet know about, but we can fold the RDMA parameters into the existing adapter instead if that makes more sense.
 
-A separate adapter file that subclasses the existing adapter may be nice for working out the rough edges we may not yet know about, but we can fold the RDMA parameters into the existing adapter instead if that makes more sense.
+An L2 adapter is given a [L1 memory descriptor](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/storage_manager.py#L1209), and we can refer to the [mooncake L2 adapter](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l2_adapters/mooncake_store_l2_adapter.py#L147-L150) for how it [registers memory for RDMA](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l2_adapters/mooncake_store_l2_adapter.py#L179-L195).
 
 ---
 
