@@ -66,7 +66,7 @@ client = GlideClient.create(config)
 region = client.register_rdma_region(slab)
 
 receipt = client.rdma_get(b"key", region.window(offset, capacity))
-receipt = client.rdma_set(b"key", region.window(offset, length))
+client.rdma_set(b"key", region.window(offset, length))
 
 region.close()
 ```
@@ -88,8 +88,7 @@ New leaf crate to glide-core that contains the components needed for establishin
         FC["FabricConfig + Provider<br/>which card to open and how"]
         ADV["RegionRef<br/>where to write and the key that permits it"]
         CMD["RdmaCommand<br/>the request as words on the wire"]
-        PROTO["protocol<br/>the request as redis-rs speaks it"]
-        RCPT["TransferReceipt<br/>how many bytes moved and the server's checksum"]
+        RCPT["ReadReceipt<br/>how many bytes moved and the server's checksum"]
       end
     
       subgraph DP["Data plane RDMA (requires libfabric)"]
@@ -120,9 +119,9 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 Build `glide-core` with large object RDMA capability using `--features rdma`. Alternately, `--features rdma-vendored` builds libfabric from source and allows `--all-features` to continue working in CI/CD.
 
-RDMA transfers are only between the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
+The [server module lists `LO.HELLO` as a write command](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
-RDMA handshakes occur at construction time, during reconnects, and when cluster topology changes. There should be only one `LO.HELLO` per RESP connection.
+RDMA handshakes occur on the first transfer (`LO.GET` or `LO.SET` command). There should be only one `LO.HELLO` per RESP connection. The server module [tracks RDMA sessions by each connection's `client_id`](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/transport/session.rs#L88), so the client should also pair an RDMA session with its own RESP connection. This way, RDMA sessions are kept in sync whenever a RESP connection must be replaced or a new one must be created or removed due to cluster topology changes.
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 
@@ -199,7 +198,7 @@ Integrating with LMCache using RDMA-capable valkey-glide simply means using the 
 ```bash
 lmcache server --host 0.0.0.0 --port 5555 \
 	--chunk-size 512 --l1-size-gb 100 \
-  --l2-adapter '{"type":"valkey_dma",
+  --l2-adapter '{"type":"valkey_rdma",
                  "startup_nodes":"kv.internal:6379",
                  "num_workers":8,
                  "ttl_seconds":3600,
