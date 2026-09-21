@@ -136,6 +136,8 @@ RDMA handshakes occur on the first transfer (`LO.GET` or `LO.SET` command). Ther
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 
+RDMA transfers are not abortable and `glide-core` applies no timeout to `LO.GET` or `LO.SET` commands. Callers that wish to cancel a transfer must close the client.
+
 ### glide-ffi
 
 Pass the new configuration and APIs through from glide-core to the python-sync SDK. Add a `rdma` feature to the crate as well.
