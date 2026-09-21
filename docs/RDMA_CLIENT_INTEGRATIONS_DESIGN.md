@@ -81,37 +81,48 @@ New leaf crate to glide-core that contains the components needed for establishin
     
     ```mermaid
     flowchart TB
-      GC["glide-core<br/>sends the commands, owns the connection"]
-    
-      subgraph CP["Control plane (RESP)"]
+      subgraph GCORE["glide-core — owns the connections, sends the commands"]
+        direction TB
+        CONN["GlideConnectionWithRdma<br/>one RESP connection, and the session opened on it"]
+        PROTO["rdma::protocol<br/>glide-rdma's commands as redis-rs speaks them"]
+      end
+
+      subgraph WIRE["glide-rdma — wire format, builds without libfabric"]
         direction TB
         FC["FabricConfig + Provider<br/>which card to open and how"]
-        ADV["RegionRef<br/>where to write and the key that permits it"]
-        CMD["RdmaCommand<br/>the request as words on the wire"]
-        RCPT["ReadReceipt<br/>how many bytes moved and the server's checksum"]
+        CMD["RdmaCommand<br/>LO.HELLO / LO.GET / LO.SET, as a name and arguments"]
+        ADV["RegionRef<br/>the remote key and address permitting one transfer"]
+        HS["Handshake<br/>the fabric addresses the server answered with"]
+        RCPT["ReadReceipt<br/>bytes moved, and the server's checksum when it sends one"]
+        CK["checksum<br/>CRC-32c, the same one the server computes"]
       end
-    
-      subgraph DP["Data plane RDMA (requires libfabric)"]
+
+      subgraph DP["glide-rdma — data plane, requires libfabric"]
         direction TB
-        FAB["RdmaFabric<br/>host fabric endpoint"]
+        FAB["RdmaFabric<br/>this host's endpoint and its address vector"]
+        SESS["RdmaSession<br/>the server addresses one connection may be reached from"]
         BUF["RdmaBuffer<br/>pinned pages the server may read or write"]
-        WIN["RegionWindow<br/>one slice of those pages for one transfer"]
+        WIN["RegionWindow<br/>one slice of those pages, for one transfer"]
         EP["LibfabricEndpoint<br/>raw libfabric bring-up and teardown"]
-        PROG["ProgressDriver<br/>polls for inbound RDMA (tcp provider only)"]
+        PROG["ProgressDriver<br/>polls for completions; every provider except efa-direct"]
       end
-    
-      GC -->|configures| FC
-      GC -->|sends| PROTO
-      FC -->|opens| FAB
+
+      CONN -->|"sends its commands through"| PROTO
+      PROTO -->|builds| CMD
+      PROTO -->|"parses the LO.HELLO reply into"| HS
+      PROTO -->|"parses a transfer reply into"| RCPT
+      RCPT -.->|"a read is verified against"| CK
+
+      FC -->|"opens, once per client"| FAB
+      FAB -.->|"handed to every connection"| CONN
       FAB -->|owns| EP
       FAB -->|drives| PROG
-      FAB -->|registers memory into| BUF
+      FAB -->|"registers memory into"| BUF
       BUF -->|"slice(at, len)"| WIN
-      BUF --> ADV
-      WIN --> ADV
-      ADV -->|"three of its arguments"| CMD
-      CMD -->|wrapped by| PROTO
-      PROTO -->|reply parses into| RCPT
+      WIN -->|"region_ref()"| ADV
+      ADV -->|"two of a transfer's arguments"| CMD
+      HS -->|"open_session mints"| SESS
+      SESS -.->|"opened by the first transfer, held for the connection's life"| CONN
     ```
     
 
