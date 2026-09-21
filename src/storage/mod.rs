@@ -3,6 +3,7 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
+use crc_fast::CrcAlgorithm;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
@@ -294,6 +295,9 @@ pub struct ChunkIterator {
     addr_idx: usize,
     /// Byte offset within the current flat_addrs entry.
     addr_offset: usize,
+    /// Per-chunk CRC32C from transport completions. Indexed by chunk index.
+    /// `None` entries indicate chunks whose checksum has not been recorded.
+    checksums: Vec<Option<u32>>,
 }
 
 impl ChunkIterator {
@@ -342,6 +346,7 @@ impl ChunkIterator {
             flat_addrs: client_addrs.unwrap_or_default(),
             addr_idx: 0,
             addr_offset: 0,
+            checksums: vec![None; total_chunks as usize],
         }
     }
 
@@ -396,10 +401,37 @@ impl ChunkIterator {
         &self.chunks[idx as usize]
     }
 
-    /// Reset cursor to the beginning. Used when re-iterating (e.g. CRC pass after reads).
+    /// Reset cursor to the beginning. Used when re-iterating (e.g. collect_dram_bytes).
     /// Does NOT reset client address mapping state — addresses already populated stay.
     pub fn reset_cursor(&mut self) {
         self.cursor = 0;
+    }
+
+    /// Record a per-chunk CRC32C from a transport completion.
+    /// Chunks may arrive out of order; the checksum is stored by chunk index.
+    pub fn record_checksum(&mut self, chunk_index: u32, crc: u32) {
+        self.checksums[chunk_index as usize] = Some(crc);
+    }
+
+    /// Combine all recorded checksums in chunk order into a whole-object CRC32C.
+    /// Panics if any chunk's checksum has not been recorded.
+    pub fn combine_checksums(&self) -> u32 {
+        let mut combined: u64 = 0;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            let crc = self.checksums[i].unwrap_or_else(|| panic!("chunk {i} checksum not recorded"))
+                as u64;
+            if i == 0 {
+                combined = crc;
+            } else {
+                combined = crc_fast::checksum_combine(
+                    CrcAlgorithm::Crc32Iscsi,
+                    combined,
+                    crc,
+                    chunk.user_len as u64,
+                );
+            }
+        }
+        combined as u32
     }
 }
 
@@ -542,5 +574,40 @@ mod tests {
         assert!(it.next_chunk().is_none());
         it.reset_cursor();
         assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+    }
+
+    #[test]
+    fn test_record_and_combine_single_chunk() {
+        let data = b"hello world";
+        let whole_crc = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, data) as u32;
+        let mut iter = ChunkIterator::new(data.len() as u64, 4096, 1, None);
+        iter.next_chunk(); // advance past the single chunk
+        iter.record_checksum(0, whole_crc);
+        assert_eq!(iter.combine_checksums(), whole_crc);
+    }
+
+    #[test]
+    fn test_record_and_combine_multi_chunk() {
+        let chunk_size = 4;
+        let data = b"abcdefghij"; // 10 bytes -> 3 chunks: 4, 4, 2
+        let whole_crc = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, data) as u32;
+        let mut iter = ChunkIterator::new(data.len() as u64, chunk_size, 3, None);
+        // Record per-chunk CRCs (simulating out-of-order arrival).
+        let crc1 = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, &data[4..8]) as u32;
+        iter.record_checksum(1, crc1);
+        let crc2 = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, &data[8..10]) as u32;
+        iter.record_checksum(2, crc2);
+        let crc0 = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, &data[0..4]) as u32;
+        iter.record_checksum(0, crc0);
+        assert_eq!(iter.combine_checksums(), whole_crc);
+    }
+
+    #[test]
+    #[should_panic(expected = "checksum not recorded")]
+    fn test_combine_panics_on_missing_checksum() {
+        let mut iter = ChunkIterator::new(100, 50, 2, None);
+        iter.record_checksum(0, 123);
+        // chunk 1 not recorded — should panic.
+        iter.combine_checksums();
     }
 }
