@@ -241,6 +241,8 @@ An L2 adapter is given a [L1 memory descriptor](https://github.com/LMCache/LMCac
 
 ## User experience
 
+Recommendation: prioritize the LMCache integration which unblocks integration with vLLM as well as other inference frameworks.
+
 ### Most straightforward option: LMCache
 
 Integrating with LMCache using RDMA-capable valkey-glide simply means using the L2 adapter written as part of the LMCache integration.
@@ -304,3 +306,5 @@ vllm serve <model> --kv-transfer-config '{
 ## Implementation
 
 For the direct integration, we would subclass [SecondaryTierManager](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/base.py#L121) to create `ValkeyRdmaTierManager` that uses a pool of glide-sync clients to send `LO.*` commands. We can use the [file system](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/fs/manager.py) and [object store](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/obj/manager.py) secondary tier manager implementations as reference. Then [register](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/factory.py) the tier to make it available as an option to vLLM.
+
+Note that the `kv_offload` feature still appears to be under active development and these details may change if/when we decide to prioritize this vLLM direct integration path.
