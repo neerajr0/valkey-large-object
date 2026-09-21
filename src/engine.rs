@@ -736,50 +736,54 @@ async fn do_tiered_nvme_write(
 
     match write_result {
         Ok(Ok(())) => {
-            // Version check + set_value. No DRAMPool involvement on Tiered SET.
-            {
+            let on_disk = std::fs::metadata(&file_path)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "NVMe accounting: cannot stat object {object_id:?} at {file_path} \
+                         to verify write size: {e}"
+                    )
+                })
+                .len();
+
+            // Compare-and-set under one lock. Clone the old ObjectFile Arc out so its teardown
+            // runs after the lock drops, not inline under the lock inside lo_free.
+            let (stale, _old_file) = {
                 let ctx = thread_ctx.lock();
                 let key_str = ctx.create_string(key_name);
                 let key = ctx.open_key_writable(&key_str);
-                if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-                    if existing.object_id > object_id {
-                        // Stale write — a newer SET already completed. Discard silently.
-                        // No ObjectFile was created, so release the reservation here.
-                        uring::decrease_nvme_disk_usage(disk_len);
-                        if let Err(e) = std::fs::remove_file(&file_path) {
-                            storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
-                        }
-                        thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+
+                let (stale, old_file) = match key.get_value::<LoValue>(&LO_TYPE) {
+                    Ok(Some(existing)) if existing.object_id > object_id => (true, None),
+                    Ok(Some(existing)) => (false, existing.file.clone()),
+                    _ => (false, None),
+                };
+
+                if !stale {
+                    assert_eq!(
+                        on_disk, disk_len,
+                        "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
+                         reserved {disk_len} B — write path and accounting have diverged"
+                    );
+                    let lo_value = LoValue {
+                        object_id,
+                        len: obj_len,
+                        crc32c: crc,
+                        file: Some(Arc::new(ObjectFile::new(object_id, disk_len))),
+                    };
+                    if key.set_value(&LO_TYPE, lo_value).is_err() {
+                        thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
                         return;
                     }
                 }
-                // Winning branch (our OID ≥ any committed OID). Confirm the write
-                // produced exactly the size we accounted for.
-                let on_disk = std::fs::metadata(&file_path)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "NVMe accounting: cannot stat object {object_id:?} at {file_path} \
-                             to verify write size: {e}"
-                        )
-                    })
-                    .len();
-                assert_eq!(
-                    on_disk, disk_len,
-                    "NVMe accounting: object {object_id:?} on disk is {on_disk} B but we \
-                     reserved {disk_len} B — write path and accounting have diverged"
-                );
-                // Create the new version's ObjectFile owning this file's existence,
-                // lazy read fd, and NVMe bytes. An overwrite triggers lo_free on the
-                // old LoValue, dropping its ObjectFile (teardown).
-                let lo_value = LoValue {
-                    object_id,
-                    len: obj_len,
-                    crc32c: crc,
-                    file: Some(Arc::new(ObjectFile::new(object_id, disk_len))),
-                };
-                if key.set_value(&LO_TYPE, lo_value).is_err() {
-                    thread_ctx.reply(Err(ValkeyError::Str("ERR failed to set key")));
-                    return;
+                (stale, old_file)
+            };
+            // `_old_file` drops here if it's not pinned by an inflight request.
+
+            if stale {
+                // Lost the race — discard: free the reservation and unlink our file
+                uring::decrease_nvme_disk_usage(disk_len);
+                if let Err(e) = std::fs::remove_file(&file_path) {
+                    storage::warn_failed_unlink("SET write cleanup", &file_path, &e);
                 }
             }
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
