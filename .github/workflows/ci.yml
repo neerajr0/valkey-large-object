@@ -15,7 +15,7 @@ env:
 
 jobs:
   test:
-    runs-on: self-hosted
+    runs-on: [self-hosted, ci]
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +28,17 @@ jobs:
             cache_key_suffix: asan
     name: ${{ matrix.name }}
     steps:
+      - name: Ensure disk headroom
+        run: |
+          set -euo pipefail
+          THRESHOLD=85
+          USE=$(df --output=pcent "$RUNNER_WORKSPACE" | tail -1 | tr -dc '0-9')
+          echo "Disk at ${USE}% on $(df --output=target "$RUNNER_WORKSPACE" | tail -1)"
+          if [ "${USE:-0}" -ge "$THRESHOLD" ]; then
+            echo "::warning::Disk at ${USE}%, trimming cargo cache"
+            "$HOME/.cargo/bin/cargo-cache" --autoclean || echo "cargo-cache not installed, skipping"
+          fi
+
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
