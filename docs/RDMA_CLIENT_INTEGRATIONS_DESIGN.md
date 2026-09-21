@@ -29,7 +29,7 @@
 
 Note: The valkey-glide maintainers probably have a more defined path for packaging and distribution of new features, but here we outline one possible path forward. Depending on what they ask for, the work may or may not fit into our timeline.
 
-RDMA capability can be considered a “preview” feature until it’s more mature. People should be able to install valkey-glide normally without picking up extra dependencies and opt in to using the RDMA capabilities as they wish.
+RDMA capability can be considered a “preview” feature until it’s more mature. People should be able to install valkey-glide normally without picking up extra dependencies (namely [libfabric](https://github.com/ofiwg/libfabric)) and opt in to using the RDMA capabilities as they wish. Note that the `efa-direct` option for RDMA can be run only on hosts with the special EFA hardware.
 
 Pip supports installing from a [source distribution](https://packaging.python.org/en/latest/tutorials/installing-packages/#source-distributions-vs-wheels) (sdist) instead of a pre-built binary (wheel), so the RDMA-capable client can be made available only via sdist while in preview. These instructions assume valkey-glide will be installed on a host with an EFA and libfabric.
 
