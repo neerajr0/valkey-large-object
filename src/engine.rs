@@ -368,7 +368,8 @@ fn execute_get_tiered(
                 rkey,
                 remote_addr,
             } => {
-                let (session, rkey, remote_addr) = (session.clone(), *rkey, *remote_addr);
+                let session = session.clone();
+                let efa_addrs = single_efa_addrs(*rkey, *remote_addr, obj_len);
                 crate::runtime_handle().spawn(async move {
                     let _keep_alive = (file, fd);
                     do_tiered_promote_and_serve_efa(
@@ -382,8 +383,7 @@ fn execute_get_tiered(
                         blocked_client,
                         max_sqes_per_batch,
                         session,
-                        rkey,
-                        remote_addr,
+                        efa_addrs,
                     )
                     .await;
                 });
@@ -450,7 +450,8 @@ fn execute_get_tiered(
             rkey,
             remote_addr,
         } => {
-            let (session, rkey, remote_addr) = (session.clone(), *rkey, *remote_addr);
+            let session = session.clone();
+            let efa_addrs = single_efa_addrs(*rkey, *remote_addr, obj_len);
             crate::runtime_handle().spawn(async move {
                 // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile
                 // pin and open fd are held alive for the read's duration.
@@ -465,8 +466,7 @@ fn execute_get_tiered(
                     raw_fd,
                     blocked_client,
                     session,
-                    rkey,
-                    remote_addr,
+                    efa_addrs,
                 )
                 .await;
             });
@@ -551,8 +551,7 @@ async fn do_tiered_promote_and_serve_efa(
     blocked_client: valkey_module::BlockedClient,
     max_sqes_per_batch: usize,
     session: Arc<Session>,
-    rkey: u64,
-    remote_addr: u64,
+    efa_addrs: Vec<storage::ClientAddress>,
 ) {
     let GetObjectInfo {
         object_id,
@@ -573,7 +572,6 @@ async fn do_tiered_promote_and_serve_efa(
         crc32c_expected,
     )
     .await;
-    let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
     let mut chunk_iter =
         ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
     let total_chunks = chunk_iter.total_chunks();
@@ -738,8 +736,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
     fd: RawFd,
     blocked_client: valkey_module::BlockedClient,
     session: Arc<Session>,
-    rkey: u64,
-    remote_addr: u64,
+    efa_addrs: Vec<storage::ClientAddress>,
 ) {
     let GetObjectInfo {
         object_id,
@@ -750,7 +747,6 @@ async fn do_tiered_nvme_read_and_serve_efa(
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let total_chunks = chunk_iter.total_chunks();
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
@@ -1107,6 +1103,7 @@ fn execute_set_tiered(
             rkey,
             remote_addr,
         } => {
+            let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
             crate::runtime_handle().spawn(async move {
                 do_tiered_nvme_write_efa(
                     SetObjectInfo {
@@ -1117,8 +1114,7 @@ fn execute_set_tiered(
                     stream_ctx,
                     blocked_client,
                     session,
-                    rkey,
-                    remote_addr,
+                    efa_addrs,
                 )
                 .await;
             });
@@ -1261,8 +1257,7 @@ async fn do_tiered_nvme_write_efa(
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     session: Arc<Session>,
-    rkey: u64,
-    remote_addr: u64,
+    efa_addrs: Vec<storage::ClientAddress>,
 ) {
     let SetObjectInfo {
         object_id,
@@ -1298,7 +1293,6 @@ async fn do_tiered_nvme_write_efa(
             return;
         }
     };
-    let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let total_chunks = chunk_iter.total_chunks();
     let mut chunks_done: u32 = 0;

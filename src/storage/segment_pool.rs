@@ -133,7 +133,7 @@ impl SegmentPool {
                 rem
             }
         };
-        let full_count = if n > 1 { n - 1 } else { 0 };
+        let full_count = n.saturating_sub(1);
         // Allocate the first N-1 uniform-sized buffers (all-or-nothing).
         let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
         // Allocate the last (possibly smaller) buffer.
