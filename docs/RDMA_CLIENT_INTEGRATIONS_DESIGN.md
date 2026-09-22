@@ -149,7 +149,7 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 ### glide-core
 
-Build `glide-core` with large object RDMA capability using `--features rdma`. Alternately, `--features rdma-vendored` builds libfabric from source and allows `--all-features` to continue working in CI/CD.
+Allows for building `glide-core` with large object RDMA capability using `--features rdma`.
 
 The [server module lists `LO.HELLO` as a write command](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
@@ -157,7 +157,7 @@ RDMA handshakes occur on the first transfer (`LO.GET` or `LO.SET` command). Ther
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 
-RDMA transfers are not abortable and `glide-core` applies no timeout to `LO.GET` or `LO.SET` commands. Callers that wish to cancel a transfer must close the client.
+RDMA transfers are not abortable and `glide-core` applies no timeout to `LO.GET` or `LO.SET` commands. Callers that wish to cancel a transfer must close the client. Note that at the time of writing this doc, `LO.GET` doesn't accept a `length` argument and may instead receive an error from the server if the given memory window isn't large enough to accommodate the object.
 
 ### glide-ffi
 
