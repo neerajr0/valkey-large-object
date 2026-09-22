@@ -316,6 +316,8 @@ pub struct ChunkIterator {
     /// Byte offset within the current client_efa_addrs entry.
     addr_offset: usize,
     /// Per-chunk CRC32C from EFA transport completions. Indexed by chunk index.
+    /// Only used on SET paths (record_checksum + combine_checksums); GET paths
+    /// already have the stored CRC and never write to this vec.
     /// None for TCP paths (CRC computed inline via rolling digest).
     /// Some(...) for EFA paths; inner `None` entries indicate chunks not yet recorded.
     checksums: Option<Vec<Option<u32>>>,
