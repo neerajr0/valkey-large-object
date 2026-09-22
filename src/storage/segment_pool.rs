@@ -95,6 +95,15 @@ impl SegmentPool {
         count: usize,
         min_required: usize,
     ) -> Option<Vec<SegmentBuffer>> {
+        assert!(chunk_size > 0, "alloc_n: chunk_size must be > 0");
+        assert!(count > 0, "alloc_n: count must be > 0");
+        assert!(min_required > 0, "alloc_n: min_required must be > 0");
+        assert!(
+            min_required <= count,
+            "alloc_n: min_required ({}) > count ({})",
+            min_required,
+            count
+        );
         let aligned_size = super::align_up(chunk_size);
         let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
             .expect("alloc_n: invalid chunk_size layout");
