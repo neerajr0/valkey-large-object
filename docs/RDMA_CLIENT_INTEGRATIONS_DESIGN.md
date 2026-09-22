@@ -29,26 +29,10 @@
 
 Note: The valkey-glide maintainers probably have a more defined path for packaging and distribution of new features, but here we outline one possible path forward. Depending on what they ask for, the work may or may not fit into our timeline.
 
-RDMA capability can be considered a “preview” feature until it’s more mature. People should be able to install valkey-glide normally without picking up extra dependencies (namely [libfabric](https://github.com/ofiwg/libfabric)) and opt in to using the RDMA capabilities as they wish. Note that the `efa-direct` option for RDMA can be run only on hosts with the special EFA hardware.
-
-Pip supports installing from a [source distribution](https://packaging.python.org/en/latest/tutorials/installing-packages/#source-distributions-vs-wheels) (sdist) instead of a pre-built binary (wheel), so the RDMA-capable client can be made available only via sdist while in preview. These instructions assume valkey-glide will be installed on a host with an EFA and libfabric.
+RDMA capability will be compiled into the released binary but is opt-in at runtime by providing an optional configuration object, as is done for the compression configuration. The main RDMA dependency, [libfabric](https://github.com/ofiwg/libfabric), is dynamically linked at runtime and libfabric headers and bindings can be vendored in the `glide-rdma` crate to satisfy the libfabric build-time dependency as well.
 
 ```bash
-# Typical install for a prebuilt wheel, no libfabric
 pip install valkey-glide-sync
-
-# RDMA preview install builds from source with the `rdma` feature on
-
-# Install build toolchain
-sudo apt-get install -y build-essential pkg-config protobuf-compiler
-curl https://sh.rustup.rs -sSf | sh -s -- -y && source "$HOME/.cargo/env"
-
-export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib64:$LD_LIBRARY_PATH
-
-# Complete the valkey-glide + RDMA build
-GLIDE_SYNC_RDMA=1 RELEASE_MODE=1 \
-	pip install --no-binary valkey-glide-sync valkey-glide-sync
 ```
 
 ### Usage
@@ -193,27 +177,9 @@ Uses valkey-glide’s python client, glide-sync.
 
 ## User experience
 
-The RDMA-capable adapter is dormant until the RDMA-capable valkey-glide client is installed/built and the adapter is named by the `--l2-adapter` argument.
+The RDMA-capable adapter is dormant until the RDMA-capable valkey-glide client is installed and the adapter is named by the `--l2-adapter` argument.
 
-Installation would look something like:
-
-```bash
-# Install build toolchain
-sudo apt-get install -y build-essential pkg-config protobuf-compiler
-curl https://sh.rustup.rs -sSf | sh -s -- -y && source "$HOME/.cargo/env"
-
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install lmcache
-
-export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib64:$LD_LIBRARY_PATH
-
-# Complete the valkey-glide + RDMA build
-GLIDE_SYNC_RDMA=1 RELEASE_MODE=1 \
-  uv pip install --no-binary-package valkey-glide-sync valkey-glide-sync
-```
-
-And running LMCache and vLLM with the adapter would look like:
+Running LMCache and vLLM with the adapter would look like:
 
 ```bash
 lmcache server --host 0.0.0.0 --port 5555 \
@@ -265,24 +231,7 @@ vllm serve Qwen/Qwen3-14B --kv-transfer-config \
 
 vLLM appears to be working on implementing their own version of tiered KV caching called [kv_offload](https://github.com/vllm-project/vllm/tree/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload) (see this [github issue](https://github.com/vllm-project/vllm/issues/38260) and [github PR](https://github.com/vllm-project/vllm/pull/40020)). We can integrate with this framework by writing an implementation of [SecondaryTierManager](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/base.py#L121) to provide Valkey with RDMA capabilities.
 
-Once integrated, installation would look like:
-
-```bash
-# Install build toolchain
-sudo apt-get install -y build-essential pkg-config protobuf-compiler
-curl https://sh.rustup.rs -sSf | sh -s -- -y && source "$HOME/.cargo/env"
-
-export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib64:$LD_LIBRARY_PATH
-
-# Complete the valkey-glide + RDMA build
-GLIDE_SYNC_RDMA=1 RELEASE_MODE=1 \
-  pip install --no-binary-package valkey-glide-sync valkey-glide-sync
-  
-pip install vllm
-```
-
-And running it would look something like:
+Running it would look something like:
 
 ```bash
 vllm serve <model> --kv-transfer-config '{
