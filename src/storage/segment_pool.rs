@@ -132,14 +132,12 @@ impl SegmentPool {
     pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
-        let last_chunk_size = {
-            let rem = size % chunk_size;
-            if rem == 0 {
-                chunk_size
-            } else {
-                rem
-            }
-        };
+        let last_chunk_size = super::chunk_user_data_len(
+            total_chunks - 1,
+            total_chunks,
+            size,
+            chunk_size,
+        );
         // Fast path: single chunk — allocate and return directly.
         if total_chunks == 1 {
             return self.alloc_n(last_chunk_size, 1, 1);

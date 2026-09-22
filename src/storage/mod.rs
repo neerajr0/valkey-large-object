@@ -43,6 +43,26 @@ pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
 }
 
+/// User data length for a given chunk. All chunks are `chunk_size` except
+/// the last, which may be shorter (the remainder of `total_len / chunk_size`).
+pub(crate) fn chunk_user_data_len(
+    chunk_index: usize,
+    total_chunks: usize,
+    total_len: usize,
+    chunk_size: usize,
+) -> usize {
+    if chunk_index == total_chunks - 1 {
+        let rem = total_len % chunk_size;
+        if rem == 0 {
+            chunk_size
+        } else {
+            rem
+        }
+    } else {
+        chunk_size
+    }
+}
+
 // ─── TryClone Trait ──────────────────────────────────────────────────────────
 
 /// Fallible deep-copy. Like Clone but returns None on failure modes when not possible.
@@ -324,19 +344,14 @@ impl ChunkIterator {
         let total_chunks = user_len.div_ceil(chunk_size as u64) as u32;
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         for i in 0..total_chunks {
-            let user_data_len = if i == total_chunks - 1 {
-                let rem = (user_len % chunk_size as u64) as usize;
-                if rem == 0 {
-                    chunk_size
-                } else {
-                    rem
-                }
-            } else {
-                chunk_size
-            };
             chunks.push(Chunk {
                 index: i,
-                user_data_len,
+                user_data_len: chunk_user_data_len(
+                    i as usize,
+                    total_chunks as usize,
+                    user_len as usize,
+                    chunk_size,
+                ),
                 buffer_idx: i as usize % num_buffers,
                 addrs: None,
             });
