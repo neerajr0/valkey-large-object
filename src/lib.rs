@@ -480,9 +480,27 @@ valkey_module! {
             ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let max = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let min = CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= streaming-min-buffers"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
             ["streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let min = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let max = CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR streaming-min-buffers must be <= max-buffers-per-op"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,

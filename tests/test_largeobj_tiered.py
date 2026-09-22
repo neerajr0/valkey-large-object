@@ -18,7 +18,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f" max-promote-size 268435456"
             f" bench-mode no"
             f" direct-io no"
-            f" lo-chunk-size 4096"
+            f" chunk-size 4096"
         )
 
     def test_set_creates_nvme_file(self):
@@ -42,7 +42,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         """Tiered mode: SET then GET returns correct data, including multi-chunk objects.
         Validates FileHeader presence and data offset in the .dat file."""
         client = self.server.get_new_client()
-        # lo-chunk-size is 4096 in this class.
+        # chunk-size is 4096 in this class.
         # Single chunk: 4096 bytes.
         payload_single = b'A' * 4096
         client.execute_command('LO.SET', 'rt_single', payload_single)
@@ -159,7 +159,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         """Concurrent DEL while multi-chunk SET is in flight. Verify no crash
         and key state is consistent afterward."""
         client = self.server.get_new_client()
-        # SET a multi-chunk object (lo-chunk-size=4096, payload=32768 → 8 chunks).
+        # SET a multi-chunk object (chunk-size=4096, payload=32768 → 8 chunks).
         payload = b'D' * 32768
         client.execute_command('LO.SET', 'delset_key', payload)
         assert client.execute_command('LO.GET', 'delset_key') == payload
@@ -328,7 +328,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             f" max-promote-size 0"
             f" bench-mode no"
             f" direct-io no"
-            f" lo-chunk-size 4096"
+            f" chunk-size 4096"
         )
 
     def test_set_get_roundtrip_no_promotion(self):
@@ -348,22 +348,15 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             result = client.execute_command('LO.GET', 'repeat_key')
             assert result == payload
 
-    def test_nvme_staging_exhaustion(self):
-        """With streaming, NVMePool holds a rotating window of X buffers, not
-        the full object. Exhaustion is detected when the pool cannot provide at
-        least lo-streaming-min-buffers. Test by setting min > max so alloc_n
-        can never satisfy the minimum."""
+    def test_config_rejects_min_buffers_exceeding_max(self):
+        """CONFIG SET rejects streaming-min-buffers > max-buffers-per-op."""
         client = self.server.get_new_client()
-        # max-buffers-per-op=2 means alloc_n returns at most 2 buffers.
-        # min-buffers=3 means we need at least 3 to proceed → guaranteed rejection.
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-buffers-per-op', '2')
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-streaming-min-buffers', '3')
-        payload = b'Z' * 4096
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-buffers-per-op', '2')
         try:
-            client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
+            client.execute_command('CONFIG', 'SET', 'largeobj.streaming-min-buffers', '3')
+            assert False, "Expected CONFIG SET rejection"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'streaming-min-buffers' in str(e).lower() or 'max-buffers-per-op' in str(e).lower(), f"Unexpected error: {e}"
 
     # ─── MEMORY USAGE tests ───────────────────────────────────────────────
 
@@ -471,7 +464,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             f" nvme-maxmemory {self.CAP}"
             f" nvme-staging-size {self.CAP}"
             f" segment-size 1048576"
-            f" lo-chunk-size {self.OBJ}"
+            f" chunk-size {self.OBJ}"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -547,7 +540,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
             f" nvme-maxmemory {self.CAP}"
             f" nvme-staging-size 4194304"
             f" segment-size 2097152"
-            f" lo-chunk-size 1048576"
+            f" chunk-size 1048576"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -591,7 +584,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" dram-segment-size 4194304"
             f" max-promote-size 0"
-            f" lo-chunk-size 4096"
+            f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -625,7 +618,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" dram-segment-size 4194304"
             f" max-promote-size 0"
-            f" lo-chunk-size 4096"
+            f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )

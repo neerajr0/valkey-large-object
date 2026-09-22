@@ -132,12 +132,8 @@ impl SegmentPool {
     pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
-        let last_chunk_size = super::chunk_user_data_len(
-            total_chunks - 1,
-            total_chunks,
-            size,
-            chunk_size,
-        );
+        let last_chunk_size =
+            super::chunk_user_data_len(total_chunks - 1, total_chunks, size, chunk_size);
         // Fast path: single chunk — allocate and return directly.
         if total_chunks == 1 {
             return self.alloc_n(last_chunk_size, 1, 1);
@@ -457,5 +453,17 @@ impl SegmentPool {
                 .map(|seg| seg.draining.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(false)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
+    fn test_alloc_n_panics_when_min_exceeds_count() {
+        let pool = SegmentPool::new(1, 65536);
+        pool.alloc_n(4096, 2, 3);
     }
 }

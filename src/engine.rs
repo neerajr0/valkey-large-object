@@ -397,10 +397,12 @@ fn execute_get_tiered(
     // Future: LRFU admission policy may also reject promotion here.
     let chunk_size = crate::chunk_size();
     let nvme_pool = storage::get_nvme_pool();
+    let max_buffers = crate::max_buffers_per_op();
+    let min_buffers = crate::streaming_min_buffers();
     let buffers = match nvme_pool.alloc_n(
         chunk_size,
-        crate::max_buffers_per_op(),
-        crate::streaming_min_buffers(),
+        max_buffers,
+        min_buffers,
     ) {
         Some(bufs) => bufs,
         None => {

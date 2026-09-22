@@ -429,8 +429,9 @@ impl ChunkIterator {
     /// Record a per-chunk CRC32C from an EFA transport completion.
     /// Chunks may arrive out of order; the checksum is stored by chunk index.
     pub fn record_checksum(&mut self, chunk_index: u32, crc: u32) {
-        self.checksums.as_mut().expect("record_checksum called on TCP path")[chunk_index as usize] =
-            Some(crc);
+        self.checksums
+            .as_mut()
+            .expect("record_checksum called on TCP path")[chunk_index as usize] = Some(crc);
     }
 
     /// Combine all recorded checksums in chunk order into a whole-object CRC32C.
@@ -439,9 +440,8 @@ impl ChunkIterator {
         let checksums = self.checksums.as_ref().expect("checksums not initialized");
         let mut combined: u64 = 0;
         for (i, chunk) in self.chunks.iter().enumerate() {
-            let crc = checksums[i]
-                .unwrap_or_else(|| panic!("chunk {i} checksum not recorded"))
-                as u64;
+            let crc =
+                checksums[i].unwrap_or_else(|| panic!("chunk {i} checksum not recorded")) as u64;
             if i == 0 {
                 combined = crc;
             } else {
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(a1.len(), 2);
         assert_eq!(a1[0], (0x1000 + 4096, 904, 7)); // remaining from addr 0
         assert_eq!(a1[1], (0x2000, 3192, 7)); // from addr 1
-                                                    // Chunk 2: single address from second entry.
+        // Chunk 2: single address from second entry.
         let c2 = it.next_chunk().unwrap();
         let a2 = c2.addrs.as_ref().unwrap();
         assert_eq!(a2.len(), 1);
