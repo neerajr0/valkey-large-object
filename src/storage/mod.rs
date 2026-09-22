@@ -258,7 +258,8 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 
 /// A client EFA memory address: (remote_addr, size, rkey).
 /// Each registered memory region on the client has its own rkey.
-/// ChunkIterator consumes these sequentially, splitting across chunk boundaries.
+/// Used for both user-provided addresses (from command args) and internally
+/// computed addresses (from ChunkIterator's incremental mapping).
 pub type ClientAddress = (u64, usize, u64);
 
 /// A piece of the overall object. Pure metadata — does not own the underlying buffer.
@@ -274,9 +275,9 @@ pub struct Chunk {
     /// For StreamingContext: buffer_idx == chunk_index % num_buffers (rotating).
     pub buffer_idx: usize,
     /// Per-chunk EFA transfer addresses. Empty for TCP paths.
-    /// Each entry is (remote_addr, len, rkey) — one fi_write/fi_read per entry.
+    /// Each entry is a ClientAddress (remote_addr, len, rkey) — one fi_write/fi_read per entry.
     /// Populated incrementally by ChunkIterator::next_chunk().
-    pub addrs: Vec<(u64, usize, u64)>,
+    pub addrs: Vec<ClientAddress>,
 }
 
 /// Task-local iterator over chunks. One per tokio task.
