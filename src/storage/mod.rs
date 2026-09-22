@@ -269,7 +269,7 @@ pub struct Chunk {
     /// Absolute chunk index within the object (0-based).
     pub index: u32,
     /// Exact user data bytes in this chunk.
-    pub user_len: usize,
+    pub user_data_len: usize,
     /// Index into the owning context's Vec<SegmentBuffer>.
     /// For ObjectContext: buffer_idx == chunk_index (1:1).
     /// For StreamingContext: buffer_idx == chunk_index % num_buffers (rotating).
@@ -285,7 +285,7 @@ pub struct Chunk {
 /// address mapping. Does NOT own buffers — indexes into the owning context's
 /// Vec<SegmentBuffer>.
 pub struct ChunkIterator {
-    /// Pre-computed chunk metadata (user_len, buffer_idx). Addresses populated lazily.
+    /// Pre-computed chunk metadata (user_data_len, buffer_idx). Addresses populated lazily.
     chunks: Vec<Chunk>,
     /// Next chunk to return.
     cursor: usize,
@@ -303,29 +303,29 @@ pub struct ChunkIterator {
 
 impl ChunkIterator {
     /// Create a new ChunkIterator.
-    /// - `obj_len`: total object size in bytes (must be > 0).
+    /// - `user_len`: total user data size in bytes (must be > 0).
     /// - `chunk_size`: lo-chunk-size config value (must be > 0).
     /// - `num_buffers`: number of buffers in the owning context.
     ///   For ObjectContext (all buffers upfront): num_buffers == total_chunks.
     ///   For StreamingContext (rotating window): num_buffers == window size.
     /// - `client_addrs`: Flattened EFA (addr, size, rkey) entries. None for TCP.
     ///
-    /// Creates all Chunk metadata upfront (user_len, buffer_idx).
+    /// Creates all Chunk metadata upfront (user_data_len, buffer_idx).
     /// Client address mapping is deferred to next_chunk() calls.
     pub fn new(
-        obj_len: u64,
+        user_len: u64,
         chunk_size: usize,
         num_buffers: usize,
         client_addrs: Option<Vec<ClientEFAAddress>>,
     ) -> Self {
-        assert!(obj_len > 0, "ChunkIterator: obj_len must be > 0");
+        assert!(user_len > 0, "ChunkIterator: user_len must be > 0");
         assert!(chunk_size > 0, "ChunkIterator: chunk_size must be > 0");
         assert!(num_buffers > 0, "ChunkIterator: num_buffers must be > 0");
-        let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
+        let total_chunks = user_len.div_ceil(chunk_size as u64) as u32;
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         for i in 0..total_chunks {
-            let user_len = if i == total_chunks - 1 {
-                let rem = (obj_len % chunk_size as u64) as usize;
+            let user_data_len = if i == total_chunks - 1 {
+                let rem = (user_len % chunk_size as u64) as usize;
                 if rem == 0 {
                     chunk_size
                 } else {
@@ -336,7 +336,7 @@ impl ChunkIterator {
             };
             chunks.push(Chunk {
                 index: i,
-                user_len,
+                user_data_len,
                 buffer_idx: i as usize % num_buffers,
                 addrs: None,
             });
@@ -371,7 +371,7 @@ impl ChunkIterator {
         self.cursor += 1;
         // Incremental client address mapping (EFA only).
         if let Some(ref efa_addrs) = self.client_efa_addrs {
-            let mut remaining = self.chunks[idx].user_len;
+            let mut remaining = self.chunks[idx].user_data_len;
             let mut addrs = Vec::new();
             while remaining > 0 {
                 if self.addr_idx >= efa_addrs.len() {
@@ -436,7 +436,7 @@ impl ChunkIterator {
                     CrcAlgorithm::Crc32Iscsi,
                     combined,
                     crc,
-                    chunk.user_len as u64,
+                    chunk.user_data_len as u64,
                 );
             }
         }
@@ -458,7 +458,7 @@ mod tests {
         let mut it = ChunkIterator::new(4096, 4096, 1, None);
         assert_eq!(it.total_chunks(), 1);
         let c = it.next_chunk().unwrap();
-        assert_eq!(c.user_len, 4096);
+        assert_eq!(c.user_data_len, 4096);
         assert_eq!(c.buffer_idx, 0);
         assert!(it.next_chunk().is_none());
     }
@@ -469,7 +469,7 @@ mod tests {
         let mut it = ChunkIterator::new(1, 4096, 1, None);
         assert_eq!(it.total_chunks(), 1);
         let c = it.next_chunk().unwrap();
-        assert_eq!(c.user_len, 1);
+        assert_eq!(c.user_data_len, 1);
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(it.total_chunks(), 4);
         for i in 0..4 {
             let c = it.next_chunk().unwrap();
-            assert_eq!(c.user_len, 4096);
+            assert_eq!(c.user_data_len, 4096);
             assert_eq!(c.buffer_idx, i);
         }
         assert!(it.next_chunk().is_none());
@@ -490,10 +490,10 @@ mod tests {
         // obj_len = 3 * chunk_size + 1 -> last chunk has 1 byte.
         let mut it = ChunkIterator::new(12289, 4096, 4, None);
         assert_eq!(it.total_chunks(), 4);
-        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
-        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
-        assert_eq!(it.next_chunk().unwrap().user_len, 4096);
-        assert_eq!(it.next_chunk().unwrap().user_len, 1);
+        assert_eq!(it.next_chunk().unwrap().user_data_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_data_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_data_len, 4096);
+        assert_eq!(it.next_chunk().unwrap().user_data_len, 1);
     }
 
     #[test]
@@ -504,9 +504,9 @@ mod tests {
         let mut it = ChunkIterator::new(obj_len, chunk_size, 7, None);
         assert_eq!(it.total_chunks(), 7);
         for _ in 0..6 {
-            assert_eq!(it.next_chunk().unwrap().user_len, chunk_size);
+            assert_eq!(it.next_chunk().unwrap().user_data_len, chunk_size);
         }
-        assert_eq!(it.next_chunk().unwrap().user_len, 2 * 1024 * 1024);
+        assert_eq!(it.next_chunk().unwrap().user_data_len, 2 * 1024 * 1024);
     }
 
     #[test]

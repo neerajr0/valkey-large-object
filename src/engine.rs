@@ -132,7 +132,7 @@ fn collect_dram_bytes(
     while let Some(chunk) = chunk_iter.next_chunk() {
         let buf = &obj_ctx.buffers[chunk.buffer_idx];
         let ptr = dram_pool.buffer_ptr(buf);
-        let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_len) };
+        let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_data_len) };
         data.extend_from_slice(slice);
     }
     data
@@ -516,7 +516,7 @@ async fn do_tiered_promote_and_serve_tcp(
                 iovec_index: dram_pool.iovec_index_for_buf(buf),
                 buf_ptr: dram_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_len as u64,
+                len: chunk.user_data_len as u64,
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
@@ -590,7 +590,7 @@ async fn do_tiered_promote_and_serve_efa(
                 iovec_index: dram_pool.iovec_index_for_buf(buf),
                 buf_ptr: dram_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_len as u64,
+                len: chunk.user_data_len as u64,
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
@@ -696,7 +696,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
                 iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: nvme_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_len as u64,
+                len: chunk.user_data_len as u64,
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
@@ -714,7 +714,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
                 let chunk = chunk_iter.peek_chunk(batch_start + i as u32);
                 let buf = &stream_ctx.buffers[chunk.buffer_idx];
                 let ptr = nvme_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_len) };
+                let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_data_len) };
                 reply_buf.extend_from_slice(slice);
             }
         }
@@ -773,7 +773,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
                 iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: nvme_pool.buffer_ptr(buf),
                 file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_len as u64,
+                len: chunk.user_data_len as u64,
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
@@ -900,10 +900,10 @@ fn serve_set_dram_tcp(
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     while let Some(chunk) = chunk_iter.next_chunk() {
         let src_offset = chunk.index as usize * chunk_size;
-        let src = &data[src_offset..src_offset + chunk.user_len];
+        let src = &data[src_offset..src_offset + chunk.user_data_len];
         let buf = &buffers[chunk.buffer_idx];
         let dst = dram_pool.buffer_ptr(buf);
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_len) };
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_data_len) };
         digest.update(src);
     }
     let crc = digest.finalize() as u32;
@@ -1174,16 +1174,16 @@ async fn do_tiered_nvme_write_tcp(
         for _ in 0..batch_count {
             let chunk = chunk_iter.next_chunk().unwrap();
             let src_offset = chunk.index as usize * chunk_size;
-            let src = &data[src_offset..src_offset + chunk.user_len];
+            let src = &data[src_offset..src_offset + chunk.user_data_len];
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             let dst = nvme_pool.buffer_ptr(buf);
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_len) };
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_data_len) };
             digest.update(src);
             ops.push(uring::UringOp {
                 iovec_index: nvme_pool.iovec_index_for_buf(buf),
                 buf_ptr: dst,
                 file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_len as u64,
+                len: chunk.user_data_len as u64,
             });
         }
         let receivers = uring::submit_write_batch(fd, ops);
@@ -1329,7 +1329,7 @@ async fn do_tiered_nvme_write_efa(
                         buf_ptr: nvme_pool.buffer_ptr(buf),
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
-                        len: chunk.user_len as u64,
+                        len: chunk.user_data_len as u64,
                     };
                     nvme_write_receivers.push(uring::submit_write(fd, write_op));
                 }
