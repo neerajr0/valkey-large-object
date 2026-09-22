@@ -606,11 +606,8 @@ mod tests {
         let pool = SegmentPool::new(1, 65536);
         // Determine actual capacity by filling the pool one block at a time.
         let mut filler = Vec::new();
-        loop {
-            match pool.alloc_n(4096, 1, 1) {
-                Some(mut v) => filler.push(v.remove(0)),
-                None => break,
-            }
+        while let Some(mut v) = pool.alloc_n(4096, 1, 1) {
+            filler.push(v.remove(0));
         }
         // Free one block — leaves exactly 1 × 4096 free.
         let last = filler.pop().unwrap();
