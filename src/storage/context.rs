@@ -32,9 +32,11 @@ pub struct SegmentBuffer {
     pub segment_idx: u16,
     /// Byte offset within that segment.
     pub offset: u64,
-    /// Allocation size in bytes. This is what talc actually allocated: the user data
-    /// length rounded up to IO_ALIGN via align_up(). The last chunk of an object may
-    /// have fewer valid bytes — use Chunk.user_len for the exact data boundary.
+    /// Requested allocation size in bytes: the user data length rounded up to IO_ALIGN
+    /// via align_up(). Talc may internally allocate more due to its own metadata, but
+    /// this field tracks only what we asked for. The user of this structure (e.g. Chunk) 
+    /// needs to track the exact bytes to read from every SegmentBuffer due to the 
+    /// alignment mentioned above.
     pub len: u32,
 }
 
