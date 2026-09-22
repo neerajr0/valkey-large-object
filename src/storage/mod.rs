@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(a1.len(), 2);
         assert_eq!(a1[0], (0x1000 + 4096, 904, 7)); // remaining from addr 0
         assert_eq!(a1[1], (0x2000, 3192, 7)); // from addr 1
-        // Chunk 2: single address from second entry.
+                                              // Chunk 2: single address from second entry.
         let c2 = it.next_chunk().unwrap();
         let a2 = c2.addrs.as_ref().unwrap();
         assert_eq!(a2.len(), 1);

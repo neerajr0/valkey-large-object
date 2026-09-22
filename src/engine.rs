@@ -399,11 +399,7 @@ fn execute_get_tiered(
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::streaming_min_buffers();
-    let buffers = match nvme_pool.alloc_n(
-        chunk_size,
-        max_buffers,
-        min_buffers,
-    ) {
+    let buffers = match nvme_pool.alloc_n(chunk_size, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
