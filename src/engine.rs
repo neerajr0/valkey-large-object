@@ -26,7 +26,7 @@ use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use valkey_module::{ValkeyError, ValkeyValue};
+use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -937,7 +937,7 @@ fn serve_set_dram_tcp(
     }
     let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
     dram_pool.insert_object(object_id, obj_ctx);
-    Ok(ValkeyValue::SimpleStringStatic("OK"))
+    VALKEY_OK
 }
 
 pub enum DataSource {
@@ -1041,7 +1041,7 @@ fn execute_set_dram_efa(
                             // Stale write — a newer SET already completed.
                             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
                             dram_pool.remove_object(&object_id);
-                            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                            thread_ctx.reply(VALKEY_OK);
                             return;
                         }
                     }
@@ -1061,7 +1061,7 @@ fn execute_set_dram_efa(
                         return;
                     }
                 }
-                thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+                thread_ctx.reply(VALKEY_OK);
             });
         }
     }
@@ -1250,11 +1250,11 @@ async fn do_tiered_nvme_write_tcp(
         },
     ) {
         Ok(true) => {
-            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+            thread_ctx.reply(VALKEY_OK);
         }
         Ok(false) => {
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+            thread_ctx.reply(VALKEY_OK);
         }
         Err(e) => {
             reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
@@ -1412,11 +1412,11 @@ async fn do_tiered_nvme_write_efa(
         },
     ) {
         Ok(true) => {
-            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+            thread_ctx.reply(VALKEY_OK);
         }
         Ok(false) => {
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-            thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
+            thread_ctx.reply(VALKEY_OK);
         }
         Err(e) => {
             reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
