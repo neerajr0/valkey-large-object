@@ -167,7 +167,7 @@ Pass the new configuration and APIs through from glide-core to the python-sync S
 
 Update existing configuration objects to accept an optional RDMA configuration. Expose new APIs for `register_rdma_region`, `rdma_get`, `rdma_set`, and `rdma_checksum`.
 
-Packaging changes will also vendor `glide-rdma` into the sdist so the `GLIDE_SYNC_RDMA=1 pip install` command in the User experience > Installation section will work.
+A `GLIDE_SYNC_RDMA` environment variable will be available to enable the RDMA feature in the ffi and rust layers in the `pypi-cd.yml` pipeline. This allows us to build RDMA capability into only the Python glide-sync SDK first to unblock the LMCache integration; there may be other issues or considerations in the other language ecosystems we don't yet know about.
 
 ---
 
