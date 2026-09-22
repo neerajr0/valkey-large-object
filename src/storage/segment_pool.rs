@@ -77,8 +77,8 @@ impl SegmentPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate up to `count` uniform buffers. Used directly for StreamingContext
-    /// (rotating window of reusable buffers), and internally by `alloc`.
+    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
+    /// least `min_required`. All-or-nothing when `min_required == count`.
     ///
     /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
     /// order under one state lock and attempts `talc.malloc`. Allocation may
@@ -86,6 +86,9 @@ impl SegmentPool {
     ///
     /// Returns `None` if fewer than `min_required` could be allocated (partial
     /// allocation freed internally). Callers never need cleanup logic.
+    ///
+    /// Used directly for StreamingContext (rotating window of reusable buffers),
+    /// and internally by `alloc`.
     pub fn alloc_n(
         &self,
         chunk_size: usize,
@@ -113,9 +116,10 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// Allocate all buffers for an ObjectContext (DRAM cache), where the last
-    /// chunk may be smaller. All-or-nothing.
-    /// Derives chunk geometry from `size` and `crate::chunk_size()`.
+    /// Allocate all buffers for an object, where the last chunk may be smaller.
+    /// All-or-nothing. Derives chunk geometry from `size` and `crate::chunk_size()`.
+    ///
+    /// Used for ObjectContext (DRAM cache) allocations.
     pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
