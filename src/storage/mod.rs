@@ -274,10 +274,10 @@ pub struct Chunk {
     /// For ObjectContext: buffer_idx == chunk_index (1:1).
     /// For StreamingContext: buffer_idx == chunk_index % num_buffers (rotating).
     pub buffer_idx: usize,
-    /// Per-chunk EFA transfer addresses. Empty for TCP paths.
-    /// Each entry is a ClientAddress (remote_addr, len, rkey) — one fi_write/fi_read per entry.
+    /// Per-chunk EFA transfer addresses. None for TCP paths.
+    /// Each entry is a ClientEFAAddress (remote_addr, len, rkey) — one fi_write/fi_read per entry.
     /// Populated incrementally by ChunkIterator::next_chunk().
-    pub addrs: Vec<ClientEFAAddress>,
+    pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
 /// Task-local iterator over chunks. One per tokio task.
@@ -289,15 +289,16 @@ pub struct ChunkIterator {
     chunks: Vec<Chunk>,
     /// Next chunk to return.
     cursor: usize,
-    /// Client-provided EFA remote memory addresses.
-    client_efa_addrs: Vec<ClientEFAAddress>,
+    /// Client-provided EFA remote memory addresses. None for TCP paths.
+    client_efa_addrs: Option<Vec<ClientEFAAddress>>,
     /// Index into client_efa_addrs for the current address being consumed.
     addr_idx: usize,
     /// Byte offset within the current client_efa_addrs entry.
     addr_offset: usize,
-    /// Per-chunk CRC32C from transport completions. Indexed by chunk index.
-    /// `None` entries indicate chunks whose checksum has not been recorded.
-    checksums: Vec<Option<u32>>,
+    /// Per-chunk CRC32C from EFA transport completions. Indexed by chunk index.
+    /// None for TCP paths (CRC computed inline via rolling digest).
+    /// Some(...) for EFA paths; inner `None` entries indicate chunks not yet recorded.
+    checksums: Option<Vec<Option<u32>>>,
 }
 
 impl ChunkIterator {
@@ -337,16 +338,21 @@ impl ChunkIterator {
                 index: i,
                 user_len,
                 buffer_idx: i as usize % num_buffers,
-                addrs: Vec::new(),
+                addrs: None,
             });
         }
+        let is_efa = client_addrs.is_some();
         Self {
             chunks,
             cursor: 0,
-            client_efa_addrs: client_addrs.unwrap_or_default(),
+            client_efa_addrs: client_addrs,
             addr_idx: 0,
             addr_offset: 0,
-            checksums: vec![None; total_chunks as usize],
+            checksums: if is_efa {
+                Some(vec![None; total_chunks as usize])
+            } else {
+                None
+            },
         }
     }
 
@@ -364,11 +370,11 @@ impl ChunkIterator {
         let idx = self.cursor;
         self.cursor += 1;
         // Incremental client address mapping (EFA only).
-        if !self.client_efa_addrs.is_empty() {
+        if let Some(ref efa_addrs) = self.client_efa_addrs {
             let mut remaining = self.chunks[idx].user_len;
             let mut addrs = Vec::new();
             while remaining > 0 {
-                if self.addr_idx >= self.client_efa_addrs.len() {
+                if self.addr_idx >= efa_addrs.len() {
                     // TODO: Fail the request with an error instead of silently
                     // producing a partial chunk.
                     debug_assert!(false,
@@ -377,7 +383,7 @@ impl ChunkIterator {
                     );
                     break;
                 }
-                let (base_addr, total_size, rkey) = self.client_efa_addrs[self.addr_idx];
+                let (base_addr, total_size, rkey) = efa_addrs[self.addr_idx];
                 let avail = total_size - self.addr_offset;
                 if avail == 0 {
                     self.addr_idx += 1;
@@ -389,7 +395,7 @@ impl ChunkIterator {
                 self.addr_offset += take;
                 remaining -= take;
             }
-            self.chunks[idx].addrs = addrs;
+            self.chunks[idx].addrs = Some(addrs);
         }
         Some(&self.chunks[idx])
     }
@@ -407,18 +413,21 @@ impl ChunkIterator {
         self.cursor = 0;
     }
 
-    /// Record a per-chunk CRC32C from a transport completion.
+    /// Record a per-chunk CRC32C from an EFA transport completion.
     /// Chunks may arrive out of order; the checksum is stored by chunk index.
     pub fn record_checksum(&mut self, chunk_index: u32, crc: u32) {
-        self.checksums[chunk_index as usize] = Some(crc);
+        self.checksums.as_mut().expect("record_checksum called on TCP path")[chunk_index as usize] =
+            Some(crc);
     }
 
     /// Combine all recorded checksums in chunk order into a whole-object CRC32C.
-    /// Panics if any chunk's checksum has not been recorded.
+    /// Only valid for EFA paths. Panics if any chunk's checksum has not been recorded.
     pub fn combine_checksums(&self) -> u32 {
+        let checksums = self.checksums.as_ref().expect("checksums not initialized");
         let mut combined: u64 = 0;
         for (i, chunk) in self.chunks.iter().enumerate() {
-            let crc = self.checksums[i].unwrap_or_else(|| panic!("chunk {i} checksum not recorded"))
+            let crc = checksums[i]
+                .unwrap_or_else(|| panic!("chunk {i} checksum not recorded"))
                 as u64;
             if i == 0 {
                 combined = crc;
@@ -522,16 +531,19 @@ mod tests {
         assert_eq!(it.total_chunks(), 3);
         // Chunk 0: full chunk.
         let c0 = it.next_chunk().unwrap();
-        assert_eq!(c0.addrs.len(), 1);
-        assert_eq!(c0.addrs[0], (0x1000, 4096, 42));
+        let a0 = c0.addrs.as_ref().unwrap();
+        assert_eq!(a0.len(), 1);
+        assert_eq!(a0[0], (0x1000, 4096, 42));
         // Chunk 1: full chunk.
         let c1 = it.next_chunk().unwrap();
-        assert_eq!(c1.addrs.len(), 1);
-        assert_eq!(c1.addrs[0], (0x1000 + 4096, 4096, 42));
+        let a1 = c1.addrs.as_ref().unwrap();
+        assert_eq!(a1.len(), 1);
+        assert_eq!(a1[0], (0x1000 + 4096, 4096, 42));
         // Chunk 2: partial last chunk (1 byte).
         let c2 = it.next_chunk().unwrap();
-        assert_eq!(c2.addrs.len(), 1);
-        assert_eq!(c2.addrs[0], (0x1000 + 8192, 1, 42));
+        let a2 = c2.addrs.as_ref().unwrap();
+        assert_eq!(a2.len(), 1);
+        assert_eq!(a2[0], (0x1000 + 8192, 1, 42));
     }
 
     #[test]
@@ -543,17 +555,20 @@ mod tests {
         let mut it = ChunkIterator::new(8193, 4096, 3, Some(cr));
         // Chunk 0: single address from first entry.
         let c0 = it.next_chunk().unwrap();
-        assert_eq!(c0.addrs.len(), 1);
-        assert_eq!(c0.addrs[0], (0x1000, 4096, 7));
+        let a0 = c0.addrs.as_ref().unwrap();
+        assert_eq!(a0.len(), 1);
+        assert_eq!(a0[0], (0x1000, 4096, 7));
         // Chunk 1: straddles two addresses.
         let c1 = it.next_chunk().unwrap();
-        assert_eq!(c1.addrs.len(), 2);
-        assert_eq!(c1.addrs[0], (0x1000 + 4096, 904, 7)); // remaining from addr 0
-        assert_eq!(c1.addrs[1], (0x2000, 3192, 7)); // from addr 1
+        let a1 = c1.addrs.as_ref().unwrap();
+        assert_eq!(a1.len(), 2);
+        assert_eq!(a1[0], (0x1000 + 4096, 904, 7)); // remaining from addr 0
+        assert_eq!(a1[1], (0x2000, 3192, 7)); // from addr 1
                                                     // Chunk 2: single address from second entry.
         let c2 = it.next_chunk().unwrap();
-        assert_eq!(c2.addrs.len(), 1);
-        assert_eq!(c2.addrs[0], (0x2000 + 3192, 1, 7));
+        let a2 = c2.addrs.as_ref().unwrap();
+        assert_eq!(a2.len(), 1);
+        assert_eq!(a2[0], (0x2000 + 3192, 1, 7));
     }
 
     #[test]
@@ -561,9 +576,9 @@ mod tests {
         // TCP path: no client addresses configured.
         let mut it = ChunkIterator::new(8192, 4096, 2, None);
         let c0 = it.next_chunk().unwrap();
-        assert!(c0.addrs.is_empty());
+        assert!(c0.addrs.is_none());
         let c1 = it.next_chunk().unwrap();
-        assert!(c1.addrs.is_empty());
+        assert!(c1.addrs.is_none());
     }
 
     #[test]
@@ -580,7 +595,9 @@ mod tests {
     fn test_record_and_combine_single_chunk() {
         let data = b"hello world";
         let whole_crc = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, data) as u32;
-        let mut iter = ChunkIterator::new(data.len() as u64, 4096, 1, None);
+        // Pass Some(addrs) to enable per-chunk checksums (EFA path).
+        let addrs = vec![(0x1000u64, data.len(), 1u64)];
+        let mut iter = ChunkIterator::new(data.len() as u64, 4096, 1, Some(addrs));
         iter.next_chunk(); // advance past the single chunk
         iter.record_checksum(0, whole_crc);
         assert_eq!(iter.combine_checksums(), whole_crc);
@@ -591,7 +608,9 @@ mod tests {
         let chunk_size = 4;
         let data = b"abcdefghij"; // 10 bytes -> 3 chunks: 4, 4, 2
         let whole_crc = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, data) as u32;
-        let mut iter = ChunkIterator::new(data.len() as u64, chunk_size, 3, None);
+        // Pass Some(addrs) to enable per-chunk checksums (EFA path).
+        let addrs = vec![(0x1000u64, data.len(), 1u64)];
+        let mut iter = ChunkIterator::new(data.len() as u64, chunk_size, 3, Some(addrs));
         // Record per-chunk CRCs (simulating out-of-order arrival).
         let crc1 = crc_fast::checksum(CrcAlgorithm::Crc32Iscsi, &data[4..8]) as u32;
         iter.record_checksum(1, crc1);
@@ -605,7 +624,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "checksum not recorded")]
     fn test_combine_panics_on_missing_checksum() {
-        let mut iter = ChunkIterator::new(100, 50, 2, None);
+        let addrs = vec![(0x1000u64, 100usize, 1u64)];
+        let mut iter = ChunkIterator::new(100, 50, 2, Some(addrs));
         iter.record_checksum(0, 123);
         // chunk 1 not recorded — should panic.
         iter.combine_checksums();

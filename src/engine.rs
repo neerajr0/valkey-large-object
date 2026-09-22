@@ -608,7 +608,7 @@ async fn do_tiered_promote_and_serve_efa(
                 let chunk = chunk_iter.peek_chunk(batch_start + batch_idx as u32);
                 let buf = &obj_ctx.buffers[chunk.buffer_idx];
                 let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                let addrs_owned = chunk.addrs.clone();
+                let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
                 let session = session.clone();
                 efa_in_flight.push(async move {
                     efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
@@ -796,7 +796,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
             let chunk = chunk_iter.peek_chunk(batch_start + batch_idx as u32);
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
-            let addrs_owned = chunk.addrs.clone();
+            let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
             let session = session.clone();
             efa_in_flight.push(async move {
                 efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
@@ -987,7 +987,7 @@ fn execute_set_dram_efa(
                     let chunk_index = chunk.index;
                     let buf = &buffers[chunk.buffer_idx];
                     let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                    let addrs_owned = chunk.addrs.clone();
+                    let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
                     let session = session.clone();
                     efa_futures.push(async move {
                         let crc =
@@ -1307,7 +1307,7 @@ async fn do_tiered_nvme_write_efa(
             let chunk_index = chunk.index;
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
-            let addrs_owned = chunk.addrs.clone();
+            let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
             let session = session.clone();
             efa_futures.push(async move {
                 let crc =
@@ -1460,7 +1460,7 @@ fn serve_from_dram(
                 while let Some(chunk) = chunk_iter.next_chunk() {
                     let buf = &obj_ctx.buffers[chunk.buffer_idx];
                     let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                    let addrs_owned = chunk.addrs.clone();
+                    let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
                     let session = session.clone();
                     efa_futures.push(async move {
                         efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write)
@@ -1498,7 +1498,7 @@ fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::C
 async fn efa_transfer_addrs(
     session: &Arc<Session>,
     buf_ptr: usize,
-    addrs: &[(u64, usize, u64)],
+    addrs: &[storage::ClientEFAAddress],
     direction: EfaDirection,
 ) -> Result<u32, ValkeyError> {
     // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
