@@ -115,7 +115,7 @@ impl FileHeader {
         page.extend_from_slice(&self.object_id.to_le_bytes());
         page.extend_from_slice(&self.len.to_le_bytes());
         page.extend_from_slice(&self.crc32c.to_le_bytes());
-        debug_assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
+        assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
         page.resize(FILE_HEADER_SIZE as usize, 0);
         page
     }
@@ -203,7 +203,7 @@ pub async fn read_and_verify_file_header(
     expected_len: u64,
     crc32c_expected: u32,
 ) {
-    debug_assert!(
+    assert!(
         pool_buffer_ptr != 0,
         "read_and_verify_file_header: null buffer pointer"
     );
@@ -284,7 +284,7 @@ pub async fn write_file_header(
     buf: &SegmentBuffer,
     nvme_pool: &NVMePool,
 ) -> Result<(), super::StorageError> {
-    debug_assert!(
+    assert!(
         buf.len as u64 >= FILE_HEADER_SIZE,
         "NVMePool buffer too small for FileHeader"
     );

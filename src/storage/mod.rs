@@ -318,9 +318,9 @@ impl ChunkIterator {
         num_buffers: usize,
         client_addrs: Option<Vec<ClientEFAAddress>>,
     ) -> Self {
-        debug_assert!(obj_len > 0, "ChunkIterator: obj_len must be > 0");
-        debug_assert!(chunk_size > 0, "ChunkIterator: chunk_size must be > 0");
-        debug_assert!(num_buffers > 0, "ChunkIterator: num_buffers must be > 0");
+        assert!(obj_len > 0, "ChunkIterator: obj_len must be > 0");
+        assert!(chunk_size > 0, "ChunkIterator: chunk_size must be > 0");
+        assert!(num_buffers > 0, "ChunkIterator: num_buffers must be > 0");
         let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         for i in 0..total_chunks {
@@ -377,7 +377,7 @@ impl ChunkIterator {
                 if self.addr_idx >= efa_addrs.len() {
                     // TODO: Fail the request with an error instead of silently
                     // producing a partial chunk.
-                    debug_assert!(false,
+                    assert!(false,
                         "ChunkIterator: client addresses exhausted with {} bytes remaining in chunk {}",
                         remaining, idx
                     );
