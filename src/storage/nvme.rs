@@ -193,7 +193,7 @@ pub fn object_disk_len(logical_len: u64) -> u64 {
 /// mismatch (serving corrupt data is worse than crashing). Panics on poller failure
 /// (RecvError means the io_uring poller is dead).
 /// `pool_buffer_ptr` passed as usize for Send safety (raw pointer is not Send).
-/// lo-chunk-size config enforces min 4096, so every pool buffer can hold a full
+/// chunk-size config enforces min 4096, so every pool buffer can hold a full
 /// FileHeader page.
 pub async fn read_and_verify_file_header(
     fd: RawFd,
@@ -274,7 +274,7 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, super::Storage
 }
 
 /// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.
-/// lo-chunk-size config enforces min 4096, so every pool buffer can hold a full
+/// chunk-size config enforces min 4096, so every pool buffer can hold a full
 /// FileHeader page.
 pub async fn write_file_header(
     fd: RawFd,

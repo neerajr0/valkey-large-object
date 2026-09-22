@@ -324,7 +324,7 @@ pub struct ChunkIterator {
 impl ChunkIterator {
     /// Create a new ChunkIterator.
     /// - `user_len`: total user data size in bytes (must be > 0).
-    /// - `chunk_size`: lo-chunk-size config value (must be > 0).
+    /// - `chunk_size`: chunk-size config value (must be > 0).
     /// - `num_buffers`: number of buffers in the owning context.
     ///   For ObjectContext (all buffers upfront): num_buffers == total_chunks.
     ///   For StreamingContext (rotating window): num_buffers == window size.
