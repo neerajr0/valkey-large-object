@@ -123,8 +123,7 @@ impl SegmentPool {
     /// Derives chunk geometry from `obj_len` and `crate::chunk_size()`.
     pub fn alloc_for_object(&self, obj_len: u64) -> Option<Vec<SegmentBuffer>> {
         let chunk_size = crate::chunk_size();
-        let total_chunks = obj_len.div_ceil(chunk_size as u64) as u32;
-        let n = total_chunks as usize;
+        let total_chunks = obj_len.div_ceil(chunk_size as u64) as usize;
         let last_chunk_size = {
             let rem = (obj_len % chunk_size as u64) as usize;
             if rem == 0 {
@@ -133,7 +132,7 @@ impl SegmentPool {
                 rem
             }
         };
-        let full_count = n.saturating_sub(1);
+        let full_count = total_chunks.saturating_sub(1);
         // Allocate the first N-1 uniform-sized buffers (all-or-nothing).
         let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
         // Allocate the last (possibly smaller) buffer.
