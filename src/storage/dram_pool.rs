@@ -42,7 +42,7 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
+    pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         self.pool.alloc(size)
     }
 
@@ -56,10 +56,6 @@ impl DRAMPool {
 
     pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
         self.pool.alloc_n(chunk_size, count, count)
-    }
-
-    pub fn alloc_for_object(&self, obj_len: u64) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_for_object(obj_len)
     }
 
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
@@ -143,10 +139,10 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        // All-or-nothing: alloc_for_object rolls back internally if pool can't satisfy.
+        // All-or-nothing: alloc rolls back internally if pool can't satisfy.
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let buffers = self.alloc_for_object(obj_len)?;
+        let buffers = self.alloc(obj_len as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self

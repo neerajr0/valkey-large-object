@@ -77,13 +77,8 @@ impl SegmentPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate a single buffer. Delegates to `alloc_n(size, 1, 1)`.
-    pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        self.alloc_n(size, 1, 1).map(|mut v| v.remove(0))
-    }
-
     /// Allocate up to `count` uniform buffers. Used directly for StreamingContext
-    /// (rotating window of reusable buffers), and internally by `alloc_for_object`.
+    /// (rotating window of reusable buffers), and internally by `alloc`.
     ///
     /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
     /// order under one state lock and attempts `talc.malloc`. Allocation may
@@ -120,12 +115,12 @@ impl SegmentPool {
 
     /// Allocate all buffers for an ObjectContext (DRAM cache), where the last
     /// chunk may be smaller. All-or-nothing.
-    /// Derives chunk geometry from `obj_len` and `crate::chunk_size()`.
-    pub fn alloc_for_object(&self, obj_len: u64) -> Option<Vec<SegmentBuffer>> {
+    /// Derives chunk geometry from `size` and `crate::chunk_size()`.
+    pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         let chunk_size = crate::chunk_size();
-        let total_chunks = obj_len.div_ceil(chunk_size as u64) as usize;
+        let total_chunks = size.div_ceil(chunk_size);
         let last_chunk_size = {
-            let rem = (obj_len % chunk_size as u64) as usize;
+            let rem = size % chunk_size;
             if rem == 0 {
                 chunk_size
             } else {
@@ -138,7 +133,7 @@ impl SegmentPool {
         // Allocate the last (possibly smaller) buffer.
         let aligned_last = super::align_up(last_chunk_size);
         let last_layout = Layout::from_size_align(aligned_last, super::IO_ALIGN)
-            .expect("alloc_for_object: invalid last_chunk_size layout");
+            .expect("alloc: invalid last_chunk_size layout");
         let Some(last_buf) = self.alloc_one(aligned_last, last_layout) else {
             // All-or-nothing: free the uniform buffers we already got.
             for buf in &buffers {

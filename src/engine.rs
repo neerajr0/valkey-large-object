@@ -880,7 +880,7 @@ fn serve_set_dram_tcp(
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, u32::MAX as usize, None);
-    let buffers = match dram_pool.alloc_for_object(obj_len) {
+    let buffers = match dram_pool.alloc(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
             // Reactive expansion: pool exhausted — try adding one segment, then retry.
@@ -888,7 +888,7 @@ fn serve_set_dram_tcp(
                 info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
             }
-            match dram_pool.alloc_for_object(obj_len) {
+            match dram_pool.alloc(obj_len as usize) {
                 Some(bufs) => bufs,
                 None => {
                     info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -954,7 +954,7 @@ fn execute_set_dram_efa(
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
     // DRAMPool::alloc_n: all-or-nothing.
-    let buffers = match dram_pool.alloc_for_object(obj_len) {
+    let buffers = match dram_pool.alloc(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);

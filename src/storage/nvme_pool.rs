@@ -19,10 +19,6 @@ impl NVMePool {
         }
     }
 
-    pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        self.pool.alloc(size)
-    }
-
     pub fn free(&self, buf: &SegmentBuffer) {
         self.pool.free(buf)
     }
