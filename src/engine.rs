@@ -551,7 +551,7 @@ async fn do_tiered_promote_and_serve_efa(
     blocked_client: valkey_module::BlockedClient,
     max_sqes_per_batch: usize,
     session: Arc<Session>,
-    efa_addrs: Vec<storage::ClientAddress>,
+    efa_addrs: Vec<storage::ClientEFAAddress>,
 ) {
     let GetObjectInfo {
         object_id,
@@ -736,7 +736,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
     fd: RawFd,
     blocked_client: valkey_module::BlockedClient,
     session: Arc<Session>,
-    efa_addrs: Vec<storage::ClientAddress>,
+    efa_addrs: Vec<storage::ClientEFAAddress>,
 ) {
     let GetObjectInfo {
         object_id,
@@ -1257,7 +1257,7 @@ async fn do_tiered_nvme_write_efa(
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     session: Arc<Session>,
-    efa_addrs: Vec<storage::ClientAddress>,
+    efa_addrs: Vec<storage::ClientEFAAddress>,
 ) {
     let SetObjectInfo {
         object_id,
@@ -1484,11 +1484,11 @@ fn serve_from_dram(
 
 // ─── EFA Transport Helpers ───────────────────────────────────────────────────
 
-/// Wrap a single contiguous EFA address as a ClientAddress list.
+/// Wrap a single contiguous EFA address as a ClientEFAAddress list.
 /// Temporary: once multi-address support lands, callers will receive
-/// Vec<ClientAddress> directly from the transport layer. For now, we
+/// Vec<ClientEFAAddress> directly from the transport layer. For now, we
 /// perform the transformation to Vec in this function.
-fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::ClientAddress> {
+fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::ClientEFAAddress> {
     vec![(remote_addr, obj_len as usize, rkey)]
 }
 

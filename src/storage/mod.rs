@@ -260,7 +260,7 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// Each registered memory region on the client has its own rkey.
 /// Used for both user-provided addresses (from command args) and internally
 /// computed addresses (from ChunkIterator's incremental mapping).
-pub type ClientAddress = (u64, usize, u64);
+pub type ClientEFAAddress = (u64, usize, u64);
 
 /// A piece of the overall object. Pure metadata — does not own the underlying buffer.
 /// Created by ChunkIterator and returned by next_chunk().
@@ -277,7 +277,7 @@ pub struct Chunk {
     /// Per-chunk EFA transfer addresses. Empty for TCP paths.
     /// Each entry is a ClientAddress (remote_addr, len, rkey) — one fi_write/fi_read per entry.
     /// Populated incrementally by ChunkIterator::next_chunk().
-    pub addrs: Vec<ClientAddress>,
+    pub addrs: Vec<ClientEFAAddress>,
 }
 
 /// Task-local iterator over chunks. One per tokio task.
@@ -289,12 +289,11 @@ pub struct ChunkIterator {
     chunks: Vec<Chunk>,
     /// Next chunk to return.
     cursor: usize,
-    // Incremental client address mapping state.
-    /// Sequential (addr, size, rkey) entries for EFA consumption.
-    flat_addrs: Vec<ClientAddress>,
-    /// Index into flat_addrs for the current address being consumed.
+    /// Client-provided EFA remote memory addresses.
+    client_efa_addrs: Vec<ClientEFAAddress>,
+    /// Index into client_efa_addrs for the current address being consumed.
     addr_idx: usize,
-    /// Byte offset within the current flat_addrs entry.
+    /// Byte offset within the current client_efa_addrs entry.
     addr_offset: usize,
     /// Per-chunk CRC32C from transport completions. Indexed by chunk index.
     /// `None` entries indicate chunks whose checksum has not been recorded.
@@ -316,7 +315,7 @@ impl ChunkIterator {
         obj_len: u64,
         chunk_size: usize,
         num_buffers: usize,
-        client_addrs: Option<Vec<ClientAddress>>,
+        client_addrs: Option<Vec<ClientEFAAddress>>,
     ) -> Self {
         debug_assert!(obj_len > 0, "ChunkIterator: obj_len must be > 0");
         debug_assert!(chunk_size > 0, "ChunkIterator: chunk_size must be > 0");
@@ -344,7 +343,7 @@ impl ChunkIterator {
         Self {
             chunks,
             cursor: 0,
-            flat_addrs: client_addrs.unwrap_or_default(),
+            client_efa_addrs: client_addrs.unwrap_or_default(),
             addr_idx: 0,
             addr_offset: 0,
             checksums: vec![None; total_chunks as usize],
@@ -365,11 +364,11 @@ impl ChunkIterator {
         let idx = self.cursor;
         self.cursor += 1;
         // Incremental client address mapping (EFA only).
-        if !self.flat_addrs.is_empty() {
+        if !self.client_efa_addrs.is_empty() {
             let mut remaining = self.chunks[idx].user_len;
             let mut addrs = Vec::new();
             while remaining > 0 {
-                if self.addr_idx >= self.flat_addrs.len() {
+                if self.addr_idx >= self.client_efa_addrs.len() {
                     // TODO: Fail the request with an error instead of silently
                     // producing a partial chunk.
                     debug_assert!(false,
@@ -378,7 +377,7 @@ impl ChunkIterator {
                     );
                     break;
                 }
-                let (base_addr, total_size, rkey) = self.flat_addrs[self.addr_idx];
+                let (base_addr, total_size, rkey) = self.client_efa_addrs[self.addr_idx];
                 let avail = total_size - self.addr_offset;
                 if avail == 0 {
                     self.addr_idx += 1;
