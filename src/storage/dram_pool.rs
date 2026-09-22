@@ -42,8 +42,8 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    pub fn alloc(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc(size)
+    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_exact(size)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -52,10 +52,6 @@ impl DRAMPool {
 
     pub fn free_n(&self, buffers: &[SegmentBuffer]) {
         self.pool.free_n(buffers)
-    }
-
-    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_n(chunk_size, count, count)
     }
 
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
@@ -125,8 +121,8 @@ impl DRAMPool {
     /// Returns None if pool is full or object exceeds max-promote-size.
     /// On success returns Arc<ObjectContext> in Filling state — caller reads
     /// NVMe data into the buffers, then calls mark_ready().
-    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
-    /// with all-or-nothing semantics (min_required = total_chunks).
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_exact
+    /// with all-or-nothing semantics.
     ///
     /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
     /// Expansion is the scaling cron's responsibility, not the GET hot path.
@@ -139,10 +135,10 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        // All-or-nothing: alloc rolls back internally if pool can't satisfy.
+        // All-or-nothing: alloc_exact rolls back internally if pool can't satisfy.
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let buffers = self.alloc(obj_len as usize)?;
+        let buffers = self.alloc_exact(obj_len as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self

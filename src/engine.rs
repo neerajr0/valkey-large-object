@@ -395,11 +395,10 @@ fn execute_get_tiered(
     // Reaches here when try_promote_object returns None: pool full, object
     // exceeds max-promote-size, or another GET is already promoting this OID.
     // Future: LRFU admission policy may also reject promotion here.
-    let chunk_size = crate::chunk_size();
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::streaming_min_buffers();
-    let buffers = match nvme_pool.alloc_n(chunk_size, max_buffers, min_buffers) {
+    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -894,7 +893,7 @@ fn serve_set_dram_tcp(
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, u32::MAX as usize, None);
-    let buffers = match dram_pool.alloc(obj_len as usize) {
+    let buffers = match dram_pool.alloc_exact(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
             // Reactive expansion: pool exhausted — try adding one segment, then retry.
@@ -902,7 +901,7 @@ fn serve_set_dram_tcp(
                 info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
             }
-            match dram_pool.alloc(obj_len as usize) {
+            match dram_pool.alloc_exact(obj_len as usize) {
                 Some(bufs) => bufs,
                 None => {
                     info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -967,8 +966,8 @@ fn execute_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_n: all-or-nothing.
-    let buffers = match dram_pool.alloc(obj_len as usize) {
+    // DRAMPool::alloc_exact: all-or-nothing.
+    let buffers = match dram_pool.alloc_exact(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -1078,12 +1077,10 @@ fn execute_set_tiered(
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
 ) {
-    let chunk_size = crate::chunk_size();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::streaming_min_buffers();
     let nvme_pool = storage::get_nvme_pool();
-    // alloc_n returns None if fewer than min_buffers could be allocated (freed internally).
-    let buffers = match nvme_pool.alloc_n(chunk_size, max_buffers, min_buffers) {
+    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);

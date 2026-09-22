@@ -43,7 +43,7 @@ pub struct SegmentBuffer {
 impl super::TryClone for SegmentBuffer {
     fn try_clone(&self) -> Option<Self> {
         let pool = crate::storage::get_dram_pool();
-        let new_buf = pool.alloc_n(self.len as usize, 1)?.remove(0);
+        let new_buf = pool.alloc_exact(self.len as usize)?.remove(0);
         let src_ptr = pool.buffer_ptr(self);
         let dst_ptr = pool.buffer_ptr(&new_buf);
         // SAFETY: src and dst are non-overlapping regions within pool segment(s).

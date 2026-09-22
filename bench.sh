@@ -314,12 +314,16 @@ for BENCH_MODE in $MODES_STR; do
         echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, clients=$EFFECTIVE_CLIENTS]"
         echo "     mode=$BENCH_MODE dram-maxmemory=$((DRAM_MAXMEMORY / 1048576))MB segment-size=$((SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
 
-        # Build module args based on mode
+        # Build module args based on mode.
+        # chunk-size = BYTES: buffers match object size, so the staging pool
+        # formula (CLIENTS * BYTES * 2) correctly predicts memory usage.
+        # Default 8MB chunk-size wastes pool space for sub-8MB objects.
         case "$BENCH_MODE" in
             Dram)
                 MODULE_ARGS="operating-mode Dram"
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS chunk-size $BYTES"
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
@@ -328,6 +332,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
+                MODULE_ARGS="$MODULE_ARGS chunk-size $BYTES"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
@@ -337,6 +342,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
+                MODULE_ARGS="$MODULE_ARGS chunk-size $BYTES"
                 ;;
             *)
                 echo "  ERROR: Unknown mode $BENCH_MODE"; continue ;;
