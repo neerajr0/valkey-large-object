@@ -494,6 +494,10 @@ async fn do_tiered_promote_and_serve_tcp(
     let total_chunks = chunk_iter.total_chunks();
     let bench = crate::bench_mode();
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    // TODO: Parallelize header and data read submission. Currently serialized
+    // because buffers[0] is shared between the header read and chunk 0's data
+    // read — submitting both concurrently causes the data read to overwrite
+    // header bytes before validation.
     let hdr_buf = &obj_ctx.buffers[0];
     storage::read_and_verify_file_header(
         fd,
@@ -562,6 +566,10 @@ async fn do_tiered_promote_and_serve_efa(
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    // TODO: Parallelize header and data read submission. Currently serialized
+    // because buffers[0] is shared between the header read and chunk 0's data
+    // read — submitting both concurrently causes the data read to overwrite
+    // header bytes before validation.
     let hdr_buf = &obj_ctx.buffers[0];
     storage::read_and_verify_file_header(
         fd,
@@ -668,6 +676,10 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
     let total_chunks = chunk_iter.total_chunks();
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    // TODO: Parallelize header and data read submission. Currently serialized
+    // because buffers[0] is shared between the header read and chunk 0's data
+    // read — submitting both concurrently causes the data read to overwrite
+    // header bytes before validation.
     let hdr_buf = &stream_ctx.buffers[0];
     storage::read_and_verify_file_header(
         fd,
@@ -750,6 +762,10 @@ async fn do_tiered_nvme_read_and_serve_efa(
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let total_chunks = chunk_iter.total_chunks();
     // Pre-loop: read and verify FileHeader. Panics on corrupt data.
+    // TODO: Parallelize header and data read submission. Currently serialized
+    // because buffers[0] is shared between the header read and chunk 0's data
+    // read — submitting both concurrently causes the data read to overwrite
+    // header bytes before validation.
     let hdr_buf = &stream_ctx.buffers[0];
     storage::read_and_verify_file_header(
         fd,
