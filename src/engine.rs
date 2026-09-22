@@ -1151,7 +1151,7 @@ async fn do_tiered_nvme_write_tcp(
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
     let total_chunks = chunk_iter.total_chunks();
-    let disk_len = storage::object_disk_len(obj_len);
+    let disk_len = storage::object_disk_len(&mut chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
@@ -1279,7 +1279,9 @@ async fn do_tiered_nvme_write_efa(
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let disk_len = storage::object_disk_len(obj_len);
+    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
+    let total_chunks = chunk_iter.total_chunks();
+    let disk_len = storage::object_disk_len(&mut chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
@@ -1304,8 +1306,6 @@ async fn do_tiered_nvme_write_efa(
             return;
         }
     };
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
-    let total_chunks = chunk_iter.total_chunks();
     let mut chunks_done: u32 = 0;
     while chunks_done < total_chunks {
         let batch_count = batch_size.min((total_chunks - chunks_done) as usize);

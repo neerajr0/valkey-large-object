@@ -178,11 +178,21 @@ impl FileHeader {
 
 // ─── Disk Length ──────────────────────────────────────────────────────────────
 
-/// O_DIRECT-aligned on-disk size of an object with `logical_len` payload bytes,
-/// including the FILE_HEADER_SIZE page at offset 0.
-/// Shared helper function to ensure no drift between expected and actual file sizes.
-pub fn object_disk_len(logical_len: u64) -> u64 {
-    FILE_HEADER_SIZE + super::align_up(logical_len as usize) as u64
+/// O_DIRECT-aligned on-disk size of an object file, computed by iterating
+/// through the ChunkIterator and summing each chunk's aligned I/O length.
+/// This matches what the uring poller actually writes (`align_up(op.len)` per
+/// SQE).
+///
+/// Resets the iterator cursor to 0 before and after iteration so the caller
+/// can continue using it normally.
+pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
+    chunk_iter.reset_cursor();
+    let mut chunk_bytes: u64 = 0;
+    while let Some(chunk) = chunk_iter.next_chunk() {
+        chunk_bytes += super::align_up(chunk.user_data_len) as u64;
+    }
+    chunk_iter.reset_cursor();
+    FILE_HEADER_SIZE + chunk_bytes
 }
 
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
@@ -390,8 +400,10 @@ mod tests {
     fn test_reserve_then_free_returns_to_zero() {
         let _g = lock();
         let base = nvme_disk_usage();
+        // chunk_size=4096 (aligned), so each object is one or more chunks.
         for len in [1u64, 4095, 4096, 4097, 1_048_576] {
-            let disk_len = object_disk_len(len);
+            let mut iter = super::super::ChunkIterator::new(len, 4096, 256, None);
+            let disk_len = object_disk_len(&mut iter);
             increase_nvme_disk_usage(disk_len);
             decrease_nvme_disk_usage(disk_len);
         }
@@ -407,5 +419,45 @@ mod tests {
         // Subtracting u64::MAX underflows from any real baseline, triggering the
         // fatal assert regardless of what the counter currently holds.
         decrease_nvme_disk_usage(u64::MAX);
+    }
+
+    // ─── object_disk_len ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_object_disk_len_single_chunk() {
+        // 1 byte → 1 chunk, align_up(1) = 4096. Total = 4096 header + 4096 data.
+        let mut iter = super::super::ChunkIterator::new(1, 4096, 1, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 4096);
+    }
+
+    #[test]
+    fn test_object_disk_len_exact_multiple_aligned_chunk_size() {
+        // 8192 bytes, chunk_size=4096 → 2 full chunks. Each align_up(4096)=4096.
+        let mut iter = super::super::ChunkIterator::new(8192, 4096, 2, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 4096 + 4096);
+    }
+
+    #[test]
+    fn test_object_disk_len_partial_last_chunk_aligned_chunk_size() {
+        // 10000 bytes, chunk_size=4096 → chunks: 4096, 4096, 1808.
+        // align_up: 4096, 4096, 4096. Data total = 12288.
+        let mut iter = super::super::ChunkIterator::new(10000, 4096, 3, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 12288);
+    }
+
+    #[test]
+    fn test_object_disk_len_unaligned_chunk_size() {
+        // 10000 bytes, chunk_size=5000 → chunks: 5000, 5000.
+        // align_up(5000) = 8192 each. Data total = 16384.
+        let mut iter = super::super::ChunkIterator::new(10000, 5000, 2, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192);
+    }
+
+    #[test]
+    fn test_object_disk_len_unaligned_chunk_size_with_remainder() {
+        // 8193 bytes, chunk_size=5000 → chunks: 5000, 3193.
+        // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
+        let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
     }
 }
