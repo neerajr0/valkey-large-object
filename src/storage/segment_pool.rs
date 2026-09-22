@@ -135,10 +135,7 @@ impl SegmentPool {
         // Allocate the first N-1 uniform-sized buffers (all-or-nothing).
         let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
         // Allocate the last (possibly smaller) buffer.
-        let aligned_last = super::align_up(last_chunk_size);
-        let last_layout = Layout::from_size_align(aligned_last, super::IO_ALIGN)
-            .expect("alloc: invalid last_chunk_size layout");
-        let Some(last_buf) = self.alloc_one(aligned_last, last_layout) else {
+        let Some(last_buf) = self.alloc_n(last_chunk_size, 1, 1).map(|mut v| v.remove(0)) else {
             // All-or-nothing: free the uniform buffers we already got.
             for buf in &buffers {
                 self.free(buf);
