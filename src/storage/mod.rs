@@ -390,13 +390,11 @@ impl ChunkIterator {
             let mut addrs = Vec::new();
             while remaining > 0 {
                 if self.addr_idx >= efa_addrs.len() {
-                    // TODO: Fail the request with an error instead of silently
-                    // producing a partial chunk.
-                    assert!(false,
-                        "ChunkIterator: client addresses exhausted with {} bytes remaining in chunk {}",
+                    unreachable!(
+                        "ChunkIterator: client addresses exhausted with {} bytes remaining in chunk {} \
+                         — command-level validation should have rejected this",
                         remaining, idx
                     );
-                    break;
                 }
                 let (base_addr, total_size, rkey) = efa_addrs[self.addr_idx];
                 let avail = total_size - self.addr_offset;

@@ -93,6 +93,9 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let file = lo_value.file.clone();
 
     // Determine transport: EFA if rkey+remote_addr provided, else TCP.
+    // TODO: Add a client buffer length argument to LO.GET so the server can
+    // validate the address space covers obj_len before fi_write. Also add
+    // validation when multi-address support lands (sum of address lengths >= obj_len).
     let transport = if args.len() >= 4 {
         let rkey: u64 = args[2]
             .to_string_lossy()
