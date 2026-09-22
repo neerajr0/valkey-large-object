@@ -131,8 +131,12 @@ impl SegmentPool {
                 rem
             }
         };
-        let full_count = total_chunks.saturating_sub(1);
-        // Allocate the first N-1 uniform-sized buffers (all-or-nothing).
+        // Fast path: single chunk — allocate and return directly.
+        if total_chunks == 1 {
+            return self.alloc_n(last_chunk_size, 1, 1);
+        }
+        // Multi-chunk: allocate the first N-1 uniform-sized buffers (all-or-nothing).
+        let full_count = total_chunks - 1;
         let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
         // Allocate the last (possibly smaller) buffer.
         let Some(last_buf) = self.alloc_n(last_chunk_size, 1, 1).map(|mut v| v.remove(0)) else {
