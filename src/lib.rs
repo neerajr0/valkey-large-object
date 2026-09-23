@@ -47,6 +47,7 @@ pub mod engine;
 pub mod errors;
 pub mod info;
 pub mod storage;
+mod stream;
 pub mod transport;
 
 use info::lo_info;

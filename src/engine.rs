@@ -31,7 +31,7 @@ use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
 use crate::info;
-use crate::storage::{self, nvme, uring, ChunkIterator, ObjectContext, ObjectFile};
+use crate::storage::{self, nvme, ChunkIterator, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
 
@@ -77,7 +77,8 @@ pub enum Transport {
 }
 
 /// Direction for EFA multi-address transfers.
-enum EfaDirection {
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum EfaDirection {
     Read,
     Write,
 }
@@ -111,7 +112,7 @@ pub enum EngineResult {
 
 /// Increment a metric counter and reply with an error.
 /// Consolidates the most common error-reply pattern in the engine.
-fn reply_err(
+pub(crate) fn reply_err(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     metric: &std::sync::atomic::AtomicU64,
     err: ValkeyError,
@@ -506,62 +507,32 @@ async fn do_tiered_promote_and_serve_tcp(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), None);
-    let total_chunks = chunk_iter.total_chunks();
-    let bench = crate::bench_mode();
-    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
-    // TODO: Parallelize header and data read submission. Currently serialized
-    // because buffers[0] is shared between the header read and chunk 0's data
-    // read — submitting both concurrently causes the data read to overwrite
-    // header bytes before validation.
+    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), None);
     let hdr_buf = &obj_ctx.buffers[0];
-    storage::read_and_verify_file_header(
+    let job = crate::stream::ReadJob {
         fd,
-        dram_pool.iovec_index_for_buf(hdr_buf),
-        dram_pool.buffer_ptr(hdr_buf) as usize,
-        object_id,
         obj_len,
+        chunk_size,
         crc32c_expected,
-    )
-    .await;
-    // Batch loop: ReadFixed into DRAMPool buffers.
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = max_sqes_per_batch.min((total_chunks - chunks_done) as usize);
-        let mut ops = Vec::with_capacity(batch_count);
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let buf = &obj_ctx.buffers[chunk.buffer_idx];
-            ops.push(uring::UringOp {
-                iovec_index: dram_pool.iovec_index_for_buf(buf),
-                buf_ptr: dram_pool.buffer_ptr(buf),
-                file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_data_len as u64,
-            });
-        }
-        let receivers = uring::submit_read_batch(fd, ops);
-        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Read).await {
-            dram_pool.remove_object(&object_id);
-            reply_err(
-                &thread_ctx,
-                &info::NVME_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_READ),
-            );
-            return;
-        }
-        obj_ctx.advance_chunks_ready(batch_count as u32);
-        // TODO: obj_ctx.notify_progress() for coalesced waiters.
-        chunks_done += batch_count as u32;
-    }
-    // Post-loop: mark ready, serve from DRAMPool.
-    obj_ctx.mark_ready();
-    if bench {
-        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-    } else {
-        let data = collect_dram_bytes(dram_pool, &obj_ctx, obj_len, &mut chunk_iter);
-        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+        object_id,
+        hdr_iovec: dram_pool.iovec_index_for_buf(hdr_buf),
+        hdr_ptr: dram_pool.buffer_ptr(hdr_buf) as usize,
+        efa_error_policy: crate::stream::EfaErrorPolicy::ContinueFilling,
+        batch_width: max_sqes_per_batch,
+    };
+    let plan = crate::stream::DramPlan {
+        buffers: &obj_ctx.buffers,
+        pool: dram_pool,
+    };
+    let sink = crate::stream::TcpReadSink::new(obj_len, crate::bench_mode());
+    let progress = Some(crate::stream::ProgressHook {
+        obj_ctx: &obj_ctx,
+        dram_pool,
+    });
+    if let Ok(reply) =
+        crate::stream::stream_read(job, chunk_iter, &plan, sink, progress, &thread_ctx).await
+    {
+        thread_ctx.reply(Ok(reply));
     }
 }
 
@@ -583,96 +554,33 @@ async fn do_tiered_promote_and_serve_efa(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
-    // TODO: Parallelize header and data read submission. Currently serialized
-    // because buffers[0] is shared between the header read and chunk 0's data
-    // read — submitting both concurrently causes the data read to overwrite
-    // header bytes before validation.
-    let hdr_buf = &obj_ctx.buffers[0];
-    storage::read_and_verify_file_header(
-        fd,
-        dram_pool.iovec_index_for_buf(hdr_buf),
-        dram_pool.buffer_ptr(hdr_buf) as usize,
-        object_id,
-        obj_len,
-        crc32c_expected,
-    )
-    .await;
-    let mut chunk_iter =
+    let chunk_iter =
         ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
-    let total_chunks = chunk_iter.total_chunks();
-    // Batch loop: ReadFixed into DRAMPool, interleaved EFA write.
-    // On EFA failure: stop sending but continue ReadFixed for coalesced waiters.
-    let mut transport_err: Option<ValkeyError> = None;
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = max_sqes_per_batch.min((total_chunks - chunks_done) as usize);
-        let batch_start = chunks_done;
-        let mut ops = Vec::with_capacity(batch_count);
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let buf = &obj_ctx.buffers[chunk.buffer_idx];
-            ops.push(uring::UringOp {
-                iovec_index: dram_pool.iovec_index_for_buf(buf),
-                buf_ptr: dram_pool.buffer_ptr(buf),
-                file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_data_len as u64,
-            });
-        }
-        let receivers = uring::submit_read_batch(fd, ops);
-        // Interleaved NVMe read -> EFA write: as each read completes,
-        // immediately fire the EFA write for that chunk.
-        let mut completions = uring::into_completions(receivers);
-        let mut efa_in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        let mut nvme_read_err = false;
-        while let Some((batch_idx, result)) = completions.next().await {
-            if let Err(_e) = result {
-                nvme_read_err = true;
-                break;
-            }
-            if transport_err.is_none() {
-                let chunk = chunk_iter.peek_chunk(batch_start + batch_idx as u32);
-                let buf = &obj_ctx.buffers[chunk.buffer_idx];
-                let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
-                let session = session.clone();
-                efa_in_flight.push(async move {
-                    efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
-                });
-            }
-        }
-        if nvme_read_err {
-            // Drain remaining completions so in-flight io_uring ops finish
-            // before DRAMPool buffers are freed.
-            while completions.next().await.is_some() {}
-            dram_pool.remove_object(&object_id);
-            reply_err(
-                &thread_ctx,
-                &info::NVME_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_READ),
-            );
-            return;
-        }
-        // Drain in-flight EFA writes.
-        while let Some(result) = efa_in_flight.next().await {
-            if let Err(e) = result {
-                transport_err = Some(e);
-                // Don't return — continue filling DRAMPool for coalesced waiters.
-                break;
-            }
-        }
-        obj_ctx.advance_chunks_ready(batch_count as u32);
-        // TODO: obj_ctx.notify_progress() for coalesced waiters.
-        chunks_done += batch_count as u32;
-    }
-    obj_ctx.mark_ready();
-    match transport_err {
-        Some(e) => reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e),
-        None => {
-            thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
-        }
+    let hdr_buf = &obj_ctx.buffers[0];
+    let job = crate::stream::ReadJob {
+        fd,
+        obj_len,
+        chunk_size,
+        crc32c_expected,
+        object_id,
+        hdr_iovec: dram_pool.iovec_index_for_buf(hdr_buf),
+        hdr_ptr: dram_pool.buffer_ptr(hdr_buf) as usize,
+        efa_error_policy: crate::stream::EfaErrorPolicy::ContinueFilling,
+        batch_width: max_sqes_per_batch,
+    };
+    let plan = crate::stream::DramPlan {
+        buffers: &obj_ctx.buffers,
+        pool: dram_pool,
+    };
+    let sink = crate::stream::EfaReadSink::new(session);
+    let progress = Some(crate::stream::ProgressHook {
+        obj_ctx: &obj_ctx,
+        dram_pool,
+    });
+    if let Ok(reply) =
+        crate::stream::stream_read(job, chunk_iter, &plan, sink, progress, &thread_ctx).await
+    {
+        thread_ctx.reply(Ok(reply));
     }
 }
 
@@ -689,74 +597,29 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let bench = crate::bench_mode();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
-    let total_chunks = chunk_iter.total_chunks();
-    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
-    // TODO: Parallelize header and data read submission. Currently serialized
-    // because buffers[0] is shared between the header read and chunk 0's data
-    // read — submitting both concurrently causes the data read to overwrite
-    // header bytes before validation.
+    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
     let hdr_buf = &stream_ctx.buffers[0];
-    storage::read_and_verify_file_header(
+    let job = crate::stream::ReadJob {
         fd,
-        nvme_pool.iovec_index_for_buf(hdr_buf),
-        nvme_pool.buffer_ptr(hdr_buf) as usize,
-        object_id,
         obj_len,
+        chunk_size,
         crc32c_expected,
-    )
-    .await;
-    // Batch loop: read chunks from NVMe, accumulate into reply_buf.
-    let mut reply_buf = if bench {
-        Vec::new()
-    } else {
-        Vec::with_capacity(obj_len as usize)
+        object_id,
+        hdr_iovec: nvme_pool.iovec_index_for_buf(hdr_buf),
+        hdr_ptr: nvme_pool.buffer_ptr(hdr_buf) as usize,
+        efa_error_policy: crate::stream::EfaErrorPolicy::Abort,
+        batch_width: batch_size,
     };
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
-        let batch_start = chunks_done;
-        let mut ops = Vec::with_capacity(batch_count);
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let buf = &stream_ctx.buffers[chunk.buffer_idx];
-            ops.push(uring::UringOp {
-                iovec_index: nvme_pool.iovec_index_for_buf(buf),
-                buf_ptr: nvme_pool.buffer_ptr(buf),
-                file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_data_len as u64,
-            });
-        }
-        let receivers = uring::submit_read_batch(fd, ops);
-        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Read).await {
-            reply_err(
-                &thread_ctx,
-                &info::NVME_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_READ),
-            );
-            return;
-        }
-        // Copy batch results into reply buffer.
-        if !bench {
-            for i in 0..batch_count {
-                let chunk = chunk_iter.peek_chunk(batch_start + i as u32);
-                let buf = &stream_ctx.buffers[chunk.buffer_idx];
-                let ptr = nvme_pool.buffer_ptr(buf);
-                let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_data_len) };
-                reply_buf.extend_from_slice(slice);
-            }
-        }
-        chunks_done += batch_count as u32;
-    }
-    // Post-loop: reply with accumulated data or bench integer.
+    let plan = crate::stream::NvmePlan {
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+    };
+    let sink = crate::stream::TcpReadSink::new(obj_len, crate::bench_mode());
     // StreamingContext dropped on return → NVMe buffers freed.
-    if bench {
-        thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
-    } else {
-        thread_ctx.reply(Ok(ValkeyValue::StringBuffer(reply_buf)));
+    if let Ok(reply) =
+        crate::stream::stream_read(job, chunk_iter, &plan, sink, None, &thread_ctx).await
+    {
+        thread_ctx.reply(Ok(reply));
     }
 }
 
@@ -778,77 +641,29 @@ async fn do_tiered_nvme_read_and_serve_efa(
     let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
-    let total_chunks = chunk_iter.total_chunks();
-    // Pre-loop: read and verify FileHeader. Panics on corrupt data.
-    // TODO: Parallelize header and data read submission. Currently serialized
-    // because buffers[0] is shared between the header read and chunk 0's data
-    // read — submitting both concurrently causes the data read to overwrite
-    // header bytes before validation.
+    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let hdr_buf = &stream_ctx.buffers[0];
-    storage::read_and_verify_file_header(
+    let job = crate::stream::ReadJob {
         fd,
-        nvme_pool.iovec_index_for_buf(hdr_buf),
-        nvme_pool.buffer_ptr(hdr_buf) as usize,
-        object_id,
         obj_len,
+        chunk_size,
         crc32c_expected,
-    )
-    .await;
-    // Batch loop: read chunks from NVMe, interleaved EFA write.
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
-        let batch_start = chunks_done;
-        let mut ops = Vec::with_capacity(batch_count);
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let buf = &stream_ctx.buffers[chunk.buffer_idx];
-            ops.push(uring::UringOp {
-                iovec_index: nvme_pool.iovec_index_for_buf(buf),
-                buf_ptr: nvme_pool.buffer_ptr(buf),
-                file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_data_len as u64,
-            });
-        }
-        let receivers = uring::submit_read_batch(fd, ops);
-        // Interleaved NVMe read → EFA write: as each read completes, immediately
-        // fire the EFA write for that chunk.
-        let mut completions = uring::into_completions(receivers);
-        let mut efa_in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        while let Some((batch_idx, result)) = completions.next().await {
-            if let Err(_e) = result {
-                // Drain remaining completions so io_uring ops finish before
-                // StreamingContext drop frees NVMe buffers.
-                while completions.next().await.is_some() {}
-                reply_err(
-                    &thread_ctx,
-                    &info::NVME_READ_ERRORS,
-                    ValkeyError::Str(errors::ERR_NVME_READ),
-                );
-                return;
-            }
-            let chunk = chunk_iter.peek_chunk(batch_start + batch_idx as u32);
-            let buf = &stream_ctx.buffers[chunk.buffer_idx];
-            let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
-            let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
-            let session = session.clone();
-            efa_in_flight.push(async move {
-                efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write).await
-            });
-        }
-        // Drain in-flight EFA writes before advancing to next batch (buffers reused).
-        while let Some(result) = efa_in_flight.next().await {
-            if let Err(e) = result {
-                reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e);
-                return;
-            }
-        }
-        chunks_done += batch_count as u32;
+        object_id,
+        hdr_iovec: nvme_pool.iovec_index_for_buf(hdr_buf),
+        hdr_ptr: nvme_pool.buffer_ptr(hdr_buf) as usize,
+        efa_error_policy: crate::stream::EfaErrorPolicy::Abort,
+        batch_width: batch_size,
+    };
+    let plan = crate::stream::NvmePlan {
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+    };
+    let sink = crate::stream::EfaReadSink::new(session);
+    if let Ok(reply) =
+        crate::stream::stream_read(job, chunk_iter, &plan, sink, None, &thread_ctx).await
+    {
+        thread_ctx.reply(Ok(reply));
     }
-    thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1015,36 +830,26 @@ fn execute_set_dram_efa(
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let mut chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(efa_addrs));
-                // Parallel EFA reads for all chunks.
-                let mut efa_futures = FuturesUnordered::new();
-                while let Some(chunk) = chunk_iter.next_chunk() {
-                    let chunk_index = chunk.index;
-                    let buf = &buffers[chunk.buffer_idx];
-                    let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                    let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
-                    let session = session.clone();
-                    efa_futures.push(async move {
-                        let crc =
-                            efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read)
-                                .await?;
-                        Ok::<_, ValkeyError>((chunk_index, crc))
-                    });
-                }
-                while let Some(result) = efa_futures.next().await {
-                    match result {
-                        Ok((chunk_index, crc)) => {
-                            chunk_iter.record_checksum(chunk_index, crc);
-                        }
-                        Err(_) => {
-                            reply_err(
-                                &thread_ctx,
-                                &info::EFA_READ_ERRORS,
-                                ValkeyError::Str(errors::ERR_EFA_READ),
-                            );
-                            dram_pool.free_n(&buffers);
-                            return;
-                        }
-                    }
+                // Parallel EFA reads for all chunks, per-chunk CRC recorded.
+                let plan = crate::stream::DramPlan {
+                    buffers: &buffers,
+                    pool: dram_pool,
+                };
+                if let Err(_e) = crate::stream::efa_transfer_all(
+                    &mut chunk_iter,
+                    &plan,
+                    &session,
+                    EfaDirection::Read,
+                )
+                .await
+                {
+                    reply_err(
+                        &thread_ctx,
+                        &info::EFA_READ_ERRORS,
+                        ValkeyError::Str(errors::ERR_EFA_READ),
+                    );
+                    dram_pool.free_n(&buffers);
+                    return;
                 }
                 // Post-hoc CRC pass (sequential, in chunk order).
                 let crc = chunk_iter.combine_checksums();
@@ -1171,7 +976,6 @@ async fn do_tiered_nvme_write_tcp(
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
-    let total_chunks = chunk_iter.total_chunks();
     let disk_len = storage::object_disk_len(&mut chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
@@ -1199,31 +1003,36 @@ async fn do_tiered_nvme_write_tcp(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    // Batch loop: chunk data into NVMePool buffers, write to NVMe.
-    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
-        let mut ops = Vec::with_capacity(batch_count);
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let src_offset = chunk.index as usize * chunk_size;
-            let src = &data[src_offset..src_offset + chunk.user_data_len];
-            let buf = &stream_ctx.buffers[chunk.buffer_idx];
-            let dst = nvme_pool.buffer_ptr(buf);
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_data_len) };
-            digest.update(src);
-            ops.push(uring::UringOp {
-                iovec_index: nvme_pool.iovec_index_for_buf(buf),
-                buf_ptr: dst,
-                file_offset: storage::FILE_HEADER_SIZE + chunk.index as u64 * chunk_size as u64,
-                len: chunk.user_data_len as u64,
-            });
+    let source = crate::stream::TcpWriteSource {
+        data: &data,
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+        digest: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+    };
+    let crc = match crate::stream::stream_write(
+        &fd,
+        obj_len,
+        chunk_size,
+        object_id,
+        &stream_ctx.buffers[0],
+        nvme_pool,
+        batch_size,
+        chunk_iter,
+        source,
+    )
+    .await
+    {
+        Ok(crc) => crc,
+        // On error the fd + object_file drop on return: file unlinked, disk released.
+        Err(crate::stream::WriteError::EfaRead) => {
+            reply_err(
+                &thread_ctx,
+                &info::EFA_READ_ERRORS,
+                ValkeyError::Str(errors::ERR_EFA_READ),
+            );
+            return;
         }
-        let receivers = uring::submit_write_batch(fd.as_raw_fd(), ops);
-        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Write).await {
+        Err(crate::stream::WriteError::NvmeWrite) => {
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
@@ -1231,27 +1040,7 @@ async fn do_tiered_nvme_write_tcp(
             );
             return;
         }
-        chunks_done += batch_count as u32;
-    }
-    let crc = digest.finalize() as u32;
-    // Post-loop: write FileHeader using buffer[0] (reused after data loop).
-    if let Err(_e) = storage::write_file_header(
-        fd.as_raw_fd(),
-        object_id,
-        obj_len,
-        crc,
-        &stream_ctx.buffers[0],
-        nvme_pool,
-    )
-    .await
-    {
-        reply_err(
-            &thread_ctx,
-            &info::NVME_WRITE_ERRORS,
-            ValkeyError::Str(errors::ERR_NVME_WRITE),
-        );
-        return;
-    }
+    };
     test_pause_before_finalize().await;
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(SetFinalizeOutcome::ValueSet) => {
@@ -1285,7 +1074,6 @@ async fn do_tiered_nvme_write_efa(
     let batch_size = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
-    let total_chunks = chunk_iter.total_chunks();
     let disk_len = storage::object_disk_len(&mut chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
@@ -1313,91 +1101,43 @@ async fn do_tiered_nvme_write_efa(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let mut chunks_done: u32 = 0;
-    while chunks_done < total_chunks {
-        let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
-        // Interleaved EFA read → NVMe write: as each EFA read completes,
-        // immediately submit the NVMe write for that chunk. This overlaps
-        // network and disk I/O within the batch.
-        let mut efa_futures = FuturesUnordered::new();
-        for _ in 0..batch_count {
-            let chunk = chunk_iter
-                .next_chunk()
-                .expect("ChunkIterator out of bounds");
-            let chunk_index = chunk.index;
-            let buf = &stream_ctx.buffers[chunk.buffer_idx];
-            let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
-            let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
-            let session = session.clone();
-            efa_futures.push(async move {
-                let crc =
-                    efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Read).await?;
-                Ok::<_, ValkeyError>((chunk_index, crc))
-            });
-        }
-        // As each EFA read completes, submit the NVMe write.
-        let mut nvme_write_receivers = Vec::new();
-        while let Some(result) = efa_futures.next().await {
-            match result {
-                Ok((chunk_index, crc)) => {
-                    chunk_iter.record_checksum(chunk_index, crc);
-                    // EFA read for this chunk complete — submit NVMe write immediately.
-                    let chunk = chunk_iter.peek_chunk(chunk_index);
-                    let buf = &stream_ctx.buffers[chunk.buffer_idx];
-                    let write_op = uring::UringOp {
-                        iovec_index: nvme_pool.iovec_index_for_buf(buf),
-                        buf_ptr: nvme_pool.buffer_ptr(buf),
-                        file_offset: storage::FILE_HEADER_SIZE
-                            + chunk.index as u64 * chunk_size as u64,
-                        len: chunk.user_data_len as u64,
-                    };
-                    nvme_write_receivers.push(uring::submit_write(fd.as_raw_fd(), write_op));
-                }
-                Err(_) => {
-                    reply_err(
-                        &thread_ctx,
-                        &info::EFA_READ_ERRORS,
-                        ValkeyError::Str(errors::ERR_EFA_READ),
-                    );
-                    return;
-                }
-            }
-        }
-        // Drain NVMe writes (may already be done — they started during EFA reads).
-        for rx in nvme_write_receivers {
-            match rx.await {
-                Ok(Ok(())) => {}
-                _ => {
-                    reply_err(
-                        &thread_ctx,
-                        &info::NVME_WRITE_ERRORS,
-                        ValkeyError::Str(errors::ERR_NVME_WRITE),
-                    );
-                    return;
-                }
-            }
-        }
-        chunks_done += batch_count as u32;
-    }
-    let crc = chunk_iter.combine_checksums();
-    // Post-loop: write FileHeader.
-    if let Err(_e) = storage::write_file_header(
-        fd.as_raw_fd(),
-        object_id,
+    let source = crate::stream::EfaWriteSource {
+        session,
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+    };
+    let crc = match crate::stream::stream_write(
+        &fd,
         obj_len,
-        crc,
+        chunk_size,
+        object_id,
         &stream_ctx.buffers[0],
         nvme_pool,
+        batch_size,
+        chunk_iter,
+        source,
     )
     .await
     {
-        reply_err(
-            &thread_ctx,
-            &info::NVME_WRITE_ERRORS,
-            ValkeyError::Str(errors::ERR_NVME_WRITE),
-        );
-        return;
-    }
+        Ok(crc) => crc,
+        // On error the fd + object_file drop on return: file unlinked, disk released.
+        Err(crate::stream::WriteError::EfaRead) => {
+            reply_err(
+                &thread_ctx,
+                &info::EFA_READ_ERRORS,
+                ValkeyError::Str(errors::ERR_EFA_READ),
+            );
+            return;
+        }
+        Err(crate::stream::WriteError::NvmeWrite) => {
+            reply_err(
+                &thread_ctx,
+                &info::NVME_WRITE_ERRORS,
+                ValkeyError::Str(errors::ERR_NVME_WRITE),
+            );
+            return;
+        }
+    };
     test_pause_before_finalize().await;
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(SetFinalizeOutcome::ValueSet) => {
@@ -1456,24 +1196,23 @@ fn serve_from_dram(
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let mut chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
-                let mut efa_futures = FuturesUnordered::new();
-                while let Some(chunk) = chunk_iter.next_chunk() {
-                    let buf = &obj_ctx.buffers[chunk.buffer_idx];
-                    let buf_ptr = dram_pool.buffer_ptr(buf) as usize;
-                    let addrs_owned = chunk.addrs.clone().expect("chunk missing EFA addrs");
-                    let session = session.clone();
-                    efa_futures.push(async move {
-                        efa_transfer_addrs(&session, buf_ptr, &addrs_owned, EfaDirection::Write)
-                            .await
-                    });
-                }
-                while let Some(result) = efa_futures.next().await {
-                    if let Err(e) = result {
-                        reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e);
-                        return;
+                let plan = crate::stream::DramPlan {
+                    buffers: &obj_ctx.buffers,
+                    pool: dram_pool,
+                };
+                match crate::stream::efa_transfer_all(
+                    &mut chunk_iter,
+                    &plan,
+                    &session,
+                    EfaDirection::Write,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
                     }
+                    Err(e) => reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e),
                 }
-                thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
             });
         }
     }
@@ -1492,7 +1231,7 @@ fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::C
 /// EFA transfer for a chunk's addresses. Each address is (remote_addr, len, rkey).
 /// Fires all sub-transfers in parallel via FuturesUnordered. Returns the combined
 /// transport checksum (CRC32C for reads, 0 for writes).
-async fn efa_transfer_addrs(
+pub(crate) async fn efa_transfer_addrs(
     session: &Arc<Session>,
     buf_ptr: usize,
     addrs: &[storage::ClientEFAAddress],
