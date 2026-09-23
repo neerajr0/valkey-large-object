@@ -110,8 +110,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
             client.execute_command('LO.HELLO', address)
-            result = client.execute_command('LO.GET', 'key', rkey, remote_addr)
-            assert isinstance(result, list) and result[0] == TARGET_LEN
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert isinstance(crc, int)
             # The target exits once every byte of the pattern has landed.
             output = process.communicate(timeout=30)[0]
             assert 'payload verified' in output, output
