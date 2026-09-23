@@ -138,56 +138,53 @@ fn collect_dram_bytes(
     data
 }
 
-/// Describes a completed NVMe write ready to be committed to the keyspace.
-struct NvmeWriteResult<'a> {
-    object_id: ObjectId,
-    obj_len: u64,
-    crc: u32,
-    disk_len: u64,
-    file_path: &'a str,
-}
-
 /// Version check + set_value on the async SET path.
-/// `on_discard` runs if the write is stale (newer SET won) or set_value fails.
+/// On success the `ObjectFile` is moved into the `LoValue` and lives with the key.
+/// On stale or error the `ObjectFile` drops, which removes the file and releases
+/// the NVMe disk budget automatically.
 /// Returns true if value was set, false if stale (silently discarded).
-fn set_finalize<F: FnOnce()>(
+fn set_finalize(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     key_name: &[u8],
-    write: &NvmeWriteResult,
-    on_discard: F,
+    object_file: Arc<ObjectFile>,
+    obj_len: u64,
+    crc: u32,
 ) -> Result<bool, ValkeyError> {
+    let object_id = object_file.object_id();
+    let disk_len = object_file.disk_len();
+    let file_path = object_id.file_path(&crate::nvme_dir());
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-        if existing.object_id > write.object_id {
-            on_discard();
+        if existing.object_id > object_id {
+            // ObjectFile drops here — removes file + releases disk budget.
             return Ok(false);
         }
     }
-    let on_disk = std::fs::metadata(write.file_path)
+    let on_disk = std::fs::metadata(&file_path)
         .unwrap_or_else(|e| {
             panic!(
                 "NVMe accounting: cannot stat object {:?} at {} \
                  to verify write size: {e}",
-                write.object_id, write.file_path
+                object_id, file_path
             )
         })
         .len();
     assert_eq!(
-        on_disk, write.disk_len,
+        on_disk, disk_len,
         "NVMe accounting: object {:?} on disk is {on_disk} B but we \
          reserved {} B — write path and accounting have diverged",
-        write.object_id, write.disk_len
+        object_id, disk_len
     );
     let lo_value = LoValue {
-        object_id: write.object_id,
-        len: write.obj_len,
-        crc32c: write.crc,
-        file: Some(Arc::new(ObjectFile::new(write.object_id, write.disk_len))),
+        object_id,
+        len: obj_len,
+        crc32c: crc,
+        file: Some(object_file),
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
-        on_discard();
+        // set_value failed — LoValue dropped, ObjectFile drops, cleanup automatic.
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
     Ok(true)
@@ -1176,6 +1173,8 @@ async fn do_tiered_nvme_write_tcp(
             return;
         }
     };
+    // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
+    let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
     // Batch loop: chunk data into NVMePool buffers, write to NVMe.
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     let mut chunks_done: u32 = 0;
@@ -1199,8 +1198,6 @@ async fn do_tiered_nvme_write_tcp(
         }
         let receivers = uring::submit_write_batch(fd.as_raw_fd(), ops);
         if let Err(_e) = uring::await_batch(receivers, "write").await {
-            nvme::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&file_path);
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
@@ -1222,8 +1219,6 @@ async fn do_tiered_nvme_write_tcp(
     )
     .await
     {
-        nvme::decrease_nvme_disk_usage(disk_len);
-        let _ = std::fs::remove_file(&file_path);
         reply_err(
             &thread_ctx,
             &info::NVME_WRITE_ERRORS,
@@ -1231,21 +1226,7 @@ async fn do_tiered_nvme_write_tcp(
         );
         return;
     }
-    match set_finalize(
-        &thread_ctx,
-        &key_name,
-        &NvmeWriteResult {
-            object_id,
-            obj_len,
-            crc,
-            disk_len,
-            file_path: &file_path,
-        },
-        || {
-            nvme::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&file_path);
-        },
-    ) {
+    match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(true) => {
             thread_ctx.reply(VALKEY_OK);
         }
@@ -1303,6 +1284,8 @@ async fn do_tiered_nvme_write_efa(
             return;
         }
     };
+    // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
+    let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
     let mut chunks_done: u32 = 0;
     while chunks_done < total_chunks {
         let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
@@ -1356,8 +1339,6 @@ async fn do_tiered_nvme_write_efa(
             match rx.await {
                 Ok(Ok(())) => {}
                 _ => {
-                    nvme::decrease_nvme_disk_usage(disk_len);
-                    let _ = std::fs::remove_file(&file_path);
                     reply_err(
                         &thread_ctx,
                         &info::NVME_WRITE_ERRORS,
@@ -1381,8 +1362,6 @@ async fn do_tiered_nvme_write_efa(
     )
     .await
     {
-        nvme::decrease_nvme_disk_usage(disk_len);
-        let _ = std::fs::remove_file(&file_path);
         reply_err(
             &thread_ctx,
             &info::NVME_WRITE_ERRORS,
@@ -1390,21 +1369,7 @@ async fn do_tiered_nvme_write_efa(
         );
         return;
     }
-    match set_finalize(
-        &thread_ctx,
-        &key_name,
-        &NvmeWriteResult {
-            object_id,
-            obj_len,
-            crc,
-            disk_len,
-            file_path: &file_path,
-        },
-        || {
-            nvme::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&file_path);
-        },
-    ) {
+    match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(true) => {
             thread_ctx.reply(VALKEY_OK);
         }

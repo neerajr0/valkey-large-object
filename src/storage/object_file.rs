@@ -65,6 +65,10 @@ impl ObjectFile {
         self.object_id
     }
 
+    pub fn disk_len(&self) -> u64 {
+        self.disk_len
+    }
+
     /// Returns a cloned `Arc<OwnedFd>`. Calls into the `FdPool`, which owns the fd and
     /// caches it for reuse. The returned reference should be used to protect the
     /// fd from being closed while there are inflight read requests.
