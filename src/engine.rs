@@ -652,10 +652,7 @@ async fn do_tiered_promote_and_serve_efa(
     match transport_err {
         Some(e) => reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e),
         None => {
-            thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-                ValkeyValue::Integer(obj_len as i64),
-                ValkeyValue::Integer(crc32c_expected as i64),
-            ])));
+            thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
         }
     }
 }
@@ -828,10 +825,7 @@ async fn do_tiered_nvme_read_and_serve_efa(
         }
         chunks_done += batch_count as u32;
     }
-    thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-        ValkeyValue::Integer(obj_len as i64),
-        ValkeyValue::Integer(crc32c_expected as i64),
-    ])));
+    thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1450,10 +1444,7 @@ fn serve_from_dram(
                         return;
                     }
                 }
-                thread_ctx.reply(Ok(ValkeyValue::Array(vec![
-                    ValkeyValue::Integer(obj_len as i64),
-                    ValkeyValue::Integer(crc32c as i64),
-                ])));
+                thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
             });
         }
     }
