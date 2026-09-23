@@ -6,7 +6,7 @@
 //! knows what an NVMe object file *is*.
 
 use std::mem::size_of;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::context::SegmentBuffer;
@@ -265,7 +265,8 @@ pub async fn read_and_verify_file_header(
 }
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, super::StorageError> {
+/// Returns an `OwnedFd` that closes the file descriptor on drop.
+pub fn open_nvme_file_for_write(file_path: &str) -> Result<OwnedFd, super::StorageError> {
     let c_path = std::ffi::CString::new(file_path).expect("file_path null");
     let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
@@ -279,7 +280,8 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<RawFd, super::Storage
                 .unwrap_or(libc::EIO),
         })
     } else {
-        Ok(fd)
+        // SAFETY: fd is a valid, newly opened file descriptor owned exclusively by us.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 

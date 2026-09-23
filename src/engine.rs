@@ -1197,9 +1197,8 @@ async fn do_tiered_nvme_write_tcp(
                 len: chunk.user_data_len as u64,
             });
         }
-        let receivers = uring::submit_write_batch(fd, ops);
+        let receivers = uring::submit_write_batch(fd.as_raw_fd(), ops);
         if let Err(_e) = uring::await_batch(receivers, "write").await {
-            unsafe { libc::close(fd) };
             nvme::decrease_nvme_disk_usage(disk_len);
             let _ = std::fs::remove_file(&file_path);
             reply_err(
@@ -1214,7 +1213,7 @@ async fn do_tiered_nvme_write_tcp(
     let crc = digest.finalize() as u32;
     // Post-loop: write FileHeader using buffer[0] (reused after data loop).
     if let Err(_e) = storage::write_file_header(
-        fd,
+        fd.as_raw_fd(),
         object_id,
         obj_len,
         crc,
@@ -1223,7 +1222,6 @@ async fn do_tiered_nvme_write_tcp(
     )
     .await
     {
-        unsafe { libc::close(fd) };
         nvme::decrease_nvme_disk_usage(disk_len);
         let _ = std::fs::remove_file(&file_path);
         reply_err(
@@ -1233,7 +1231,6 @@ async fn do_tiered_nvme_write_tcp(
         );
         return;
     }
-    unsafe { libc::close(fd) };
     match set_finalize(
         &thread_ctx,
         &key_name,
@@ -1342,7 +1339,7 @@ async fn do_tiered_nvme_write_efa(
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
                     };
-                    nvme_write_receivers.push(uring::submit_write(fd, write_op));
+                    nvme_write_receivers.push(uring::submit_write(fd.as_raw_fd(), write_op));
                 }
                 Err(_) => {
                     reply_err(
@@ -1359,7 +1356,6 @@ async fn do_tiered_nvme_write_efa(
             match rx.await {
                 Ok(Ok(())) => {}
                 _ => {
-                    unsafe { libc::close(fd) };
                     nvme::decrease_nvme_disk_usage(disk_len);
                     let _ = std::fs::remove_file(&file_path);
                     reply_err(
@@ -1376,7 +1372,7 @@ async fn do_tiered_nvme_write_efa(
     let crc = chunk_iter.combine_checksums();
     // Post-loop: write FileHeader.
     if let Err(_e) = storage::write_file_header(
-        fd,
+        fd.as_raw_fd(),
         object_id,
         obj_len,
         crc,
@@ -1385,7 +1381,6 @@ async fn do_tiered_nvme_write_efa(
     )
     .await
     {
-        unsafe { libc::close(fd) };
         nvme::decrease_nvme_disk_usage(disk_len);
         let _ = std::fs::remove_file(&file_path);
         reply_err(
@@ -1395,7 +1390,6 @@ async fn do_tiered_nvme_write_efa(
         );
         return;
     }
-    unsafe { libc::close(fd) };
     match set_finalize(
         &thread_ctx,
         &key_name,
