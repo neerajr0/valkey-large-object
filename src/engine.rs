@@ -515,7 +515,9 @@ async fn do_tiered_promote_and_serve_tcp(
         let batch_count = max_sqes_per_batch.min((total_chunks - chunks_done) as usize);
         let mut ops = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let buf = &obj_ctx.buffers[chunk.buffer_idx];
             ops.push(uring::UringOp {
                 iovec_index: dram_pool.iovec_index_for_buf(buf),
@@ -593,7 +595,9 @@ async fn do_tiered_promote_and_serve_efa(
         let batch_start = chunks_done;
         let mut ops = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let buf = &obj_ctx.buffers[chunk.buffer_idx];
             ops.push(uring::UringOp {
                 iovec_index: dram_pool.iovec_index_for_buf(buf),
@@ -700,7 +704,9 @@ async fn do_tiered_nvme_read_and_serve_tcp(
         let batch_start = chunks_done;
         let mut ops = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             ops.push(uring::UringOp {
                 iovec_index: nvme_pool.iovec_index_for_buf(buf),
@@ -781,7 +787,9 @@ async fn do_tiered_nvme_read_and_serve_efa(
         let batch_start = chunks_done;
         let mut ops = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             ops.push(uring::UringOp {
                 iovec_index: nvme_pool.iovec_index_for_buf(buf),
@@ -1183,7 +1191,9 @@ async fn do_tiered_nvme_write_tcp(
         let batch_count = batch_size.min((total_chunks - chunks_done) as usize);
         let mut ops = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let src_offset = chunk.index as usize * chunk_size;
             let src = &data[src_offset..src_offset + chunk.user_data_len];
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
@@ -1295,7 +1305,9 @@ async fn do_tiered_nvme_write_efa(
         // network and disk I/O within the batch.
         let mut efa_futures = FuturesUnordered::new();
         for _ in 0..batch_count {
-            let chunk = chunk_iter.next_chunk().expect("ChunkIterator yielded None before total_chunks");
+            let chunk = chunk_iter
+                .next_chunk()
+                .expect("ChunkIterator out of bounds");
             let chunk_index = chunk.index;
             let buf = &stream_ctx.buffers[chunk.buffer_idx];
             let buf_ptr = nvme_pool.buffer_ptr(buf) as usize;
