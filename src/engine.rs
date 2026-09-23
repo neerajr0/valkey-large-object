@@ -1522,7 +1522,19 @@ async fn efa_transfer_addrs(
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
         let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
-        results[idx] = Some(done.checksum.unwrap_or(0));
+        results[idx] = match direction {
+            // SET path: transport must provide a checksum for CRC combination.
+            EfaDirection::Read => Some(
+                done.checksum
+                    .expect("EFA Read completion missing checksum — transport must provide CRC"),
+            ),
+            // GET path: checksum not needed (already stored in FileHeader).
+            EfaDirection::Write => Some(0),
+        };
+    }
+    // GET (Write) path: callers ignore the returned CRC — skip combination.
+    if matches!(direction, EfaDirection::Write) {
+        return Ok(0);
     }
     let mut combined = results[0].expect("EFA transfer result missing") as u64;
     for i in 1..results.len() {
