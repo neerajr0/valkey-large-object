@@ -269,11 +269,10 @@ impl ReadSink for EfaReadSink {
             Err(e) => SinkOutcome::TransportErr(e),
         }
     }
-    fn success_reply(self, obj_len: u64, crc: u32) -> ValkeyValue {
-        ValkeyValue::Array(vec![
-            ValkeyValue::Integer(obj_len as i64),
-            ValkeyValue::Integer(crc as i64),
-        ])
+    fn success_reply(self, _obj_len: u64, crc: u32) -> ValkeyValue {
+        // Main's EFA GET replies the bare object CRC (the client already knows the
+        // length it requested). NOT an [obj_len, crc] array.
+        ValkeyValue::Integer(crc as i64)
     }
 }
 
