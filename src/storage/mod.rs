@@ -387,7 +387,11 @@ impl ChunkIterator {
         let idx = self.cursor;
         self.cursor += 1;
         // Incremental client address mapping (EFA only).
-        if let Some(ref efa_addrs) = self.client_efa_addrs {
+        // Skip if addresses were already populated (e.g. re-iteration after reset_cursor).
+        if self.chunks[idx].addrs.is_some() {
+            return Some(&self.chunks[idx]);
+        }
+        if let Some(efa_addrs) = &self.client_efa_addrs {
             let mut remaining = self.chunks[idx].user_data_len;
             let mut addrs = Vec::new();
             while remaining > 0 {
