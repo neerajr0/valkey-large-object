@@ -120,6 +120,21 @@ fn reply_err(
     thread_ctx.reply(Err(err));
 }
 
+/// Test hook: pause between NVMe write completion and set_finalize to allow
+/// integration tests to inject a DEL and deterministically exercise the
+/// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
+/// config. 0 = disabled (production default).
+async fn test_pause_before_finalize() {
+    let pause_ms = crate::test_pause_before_finalize_set_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+}
+
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
 fn collect_dram_bytes(
     dram_pool: &storage::DRAMPool,
@@ -1237,6 +1252,7 @@ async fn do_tiered_nvme_write_tcp(
         );
         return;
     }
+    test_pause_before_finalize().await;
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
@@ -1382,6 +1398,7 @@ async fn do_tiered_nvme_write_efa(
         );
         return;
     }
+    test_pause_before_finalize().await;
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);

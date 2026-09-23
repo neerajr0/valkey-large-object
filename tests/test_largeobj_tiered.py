@@ -1,6 +1,7 @@
 import os
 import glob
 import time
+import threading
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 from valkeytestframework.util.waiters import wait_for_equal
@@ -156,30 +157,56 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     # These use the same config as the promotion tests above.
 
     def test_tiered_delete_during_set(self):
-        """Concurrent DEL while multi-chunk SET is in flight. Verify no crash
-        and key state is consistent afterward."""
+        """Deterministic delete-during-SET: the test-pause hook freezes the
+        SET's tokio task after NVMe data writes complete but before set_finalize
+        commits the key. While the SET is paused we fire a DEL from a second
+        client, guaranteeing the interleaving:
+            Thread A (tokio):  write chunks → [PAUSE] → set_finalize (commits)
+            Thread B (main) :                  DEL key (removes v1)
+        The DEL removes the existing v1. The paused SET then resumes: set_finalize
+        finds no existing key (DEL cleared it), so it commits payload2 as a fresh
+        key. No crash, no corruption, and GET returns payload2."""
         client = self.server.get_new_client()
-        # SET a multi-chunk object (chunk-size=4096, payload=32768 → 8 chunks).
+        del_client = self.server.get_new_client()
         payload = b'D' * 32768
         client.execute_command('LO.SET', 'delset_key', payload)
         assert client.execute_command('LO.GET', 'delset_key') == payload
-        # Now SET a new value and immediately DEL. The SET is async (tiered),
-        # so DEL may race with the NVMe write.
+        # Enable the test hook: pause tiered SET for 2s after writing chunks.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '2000'
+        )
         payload2 = b'E' * 32768
-        # Use pipeline to fire SET + DEL back-to-back.
-        pipe = client.pipeline(transaction=False)
-        pipe.execute_command('LO.SET', 'delset_key', payload2)
-        pipe.execute_command('DEL', 'delset_key')
-        results = pipe.execute()
-        # SET should return OK (it completes before or after DEL processes).
-        # DEL returns 1 if key existed, 0 if SET hasn't committed yet.
-        # The key point: no crash.
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
-        # After both complete, key should be gone.
-        result = client.execute_command('LO.GET', 'delset_key')
-        # Result is either None (DEL won) or payload2 (SET won and DEL happened
-        # before SET committed). Either is valid — no crash is the assertion.
-        assert result is None or result == payload2, f"Unexpected result: {result}"
+        set_result = [None]
+        set_error = [None]
+        def background_set():
+            try:
+                # This SET blocks for ~2s (paused after NVMe write, before commit).
+                set_result[0] = client.execute_command(
+                    'LO.SET', 'delset_key', payload2
+                )
+            except Exception as e:
+                set_error[0] = e
+        t = threading.Thread(target=background_set)
+        t.start()
+        # Wait long enough for the SET to begin its NVMe writes and enter the
+        # pause window (chunk writes are fast for 32KB at 4KB chunks).
+        time.sleep(0.5)
+        # DEL fires while SET is paused — deterministically hits the race window.
+        del_result = del_client.execute_command('DEL', 'delset_key')
+        assert del_result == 1, f"Expected DEL to find key, got {del_result}"
+        t.join(timeout=10)
+        assert not t.is_alive(), "SET thread did not finish"
+        assert set_error[0] is None, f"SET raised: {set_error[0]}"
+        # Disable the hook.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
+        )
+        # The paused SET's set_finalize sees no existing key (DEL removed v1)
+        # and commits payload2 as a fresh key.
+        wait_for_equal(
+            lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
+        )
+        assert client.execute_command('LO.GET', 'delset_key') == payload2
 
     def test_zero_length_object_rejected(self):
         """LO.SET with zero-length payload is rejected."""

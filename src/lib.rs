@@ -152,6 +152,14 @@ lazy_static::lazy_static! {
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
 
+    // ─── Test Hooks ──────────────────────────────────────────────────────
+
+    /// Test-only: pause the tiered SET path for this many milliseconds after
+    /// writing data chunks but before calling set_finalize. 0 = disabled.
+    /// Allows integration tests to inject a DEL in the mid-stream window
+    /// and deterministically exercise the delete-during-SET race.
+    static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
@@ -292,6 +300,10 @@ pub fn max_buffers_per_op() -> usize {
 
 pub fn streaming_min_buffers() -> usize {
     CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn test_pause_before_finalize_set_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -501,6 +513,8 @@ valkey_module! {
                      Ok(())
                  }
              }))],
+            ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
