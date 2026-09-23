@@ -138,18 +138,25 @@ fn collect_dram_bytes(
     data
 }
 
+/// Outcome of `set_finalize` — distinguishes a successful write from a stale discard.
+enum SetFinalizeOutcome {
+    /// Value was written and attached to the key.
+    ValueSet,
+    /// A newer version already existed; this write was silently discarded.
+    StaleDiscarded,
+}
+
 /// Version check + set_value on the async SET path.
 /// On success the `ObjectFile` is moved into the `LoValue` and lives with the key.
 /// On stale or error the `ObjectFile` drops, which removes the file and releases
 /// the NVMe disk budget automatically.
-/// Returns true if value was set, false if stale (silently discarded).
 fn set_finalize(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     key_name: &[u8],
     object_file: Arc<ObjectFile>,
     obj_len: u64,
     crc: u32,
-) -> Result<bool, ValkeyError> {
+) -> Result<SetFinalizeOutcome, ValkeyError> {
     let object_id = object_file.object_id();
     let disk_len = object_file.disk_len();
     let file_path = object_id.file_path(&crate::nvme_dir());
@@ -159,7 +166,7 @@ fn set_finalize(
     if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
         if existing.object_id > object_id {
             // ObjectFile drops here — removes file + releases disk budget.
-            return Ok(false);
+            return Ok(SetFinalizeOutcome::StaleDiscarded);
         }
     }
     let on_disk = std::fs::metadata(&file_path)
@@ -187,7 +194,7 @@ fn set_finalize(
         // set_value failed — LoValue dropped, ObjectFile drops, cleanup automatic.
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
-    Ok(true)
+    Ok(SetFinalizeOutcome::ValueSet)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1227,10 +1234,10 @@ async fn do_tiered_nvme_write_tcp(
         return;
     }
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
-        Ok(true) => {
+        Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }
-        Ok(false) => {
+        Ok(SetFinalizeOutcome::StaleDiscarded) => {
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(VALKEY_OK);
         }
@@ -1370,10 +1377,10 @@ async fn do_tiered_nvme_write_efa(
         return;
     }
     match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
-        Ok(true) => {
+        Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }
-        Ok(false) => {
+        Ok(SetFinalizeOutcome::StaleDiscarded) => {
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(VALKEY_OK);
         }
