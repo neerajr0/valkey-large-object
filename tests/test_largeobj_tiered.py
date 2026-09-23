@@ -436,6 +436,13 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
     """
 
+    # Must match storage::FILE_HEADER_SIZE and storage::IO_ALIGN in mod.rs.
+    FILE_HEADER_SIZE = 4096
+    IO_ALIGN = 4096
+
+    def _align_up(self, n):
+        return (n + self.IO_ALIGN - 1) & ~(self.IO_ALIGN - 1)
+
     def _dat_count(self):
         return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
 
@@ -591,6 +598,9 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         client = self.server.get_new_client()
         aligned_payload = b"Q" * (1024 * 1024)       # 1048576 — already 4096-aligned
         unaligned_payload = b"P" * (1024 * 1024 + 1)  # 1048577 — needs padding
+        # Verify the relationship between payload sizes and nvme-maxmemory cap.
+        assert self.FILE_HEADER_SIZE + len(aligned_payload) == self.CAP
+        assert self.FILE_HEADER_SIZE + self._align_up(len(unaligned_payload)) > self.CAP
         # Aligned case succeeds: disk_len = 4096 + 1048576 = 1052672 == cap.
         self._set_ok(client, "fitkey", aligned_payload)
         assert client.execute_command("DBSIZE") == 1
