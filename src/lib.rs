@@ -170,7 +170,7 @@ lazy_static::lazy_static! {
     static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
-    static ref CFG_STREAMING_MIN_BUFFERS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -298,8 +298,8 @@ pub fn max_buffers_per_op() -> usize {
     CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn streaming_min_buffers() -> usize {
-    CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn min_buffers_per_op() -> usize {
+    CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
@@ -495,20 +495,20 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None,
              Some(Box::new(|_ctx, _name, new_val| {
                  let max = new_val.load(std::sync::atomic::Ordering::Relaxed);
-                 let min = CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+                 let min = CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
                  if min > max {
-                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= streaming-min-buffers"))
+                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= min-buffers-per-op"))
                  } else {
                      Ok(())
                  }
              }))],
-            ["streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
+            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None,
              Some(Box::new(|_ctx, _name, new_val| {
                  let min = new_val.load(std::sync::atomic::Ordering::Relaxed);
                  let max = CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
                  if min > max {
-                     Err(valkey_module::ValkeyError::Str("ERR streaming-min-buffers must be <= max-buffers-per-op"))
+                     Err(valkey_module::ValkeyError::Str("ERR min-buffers-per-op must be <= max-buffers-per-op"))
                  } else {
                      Ok(())
                  }

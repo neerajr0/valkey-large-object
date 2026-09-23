@@ -376,16 +376,16 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             assert result == payload
 
     def test_reject_invalid_buffer_configs(self):
-        """CONFIG SET rejects streaming-min-buffers > max-buffers-per-op and
+        """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
         vice-versa, exercising both validation callbacks."""
         client = self.server.get_new_client()
         # Direction 1: raise min above current max (default max=8).
         client.execute_command('CONFIG', 'SET', 'largeobj.max-buffers-per-op', '2')
         try:
-            client.execute_command('CONFIG', 'SET', 'largeobj.streaming-min-buffers', '3')
+            client.execute_command('CONFIG', 'SET', 'largeobj.min-buffers-per-op', '3')
             assert False, "Expected CONFIG SET rejection (min > max)"
         except ResponseError as e:
-            assert 'streaming-min-buffers' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'min-buffers-per-op' in str(e).lower(), f"Unexpected error: {e}"
         # Direction 2: lower max below current min (default min=2).
         try:
             client.execute_command('CONFIG', 'SET', 'largeobj.max-buffers-per-op', '1')

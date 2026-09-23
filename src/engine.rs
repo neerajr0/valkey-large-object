@@ -416,7 +416,7 @@ fn execute_get_tiered(
     // Future: LRFU admission policy may also reject promotion here.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
-    let min_buffers = crate::streaming_min_buffers();
+    let min_buffers = crate::min_buffers_per_op();
     let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
@@ -1099,7 +1099,7 @@ fn execute_set_tiered(
     object_id: ObjectId,
 ) {
     let max_buffers = crate::max_buffers_per_op();
-    let min_buffers = crate::streaming_min_buffers();
+    let min_buffers = crate::min_buffers_per_op();
     let nvme_pool = storage::get_nvme_pool();
     let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
