@@ -25,6 +25,22 @@ use super::StorageError;
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
+/// Direction for io_uring batch operations (used in log messages).
+#[derive(Debug)]
+pub enum UringDirection {
+    Read,
+    Write,
+}
+
+impl std::fmt::Display for UringDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UringDirection::Read => f.write_str("read"),
+            UringDirection::Write => f.write_str("write"),
+        }
+    }
+}
+
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
 #[derive(Debug)]
@@ -183,11 +199,11 @@ pub fn into_completions<T: Send + 'static>(
     stream
 }
 
-/// `op` is "read" or "write" — used only in suppressed-error log messages.
+/// `op` identifies the direction — used only in suppressed-error log messages.
 /// Used by TCP path for awaiting all batch receivers.
 pub async fn await_batch<T: Send + 'static>(
     receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
-    op: &str,
+    op: UringDirection,
 ) -> Result<(), StorageError> {
     let mut completions = into_completions(receivers);
     let mut first_err: Option<StorageError> = None;

@@ -542,7 +542,7 @@ async fn do_tiered_promote_and_serve_tcp(
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
-        if let Err(_e) = uring::await_batch(receivers, "read").await {
+        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Read).await {
             dram_pool.remove_object(&object_id);
             reply_err(
                 &thread_ctx,
@@ -731,7 +731,7 @@ async fn do_tiered_nvme_read_and_serve_tcp(
             });
         }
         let receivers = uring::submit_read_batch(fd, ops);
-        if let Err(_e) = uring::await_batch(receivers, "read").await {
+        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Read).await {
             reply_err(
                 &thread_ctx,
                 &info::NVME_READ_ERRORS,
@@ -1223,7 +1223,7 @@ async fn do_tiered_nvme_write_tcp(
             });
         }
         let receivers = uring::submit_write_batch(fd.as_raw_fd(), ops);
-        if let Err(_e) = uring::await_batch(receivers, "write").await {
+        if let Err(_e) = uring::await_batch(receivers, uring::UringDirection::Write).await {
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
