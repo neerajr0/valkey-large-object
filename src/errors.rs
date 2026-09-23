@@ -19,6 +19,7 @@ define_errors! {
     ERR_EFA_UNAVAILABLE => "ERR EFA unavailable on this instance",
     ERR_INVALID_PEER_ADDR_HEX => "ERR invalid peer address hex",
     ERR_PEER_ADDR_LEN => "ERR peer address must be 32 bytes",
+    ERR_PEER_ADDR_EMPTY => "ERR peer address must not be empty",
     ERR_INVALID_NUM_REGIONS => "ERR invalid num_regions",
     ERR_INSUFFICIENT_REGION_ARGS => "ERR insufficient region args",
     ERR_INVALID_RKEY => "ERR invalid rkey",
@@ -29,8 +30,11 @@ define_errors! {
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_OBJECT_EXCEEDS_BUF => "ERR object exceeds buffer size",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call LO.HELLO first)",
+    ERR_DMA_SESSION_EXISTS => "ERR DMA session already established (one LO.HELLO per connection)",
     ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
     ERR_SESSION_GONE => "ERR session gone",
+    ERR_NOT_FOUND => "ERR not found",
+    ERR_INVALID_INFO_FIELD => "ERR invalid information value",
 
     // Storage/Engine Errors
     ERR_NVME_READ => "ERR NVMe read",
@@ -42,9 +46,10 @@ define_errors! {
     // Streaming Errors
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
+    ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors
-    ERR_OBJECT_TOO_LARGE => "ERR object size exceeds lo-max-object-size limit",
+    ERR_OBJECT_TOO_LARGE => "ERR object size exceeds max-object-size limit",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

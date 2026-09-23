@@ -15,7 +15,7 @@ env:
 
 jobs:
   test:
-    runs-on: self-hosted
+    runs-on: [self-hosted, ci]
     strategy:
       fail-fast: false
       matrix:
@@ -28,12 +28,27 @@ jobs:
             cache_key_suffix: asan
     name: ${{ matrix.name }}
     steps:
+      - name: Ensure disk headroom
+        run: |
+          set -euo pipefail
+          THRESHOLD=85
+          USE=$(df --output=pcent "$RUNNER_WORKSPACE" | tail -1 | tr -dc '0-9')
+          echo "Disk at ${USE}% on $(df --output=target "$RUNNER_WORKSPACE" | tail -1)"
+          if [ "${USE:-0}" -ge "$THRESHOLD" ]; then
+            echo "::warning::Disk at ${USE}%, trimming cargo cache"
+            "$HOME/.cargo/bin/cargo-cache" --autoclean || echo "cargo-cache not installed, skipping"
+          fi
+
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
-          sudo yum install -y clang clang-devel gcc make git python3 python3-pip
+          sudo yum install -y clang clang-devel gcc make git python3 python3-pip pkgconfig libfabric libfabric-devel
           ${{ matrix.asan && 'sudo yum install -y libasan' || '' }}
+
+      # dma-libfabric probes libfabric through pkg-config. Check reachability early.
+      - name: Check libfabric
+        run: pkg-config --modversion libfabric
 
       - name: Install Rust
         run: |
@@ -46,7 +61,7 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --profile release --all-targets -- -D warnings
+        run: cargo clippy --profile release --all-targets --features test-harness -- -D warnings
 
       - name: Release build
         run: cargo build --release
@@ -95,6 +110,9 @@ jobs:
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+
+      - name: Build test harness
+        run: cargo build --release --features test-harness --bin fabric_target
 
       - name: Run integration tests
         if: ${{ !matrix.asan }}

@@ -29,7 +29,7 @@ CLIENTS=200
 DURATION=10
 NUM_KEYS=500
 DRAM_MAXMEMORY="34359738368"       # 32GB
-DRAM_SEGMENT_SIZE="67108864"      # 64MB
+SEGMENT_SIZE="67108864"      # 64MB
 NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
 WORKER_THREADS=2
@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --duration)      DURATION="$2"; shift 2 ;;
         --keys)          NUM_KEYS="$2"; shift 2 ;;
         --dram-maxmemory)    DRAM_MAXMEMORY="$2"; shift 2 ;;
-        --dram-segment-size) DRAM_SEGMENT_SIZE="$2"; shift 2 ;;
+        --segment-size)      SEGMENT_SIZE="$2"; shift 2 ;;
         --nvme-maxmemory)    NVME_MAXMEMORY="$2"; shift 2 ;;
         --worker-threads)    WORKER_THREADS="$2"; shift 2 ;;
         --help|-h)
@@ -66,7 +66,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
             echo "  --dram-maxmemory <BYTES>   DRAM budget in bytes (default: 34359738368 = 32GB)"
-            echo "  --dram-segment-size <BYTES> Segment size in bytes (default: 67108864 = 64MB)"
+            echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
             echo "  --nvme-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
             echo ""
@@ -194,7 +194,7 @@ echo "Keys:           $NUM_KEYS"
 echo "Module:         $MODULE_SO"
 [ -n "$NVME_DIR" ] && echo "NVMe dir:       $NVME_DIR"
 echo "DRAM maxmem:    $DRAM_MAXMEMORY ($((DRAM_MAXMEMORY / 1048576))MB)"
-echo "DRAM segment:   $DRAM_SEGMENT_SIZE ($((DRAM_SEGMENT_SIZE / 1048576))MB)"
+echo "Segment size:   $SEGMENT_SIZE ($((SEGMENT_SIZE / 1048576))MB)"
 echo "Worker threads: $WORKER_THREADS"
 echo "IO threads:     $IO_THREADS"
 echo "Server CPUs:    $SERVER_CPUS"
@@ -284,21 +284,25 @@ for BENCH_MODE in $MODES_STR; do
             EFFECTIVE_KEYS=100  # 4MB: 100 keys
         fi
 
-        # NVMe staging must hold concurrent reads: clients × obj_size.
-        # Cap at 1GB — kernel hard limit per registered buffer (IORING_REGISTER_BUFFERS).
-        # Reduce effective clients for very large objects if staging would exceed cap.
-        # Use 80% of cap for actual buffers (20% reserved for talc metadata).
+        # NVMe staging must hold all concurrent in-flight reads: each client holds
+        # one contiguous obj_size buffer for the full GET (NVMe read + serve). A
+        # buffer cannot span two segments, so every 64MB segment wastes its tail
+        # (~obj_size - talc_overhead per segment). A flat 20% aggregate reserve is
+        # not enough once the pool spans several segments — the per-segment loss
+        # scales with segment count. Size to 2x the concurrent buffer bytes so the
+        # pool survives per-segment tail waste. Cap at 1GB (kernel per-buffer limit,
+        # IORING_REGISTER_BUFFERS); reduce effective clients if 2x would exceed it.
         STAGING_CAP=1073741824  # 1GB
         USABLE_CAP=$(( STAGING_CAP * 80 / 100 ))  # 80% usable after talc overhead
-        STAGING_NEEDED=$(( CLIENTS * BYTES ))
+        STAGING_NEEDED=$(( CLIENTS * BYTES * 2 ))
         EFFECTIVE_CLIENTS=$CLIENTS
         if [ $STAGING_NEEDED -gt $USABLE_CAP ]; then
-            EFFECTIVE_CLIENTS=$(( USABLE_CAP / BYTES ))
+            EFFECTIVE_CLIENTS=$(( USABLE_CAP / (BYTES * 2) ))
             if [ $EFFECTIVE_CLIENTS -lt 1 ]; then
                 EFFECTIVE_CLIENTS=1
             fi
         fi
-        STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES + EFFECTIVE_CLIENTS * BYTES / 5 ))
+        STAGING_NEEDED=$(( EFFECTIVE_CLIENTS * BYTES * 2 ))
         if [ $STAGING_NEEDED -gt $STAGING_CAP ]; then
             STAGING_NEEDED=$STAGING_CAP
         fi
@@ -308,20 +312,20 @@ for BENCH_MODE in $MODES_STR; do
 
         echo ""
         echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, clients=$EFFECTIVE_CLIENTS]"
-        echo "     mode=$BENCH_MODE dram-maxmemory=$((DRAM_MAXMEMORY / 1048576))MB dram-segment-size=$((DRAM_SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
+        echo "     mode=$BENCH_MODE dram-maxmemory=$((DRAM_MAXMEMORY / 1048576))MB segment-size=$((SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
 
-        # Build module args based on mode
+        # Build module args based on mode.
         case "$BENCH_MODE" in
             Dram)
                 MODULE_ARGS="operating-mode Dram"
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
-                MODULE_ARGS="$MODULE_ARGS dram-segment-size $DRAM_SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
                 MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
-                MODULE_ARGS="$MODULE_ARGS dram-segment-size $DRAM_SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 ;;
@@ -329,7 +333,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="operating-mode Tiered"
                 MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
-                MODULE_ARGS="$MODULE_ARGS dram-segment-size $DRAM_SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"

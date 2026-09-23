@@ -48,12 +48,18 @@ fi
 # ─── Build Module ─────────────────────────────────────────────────────────────
 
 if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
+    if ! pkg-config --exists libfabric; then
+        echo "ERROR: libfabric not found via pkg-config."
+        echo "Install it (libfabric-devel or brew libfabric) or point PKG_CONFIG_PATH at its .pc file."
+        exit 1
+    fi
+
     echo "Running cargo fmt check..."
     cargo fmt --check
     echo ""
 
     echo "Running cargo clippy..."
-    cargo clippy --profile release --all-targets -- -D warnings
+    cargo clippy --profile release --all-targets --features test-harness -- -D warnings
     echo ""
 
     echo "Running cargo build release..."
@@ -173,6 +179,9 @@ if [ -f "$REQUIREMENTS_FILE" ]; then
 fi
 
 # ─── Run Integration Tests ───────────────────────────────────────────────────
+
+# The passive fabric peer for fabric tests.
+cargo build --release --features test-harness --bin fabric_target
 
 echo ""
 echo "Running integration tests..."

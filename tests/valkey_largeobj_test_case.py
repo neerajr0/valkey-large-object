@@ -6,6 +6,17 @@ from valkey import ResponseError
 import logging
 
 
+def info_largeobj(client):
+    """Return the largeobj INFO section as a dict with integer values decoded."""
+    raw = client.execute_command('INFO', 'largeobj')
+    result = {}
+    for k, v in raw.items():
+        key = k.decode() if isinstance(k, bytes) else k
+        val = v.decode() if isinstance(v, bytes) else str(v)
+        result[key] = int(val) if val.lstrip('-').isdigit() else val
+    return result
+
+
 class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     """Base test class for valkey-largeobj module integration tests.
 
@@ -28,10 +39,10 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
-            f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" segment-size 1048576"
             f" bench-mode no"
             f" direct-io no"
+            f" chunk-size 4096"
         )
 
     @pytest.fixture(autouse=True)

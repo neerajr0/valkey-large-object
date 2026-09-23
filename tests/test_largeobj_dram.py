@@ -9,20 +9,33 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" segment-size 2097152"
             f" bench-mode no"
             f" direct-io no"
+            f" chunk-size 4096"
         )
 
     def test_set_get_roundtrip(self):
-        """Basic SET + GET in Dram mode."""
+        """Basic SET + GET in Dram mode, including multi-chunk objects."""
         client = self.server.get_new_client()
+        # Single-chunk: 4096 bytes with chunk-size=4096 → 1 chunk.
         payload = b'A' * 4096
         result = client.execute_command('LO.SET', 'dramkey', payload)
         assert result == b'OK'
         data = client.execute_command('LO.GET', 'dramkey')
         assert data == payload
+        # Partial last chunk: 4096 + 1 = 4097 → 2 chunks (second chunk is 1 byte).
+        payload_partial = b'B' * 4097
+        client.execute_command('LO.SET', 'partial_key', payload_partial)
+        assert client.execute_command('LO.GET', 'partial_key') == payload_partial
+        # Exact multiple: 8192 = 2 * 4096 → 2 full chunks.
+        payload_exact = b'C' * 8192
+        client.execute_command('LO.SET', 'exact_key', payload_exact)
+        assert client.execute_command('LO.GET', 'exact_key') == payload_exact
+        # Many chunks: 20000 bytes → 5 chunks (last chunk is 20000 % 4096 = 3616 bytes).
+        payload_many = b'D' * 20000
+        client.execute_command('LO.SET', 'many_key', payload_many)
+        assert client.execute_command('LO.GET', 'many_key') == payload_many
 
     def test_get_nonexistent_key(self):
         """GET on nonexistent key returns nil in Dram mode."""
@@ -47,16 +60,16 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_dram_pool_exhaustion(self):
-        """An object larger than dram-segment-size fails with DRAM pool exhaustion."""
+        """An object larger than segment-size fails with pool exhausted."""
         client = self.server.get_new_client()
-        # dram-segment-size is 1MB. A 2MB object cannot be allocated.
-        obj_size = 2 * 1024 * 1024
+        # segment-size is 2MB. A 4MB object cannot be allocated.
+        obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected DRAM pool exhaustion error"
+            assert False, "Expected pool exhausted error"
         except ResponseError as e:
-            assert 'dram buffer pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -97,15 +110,15 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_copy_pool_exhausted(self):
         """COPY fails when DRAMPool cannot fit the duplicate."""
         client = self.server.get_new_client()
-        # Fill most of the 1MB pool with a large object.
-        payload = b'F' * (900 * 1024)
+        # Fill most of the 2MB pool with a large object.
+        payload = b'F' * (1200 * 1024)
         client.execute_command('LO.SET', 'bigkey', payload)
-        # COPY needs another 900KB — pool is only 1MB total.
+        # COPY needs another 1200KB — pool is only 2MB total.
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail with DRAM pool exhaustion"
+            assert False, "Expected COPY to fail with pool exhausted"
         except ResponseError:
-            pass  # Expected — pool cannot fit two 900KB objects
+            pass  # Expected — pool cannot fit two 1200KB objects
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -134,20 +147,20 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
 
-    # ─── lo-max-object-size tests ─────────────────────────────────────────
+    # ─── max-object-size tests ───────────────────────────────────────────
 
     def test_max_object_size(self):
-        """lo-max-object-size rejects oversized SETs, allows at-limit SETs,
+        """max-object-size rejects oversized SETs, allows at-limit SETs,
         and does not affect reads of already-stored objects."""
         client = self.server.get_new_client()
         limit = 8192
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit))
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit))
         # Oversized SET is rejected.
         try:
             client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
             assert False, "Expected max object size rejection"
         except ResponseError as e:
-            assert 'lo-max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
         # Rejected SET must not leave a phantom key.
         assert client.execute_command('DBSIZE') == 0
         assert client.execute_command('LO.GET', 'bigkey') is None
@@ -155,18 +168,79 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
         assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
         # Lowering limit below stored object size does not affect reads.
-        client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(limit // 2))
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
         assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
 
     def test_max_object_size_dram_rejection(self):
-        """CONFIG SET lo-max-object-size > dram-maxmemory is rejected."""
+        """CONFIG SET max-object-size > dram-maxmemory is rejected."""
         client = self.server.get_new_client()
         dram_limit = 1048576  # 1 MiB
         client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', str(dram_limit))
         obj_limit = 2 * 1048576  # 2 MiB
         try:
-            client.execute_command('CONFIG', 'SET', 'largeobj.lo-max-object-size', str(obj_limit))
+            client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(obj_limit))
             assert False, "Expected CONFIG SET to be rejected"
         except ResponseError as e:
-            assert 'lo-max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
             assert 'dram-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
+
+    # ─── LO.INFO tests ───────────────────────────────────────────────────
+
+    def test_info(self):
+        client = self.server.get_new_client()
+        payload = bytes(range(256)) * 16  # 4096 bytes, non-uniform so CRC is meaningful
+        client.execute_command('LO.SET', 'infokey', payload)
+        # Check the specfic fields for info
+        assert client.execute_command('LO.INFO', 'infokey', 'LEN') == len(payload)
+        # CRC is a u32: in range, stable across calls, and identical for identical payloads.
+        crc = client.execute_command('LO.INFO', 'infokey', 'CRC')
+        assert 0 <= crc <= 0xFFFFFFFF
+        assert client.execute_command('LO.INFO', 'infokey', 'CRC') == crc
+        client.execute_command('LO.SET', 'infokey2', payload)
+        assert client.execute_command('LO.INFO', 'infokey2', 'CRC') == crc
+        assert client.execute_command('LO.INFO', 'infokey', 'TIER') == b'dram'
+        # Check full info call
+        result = client.execute_command('LO.INFO', 'infokey')
+        assert result == [
+            b'len', len(payload),
+            b'crc', crc,
+            b'tier', b'dram',
+        ], f"Unexpected LO.INFO reply: {result!r}"
+
+    def test_info_crc_changes_on_overwrite(self):
+        """Overwriting a key updates LEN and CRC."""
+        client = self.server.get_new_client()
+        first = b'A' * 4096
+        second = b'B' * 8192
+        client.execute_command('LO.SET', 'owkey', first)
+        first_crc = client.execute_command('LO.INFO', 'owkey', 'CRC')
+        client.execute_command('LO.SET', 'owkey', second)
+        assert client.execute_command('LO.INFO', 'owkey', 'LEN') == 8192
+        assert client.execute_command('LO.INFO', 'owkey', 'CRC') != first_crc
+
+    def test_info_errors(self):
+        """LO.INFO errors are correct"""
+        client = self.server.get_new_client()
+        # Nonexistant key
+        self.verify_error_response(client, 'LO.INFO nokey', 'not found')
+        self.verify_error_response(client, 'LO.INFO nokey LEN', 'not found')
+        # Wrong type error
+        client.execute_command('SET', 'strkey', 'plain')
+        try:
+            client.execute_command('LO.INFO', 'strkey')
+            assert False, "Expected WRONGTYPE error"
+        except ResponseError as e:
+            assert 'existing key has wrong valkey type' in str(e).lower(), f"Unexpected error: {e}"
+        # Wrong number of arguments error
+        client.execute_command('LO.SET', 'badkey', b'x' * 4096)
+        try:
+            client.execute_command('LO.INFO', 'badkey', 'LEN', 'CRC')
+            assert False, "Expected arity error"
+        except ResponseError as e:
+            assert 'wrong number of arguments' in str(e).lower(), f"Unexpected error: {e}"
+        # Bad field error
+        try:
+            client.execute_command('LO.INFO', 'badkey', 'NOTREAL')
+            assert False, "Expected wrong information field error"
+        except ResponseError as e:
+            assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
