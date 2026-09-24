@@ -121,6 +121,22 @@ pub(crate) fn reply_err(
     thread_ctx.reply(Err(err));
 }
 
+/// Map a `stream::StreamError` to its metric + reply string and send the error.
+/// One place, so every path that drives `stream::run` reports failures identically.
+fn reply_stream_err(
+    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    e: crate::stream::StreamError,
+) {
+    use crate::stream::StreamError::*;
+    let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
+        NvmeRead => (&info::NVME_READ_ERRORS, errors::ERR_NVME_READ),
+        NvmeWrite => (&info::NVME_WRITE_ERRORS, errors::ERR_NVME_WRITE),
+        EfaRead => (&info::EFA_READ_ERRORS, errors::ERR_EFA_READ),
+        EfaWrite => (&info::EFA_WRITE_ERRORS, errors::ERR_EFA_WRITE),
+    };
+    reply_err(thread_ctx, metric, ValkeyError::Str(err));
+}
+
 /// Test hook: pause between NVMe write completion and set_finalize to allow
 /// integration tests to inject a DEL and deterministically exercise the
 /// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
@@ -509,30 +525,41 @@ async fn do_tiered_promote_and_serve_tcp(
     let chunk_size = crate::chunk_size();
     let chunk_iter = ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), None);
     let hdr_buf = &obj_ctx.buffers[0];
-    let job = crate::stream::ReadJob {
+    let job = crate::stream::StreamJob {
         fd,
         obj_len,
         chunk_size,
-        crc32c_expected,
         object_id,
+        crc32c_expected,
         hdr_iovec: dram_pool.iovec_index_for_buf(hdr_buf),
         hdr_ptr: dram_pool.buffer_ptr(hdr_buf) as usize,
-        efa_error_policy: crate::stream::EfaErrorPolicy::ContinueFilling,
         batch_width: max_sqes_per_batch,
+        header_write: None,
     };
-    let plan = crate::stream::DramPlan {
+    // Promotion reads the NVMe file INTO the DRAM promotion buffers (pool=dram),
+    // then the target serves them; ProgressHook marks the DRAM entry Ready.
+    let source = crate::stream::NvmeSource {
         buffers: &obj_ctx.buffers,
-        pool: dram_pool,
+        pool: &dram_pool,
     };
-    let sink = crate::stream::TcpReadSink::new(obj_len, crate::bench_mode());
-    let progress = Some(crate::stream::ProgressHook {
+    let target = crate::stream::TcpReplyTarget::new(obj_len, crate::bench_mode());
+    let progress = crate::stream::ProgressHook {
         obj_ctx: &obj_ctx,
         dram_pool,
-    });
-    if let Ok(reply) =
-        crate::stream::stream_read(job, chunk_iter, &plan, sink, progress, &thread_ctx).await
+        object_id,
+    };
+    match crate::stream::run(&job, chunk_iter, &source, &target, Some(&progress), |_| {
+        crc32c_expected
+    })
+    .await
     {
-        thread_ctx.reply(Ok(reply));
+        Ok(done) => match done.target_err {
+            Some(e) => reply_stream_err(&thread_ctx, e),
+            None => {
+                thread_ctx.reply(Ok(target.into_reply(obj_len)));
+            }
+        },
+        Err(e) => reply_stream_err(&thread_ctx, e),
     }
 }
 
@@ -557,30 +584,42 @@ async fn do_tiered_promote_and_serve_efa(
     let chunk_iter =
         ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
     let hdr_buf = &obj_ctx.buffers[0];
-    let job = crate::stream::ReadJob {
+    let job = crate::stream::StreamJob {
         fd,
         obj_len,
         chunk_size,
-        crc32c_expected,
         object_id,
+        crc32c_expected,
         hdr_iovec: dram_pool.iovec_index_for_buf(hdr_buf),
         hdr_ptr: dram_pool.buffer_ptr(hdr_buf) as usize,
-        efa_error_policy: crate::stream::EfaErrorPolicy::ContinueFilling,
         batch_width: max_sqes_per_batch,
+        header_write: None,
     };
-    let plan = crate::stream::DramPlan {
+    // Promotion reads the NVMe file INTO the DRAM promotion buffers (pool=dram),
+    // then the target serves them; ProgressHook marks the DRAM entry Ready.
+    let source = crate::stream::NvmeSource {
         buffers: &obj_ctx.buffers,
-        pool: dram_pool,
+        pool: &dram_pool,
     };
-    let sink = crate::stream::EfaReadSink::new(session);
-    let progress = Some(crate::stream::ProgressHook {
+    let target = crate::stream::EfaTarget { session };
+    let progress = crate::stream::ProgressHook {
         obj_ctx: &obj_ctx,
         dram_pool,
-    });
-    if let Ok(reply) =
-        crate::stream::stream_read(job, chunk_iter, &plan, sink, progress, &thread_ctx).await
+        object_id,
+    };
+    match crate::stream::run(&job, chunk_iter, &source, &target, Some(&progress), |_| {
+        crc32c_expected
+    })
+    .await
     {
-        thread_ctx.reply(Ok(reply));
+        Ok(done) => match done.target_err {
+            Some(e) => reply_stream_err(&thread_ctx, e),
+            // Main's EFA GET replies the bare object CRC (not an [obj_len, crc] array).
+            None => {
+                thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
+            }
+        },
+        Err(e) => reply_stream_err(&thread_ctx, e),
     }
 }
 
@@ -599,27 +638,32 @@ async fn do_tiered_nvme_read_and_serve_tcp(
     let nvme_pool = storage::get_nvme_pool();
     let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
     let hdr_buf = &stream_ctx.buffers[0];
-    let job = crate::stream::ReadJob {
+    let job = crate::stream::StreamJob {
         fd,
         obj_len,
         chunk_size,
-        crc32c_expected,
         object_id,
+        crc32c_expected,
         hdr_iovec: nvme_pool.iovec_index_for_buf(hdr_buf),
         hdr_ptr: nvme_pool.buffer_ptr(hdr_buf) as usize,
-        efa_error_policy: crate::stream::EfaErrorPolicy::Abort,
         batch_width: batch_size,
+        header_write: None,
     };
-    let plan = crate::stream::NvmePlan {
+    let source = crate::stream::NvmeSource {
         buffers: &stream_ctx.buffers,
-        pool: nvme_pool,
+        pool: &nvme_pool,
     };
-    let sink = crate::stream::TcpReadSink::new(obj_len, crate::bench_mode());
+    let target = crate::stream::TcpReplyTarget::new(obj_len, crate::bench_mode());
     // StreamingContext dropped on return → NVMe buffers freed.
-    if let Ok(reply) =
-        crate::stream::stream_read(job, chunk_iter, &plan, sink, None, &thread_ctx).await
+    match crate::stream::run(&job, chunk_iter, &source, &target, None, |_| {
+        crc32c_expected
+    })
+    .await
     {
-        thread_ctx.reply(Ok(reply));
+        Ok(_) => {
+            thread_ctx.reply(Ok(target.into_reply(obj_len)));
+        }
+        Err(e) => reply_stream_err(&thread_ctx, e),
     }
 }
 
@@ -643,26 +687,31 @@ async fn do_tiered_nvme_read_and_serve_efa(
     let nvme_pool = storage::get_nvme_pool();
     let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
     let hdr_buf = &stream_ctx.buffers[0];
-    let job = crate::stream::ReadJob {
+    let job = crate::stream::StreamJob {
         fd,
         obj_len,
         chunk_size,
-        crc32c_expected,
         object_id,
+        crc32c_expected,
         hdr_iovec: nvme_pool.iovec_index_for_buf(hdr_buf),
         hdr_ptr: nvme_pool.buffer_ptr(hdr_buf) as usize,
-        efa_error_policy: crate::stream::EfaErrorPolicy::Abort,
         batch_width: batch_size,
+        header_write: None,
     };
-    let plan = crate::stream::NvmePlan {
+    let source = crate::stream::NvmeSource {
         buffers: &stream_ctx.buffers,
-        pool: nvme_pool,
+        pool: &nvme_pool,
     };
-    let sink = crate::stream::EfaReadSink::new(session);
-    if let Ok(reply) =
-        crate::stream::stream_read(job, chunk_iter, &plan, sink, None, &thread_ctx).await
+    let target = crate::stream::EfaTarget { session };
+    match crate::stream::run(&job, chunk_iter, &source, &target, None, |_| {
+        crc32c_expected
+    })
+    .await
     {
-        thread_ctx.reply(Ok(reply));
+        Ok(_) => {
+            thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c_expected as i64)));
+        }
+        Err(e) => reply_stream_err(&thread_ctx, e),
     }
 }
 
@@ -828,31 +877,39 @@ fn execute_set_dram_efa(
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let dram_pool = storage::get_dram_pool();
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
-                let mut chunk_iter =
+                let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(efa_addrs));
-                // Parallel EFA reads for all chunks, per-chunk CRC recorded.
-                let plan = crate::stream::DramPlan {
-                    buffers: &buffers,
-                    pool: dram_pool,
+                // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
+                // ONE streaming driver (source=EFA client, target=DRAM resident).
+                let job = crate::stream::StreamJob {
+                    fd: -1,
+                    obj_len,
+                    chunk_size,
+                    object_id,
+                    crc32c_expected: 0,
+                    hdr_iovec: 0,
+                    hdr_ptr: 0,
+                    batch_width: buffers.len(),
+                    header_write: None,
                 };
-                if let Err(_e) = crate::stream::efa_transfer_all(
-                    &mut chunk_iter,
-                    &plan,
-                    &session,
-                    EfaDirection::Read,
-                )
+                let source = crate::stream::EfaSource {
+                    session,
+                    buffers: &buffers,
+                    pool: &dram_pool,
+                };
+                let target = crate::stream::DramTarget;
+                let crc = match crate::stream::run(&job, chunk_iter, &source, &target, None, |ci| {
+                    ci.combine_checksums()
+                })
                 .await
                 {
-                    reply_err(
-                        &thread_ctx,
-                        &info::EFA_READ_ERRORS,
-                        ValkeyError::Str(errors::ERR_EFA_READ),
-                    );
-                    dram_pool.free_n(&buffers);
-                    return;
-                }
-                // Post-hoc CRC pass (sequential, in chunk order).
-                let crc = chunk_iter.combine_checksums();
+                    Ok(done) => done.crc,
+                    Err(e) => {
+                        reply_stream_err(&thread_ctx, e);
+                        dram_pool.free_n(&buffers);
+                        return;
+                    }
+                };
                 // Insert ObjectContext BEFORE set_value so the key is never visible
                 // without its ObjectContext. On discard, remove the entry —
                 // ObjectContext::Drop returns buffers to DRAMPool automatically.
@@ -1003,41 +1060,39 @@ async fn do_tiered_nvme_write_tcp(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let source = crate::stream::TcpWriteSource {
-        data: &data,
-        buffers: &stream_ctx.buffers,
-        pool: nvme_pool,
-        digest: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
-    };
-    let crc = match crate::stream::stream_write(
-        &fd,
+    let job = crate::stream::StreamJob {
+        fd: fd.as_raw_fd(),
         obj_len,
         chunk_size,
         object_id,
-        &stream_ctx.buffers[0],
-        nvme_pool,
-        batch_size,
-        chunk_iter,
-        source,
-    )
+        crc32c_expected: 0,
+        hdr_iovec: 0,
+        hdr_ptr: 0,
+        batch_width: batch_size,
+        header_write: Some(crate::stream::HeaderWrite {
+            hdr_buf: &stream_ctx.buffers[0],
+            pool: nvme_pool,
+        }),
+    };
+    let source = crate::stream::TcpInlineSource {
+        data: &data,
+        buffers: &stream_ctx.buffers,
+        pool: &nvme_pool,
+    };
+    let target = crate::stream::NvmeTarget {
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+    };
+    // TCP object CRC is CRC32C over the whole inline payload, in object order.
+    let crc = match crate::stream::run(&job, chunk_iter, &source, &target, None, |_| {
+        crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32
+    })
     .await
     {
-        Ok(crc) => crc,
         // On error the fd + object_file drop on return: file unlinked, disk released.
-        Err(crate::stream::WriteError::EfaRead) => {
-            reply_err(
-                &thread_ctx,
-                &info::EFA_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_EFA_READ),
-            );
-            return;
-        }
-        Err(crate::stream::WriteError::NvmeWrite) => {
-            reply_err(
-                &thread_ctx,
-                &info::NVME_WRITE_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_WRITE),
-            );
+        Ok(done) => done.crc,
+        Err(e) => {
+            reply_stream_err(&thread_ctx, e);
             return;
         }
     };
@@ -1101,40 +1156,39 @@ async fn do_tiered_nvme_write_efa(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let source = crate::stream::EfaWriteSource {
-        session,
-        buffers: &stream_ctx.buffers,
-        pool: nvme_pool,
-    };
-    let crc = match crate::stream::stream_write(
-        &fd,
+    let job = crate::stream::StreamJob {
+        fd: fd.as_raw_fd(),
         obj_len,
         chunk_size,
         object_id,
-        &stream_ctx.buffers[0],
-        nvme_pool,
-        batch_size,
-        chunk_iter,
-        source,
-    )
+        crc32c_expected: 0,
+        hdr_iovec: 0,
+        hdr_ptr: 0,
+        batch_width: batch_size,
+        header_write: Some(crate::stream::HeaderWrite {
+            hdr_buf: &stream_ctx.buffers[0],
+            pool: nvme_pool,
+        }),
+    };
+    let source = crate::stream::EfaSource {
+        session,
+        buffers: &stream_ctx.buffers,
+        pool: &nvme_pool,
+    };
+    let target = crate::stream::NvmeTarget {
+        buffers: &stream_ctx.buffers,
+        pool: nvme_pool,
+    };
+    // EFA object CRC combines the per-chunk transport CRCs the driver recorded.
+    let crc = match crate::stream::run(&job, chunk_iter, &source, &target, None, |ci| {
+        ci.combine_checksums()
+    })
     .await
     {
-        Ok(crc) => crc,
         // On error the fd + object_file drop on return: file unlinked, disk released.
-        Err(crate::stream::WriteError::EfaRead) => {
-            reply_err(
-                &thread_ctx,
-                &info::EFA_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_EFA_READ),
-            );
-            return;
-        }
-        Err(crate::stream::WriteError::NvmeWrite) => {
-            reply_err(
-                &thread_ctx,
-                &info::NVME_WRITE_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_WRITE),
-            );
+        Ok(done) => done.crc,
+        Err(e) => {
+            reply_stream_err(&thread_ctx, e);
             return;
         }
     };
@@ -1187,31 +1241,38 @@ fn serve_from_dram(
             rkey,
             remote_addr,
         } => {
-            // EFA: parallel write from DRAMPool buffers to client GPU.
+            // EFA: write every DRAM buffer to the client via the ONE streaming
+            // driver (source=DRAM resident, target=EFA client).
             let obj_ctx = obj_ctx.clone();
             crate::runtime_handle().spawn(async move {
                 let _keep_alive = (&obj_ctx, file);
                 let dram_pool = storage::get_dram_pool();
                 let chunk_size = crate::chunk_size();
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
-                let mut chunk_iter =
+                let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
-                let plan = crate::stream::DramPlan {
+                let job = crate::stream::StreamJob {
+                    fd: -1,
+                    obj_len,
+                    chunk_size,
+                    object_id: ObjectId(0), // unused: no fd/header on Dram GET
+                    crc32c_expected: crc32c,
+                    hdr_iovec: 0,
+                    hdr_ptr: 0,
+                    batch_width: obj_ctx.buffers.len(),
+                    header_write: None,
+                };
+                let source = crate::stream::DramSource {
                     buffers: &obj_ctx.buffers,
                     pool: dram_pool,
                 };
-                match crate::stream::efa_transfer_all(
-                    &mut chunk_iter,
-                    &plan,
-                    &session,
-                    EfaDirection::Write,
-                )
-                .await
+                let target = crate::stream::EfaTarget { session };
+                match crate::stream::run(&job, chunk_iter, &source, &target, None, |_| crc32c).await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
                     }
-                    Err(e) => reply_err(&thread_ctx, &info::EFA_WRITE_ERRORS, e),
+                    Err(e) => reply_stream_err(&thread_ctx, e),
                 }
             });
         }
