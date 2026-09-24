@@ -50,7 +50,7 @@ pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     NVME_DISK_USAGE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             let next = cur.checked_add(bytes)?;
-            if max == 0 || next <= max {
+            if next <= max {
                 Some(next)
             } else {
                 None
