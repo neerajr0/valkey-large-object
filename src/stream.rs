@@ -93,6 +93,11 @@ pub struct ChunkRef {
     pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
+/// A chunk's transport checksum from a source's `produce`: `Some(crc)` when the
+/// transport supplies one (EFA read on the SET path, for `combine_checksums`),
+/// `None` for the sources that produce no CRC (NVMe read, DRAM-resident, TCP memcpy).
+pub type ChunkCrc = Option<u32>;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Source: where each chunk's bytes come from (a closed set of 4 behaviours)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -151,7 +156,7 @@ impl Source<'_> {
         fd: RawFd,
         chunk: &ChunkRef,
         chunk_size: usize,
-    ) -> Result<Option<u32>, StreamError> {
+    ) -> Result<ChunkCrc, StreamError> {
         let (buffers, pool) = self.parts();
         let buf = &buffers[chunk.buffer_idx];
         match self {
