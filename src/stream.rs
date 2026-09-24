@@ -390,13 +390,13 @@ pub enum Pool {
     Dram(&'static storage::DRAMPool),
 }
 impl Pool {
-    fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
+    pub(crate) fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
         match self {
             Pool::Nvme(p) => p.buffer_ptr(b),
             Pool::Dram(p) => p.buffer_ptr(b),
         }
     }
-    fn iovec(&self, b: &SegmentBuffer) -> u16 {
+    pub(crate) fn iovec(&self, b: &SegmentBuffer) -> u16 {
         match self {
             Pool::Nvme(p) => p.iovec_index_for_buf(b),
             Pool::Dram(p) => p.iovec_index_for_buf(b),

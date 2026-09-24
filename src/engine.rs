@@ -371,58 +371,36 @@ fn execute_get_tiered(
         // max_sqes_per_batch throttles how many ReadFixed SQEs we submit per
         // io_uring_submit() call — it does NOT control buffer count.
         let max_sqes_per_batch = crate::max_buffers_per_op();
-        let chunk_size = crate::chunk_size();
         let n_buffers = obj_ctx.buffers.len();
         let get_info = GetObjectInfo {
             object_id,
             obj_len,
             crc32c,
         };
-        match &transport {
-            Transport::Tcp => {
-                let chunk_iter = ChunkIterator::new(obj_len, chunk_size, n_buffers, None);
-                crate::runtime_handle().spawn(async move {
-                    let _keep_alive = (file, fd);
-                    let thread_ctx =
-                        valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                    promote_get(
-                        get_info,
-                        obj_ctx,
-                        raw_fd,
-                        max_sqes_per_batch,
-                        chunk_iter,
-                        thread_ctx,
-                        GetTarget::Tcp,
-                    )
-                    .await;
-                });
-            }
-            Transport::Efa {
-                session,
-                rkey,
-                remote_addr,
-            } => {
-                let session = session.clone();
-                let efa_addrs = single_efa_addrs(*rkey, *remote_addr, obj_len);
-                let chunk_iter =
-                    ChunkIterator::new(obj_len, chunk_size, n_buffers, Some(efa_addrs));
-                crate::runtime_handle().spawn(async move {
-                    let _keep_alive = (file, fd);
-                    let thread_ctx =
-                        valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                    promote_get(
-                        get_info,
-                        obj_ctx,
-                        raw_fd,
-                        max_sqes_per_batch,
-                        chunk_iter,
-                        thread_ctx,
-                        GetTarget::Efa(session),
-                    )
-                    .await;
-                });
-            }
-        }
+        let (chunk_iter, target) = get_transport_parts(transport, obj_len, n_buffers);
+        crate::runtime_handle().spawn(async move {
+            let _keep_alive = (file, fd);
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
+            // progress hook marks the cached entry Ready.
+            let progress = crate::stream::ProgressHook {
+                obj_ctx: &obj_ctx,
+                dram_pool,
+                object_id,
+            };
+            tiered_get(
+                get_info,
+                &obj_ctx.buffers,
+                crate::stream::Pool::Dram(dram_pool),
+                Some(&progress),
+                raw_fd,
+                max_sqes_per_batch,
+                chunk_iter,
+                &thread_ctx,
+                target,
+            )
+            .await;
+        });
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
@@ -459,59 +437,33 @@ fn execute_get_tiered(
         }
     };
     let raw_fd = fd.as_raw_fd();
-    let chunk_size = crate::chunk_size();
     let batch_size = stream_ctx.buffers.len();
     let get_info = GetObjectInfo {
         object_id,
         obj_len,
         crc32c,
     };
-    match &transport {
-        Transport::Tcp => {
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
-            crate::runtime_handle().spawn(async move {
-                // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile
-                // pin and open fd are held alive for the read's duration.
-                let _keep_alive = (file, fd);
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                stream_get(
-                    get_info,
-                    stream_ctx,
-                    raw_fd,
-                    chunk_iter,
-                    thread_ctx,
-                    GetTarget::Tcp,
-                )
-                .await;
-            });
-        }
-        Transport::Efa {
-            session,
-            rkey,
-            remote_addr,
-        } => {
-            let session = session.clone();
-            let efa_addrs = single_efa_addrs(*rkey, *remote_addr, obj_len);
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
-            crate::runtime_handle().spawn(async move {
-                // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile
-                // pin and open fd are held alive for the read's duration.
-                let _keep_alive = (file, fd);
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                stream_get(
-                    get_info,
-                    stream_ctx,
-                    raw_fd,
-                    chunk_iter,
-                    thread_ctx,
-                    GetTarget::Efa(session),
-                )
-                .await;
-            });
-        }
-    }
+    let nvme_pool = storage::get_nvme_pool();
+    let (chunk_iter, target) = get_transport_parts(transport, obj_len, batch_size);
+    crate::runtime_handle().spawn(async move {
+        // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
+        // open fd are held alive for the read's duration. No promotion → no cache,
+        // source reads straight from the NVMe pool window.
+        let _keep_alive = (file, fd);
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        tiered_get(
+            get_info,
+            &stream_ctx.buffers,
+            crate::stream::Pool::Nvme(nvme_pool),
+            None,
+            raw_fd,
+            batch_size,
+            chunk_iter,
+            &thread_ctx,
+            target,
+        )
+        .await;
+    });
 }
 
 /// The per-transport variant of a GET's target — the ONLY thing that differs
@@ -524,26 +476,78 @@ enum GetTarget {
     Efa(Arc<Session>),
 }
 
-/// Shared GET core for the two read envelopes (promotion + streaming). Builds the
-/// concrete target from `target`, runs the ONE driver over `source`, and replies:
-/// TCP replies the collected bytes, EFA the bare object CRC. A latched target error
-/// (promotion continue-filling) or a run error maps through `reply_stream_err`.
-#[allow(clippy::too_many_arguments)]
-async fn serve_get<S: crate::stream::Source>(
-    job: &crate::stream::StreamJob<'_>,
-    chunk_iter: ChunkIterator,
-    source: &S,
-    progress: Option<&crate::stream::ProgressHook<'_>>,
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+/// Build the per-transport GET pieces once: the chunk iterator (EFA carries the
+/// client addresses, TCP does not) and the matching `GetTarget`. Used by both the
+/// promotion and the streaming Tiered GET paths so the transport branch lives once.
+fn get_transport_parts(
+    transport: Transport,
     obj_len: u64,
-    crc32c_expected: u32,
+    n_buffers: usize,
+) -> (ChunkIterator, GetTarget) {
+    let chunk_size = crate::chunk_size();
+    match transport {
+        Transport::Tcp => (
+            ChunkIterator::new(obj_len, chunk_size, n_buffers, None),
+            GetTarget::Tcp,
+        ),
+        Transport::Efa {
+            session,
+            rkey,
+            remote_addr,
+        } => {
+            let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
+            (
+                ChunkIterator::new(obj_len, chunk_size, n_buffers, Some(efa_addrs)),
+                GetTarget::Efa(session),
+            )
+        }
+    }
+}
+
+/// The ONE Tiered GET body, for both promotion (read NVMe → DRAM cache, `progress`
+/// set) and serve-and-discard streaming (`progress` None). `source_pool` is the
+/// pool backing the buffers the NvmeSource reads into (DRAM for promotion, NVMe for
+/// streaming). Builds the job + source, runs the driver, and replies: TCP the
+/// collected bytes, EFA the bare object CRC. A latched target error (promotion
+/// continue-filling) or a run error maps through `reply_stream_err`.
+#[allow(clippy::too_many_arguments)]
+async fn tiered_get(
+    get_info: GetObjectInfo,
+    buffers: &[storage::SegmentBuffer],
+    source_pool: crate::stream::Pool,
+    progress: Option<&crate::stream::ProgressHook<'_>>,
+    fd: RawFd,
+    batch_width: usize,
+    chunk_iter: ChunkIterator,
+    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     target: GetTarget,
 ) {
-    let result = match &target {
+    let GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c: crc32c_expected,
+    } = get_info;
+    let hdr_buf = &buffers[0];
+    let job = crate::stream::StreamJob {
+        fd,
+        obj_len,
+        chunk_size: crate::chunk_size(),
+        object_id,
+        crc32c_expected,
+        hdr_iovec: source_pool.iovec(hdr_buf),
+        hdr_ptr: source_pool.ptr(hdr_buf) as usize,
+        batch_width,
+        header_write: None,
+    };
+    let source = crate::stream::NvmeSource {
+        buffers,
+        pool: source_pool,
+    };
+    // Build the target, run the driver, reply — TCP: collected bytes; EFA: bare CRC.
+    let outcome = match &target {
         GetTarget::Tcp => {
             let tgt = crate::stream::TcpReplyTarget::new(obj_len, crate::bench_mode());
-            // On clean success the collected bytes are the reply.
-            crate::stream::run_get(job, chunk_iter, source, &tgt, progress)
+            crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
                 .map(|target_err| (target_err, tgt.into_reply(obj_len)))
         }
@@ -551,128 +555,18 @@ async fn serve_get<S: crate::stream::Source>(
             let tgt = crate::stream::EfaTarget {
                 session: session.clone(),
             };
-            // Main's EFA GET replies the bare object CRC (not an [obj_len, crc] array).
-            crate::stream::run_get(job, chunk_iter, source, &tgt, progress)
+            crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
                 .map(|target_err| (target_err, ValkeyValue::Integer(crc32c_expected as i64)))
         }
     };
-    match result {
-        Ok((Some(e), _reply)) => reply_stream_err(thread_ctx, e), // promotion continue-filling
+    match outcome {
+        Ok((Some(e), _)) => reply_stream_err(thread_ctx, e), // promotion continue-filling
         Ok((None, reply)) => {
             thread_ctx.reply(Ok(reply));
         }
         Err(e) => reply_stream_err(thread_ctx, e),
     }
-}
-
-/// Envelope shared by both Tiered promotion GET paths (TCP + EFA). Reads the NVMe
-/// file INTO the DRAM promotion buffers (source = NvmeSource over the DRAM pool),
-/// serves them to the target, and the ProgressHook marks the DRAM entry Ready so
-/// the object is cached. `chunk_iter` carries the per-chunk EFA addrs for the EFA
-/// target. `target` is the ONLY per-transport difference, matched once here.
-/// On an EFA-write error the driver keeps filling DRAM for coalesced waiters and
-/// reports the error after; a source (NVMe read) error evicts the half-filled entry.
-async fn promote_get(
-    get_info: GetObjectInfo,
-    obj_ctx: Arc<ObjectContext>,
-    fd: RawFd,
-    max_sqes_per_batch: usize,
-    chunk_iter: ChunkIterator,
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    target: GetTarget,
-) {
-    let GetObjectInfo {
-        object_id,
-        obj_len,
-        crc32c: crc32c_expected,
-    } = get_info;
-    let dram_pool = storage::get_dram_pool();
-    let chunk_size = crate::chunk_size();
-    let hdr_buf = &obj_ctx.buffers[0];
-    let job = crate::stream::StreamJob {
-        fd,
-        obj_len,
-        chunk_size,
-        object_id,
-        crc32c_expected,
-        hdr_iovec: dram_pool.iovec_index_for_buf(hdr_buf),
-        hdr_ptr: dram_pool.buffer_ptr(hdr_buf) as usize,
-        batch_width: max_sqes_per_batch,
-        header_write: None,
-    };
-    // Source reads the NVMe file INTO the DRAM promotion buffers (pool=dram).
-    let source = crate::stream::NvmeSource {
-        buffers: &obj_ctx.buffers,
-        pool: crate::stream::Pool::Dram(dram_pool),
-    };
-    let progress = crate::stream::ProgressHook {
-        obj_ctx: &obj_ctx,
-        dram_pool,
-        object_id,
-    };
-    serve_get(
-        &job,
-        chunk_iter,
-        &source,
-        Some(&progress),
-        &thread_ctx,
-        obj_len,
-        crc32c_expected,
-        target,
-    )
-    .await;
-}
-
-/// TCP serve-and-discard — batched ReadFixed from NVMe, accumulate into Vec.
-/// Envelope shared by both Tiered streaming (serve-and-discard) GET paths. Reads
-/// the NVMe file through a small reused window (source = NvmeSource over the NVMe
-/// pool, no promotion/DRAM cache), serving each chunk to the target. `target` is
-/// the ONLY per-transport difference, matched once in `serve_get`. The
-/// StreamingContext is dropped on return, freeing the NVMe window buffers.
-async fn stream_get(
-    get_info: GetObjectInfo,
-    stream_ctx: storage::StreamingContext,
-    fd: RawFd,
-    chunk_iter: ChunkIterator,
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    target: GetTarget,
-) {
-    let GetObjectInfo {
-        object_id,
-        obj_len,
-        crc32c: crc32c_expected,
-    } = get_info;
-    let chunk_size = crate::chunk_size();
-    let batch_size = stream_ctx.buffers.len();
-    let nvme_pool = storage::get_nvme_pool();
-    let hdr_buf = &stream_ctx.buffers[0];
-    let job = crate::stream::StreamJob {
-        fd,
-        obj_len,
-        chunk_size,
-        object_id,
-        crc32c_expected,
-        hdr_iovec: nvme_pool.iovec_index_for_buf(hdr_buf),
-        hdr_ptr: nvme_pool.buffer_ptr(hdr_buf) as usize,
-        batch_width: batch_size,
-        header_write: None,
-    };
-    let source = crate::stream::NvmeSource {
-        buffers: &stream_ctx.buffers,
-        pool: crate::stream::Pool::Nvme(nvme_pool),
-    };
-    serve_get(
-        &job,
-        chunk_iter,
-        &source,
-        None,
-        &thread_ctx,
-        obj_len,
-        crc32c_expected,
-        target,
-    )
-    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
