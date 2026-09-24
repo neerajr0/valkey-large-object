@@ -90,14 +90,6 @@ pub struct ChunkRef {
     pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
-/// A raw pointer to a window buffer, valid until the batch it belongs to drains.
-/// Send so it can cross the `FuturesUnordered` await points on the tokio task.
-#[derive(Clone, Copy)]
-pub struct BufPtr(pub *mut u8);
-// SAFETY: points to pool segment memory, stable for the module lifetime; the
-// window discipline guarantees no aliasing write while a transfer is in flight.
-unsafe impl Send for BufPtr {}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Seam: Source (produces each chunk's bytes into its window buffer)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -260,7 +252,7 @@ pub trait Target {
         &self,
         fd: RawFd,
         chunk: &ChunkRef,
-        buf: BufPtr,
+        buf_ptr: usize,
         src_crc: u32,
         chunk_size: usize,
     ) -> Result<(), StreamError>;
@@ -298,13 +290,13 @@ impl Target for TcpReplyTarget {
         &self,
         _fd: RawFd,
         chunk: &ChunkRef,
-        buf: BufPtr,
+        buf_ptr: usize,
         _crc: u32,
         _cs: usize,
     ) -> Result<(), StreamError> {
         if !self.bench {
             // SAFETY: buffer holds `chunk.len` bytes the source just produced.
-            let slice = unsafe { std::slice::from_raw_parts(buf.0, chunk.len) };
+            let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *mut u8, chunk.len) };
             self.reply
                 .lock()
                 .expect("reply lock poisoned")
@@ -323,12 +315,12 @@ impl Target for EfaTarget {
         &self,
         _fd: RawFd,
         chunk: &ChunkRef,
-        buf: BufPtr,
+        buf_ptr: usize,
         _crc: u32,
         _cs: usize,
     ) -> Result<(), StreamError> {
         let addrs = chunk.addrs.as_ref().expect("EFA chunk missing addrs");
-        efa_transfer_addrs(&self.session, buf.0 as usize, addrs, EfaDirection::Write)
+        efa_transfer_addrs(&self.session, buf_ptr, addrs, EfaDirection::Write)
             .await
             .map(|_| ())
             .map_err(|_| StreamError::EfaWrite)
@@ -347,7 +339,7 @@ impl Target for NvmeTarget<'_> {
         &self,
         fd: RawFd,
         chunk: &ChunkRef,
-        _buf: BufPtr,
+        _buf_ptr: usize,
         _src_crc: u32,
         chunk_size: usize,
     ) -> Result<(), StreamError> {
@@ -376,7 +368,7 @@ impl Target for DramTarget {
         &self,
         _fd: RawFd,
         _chunk: &ChunkRef,
-        _buf: BufPtr,
+        _buf_ptr: usize,
         _crc: u32,
         _cs: usize,
     ) -> Result<(), StreamError> {
@@ -540,10 +532,10 @@ async fn drive_window<S: Source, T: Target>(
                     // Once any error is latched, stop feeding the target but keep
                     // producing so a promotion's DRAM copy still fills for waiters.
                     if target_err.is_none() && source_err.is_none() {
-                        let buf = BufPtr(source.buffer_ptr(chunk.buffer_idx));
+                        let buf_ptr = source.buffer_ptr(chunk.buffer_idx) as usize;
                         consume.push(async move {
                             target
-                                .consume(job.fd, &chunk, buf, src_crc, job.chunk_size)
+                                .consume(job.fd, &chunk, buf_ptr, src_crc, job.chunk_size)
                                 .await
                         });
                     }
