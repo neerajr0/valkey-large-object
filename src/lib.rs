@@ -349,7 +349,7 @@ fn validate_max_object_size(
     val: &'static AtomicI64,
 ) -> Result<(), valkey_module::ValkeyError> {
     let max_obj = val.load(std::sync::atomic::Ordering::Relaxed) as u64;
-    let buf_size = buffer_size() as u64;
+    let buf_size = chunk_size() as u64;
     if max_obj.div_ceil(buf_size) > u32::MAX as u64 {
         return Err(valkey_module::ValkeyError::Str(
             "ERR max-object-size too large for the configured chunk-size",
@@ -372,23 +372,6 @@ fn validate_max_object_size(
                 ));
             }
         }
-    }
-    Ok(())
-}
-
-/// Cross-config validation for lo-buffer-size.
-/// Lowering buffer size can push the chunk count over the u32 internal limit.
-fn validate_buffer_size(
-    _ctx: &valkey_module::configuration::ConfigurationContext,
-    _name: &str,
-    val: &'static AtomicI64,
-) -> Result<(), valkey_module::ValkeyError> {
-    let buf_size = val.load(std::sync::atomic::Ordering::Relaxed) as u64;
-    let max_obj = max_object_size();
-    if max_obj.div_ceil(buf_size) > u32::MAX as u64 {
-        return Err(valkey_module::ValkeyError::Str(
-            "ERR max-object-size too large for the configured chunk-size",
-        ));
     }
     Ok(())
 }
