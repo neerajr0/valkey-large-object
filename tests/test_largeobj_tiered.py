@@ -4,7 +4,7 @@ import time
 import threading
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
-from valkeytestframework.util.waiters import wait_for_equal
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
@@ -697,3 +697,49 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
                 client.execute_command('LO.GET', 'magic_key')
             except Exception:
                 pass
+
+class TestLargeObjSmartlog(ValkeyLargeObjTestCaseBase):
+    """SMART log INFO section in Tiered mode (default poll interval)."""
+
+    def test_smartlog_sections_present(self):
+        """Tiered mode: the aggregated smartlog sections appear"""
+        client = self.server.get_new_client()
+        wait_for_true(
+            lambda: 'largeobj_snapshot_age_seconds' in client.info('largeobj_smartlog_usage')
+        )
+        usage = client.info('largeobj_smartlog_usage')
+        warnings = client.info('largeobj_smartlog_critical_warnings')
+
+        # Every field is present on every host, including ones where no
+        # controller could be read (CI usually lacks /dev/nvme* access).
+        assert usage['largeobj_devices'] >= usage['largeobj_devices_read_failed']
+        for field in ('data_units_read', 'data_units_written',
+                      'percentage_used_avg', 'available_spare_pct_avg',
+                      'media_errors', 'unsafe_shutdowns'):
+            assert f'largeobj_{field}' in usage
+        for field in ('spare_below_threshold', 'temperature_warning',
+                      'reliability_degraded', 'media_read_only',
+                      'volatile_mem_backup_failed', 'persistent_mem_read_only'):
+            assert warnings[f'largeobj_{field}'] in (0, 1)
+
+
+class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
+    """smartlog-poll-secs 0: no poller, no INFO section, even in Tiered mode."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" bench-mode no"
+            f" direct-io no"
+            f" smartlog-poll-secs 0"
+        )
+
+    def test_smartlog_absent_when_disabled(self):
+        """The poller never starts at 0, so absence is immediate and permanent
+        (nothing to wait out). Module load succeeding with the arg already
+        proves the config is registered and accepts 0."""
+        client = self.server.get_new_client()
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
