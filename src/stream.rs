@@ -9,7 +9,11 @@
 //!            └────────┘   (produce as each ready)   └────────┘   (consume as each arrives)
 //! ```
 //!
-//! The eight paths are just source/target pairs over this one loop:
+//! The eight paths are just source/target pairs. `run_get` and `run_set` are thin
+//! wrappers over one shared window loop (`drive_window`); each carries only its own
+//! verb's work (GET verifies the on-disk header and may run a promotion progress
+//! hook; SET computes the object CRC and writes the header), so neither signature
+//! carries fields inert to the other.
 //!
 //! | Op  | Mode   | Transport | Source          | Target          |
 //! |-----|--------|-----------|-----------------|-----------------|
@@ -24,7 +28,7 @@
 //!
 //! ## The seam is a per-chunk ready stream, so interleave falls out for free
 //!
-//! `run` does NOT do "produce the whole batch, then consume the whole batch".
+//! `drive_window` does NOT "produce the whole batch, then consume the whole batch".
 //! It fans out each chunk's `Source::produce` future into a `FuturesUnordered`
 //! and, **as each one resolves**, immediately hands that chunk to
 //! `Target::consume`. So the target acts on chunk *i* the instant its source
@@ -61,10 +65,9 @@ use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use valkey_module::ValkeyValue;
+use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::ObjectId;
-use crate::engine::{efa_transfer_addrs, EfaDirection};
 use crate::storage::{self, uring, ChunkIterator, ClientEFAAddress, ObjectContext, SegmentBuffer};
 use crate::transport::Session;
 
@@ -393,7 +396,7 @@ pub trait PoolPtr: Sync {
     fn ptr(&self, buf: &SegmentBuffer) -> *mut u8;
     fn iovec(&self, buf: &SegmentBuffer) -> u16;
 }
-impl PoolPtr for &'static storage::NVMePool {
+impl PoolPtr for storage::NVMePool {
     fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
         self.buffer_ptr(b)
     }
@@ -401,7 +404,7 @@ impl PoolPtr for &'static storage::NVMePool {
         self.iovec_index_for_buf(b)
     }
 }
-impl PoolPtr for &'static storage::DRAMPool {
+impl PoolPtr for storage::DRAMPool {
     fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
         self.buffer_ptr(b)
     }
@@ -463,31 +466,32 @@ pub struct StreamJob<'a> {
     pub header_write: Option<HeaderWrite<'a>>,
 }
 
-/// What `run` produced: the object CRC, plus a latched target error (the DRAM
-/// "continue filling" case, where the loop finished but the client transfer failed).
-pub struct StreamDone {
-    pub crc: u32,
-    pub target_err: Option<StreamError>,
-}
-
 /// The single streaming driver. Moves every chunk from `source` to `target`,
 /// interleaving per chunk within a window, preserving all of main's semantics.
 ///
 /// `object_crc`: SET-TCP needs a rolling digest over the source bytes; SET-EFA
 /// combines per-chunk transport CRCs; GET returns `crc32c_expected`. The caller
 /// supplies the right closure over the (finished) chunk iterator.
-#[allow(clippy::too_many_arguments)]
-pub async fn run<S: Source, T: Target>(
+/// The shared window loop for BOTH verbs: snapshot each batch, fan out
+/// `source.produce`, and as each chunk lands feed `target.consume` (the
+/// interleave), latching the first source and first target error. This is the
+/// only code GET and SET share, so it lives here once; `run_get` / `run_set` wrap
+/// it with their own pre/post work.
+///
+/// `progress` present ⇒ DRAM promotion (a GET): a target (EFA-write) error is
+/// latched but the loop keeps filling DRAM for coalesced waiters, and each batch
+/// advances `chunks_ready` / marks Ready. Absent ⇒ a target error aborts at once.
+/// A source error always aborts (evicting the half-filled DRAM entry under `progress`).
+///
+/// Returns the (advanced) iterator — so the caller can compute the object CRC from
+/// its recorded per-chunk checksums — and the latched target error, if any.
+async fn drive_window<S: Source, T: Target>(
     job: &StreamJob<'_>,
     mut chunk_iter: ChunkIterator,
     source: &S,
     target: &T,
     progress: Option<&ProgressHook<'_>>,
-    object_crc: impl FnOnce(&ChunkIterator) -> u32,
-) -> Result<StreamDone, StreamError> {
-    // Pre-loop: GET verifies the on-disk header; SET/Dram no-op.
-    source.verify_header(job).await;
-
+) -> Result<(ChunkIterator, Option<StreamError>), StreamError> {
     let total_chunks = chunk_iter.total_chunks();
     let window = job.batch_width;
     let mut chunks_done: u32 = 0;
@@ -528,7 +532,7 @@ pub async fn run<S: Source, T: Target>(
             match produced {
                 Ok(src_crc) => {
                     // EFA-read SET returns a per-chunk transport CRC; record it on
-                    // the driver-owned iterator so object_crc can combine_checksums.
+                    // the driver-owned iterator so run_set can combine_checksums.
                     // (NVMe/DRAM/TCP sources return 0 and record nothing.)
                     if src_crc != 0 {
                         chunk_iter.record_checksum(chunk.index, src_crc);
@@ -565,10 +569,9 @@ pub async fn run<S: Source, T: Target>(
             return Err(e);
         }
 
-        // A target (client-transfer) error: a streaming GET/SET (no progress hook)
-        // aborts immediately; a DRAM promotion (progress hook present) latches the
-        // error and keeps filling the DRAM copy for coalesced waiters, replying the
-        // error only after the loop.
+        // A target (client-transfer) error: without a progress hook (streaming GET
+        // or any SET) abort now; a DRAM promotion latches it and keeps filling for
+        // coalesced waiters, surfacing the error to the caller after the loop.
         if let Some(e) = target_err {
             if progress.is_none() {
                 return Err(e);
@@ -585,7 +588,38 @@ pub async fn run<S: Source, T: Target>(
     if let Some(p) = progress {
         p.obj_ctx.mark_ready();
     }
+    Ok((chunk_iter, target_err))
+}
 
+/// GET driver: verify the on-disk FileHeader, then move every chunk source →
+/// target through the shared window. No header write, no committed CRC — the
+/// caller builds the reply from the target. Returns the latched target error
+/// (`Some` only for a DRAM promotion whose client transfer failed mid-fill).
+pub async fn run_get<S: Source, T: Target>(
+    job: &StreamJob<'_>,
+    chunk_iter: ChunkIterator,
+    source: &S,
+    target: &T,
+    progress: Option<&ProgressHook<'_>>,
+) -> Result<Option<StreamError>, StreamError> {
+    source.verify_header(job).await;
+    let (_chunk_iter, target_err) = drive_window(job, chunk_iter, source, target, progress).await?;
+    Ok(target_err)
+}
+
+/// SET driver: move every chunk source → target through the shared window, then
+/// compute the object CRC (`object_crc`) and, for an NVMe SET, persist the
+/// FileHeader. No header verify, no progress, no target-error latching (a SET has
+/// no progress hook, so any target error already aborted in `drive_window`).
+/// Returns the committed object CRC.
+pub async fn run_set<S: Source, T: Target>(
+    job: &StreamJob<'_>,
+    chunk_iter: ChunkIterator,
+    source: &S,
+    target: &T,
+    object_crc: impl FnOnce(&ChunkIterator) -> u32,
+) -> Result<u32, StreamError> {
+    let (chunk_iter, _target_err) = drive_window(job, chunk_iter, source, target, None).await?;
     let crc = object_crc(&chunk_iter);
     if let Some(hw) = job.header_write.as_ref() {
         // SET-to-NVMe: persist the FileHeader. A failure is an NVMe write error;
@@ -597,6 +631,76 @@ pub async fn run<S: Source, T: Target>(
             return Err(StreamError::NvmeWrite);
         }
     }
+    Ok(crc)
+}
 
-    Ok(StreamDone { crc, target_err })
+// ═══════════════════════════════════════════════════════════════════════════
+//  EFA transport primitive (moved here from engine.rs — its only callers are the
+//  EfaSource / EfaTarget above, so it lives with them)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Direction for EFA multi-address transfers.
+#[derive(Clone, Copy, PartialEq)]
+pub enum EfaDirection {
+    Read,
+    Write,
+}
+
+/// EFA transfer for a chunk's addresses. Each address is (remote_addr, len, rkey).
+/// Fires all sub-transfers in parallel via FuturesUnordered. Returns the combined
+/// transport checksum (CRC32C for reads, 0 for writes).
+pub(crate) async fn efa_transfer_addrs(
+    session: &Arc<Session>,
+    buf_ptr: usize,
+    addrs: &[ClientEFAAddress],
+    direction: EfaDirection,
+) -> Result<u32, ValkeyError> {
+    // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
+    // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
+    let err_str = match direction {
+        EfaDirection::Write => crate::errors::ERR_EFA_WRITE,
+        EfaDirection::Read => crate::errors::ERR_EFA_READ,
+    };
+    let mut indexed_futures = FuturesUnordered::new();
+    let mut buf_offset = 0usize;
+    let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
+    for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
+        let transfer = match direction {
+            EfaDirection::Write => {
+                session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr)
+            }
+            EfaDirection::Read => session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr),
+        }
+        .map_err(|_| ValkeyError::Str(err_str))?;
+        sub_lens.push(len);
+        indexed_futures.push(async move { (i, transfer.await) });
+        buf_offset += len;
+    }
+    let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
+    while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
+        let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
+        results[idx] = match direction {
+            // SET path: transport must provide a checksum for CRC combination.
+            EfaDirection::Read => Some(
+                done.checksum
+                    .expect("EFA Read completion missing checksum — transport must provide CRC"),
+            ),
+            // GET path: checksum not needed (already stored in FileHeader).
+            EfaDirection::Write => Some(0),
+        };
+    }
+    // GET (Write) path: callers ignore the returned CRC — skip combination.
+    if matches!(direction, EfaDirection::Write) {
+        return Ok(0);
+    }
+    let mut combined = results[0].expect("EFA transfer result missing") as u64;
+    for i in 1..results.len() {
+        combined = crc_fast::checksum_combine(
+            crc_fast::CrcAlgorithm::Crc32Iscsi,
+            combined,
+            results[i].expect("EFA transfer result missing") as u64,
+            sub_lens[i] as u64,
+        );
+    }
+    Ok(combined as u32)
 }
