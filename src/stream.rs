@@ -86,7 +86,10 @@ pub struct ChunkRef {
     pub buffer_idx: usize,
     /// Logical bytes in this chunk (last chunk is short).
     pub len: usize,
-    /// Client EFA addresses for this chunk (EFA paths); `None` for TCP/DRAM-local.
+    /// Client EFA addresses for this chunk. `Some` for EVERY EFA transfer —
+    /// whether the buffers are NVMe- or DRAM-backed — and `None` only on the TCP
+    /// paths (which move bytes inline, not over EFA). Populated by the iterator
+    /// when it was built with `Some(efa_addrs)`.
     pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
