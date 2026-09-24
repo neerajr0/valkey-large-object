@@ -123,7 +123,7 @@ pub trait Source {
 /// for a promote-into-DRAM GET (same file read, different destination pool).
 pub struct NvmeSource<'a> {
     pub buffers: &'a [SegmentBuffer],
-    pub pool: &'a dyn PoolPtr,
+    pub pool: Pool,
 }
 impl Source for NvmeSource<'_> {
     fn buffer_ptr(&self, i: usize) -> *mut u8 {
@@ -191,7 +191,7 @@ impl Source for DramSource<'_> {
 pub struct EfaSource<'a> {
     pub session: Arc<Session>,
     pub buffers: &'a [SegmentBuffer],
-    pub pool: &'a dyn PoolPtr,
+    pub pool: Pool,
 }
 impl Source for EfaSource<'_> {
     fn buffer_ptr(&self, i: usize) -> *mut u8 {
@@ -214,7 +214,7 @@ impl Source for EfaSource<'_> {
 pub struct TcpInlineSource<'a> {
     pub data: &'a [u8],
     pub buffers: &'a [SegmentBuffer],
-    pub pool: &'a dyn PoolPtr,
+    pub pool: Pool,
 }
 impl Source for TcpInlineSource<'_> {
     fn buffer_ptr(&self, i: usize) -> *mut u8 {
@@ -377,31 +377,30 @@ impl Target for DramTarget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Small helpers so EFA/TCP sources can name a pool without a generic param
+//  Pool selector: which pool backs a source's buffers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Abstracts "give me this buffer's pointer + iovec" over DRAM vs NVMe pools, so
-/// `EfaSource`/`TcpInlineSource` work for both Dram and Tiered SET without a
-/// second generic parameter on the driver. `Sync` so a `&dyn PoolPtr` held by a
-/// source stays `Send` across the driver's await points on the tokio task.
-pub trait PoolPtr: Sync {
-    fn ptr(&self, buf: &SegmentBuffer) -> *mut u8;
-    fn iovec(&self, buf: &SegmentBuffer) -> u16;
+/// `NvmeSource` and `EfaSource` each serve buffers backed by EITHER pool (NVMe
+/// streaming vs DRAM promotion for NvmeSource; Tiered vs Dram SET for EfaSource).
+/// Two known variants, resolved statically — no trait, no vtable, no generic on
+/// the driver. The two methods forward to the accessors both pools already expose.
+#[derive(Clone, Copy)]
+pub enum Pool {
+    Nvme(&'static storage::NVMePool),
+    Dram(&'static storage::DRAMPool),
 }
-impl PoolPtr for storage::NVMePool {
+impl Pool {
     fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
-        self.buffer_ptr(b)
+        match self {
+            Pool::Nvme(p) => p.buffer_ptr(b),
+            Pool::Dram(p) => p.buffer_ptr(b),
+        }
     }
     fn iovec(&self, b: &SegmentBuffer) -> u16 {
-        self.iovec_index_for_buf(b)
-    }
-}
-impl PoolPtr for storage::DRAMPool {
-    fn ptr(&self, b: &SegmentBuffer) -> *mut u8 {
-        self.buffer_ptr(b)
-    }
-    fn iovec(&self, b: &SegmentBuffer) -> u16 {
-        self.iovec_index_for_buf(b)
+        match self {
+            Pool::Nvme(p) => p.iovec_index_for_buf(b),
+            Pool::Dram(p) => p.iovec_index_for_buf(b),
+        }
     }
 }
 

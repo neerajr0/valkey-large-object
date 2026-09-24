@@ -604,7 +604,7 @@ async fn promote_get(
     // Source reads the NVMe file INTO the DRAM promotion buffers (pool=dram).
     let source = crate::stream::NvmeSource {
         buffers: &obj_ctx.buffers,
-        pool: dram_pool,
+        pool: crate::stream::Pool::Dram(dram_pool),
     };
     let progress = crate::stream::ProgressHook {
         obj_ctx: &obj_ctx,
@@ -660,7 +660,7 @@ async fn stream_get(
     };
     let source = crate::stream::NvmeSource {
         buffers: &stream_ctx.buffers,
-        pool: nvme_pool,
+        pool: crate::stream::Pool::Nvme(nvme_pool),
     };
     serve_get(
         &job,
@@ -855,7 +855,7 @@ fn execute_set_dram_efa(
                 let source = crate::stream::EfaSource {
                     session,
                     buffers: &buffers,
-                    pool: dram_pool,
+                    pool: crate::stream::Pool::Dram(dram_pool),
                 };
                 let target = crate::stream::DramTarget;
                 let crc = match crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
@@ -1074,7 +1074,7 @@ async fn nvme_set(
             let source = crate::stream::TcpInlineSource {
                 data,
                 buffers: &stream_ctx.buffers,
-                pool: nvme_pool,
+                pool: crate::stream::Pool::Nvme(nvme_pool),
             };
             crate::stream::run_set(&job, chunk_iter, &source, &target, |_| {
                 crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32
@@ -1085,7 +1085,7 @@ async fn nvme_set(
             let source = crate::stream::EfaSource {
                 session: session.clone(),
                 buffers: &stream_ctx.buffers,
-                pool: nvme_pool,
+                pool: crate::stream::Pool::Nvme(nvme_pool),
             };
             crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
                 ci.combine_checksums()
