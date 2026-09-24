@@ -147,6 +147,13 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
 
+    # ─── SMART LOG tests ───────────────────────────────────────────────────
+
+    def test_smartlog_section_absent(self):
+        """Dram mode never starts the SMART log poller"""
+        client = self.server.get_new_client()
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
+
     # ─── LO.INFO tests ───────────────────────────────────────────────────
 
     def test_info(self):

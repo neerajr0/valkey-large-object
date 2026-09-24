@@ -20,9 +20,10 @@
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
-//                                io_uring engine (Tiered only). All resources are
-//                                created as locals; OnceLock statics are set only
-//                                after everything succeeds. On failure, locals
+//                                io_uring engine and start the smartlog poller
+//                                (Tiered only). All resources are created as
+//                                locals; OnceLock statics are set only after
+//                                everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
 //   3. transport::register_buffers()
 //                              — fi_mr_reg pool buffers with EFA domains.
@@ -46,6 +47,7 @@ pub mod data_type;
 pub mod engine;
 pub mod errors;
 pub mod info;
+pub mod smartlog;
 pub mod storage;
 pub mod transport;
 
@@ -108,6 +110,11 @@ lazy_static::lazy_static! {
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
+    /// entirely: no background reads, and the INFO section never appears.
+    /// Immutable after load — the poller either starts at init or not at all.
+    static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
@@ -242,6 +249,10 @@ pub fn bench_mode() -> bool {
 
 pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn smartlog_poll_secs() -> u64 {
+    CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn scaling_expand_watermark() -> f64 {
@@ -445,13 +456,15 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// drop the fabric services, signal the io_uring poller to stop, and — in Tiered
+/// signal the SMART log poller to stop, drop the fabric services, signal the
+/// io_uring poller to stop, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
 /// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
+    smartlog::signal_shutdown();
     transport::shutdown();
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
@@ -518,6 +531,8 @@ valkey_module! {
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
+            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
