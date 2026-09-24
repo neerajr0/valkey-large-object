@@ -44,7 +44,6 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
 /// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
 /// Returns true and increments the counter on success; returns false and leaves the
 /// counter unchanged if the reservation would exceed the cap (or overflow).
-/// Returns true if nvme-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
