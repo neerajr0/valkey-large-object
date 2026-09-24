@@ -343,6 +343,14 @@ pub fn max_object_size() -> u64 {
 
 /// Cross-config validation for max-object-size.
 /// Rejects if the value would cause chunk count overflow or exceed the storage budget.
+///
+/// At initial load (before RUNTIME is set), config processing order is
+/// non-deterministic across config types (i64, enum, etc.), so the callback may
+/// fire before operating-mode is finalized. In that window we silently clamp
+/// max-object-size to the relevant storage budget instead of rejecting — this
+/// lets users set dram-maxmemory without also having to explicitly lower
+/// max-object-size. At runtime (CONFIG SET), the mode is known and we enforce
+/// strictly.
 fn validate_max_object_size(
     _ctx: &valkey_module::configuration::ConfigurationContext,
     _name: &str,
@@ -355,21 +363,30 @@ fn validate_max_object_size(
             "ERR max-object-size too large for the configured chunk-size",
         ));
     }
+    let is_initial_load = RUNTIME.get().is_none();
     match operating_mode() {
         OperatingMode::Dram => {
             let dram_max = dram_maxmemory();
             if dram_max > 0 && max_obj > dram_max {
-                return Err(valkey_module::ValkeyError::Str(
-                    "ERR max-object-size exceeds dram-maxmemory",
-                ));
+                if is_initial_load {
+                    val.store(dram_max as i64, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    return Err(valkey_module::ValkeyError::Str(
+                        "ERR max-object-size exceeds dram-maxmemory",
+                    ));
+                }
             }
         }
         OperatingMode::Tiered => {
             let nvme_max = nvme_maxmemory();
             if nvme_max > 0 && max_obj > nvme_max {
-                return Err(valkey_module::ValkeyError::Str(
-                    "ERR max-object-size exceeds nvme-maxmemory",
-                ));
+                if is_initial_load {
+                    val.store(nvme_max as i64, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    return Err(valkey_module::ValkeyError::Str(
+                        "ERR max-object-size exceeds nvme-maxmemory",
+                    ));
+                }
             }
         }
     }

@@ -171,7 +171,6 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" dram-maxmemory 2097152"
-            f" max-object-size 2097152"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
