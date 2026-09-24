@@ -537,22 +537,23 @@ async fn get_tiered_run(
         hdr_iovec: source_pool.iovec(hdr_buf),
         hdr_ptr: source_pool.ptr(hdr_buf) as usize,
         batch_width,
+        reads_header: true,
         header_write: None,
     };
-    let source = crate::stream::NvmeSource {
+    let source = crate::stream::Source::NvmeRead {
         buffers,
         pool: source_pool,
     };
     // Build the target, run the driver, reply — TCP: collected bytes; EFA: bare CRC.
     let outcome = match &target {
         GetTarget::Tcp => {
-            let tgt = crate::stream::TcpReplyTarget::new(obj_len, crate::bench_mode());
+            let tgt = crate::stream::Target::tcp_reply(obj_len, crate::bench_mode());
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
                 .map(|target_err| (target_err, tgt.into_reply(obj_len)))
         }
         GetTarget::Efa(session) => {
-            let tgt = crate::stream::EfaTarget {
+            let tgt = crate::stream::Target::EfaWrite {
                 session: session.clone(),
             };
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
@@ -744,14 +745,15 @@ fn set_dram_efa(
                     hdr_iovec: 0,
                     hdr_ptr: 0,
                     batch_width: buffers.len(),
+                    reads_header: false,
                     header_write: None,
                 };
-                let source = crate::stream::EfaSource {
+                let source = crate::stream::Source::EfaRead {
                     session,
                     buffers: &buffers,
                     pool: crate::stream::Pool::Dram(dram_pool),
                 };
-                let target = crate::stream::DramTarget;
+                let target = crate::stream::Target::DramResident;
                 let crc = match crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
                     ci.combine_checksums()
                 })
@@ -947,19 +949,20 @@ async fn set_tiered_run(
         hdr_iovec: 0,
         hdr_ptr: 0,
         batch_width: batch_size,
+        reads_header: false,
         header_write: Some(crate::stream::HeaderWrite {
             hdr_buf: &stream_ctx.buffers[0],
             pool: nvme_pool,
         }),
     };
-    let target = crate::stream::NvmeTarget {
+    let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,
         pool: nvme_pool,
     };
     // The one per-transport branch: build the source + choose the object-CRC rule.
     let result = match &variant {
         SetSource::Tcp(data) => {
-            let source = crate::stream::TcpInlineSource {
+            let source = crate::stream::Source::TcpInline {
                 data,
                 buffers: &stream_ctx.buffers,
                 pool: crate::stream::Pool::Nvme(nvme_pool),
@@ -970,7 +973,7 @@ async fn set_tiered_run(
             .await
         }
         SetSource::Efa(session) => {
-            let source = crate::stream::EfaSource {
+            let source = crate::stream::Source::EfaRead {
                 session: session.clone(),
                 buffers: &stream_ctx.buffers,
                 pool: crate::stream::Pool::Nvme(nvme_pool),
@@ -1056,13 +1059,14 @@ fn get_from_dram(
                     hdr_iovec: 0,
                     hdr_ptr: 0,
                     batch_width: obj_ctx.buffers.len(),
+                    reads_header: false,
                     header_write: None,
                 };
-                let source = crate::stream::DramSource {
+                let source = crate::stream::Source::DramResident {
                     buffers: &obj_ctx.buffers,
-                    pool: dram_pool,
+                    pool: crate::stream::Pool::Dram(dram_pool),
                 };
-                let target = crate::stream::EfaTarget { session };
+                let target = crate::stream::Target::EfaWrite { session };
                 match crate::stream::run_get(&job, chunk_iter, &source, &target, None).await {
                     // Bare object CRC on clean success; a Dram GET has no progress
                     // hook, so a target error already surfaced as Err below.
