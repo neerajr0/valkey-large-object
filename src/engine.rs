@@ -28,7 +28,7 @@ use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
 use crate::info;
-use crate::storage::{self, nvme, ChunkIterator, ObjectContext, ObjectFile};
+use crate::storage::{self, nvme, ChunkIterator, Crc, ObjectContext, ObjectFile};
 use crate::transport::Session;
 use crate::OperatingMode;
 
@@ -73,12 +73,18 @@ pub enum Transport {
     },
 }
 
+/// Batch width for a single-shot DRAM-TCP SET: the whole object is copied inline
+/// in one allocation, so there is no sliding window to bound — every chunk gets
+/// its own buffer index (no reuse). Distinct from the NVMe/EFA paths, which pass
+/// a real `buffers.len()` window width.
+const UNBOUNDED_BATCH_WIDTH: usize = u32::MAX as usize;
+
 /// Resolved object identity for GET operations — the subset of LoValue fields
 /// needed by async read tasks.
 struct GetObjectInfo {
     object_id: ObjectId,
     obj_len: u64,
-    crc32c: u32,
+    crc32c: Crc,
 }
 
 /// Object identity for SET operations — shared fields passed to async write tasks.
@@ -145,7 +151,7 @@ fn collect_dram_bytes(
 }
 
 /// Outcome of `commit_lo_value` — distinguishes a successful write from a stale discard.
-enum SetFinalizeOutcome {
+enum CommitOutcome {
     /// Value was written and attached to the key.
     ValueSet,
     /// A newer version already existed; this write was silently discarded.
@@ -162,19 +168,19 @@ fn commit_lo_value(
     key_name: &[u8],
     object_id: ObjectId,
     lo_value: LoValue,
-) -> Result<SetFinalizeOutcome, ValkeyError> {
+) -> Result<CommitOutcome, ValkeyError> {
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
         if existing.object_id > object_id {
-            return Ok(SetFinalizeOutcome::StaleDiscarded);
+            return Ok(CommitOutcome::StaleDiscarded);
         }
     }
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
-    Ok(SetFinalizeOutcome::ValueSet)
+    Ok(CommitOutcome::ValueSet)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -187,7 +193,7 @@ pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
     obj_len: u64,
-    crc32c: u32,
+    crc32c: Crc,
     file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) -> EngineResult {
@@ -250,7 +256,7 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
 fn cmd_get_dram_efa(
     object_id: ObjectId,
     obj_len: u64,
-    crc32c: u32,
+    crc32c: Crc,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
@@ -279,7 +285,7 @@ fn cmd_get_dram_efa(
 fn cmd_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
-    crc32c: u32,
+    crc32c: Crc,
     file: Arc<ObjectFile>,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
@@ -492,11 +498,12 @@ async fn cmd_get_tiered_run(
         chunk_size: crate::chunk_size(),
         object_id: Some(object_id),
         crc32c_expected,
-        hdr_iovec: source_pool.iovec(hdr_buf),
-        hdr_ptr: source_pool.ptr(hdr_buf) as usize,
+        verify_file_header: Some(crate::stream::FileHeaderRead {
+            iovec: source_pool.iovec(hdr_buf),
+            ptr: source_pool.ptr(hdr_buf) as usize,
+        }),
         batch_width,
-        reads_header: true,
-        header_write: None,
+        persist_file_header: None,
     };
     let source = crate::stream::Source::NvmeRead {
         buffers,
@@ -590,7 +597,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, u32::MAX as usize, None);
+    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, UNBOUNDED_BATCH_WIDTH, None);
     let buffers = match dram_pool.alloc_exact(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
@@ -694,18 +701,8 @@ fn cmd_set_dram_efa(
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(efa_addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
-                let job = crate::stream::StreamJob {
-                    fd: None,
-                    obj_len,
-                    chunk_size,
-                    object_id: Some(object_id),
-                    crc32c_expected: 0,
-                    hdr_iovec: 0,
-                    hdr_ptr: 0,
-                    batch_width: buffers.len(),
-                    reads_header: false,
-                    header_write: None,
-                };
+                let job =
+                    crate::stream::StreamJob::dram_transfer(obj_len, chunk_size, 0, buffers.len());
                 let source = crate::stream::Source::EfaRead {
                     session,
                     buffers: &buffers,
@@ -736,10 +733,10 @@ fn cmd_set_dram_efa(
                     file: None,
                 };
                 match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
-                    Ok(SetFinalizeOutcome::ValueSet) => {
+                    Ok(CommitOutcome::ValueSet) => {
                         thread_ctx.reply(VALKEY_OK);
                     }
-                    Ok(SetFinalizeOutcome::StaleDiscarded) => {
+                    Ok(CommitOutcome::StaleDiscarded) => {
                         // Stale write — a newer SET already completed.
                         info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
                         dram_pool.remove_object(&object_id);
@@ -895,11 +892,9 @@ async fn cmd_set_tiered_run(
         chunk_size,
         object_id: Some(object_id),
         crc32c_expected: 0,
-        hdr_iovec: 0,
-        hdr_ptr: 0,
+        verify_file_header: None,
         batch_width,
-        reads_header: false,
-        header_write: Some(crate::stream::HeaderWrite {
+        persist_file_header: Some(crate::stream::FileHeaderWrite {
             hdr_buf: &stream_ctx.buffers[0],
             pool: nvme_pool,
         }),
@@ -967,10 +962,10 @@ async fn cmd_set_tiered_run(
         file: Some(object_file),
     };
     match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
-        Ok(SetFinalizeOutcome::ValueSet) => {
+        Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }
-        Ok(SetFinalizeOutcome::StaleDiscarded) => {
+        Ok(CommitOutcome::StaleDiscarded) => {
             // lo_value dropped in commit_lo_value → ObjectFile drop unlinks + frees budget.
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(VALKEY_OK);
@@ -990,7 +985,7 @@ fn cmd_get_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
     obj_len: u64,
-    crc32c: u32,
+    crc32c: Crc,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     file: Option<Arc<ObjectFile>>,
@@ -1025,18 +1020,12 @@ fn cmd_get_from_dram(
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
-                let job = crate::stream::StreamJob {
-                    fd: None,
+                let job = crate::stream::StreamJob::dram_transfer(
                     obj_len,
                     chunk_size,
-                    object_id: None, // no fd/header on Dram GET
-                    crc32c_expected: crc32c,
-                    hdr_iovec: 0,
-                    hdr_ptr: 0,
-                    batch_width: obj_ctx.buffers.len(),
-                    reads_header: false,
-                    header_write: None,
-                };
+                    crc32c,
+                    obj_ctx.buffers.len(),
+                );
                 let source = crate::stream::Source::DramResident {
                     buffers: &obj_ctx.buffers,
                     pool: crate::stream::Pool::Dram(dram_pool),

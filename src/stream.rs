@@ -12,8 +12,9 @@
 //! The eight paths are just source/target pairs. `run_get` and `run_set` are thin
 //! wrappers over one shared window loop (`drive_window`); each carries only its own
 //! verb's work (GET verifies the on-disk header and may run a promotion progress
-//! hook; SET computes the object CRC and writes the header), so neither signature
-//! carries fields inert to the other.
+//! hook; SET computes the object CRC — TCP over the whole payload, EFA by combining
+//! per-chunk transport CRCs — and writes the header), so neither signature carries
+//! fields inert to the other.
 //!
 //! | Op  | Mode   | Transport | Source                 | Target                |
 //! |-----|--------|-----------|------------------------|-----------------------|
@@ -69,7 +70,9 @@ use futures::StreamExt;
 use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::ObjectId;
-use crate::storage::{self, uring, ChunkIterator, ClientEFAAddress, ObjectContext, SegmentBuffer};
+use crate::storage::{
+    self, uring, ChunkIterator, ClientEFAAddress, Crc, ObjectContext, SegmentBuffer,
+};
 use crate::transport::Session;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -94,11 +97,8 @@ pub struct ChunkRef {
     pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
-/// A transport checksum (CRC32C). Named so `produce`'s `Option<Crc>` return reads
-/// as "maybe a CRC": `Some` when the transport supplies one (EFA read on the SET
-/// path, for `combine_checksums`), `None` for sources that produce none (NVMe
-/// read, DRAM-resident, TCP memcpy).
-pub type Crc = u32;
+// `Crc` (a CRC32C checksum value) is defined in `storage` and imported below —
+// `produce` returns `Option<Crc>` so the value reads as "maybe a checksum".
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Source: where each chunk's bytes come from (a closed set of 4 behaviours)
@@ -386,11 +386,20 @@ pub struct PromotionProgress<'a> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The FileHeader a SET-to-NVMe path writes after its batch loop. Absent for GET
-/// (which reads+verifies the on-disk header via `job.reads_header`) and for Dram
+/// (which reads+verifies the on-disk header via `verify_file_header`) and for Dram
 /// SET (no file). Carries exactly what `write_file_header` needs.
-pub struct HeaderWrite<'a> {
+pub struct FileHeaderWrite<'a> {
     pub hdr_buf: &'a SegmentBuffer,
     pub pool: &'static storage::NVMePool,
+}
+
+/// Where a GET reads the on-disk FileHeader into, before the data reads.
+/// `Some` on a GET (verify the header); `None` on SET and DRAM (no header read).
+pub struct FileHeaderRead {
+    /// io_uring registered-buffer slot for the header read.
+    pub iovec: u16,
+    /// Pool buffer pointer the header is read into.
+    pub ptr: usize,
 }
 
 /// Everything the loop needs that isn't the source/target themselves.
@@ -403,17 +412,40 @@ pub struct StreamJob<'a> {
     /// NVMe object id — `Some` when a file header is read/written, `None` on DRAM.
     pub object_id: Option<ObjectId>,
     /// GET verifies this before the loop; SET-to-NVMe writes it in the header.
-    pub crc32c_expected: u32,
-    /// GET header-read placement (iovec slot + buffer pointer). 0 for SET/Dram.
-    pub hdr_iovec: u16,
-    pub hdr_ptr: usize,
+    pub crc32c_expected: Crc,
+    /// GET header-read placement — `Some` means "read+verify the on-disk FileHeader
+    /// before the data reads"; `None` on SET and DRAM (no header read).
+    pub verify_file_header: Option<FileHeaderRead>,
     /// Window width — SQEs/transfers in flight per batch, and the buffer-reuse bound.
     pub batch_width: usize,
-    /// GET reads+verifies the on-disk FileHeader before the loop; SET does not.
-    pub reads_header: bool,
     /// `Some` for SET-to-NVMe: the FileHeader to persist after the batch loop.
     /// `None` for GET and for DRAM-only SET (no file to write a header to).
-    pub header_write: Option<HeaderWrite<'a>>,
+    pub persist_file_header: Option<FileHeaderWrite<'a>>,
+}
+
+impl<'a> StreamJob<'a> {
+    /// A DRAM transfer job (GET serve from resident buffers, or DRAM SET): no file,
+    /// so no fd and no file-header work — `verify_file_header` and
+    /// `persist_file_header` are both `None`, and `object_id` (read only under
+    /// those) is always `None` too. `crc32c_expected` is the GET's expected CRC,
+    /// or 0 on SET.
+    pub fn dram_transfer(
+        obj_len: u64,
+        chunk_size: usize,
+        crc32c_expected: Crc,
+        batch_width: usize,
+    ) -> Self {
+        StreamJob {
+            fd: None,
+            obj_len,
+            chunk_size,
+            object_id: None,
+            crc32c_expected,
+            verify_file_header: None,
+            batch_width,
+            persist_file_header: None,
+        }
+    }
 }
 
 /// The single streaming driver. Moves every chunk from `source` to `target`,
@@ -557,7 +589,7 @@ pub async fn run_get(
         ) && matches!(target, Target::TcpReply { .. } | Target::EfaWrite { .. }),
         "run_get called with a non-GET source/target pairing"
     );
-    if job.reads_header {
+    if let Some(fh) = job.verify_file_header.as_ref() {
         // GET reads+verifies the on-disk FileHeader before the data reads.
         // TODO: Parallelize header and data read submission. Currently serialized
         // because buffers[0] is shared between the header read and chunk 0's data
@@ -565,8 +597,8 @@ pub async fn run_get(
         // validation.
         storage::read_and_verify_file_header(
             job.fd.expect("GET header read requires an fd"),
-            job.hdr_iovec,
-            job.hdr_ptr,
+            fh.iovec,
+            fh.ptr,
             job.object_id
                 .expect("GET header read requires an object_id"),
             job.obj_len,
@@ -593,7 +625,7 @@ pub async fn run_set(
     chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
-    object_crc: impl FnOnce(&ChunkIterator) -> u32,
+    object_crc: impl FnOnce(&ChunkIterator) -> Crc,
 ) -> Result<u32, StreamError> {
     // SET pairs a SET source with a SET target; callers guarantee this.
     assert!(
@@ -603,7 +635,7 @@ pub async fn run_set(
     );
     let (chunk_iter, _target_err) = drive_window(job, chunk_iter, source, target, None).await?;
     let crc = object_crc(&chunk_iter);
-    if let Some(hw) = job.header_write.as_ref() {
+    if let Some(hw) = job.persist_file_header.as_ref() {
         // SET-to-NVMe: persist the FileHeader. A failure is an NVMe write error;
         // the caller's ObjectFile Drop unlinks the file + releases the budget.
         if storage::write_file_header(

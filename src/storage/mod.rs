@@ -4,6 +4,12 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crc_fast::CrcAlgorithm;
+
+/// A CRC32C checksum value. Aliased so a `Crc` in a signature reads as "this
+/// integer is a checksum", not a length or an id. It is a `u32` on the wire and
+/// in the `FileHeader`/`LoValue`; the `checksum_combine` accumulator widens to
+/// `u64` internally, which is a crc-fast API detail, not this type.
+pub type Crc = u32;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
@@ -320,7 +326,7 @@ pub struct ChunkIterator {
     /// already have the stored CRC and never write to this vec.
     /// None for TCP paths (CRC computed inline via rolling digest).
     /// Some(...) for EFA paths; inner `None` entries indicate chunks not yet recorded.
-    checksums: Option<Vec<Option<u32>>>,
+    checksums: Option<Vec<Option<Crc>>>,
 }
 
 impl ChunkIterator {
@@ -434,7 +440,7 @@ impl ChunkIterator {
 
     /// Record a per-chunk CRC32C from an EFA transport completion.
     /// Chunks may arrive out of order; the checksum is stored by chunk index.
-    pub fn record_checksum(&mut self, chunk_index: u32, crc: u32) {
+    pub fn record_checksum(&mut self, chunk_index: u32, crc: Crc) {
         self.checksums
             .as_mut()
             .expect("record_checksum called on TCP path")[chunk_index as usize] = Some(crc);
@@ -443,7 +449,7 @@ impl ChunkIterator {
     /// Inter-chunk accumulation: combine each chunk's per-chunk CRC (from
     /// `record_checksum`) in chunk order into the whole-object CRC32C.
     /// Only valid for EFA paths. Panics if any chunk's checksum has not been recorded.
-    pub fn combine_checksums(&self) -> u32 {
+    pub fn combine_checksums(&self) -> Crc {
         let checksums = self.checksums.as_ref().expect("checksums not initialized");
         let mut combined: u64 = 0;
         for (i, chunk) in self.chunks.iter().enumerate() {
