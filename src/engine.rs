@@ -486,19 +486,16 @@ async fn cmd_get_tiered_run(
         crc32c: crc32c_expected,
     } = get_info;
     let hdr_buf = &buffers[0];
-    let job = crate::stream::StreamJob {
-        fd: Some(fd),
+    let job = crate::stream::StreamJob::for_nvme_get(
+        fd,
         obj_len,
-        chunk_size: crate::chunk_size(),
-        object_id: Some(object_id),
+        crate::chunk_size(),
+        object_id,
         crc32c_expected,
-        verify_file_header: Some(crate::stream::FileHeaderRead {
-            iovec: source_pool.iovec(hdr_buf),
-            ptr: source_pool.ptr(hdr_buf) as usize,
-        }),
         batch_width,
-        persist_file_header: None,
-    };
+        hdr_buf,
+        source_pool,
+    );
     let source = crate::stream::Source::NvmeRead {
         buffers,
         pool: source_pool,
@@ -700,8 +697,7 @@ fn cmd_set_dram_efa(
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(efa_addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
-                let job =
-                    crate::stream::StreamJob::dram_transfer(obj_len, chunk_size, 0, buffers.len());
+                let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
                 let source = crate::stream::Source::EfaRead {
                     session,
                     buffers: &buffers,
@@ -885,19 +881,15 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let job = crate::stream::StreamJob {
-        fd: Some(fd.as_raw_fd()),
+    let job = crate::stream::StreamJob::for_nvme_set(
+        fd.as_raw_fd(),
         obj_len,
         chunk_size,
-        object_id: Some(object_id),
-        crc32c_expected: 0,
-        verify_file_header: None,
+        object_id,
         batch_width,
-        persist_file_header: Some(crate::stream::FileHeaderWrite {
-            hdr_buf: &stream_ctx.buffers[0],
-            pool: nvme_pool,
-        }),
-    };
+        &stream_ctx.buffers[0],
+        nvme_pool,
+    );
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,
         pool: nvme_pool,
@@ -1019,7 +1011,7 @@ fn cmd_get_from_dram(
                 let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
-                let job = crate::stream::StreamJob::dram_transfer(
+                let job = crate::stream::StreamJob::for_dram(
                     obj_len,
                     chunk_size,
                     crc32c,

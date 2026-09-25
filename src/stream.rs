@@ -404,12 +404,12 @@ pub struct StreamJob<'a> {
 }
 
 impl<'a> StreamJob<'a> {
-    /// A DRAM transfer job (GET serve from resident buffers, or DRAM SET): no file,
-    /// so no fd and no file-header work — `verify_file_header` and
+    /// A StreamJob for the DRAM path (GET serve from resident buffers, or DRAM
+    /// SET): no file, so no fd and no file-header work — `verify_file_header` and
     /// `persist_file_header` are both `None`, and `object_id` (read only under
     /// those) is always `None` too. `crc32c_expected` is the GET's expected CRC,
     /// or 0 on SET.
-    pub fn dram_transfer(
+    pub fn for_dram(
         obj_len: u64,
         chunk_size: usize,
         crc32c_expected: Crc,
@@ -424,6 +424,60 @@ impl<'a> StreamJob<'a> {
             verify_file_header: None,
             batch_width,
             persist_file_header: None,
+        }
+    }
+
+    /// A StreamJob for the NVMe GET path: reads+verifies the on-disk FileHeader
+    /// before the data reads. Builds the `FileHeaderRead` from the header buffer
+    /// and its pool. `persist_file_header` is `None` (GET writes no header).
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_nvme_get(
+        fd: RawFd,
+        obj_len: u64,
+        chunk_size: usize,
+        object_id: ObjectId,
+        crc32c_expected: Crc,
+        batch_width: usize,
+        hdr_buf: &SegmentBuffer,
+        pool: Pool,
+    ) -> Self {
+        StreamJob {
+            fd: Some(fd),
+            obj_len,
+            chunk_size,
+            object_id: Some(object_id),
+            crc32c_expected,
+            verify_file_header: Some(FileHeaderRead {
+                iovec: pool.iovec(hdr_buf),
+                ptr: pool.ptr(hdr_buf) as usize,
+            }),
+            batch_width,
+            persist_file_header: None,
+        }
+    }
+
+    /// A StreamJob for the NVMe SET path: persists the FileHeader after the batch
+    /// loop. Builds the `FileHeaderWrite` from the header buffer and its NVMe pool.
+    /// `verify_file_header` is `None` and `crc32c_expected` is 0 (SET reads no
+    /// header; the object CRC is computed and written after the loop).
+    pub fn for_nvme_set(
+        fd: RawFd,
+        obj_len: u64,
+        chunk_size: usize,
+        object_id: ObjectId,
+        batch_width: usize,
+        hdr_buf: &'a SegmentBuffer,
+        pool: &'static storage::NVMePool,
+    ) -> Self {
+        StreamJob {
+            fd: Some(fd),
+            obj_len,
+            chunk_size,
+            object_id: Some(object_id),
+            crc32c_expected: 0,
+            verify_file_header: None,
+            batch_width,
+            persist_file_header: Some(FileHeaderWrite { hdr_buf, pool }),
         }
     }
 }
