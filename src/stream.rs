@@ -15,16 +15,16 @@
 //! hook; SET computes the object CRC and writes the header), so neither signature
 //! carries fields inert to the other.
 //!
-//! | Op  | Mode   | Transport | Source          | Target          |
-//! |-----|--------|-----------|-----------------|-----------------|
-//! | GET | Tiered | TCP       | `NvmeSource`    | `TcpReplyTarget`|
-//! | GET | Tiered | EFA       | `NvmeSource`    | `EfaTarget`     |
-//! | GET | Dram   | TCP       | `DramSource`    | `TcpReplyTarget`|
-//! | GET | Dram   | EFA       | `DramSource`    | `EfaTarget`     |
-//! | SET | Tiered | TCP       | `TcpInlineSource`| `NvmeTarget`   |
-//! | SET | Tiered | EFA       | `EfaSource`     | `NvmeTarget`    |
-//! | SET | Dram   | TCP       | `TcpInlineSource`| `DramTarget`   |
-//! | SET | Dram   | EFA       | `EfaSource`     | `DramTarget`    |
+//! | Op  | Mode   | Transport | Source                 | Target                |
+//! |-----|--------|-----------|------------------------|-----------------------|
+//! | GET | Tiered | TCP       | `Source::NvmeRead`     | `Target::TcpReply`    |
+//! | GET | Tiered | EFA       | `Source::NvmeRead`     | `Target::EfaWrite`    |
+//! | GET | Dram   | TCP       | `Source::DramResident` | `Target::TcpReply`    |
+//! | GET | Dram   | EFA       | `Source::DramResident` | `Target::EfaWrite`    |
+//! | SET | Tiered | TCP       | `Source::TcpInline`    | `Target::NvmeWrite`   |
+//! | SET | Tiered | EFA       | `Source::EfaRead`      | `Target::NvmeWrite`   |
+//! | SET | Dram   | TCP       | `Source::TcpInline`    | `Target::DramResident`|
+//! | SET | Dram   | EFA       | `Source::EfaRead`      | `Target::DramResident`|
 //!
 //! ## The seam is a per-chunk ready stream, so interleave falls out for free
 //!
@@ -35,9 +35,10 @@
 //! read lands — the Tiered-EFA SET network↔disk overlap that used to be a
 //! hand-written special case is now the generic behaviour of every path.
 //!
-//! DRAM is the degenerate case: `DramSource::produce` resolves immediately
-//! (bytes already resident) and `DramTarget::consume` is a no-op (bytes land in
-//! the pool buffer directly). No spawn, no wait — the same loop, trivially fast.
+//! DRAM is the degenerate case: `Source::DramResident::produce` resolves
+//! immediately (bytes already resident) and `Target::DramResident::consume` is a
+//! no-op (bytes land in the pool buffer directly). No spawn, no wait — the same
+//! loop, trivially fast.
 //!
 //! ## Window = backpressure = buffer-reuse safety
 //!
@@ -85,7 +86,7 @@ pub struct ChunkRef {
     /// Index into the window's buffer slice.
     pub buffer_idx: usize,
     /// Logical bytes in this chunk (last chunk is short).
-    pub len: usize,
+    pub user_data_len: usize,
     /// Client EFA addresses for this chunk. `Some` for EVERY EFA transfer —
     /// whether the buffers are NVMe- or DRAM-backed — and `None` only on the TCP
     /// paths (which move bytes inline, not over EFA). Populated by the iterator
@@ -152,6 +153,10 @@ impl Source<'_> {
 
     /// Make `chunk`'s bytes present in its buffer. `Ok(Some(crc))` carries the
     /// transport CRC for an EFA read (SET); the other sources return `Ok(None)`.
+    ///
+    /// "produce" is the stream's term, not the client data direction: GET produces
+    /// from NVMe or DRAM (DRAM is a no-op — bytes already resident); SET produces
+    /// from EFA (fi_read from the client) or TCP (memcpy the inline payload).
     async fn produce(
         &self,
         fd: RawFd,
@@ -169,7 +174,7 @@ impl Source<'_> {
                         buf_ptr: pool.ptr(buf),
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
-                        len: chunk.len as u64,
+                        len: chunk.user_data_len as u64,
                     },
                 );
                 match rx.await {
@@ -188,9 +193,11 @@ impl Source<'_> {
             }
             Source::TcpInline { data, .. } => {
                 let src_offset = chunk.index as usize * chunk_size;
-                let src = &data[src_offset..src_offset + chunk.len];
-                // SAFETY: dst is this chunk's pool buffer (>= chunk.len); src in-bounds.
-                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), pool.ptr(buf), chunk.len) };
+                let src = &data[src_offset..src_offset + chunk.user_data_len];
+                // SAFETY: dst is this chunk's pool buffer (>= chunk.user_data_len); src in-bounds.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), pool.ptr(buf), chunk.user_data_len)
+                };
                 Ok(None)
             }
         }
@@ -204,6 +211,10 @@ impl Source<'_> {
 /// The four ways a ready chunk is consumed. `consume` returns a future so a slow
 /// target (NVMe/EFA write) interleaves with the next chunk's source; a resident
 /// target (DRAM) is a no-op.
+///
+/// Mirror of `produce`: GET consumes to the client — accumulate into the reply
+/// (TCP) or fi_write to the client (EFA); SET consumes to storage — WriteFixed to
+/// NVMe (Tiered) or a no-op (DRAM, bytes already landed in the pool buffer).
 pub enum Target<'a> {
     /// Accumulate chunk bytes into the reply buffer (GET TCP); bench = size only.
     TcpReply {
@@ -259,9 +270,10 @@ impl Target<'_> {
         match self {
             Target::TcpReply { reply, bench } => {
                 if !*bench {
-                    // SAFETY: buffer holds `chunk.len` bytes the source just produced.
-                    let slice =
-                        unsafe { std::slice::from_raw_parts(buf_ptr as *mut u8, chunk.len) };
+                    // SAFETY: buffer holds `chunk.user_data_len` bytes the source just produced.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(buf_ptr as *mut u8, chunk.user_data_len)
+                    };
                     reply
                         .lock()
                         .expect("reply lock poisoned")
@@ -285,7 +297,7 @@ impl Target<'_> {
                         buf_ptr: pool.buffer_ptr(buf),
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
-                        len: chunk.len as u64,
+                        len: chunk.user_data_len as u64,
                     },
                 );
                 match rx.await {
@@ -339,11 +351,31 @@ pub enum StreamError {
     EfaWrite,
 }
 
+/// Map a `StreamError` to its metric + reply string and send the error.
+/// One place, so every path that drives `run_get` / `run_set` reports failures
+/// identically.
+pub(crate) fn reply_stream_err(
+    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    e: StreamError,
+) {
+    use StreamError::*;
+    let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
+        NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_NVME_READ),
+        NvmeWrite => (
+            &crate::info::NVME_WRITE_ERRORS,
+            crate::errors::ERR_NVME_WRITE,
+        ),
+        EfaRead => (&crate::info::EFA_READ_ERRORS, crate::errors::ERR_EFA_READ),
+        EfaWrite => (&crate::info::EFA_WRITE_ERRORS, crate::errors::ERR_EFA_WRITE),
+    };
+    crate::engine::reply_err(thread_ctx, metric, ValkeyError::Str(err));
+}
+
 /// DRAM-promotion side effects run around the batch loop (GET only). When present,
 /// the driver advances chunks_ready / marks Ready and, on a source (NVMe) error,
 /// evicts the half-filled DRAM entry; on a target (EFA) error it keeps reading so
 /// the DRAM copy still fills for coalesced waiters, replying the error at the end.
-pub struct ProgressHook<'a> {
+pub struct PromotionProgress<'a> {
     pub obj_ctx: &'a Arc<ObjectContext>,
     pub dram_pool: &'static storage::DRAMPool,
     pub object_id: ObjectId,
@@ -354,8 +386,8 @@ pub struct ProgressHook<'a> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The FileHeader a SET-to-NVMe path writes after its batch loop. Absent for GET
-/// (which verifies the header via `Source::verify_header`) and for Dram SET
-/// (no file). Carries exactly what `write_file_header` needs.
+/// (which reads+verifies the on-disk header via `job.reads_header`) and for Dram
+/// SET (no file). Carries exactly what `write_file_header` needs.
 pub struct HeaderWrite<'a> {
     pub hdr_buf: &'a SegmentBuffer,
     pub pool: &'static storage::NVMePool,
@@ -378,15 +410,17 @@ pub struct StreamJob<'a> {
     /// GET reads+verifies the on-disk FileHeader before the loop; SET does not.
     pub reads_header: bool,
     /// `Some` for SET-to-NVMe: the FileHeader to persist after the batch loop.
+    /// `None` for GET and for DRAM-only SET (no file to write a header to).
     pub header_write: Option<HeaderWrite<'a>>,
 }
 
 /// The single streaming driver. Moves every chunk from `source` to `target`,
 /// interleaving per chunk within a window, preserving all of main's semantics.
 ///
-/// `object_crc`: SET-TCP needs a rolling digest over the source bytes; SET-EFA
-/// combines per-chunk transport CRCs; GET returns `crc32c_expected`. The caller
-/// supplies the right closure over the (finished) chunk iterator.
+/// `object_crc`: SET-TCP checksums the whole payload post-hoc (one pass over the
+/// full `data`, ignoring the iterator); SET-EFA combines the per-chunk transport
+/// CRCs; GET returns `crc32c_expected`. The caller supplies the right closure over
+/// the (finished) chunk iterator.
 /// The shared window loop for BOTH verbs: snapshot each batch, fan out
 /// `source.produce`, and as each chunk lands feed `target.consume` (the
 /// interleave), latching the first source and first target error. This is the
@@ -405,7 +439,7 @@ async fn drive_window(
     mut chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
-    progress: Option<&ProgressHook<'_>>,
+    progress: Option<&PromotionProgress<'_>>,
 ) -> Result<(ChunkIterator, Option<StreamError>), StreamError> {
     let total_chunks = chunk_iter.total_chunks();
     let window = job.batch_width;
@@ -425,7 +459,7 @@ async fn drive_window(
             batch.push(ChunkRef {
                 index: c.index,
                 buffer_idx: c.buffer_idx,
-                len: c.user_data_len,
+                user_data_len: c.user_data_len,
                 addrs: c.addrs.clone(),
             });
         }
@@ -515,7 +549,7 @@ pub async fn run_get(
     chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
-    progress: Option<&ProgressHook<'_>>,
+    progress: Option<&PromotionProgress<'_>>,
 ) -> Result<Option<StreamError>, StreamError> {
     if job.reads_header {
         // GET reads+verifies the on-disk FileHeader before the data reads.
@@ -576,9 +610,16 @@ pub enum EfaDirection {
     Write,
 }
 
-/// EFA transfer for a chunk's addresses. Each address is (remote_addr, len, rkey).
-/// Fires all sub-transfers in parallel via FuturesUnordered. Returns the combined
-/// transport checksum (CRC32C for reads, 0 for writes).
+/// EFA transfer for ONE chunk. Called once per chunk — from `Source::produce`
+/// (Read, the SET path) and `Target::consume` (Write, the GET path). `addrs` is
+/// that single chunk's client-side scatter list: a chunk may map to several client
+/// memory regions, one `(remote_addr, len, rkey)` sub-transfer each.
+///
+/// Fires this chunk's sub-transfers in parallel via `FuturesUnordered` and returns
+/// the chunk's combined transport CRC32C (Read/SET) or 0 (Write/GET, checksum
+/// unneeded). This is the INTRA-chunk combination (across one chunk's addresses);
+/// the caller's `combine_checksums` later does the INTER-chunk combination
+/// (across all chunks) into the whole-object CRC.
 pub(crate) async fn efa_transfer_addrs(
     session: &Arc<Session>,
     buf_ptr: usize,
@@ -623,6 +664,8 @@ pub(crate) async fn efa_transfer_addrs(
     if matches!(direction, EfaDirection::Write) {
         return Ok(0);
     }
+    // Intra-chunk checksum accumulation: combine the CRCs of this chunk's
+    // sub-transfers (one per client address) into a single per-chunk CRC.
     let mut combined = results[0].expect("EFA transfer result missing") as u64;
     for i in 1..results.len() {
         combined = crc_fast::checksum_combine(

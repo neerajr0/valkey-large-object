@@ -440,7 +440,8 @@ impl ChunkIterator {
             .expect("record_checksum called on TCP path")[chunk_index as usize] = Some(crc);
     }
 
-    /// Combine all recorded checksums in chunk order into a whole-object CRC32C.
+    /// Inter-chunk accumulation: combine each chunk's per-chunk CRC (from
+    /// `record_checksum`) in chunk order into the whole-object CRC32C.
     /// Only valid for EFA paths. Panics if any chunk's checksum has not been recorded.
     pub fn combine_checksums(&self) -> u32 {
         let checksums = self.checksums.as_ref().expect("checksums not initialized");

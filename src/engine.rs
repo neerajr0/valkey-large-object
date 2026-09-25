@@ -42,8 +42,9 @@ use crate::OperatingMode;
 //
 // Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
 //   - Every DRAM serve that transfers a map-resident object — `get_from_dram`'s
-//     EFA path, and `do_tiered_promote_and_serve_tcp/efa`. (TCP serves copy
-//     synchronously with no await via `collect_dram_bytes`, so no pin is needed.)
+//     EFA path, and the promotion serve in `get_tiered` / `get_tiered_run`. (TCP
+//     serves copy synchronously with no await via `collect_dram_bytes`, so no pin
+//     is needed.)
 //   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
 //     already inserted in the map — the task moves that Arc in for the read.
 //   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
@@ -51,11 +52,10 @@ use crate::OperatingMode;
 //
 // Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
 // open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
-//   - Every Tiered request that READS the object: the NVMe promotion read
-//     (`do_tiered_promote_and_serve_tcp/efa`), the transient NVMe read
-//     (`do_tiered_nvme_read_and_serve_tcp/efa`), and — by the blanket rule — the
-//     DRAM serve that follows a promotion. The `ObjectFile` pin is held for the
-//     whole request, read plus transfer, via `_keep_alive = (file, fd)`.
+//   - Every Tiered request that READS the object: the NVMe promotion read and the
+//     transient NVMe read (both in `get_tiered` / `get_tiered_run`), and — by the
+//     blanket rule — the DRAM serve that follows a promotion. The `ObjectFile` pin
+//     is held for the whole request, read plus transfer, via `_keep_alive = (file, fd)`.
 //   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write
 //   path: the `ObjectFile` is created at commit via `set_finalize`, never read
 //   during the write. An overwritten old `ObjectFile` is protected by refcount
@@ -109,22 +109,6 @@ pub(crate) fn reply_err(
 ) {
     metric.fetch_add(1, Ordering::Relaxed);
     thread_ctx.reply(Err(err));
-}
-
-/// Map a `stream::StreamError` to its metric + reply string and send the error.
-/// One place, so every path that drives `stream::run` reports failures identically.
-fn reply_stream_err(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    e: crate::stream::StreamError,
-) {
-    use crate::stream::StreamError::*;
-    let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
-        NvmeRead => (&info::NVME_READ_ERRORS, errors::ERR_NVME_READ),
-        NvmeWrite => (&info::NVME_WRITE_ERRORS, errors::ERR_NVME_WRITE),
-        EfaRead => (&info::EFA_READ_ERRORS, errors::ERR_EFA_READ),
-        EfaWrite => (&info::EFA_WRITE_ERRORS, errors::ERR_EFA_WRITE),
-    };
-    reply_err(thread_ctx, metric, ValkeyError::Str(err));
 }
 
 /// Test hook: pause between NVMe write completion and set_finalize to allow
@@ -383,7 +367,7 @@ fn get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
-            let progress = crate::stream::ProgressHook {
+            let progress = crate::stream::PromotionProgress {
                 obj_ctx: &obj_ctx,
                 dram_pool,
                 object_id,
@@ -515,7 +499,7 @@ async fn get_tiered_run(
     get_info: GetObjectInfo,
     buffers: &[storage::SegmentBuffer],
     source_pool: crate::stream::Pool,
-    progress: Option<&crate::stream::ProgressHook<'_>>,
+    progress: Option<&crate::stream::PromotionProgress<'_>>,
     fd: RawFd,
     batch_width: usize,
     chunk_iter: ChunkIterator,
@@ -562,11 +546,11 @@ async fn get_tiered_run(
         }
     };
     match outcome {
-        Ok((Some(e), _)) => reply_stream_err(thread_ctx, e), // promotion continue-filling
+        Ok((Some(e), _)) => crate::stream::reply_stream_err(thread_ctx, e), // promotion continue-filling
         Ok((None, reply)) => {
             thread_ctx.reply(Ok(reply));
         }
-        Err(e) => reply_stream_err(thread_ctx, e),
+        Err(e) => crate::stream::reply_stream_err(thread_ctx, e),
     }
 }
 
@@ -761,7 +745,7 @@ fn set_dram_efa(
                 {
                     Ok(crc) => crc,
                     Err(e) => {
-                        reply_stream_err(&thread_ctx, e);
+                        crate::stream::reply_stream_err(&thread_ctx, e);
                         dram_pool.free_n(&buffers);
                         return;
                     }
@@ -987,7 +971,7 @@ async fn set_tiered_run(
     let crc = match result {
         Ok(crc) => crc,
         Err(e) => {
-            reply_stream_err(&thread_ctx, e);
+            crate::stream::reply_stream_err(&thread_ctx, e);
             return;
         }
     };
@@ -1073,7 +1057,7 @@ fn get_from_dram(
                     Ok(_) => {
                         thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
                     }
-                    Err(e) => reply_stream_err(&thread_ctx, e),
+                    Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
                 }
             });
         }
