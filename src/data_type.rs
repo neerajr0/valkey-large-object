@@ -14,7 +14,7 @@ use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
 
-use crate::storage::ObjectFile;
+use crate::storage::{Crc, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,7 @@ impl Tier {
 pub struct LoValue {
     pub object_id: ObjectId, // monotonic per-node OID (used as filename)
     pub len: u64,            // object size in bytes
-    pub crc32c: u32,         // integrity checksum (verified on replication pull)
+    pub crc32c: Crc,         // integrity checksum (verified on replication pull)
     /// The object's `ObjectFile` handle (Tiered mode only; `None` in Dram mode).
     /// Tracks the object's on-disk existence and may hold an open read fd behind
     /// an `Arc`. Dropping the last ref closes the fd and unlinks the file.

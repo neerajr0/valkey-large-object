@@ -33,6 +33,7 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
 use super::fd_pool::FdPool;
+use super::Crc;
 use crate::data_type::ObjectId;
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -84,7 +85,7 @@ impl ObjectFile {
     /// Reserves `disk_len` against nvme-maxmemory up front; the returned handle's `Drop`
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
-    pub fn copy(&self, len: u64, crc32c: u32) -> Option<ObjectFile> {
+    pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         let dir = crate::nvme_dir();
         let disk_len = self.disk_len;
         if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
@@ -113,7 +114,7 @@ impl ObjectFile {
         dst_path: &str,
         new_oid: ObjectId,
         len: u64,
-        crc32c: u32,
+        crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         let mut src = std::fs::File::open(self.object_id.file_path(&crate::nvme_dir()))?;

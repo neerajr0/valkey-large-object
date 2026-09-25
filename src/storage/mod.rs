@@ -4,6 +4,12 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crc_fast::CrcAlgorithm;
+
+/// A CRC32C checksum value. Aliased so a `Crc` in a signature reads as "this
+/// integer is a checksum", not a length or an id. It is a `u32` on the wire and
+/// in the `FileHeader`/`LoValue`; the `checksum_combine` accumulator widens to
+/// `u64` internally, which is a crc-fast API detail, not this type.
+pub type Crc = u32;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
@@ -158,7 +164,8 @@ pub fn get_fd_pool() -> &'static FdPool {
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
-/// Initialize storage layer: validate config, create pools, spawn io_uring poller (Tiered only).
+/// Initialize storage layer: validate config, create pools, spawn the io_uring
+/// and SMART log pollers (Tiered only).
 /// All OnceLock statics are set at the very end after everything succeeds.
 /// On failure, local variables drop naturally — no cleanup needed, module load retryable.
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
@@ -249,6 +256,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     }
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
+
+        // Background SMART log poller: reads the controllers once per interval;
+        // INFO only ever serves the latest snapshot. First read populates it.
+        // smartlog-poll-secs 0 disables polling and its INFO section.
+        let smartlog_secs = crate::smartlog_poll_secs();
+        if smartlog_secs > 0 {
+            crate::smartlog::start_poller(std::time::Duration::from_secs(smartlog_secs));
+        }
     }
     Ok(format!(
         "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
@@ -282,10 +297,19 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// computed addresses (from ChunkIterator's incremental mapping).
 pub type ClientEFAAddress = (u64, usize, u64);
 
-/// A piece of the overall object. Pure metadata — does not own the underlying buffer.
-/// Created by ChunkIterator and returned by next_chunk().
-#[derive(Debug)]
-pub struct Chunk {
+/// A lightweight reference to one chunk of the object — its position, which
+/// window buffer holds it, and (for EFA) the client memory regions to transfer
+/// into. Pure metadata: it does NOT own the chunk's bytes, and the stream driver
+/// clones one per chunk into its per-chunk futures.
+///
+/// INVARIANT — keep this type cheap to clone. It is cloned once per chunk on the
+/// batch-snapshot hot path, so it must never grow a field that carries a real or
+/// large allocation (payload bytes, buffers, big owned collections). Only small
+/// coordinates belong here: indices, lengths, and the short `addrs` region list.
+/// If you need heavyweight per-chunk state, store it in the owning context/pool
+/// and reference it by `buffer_idx`, not inline here.
+#[derive(Debug, Clone)]
+pub struct ChunkRef {
     /// Absolute chunk index within the object (0-based).
     pub index: u32,
     /// Exact user data bytes in this chunk.
@@ -306,7 +330,7 @@ pub struct Chunk {
 /// Vec<SegmentBuffer>.
 pub struct ChunkIterator {
     /// Pre-computed chunk metadata (user_data_len, buffer_idx). Addresses populated lazily.
-    chunks: Vec<Chunk>,
+    chunks: Vec<ChunkRef>,
     /// Next chunk to return.
     cursor: usize,
     /// Client-provided EFA remote memory addresses. None for TCP paths.
@@ -320,7 +344,7 @@ pub struct ChunkIterator {
     /// already have the stored CRC and never write to this vec.
     /// None for TCP paths (CRC computed inline via rolling digest).
     /// Some(...) for EFA paths; inner `None` entries indicate chunks not yet recorded.
-    checksums: Option<Vec<Option<u32>>>,
+    checksums: Option<Vec<Option<Crc>>>,
 }
 
 impl ChunkIterator {
@@ -346,7 +370,7 @@ impl ChunkIterator {
         let total_chunks = user_len.div_ceil(chunk_size as u64) as u32;
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         for i in 0..total_chunks {
-            chunks.push(Chunk {
+            chunks.push(ChunkRef {
                 index: i,
                 user_data_len: chunk_user_data_len(
                     i as usize,
@@ -380,7 +404,7 @@ impl ChunkIterator {
 
     /// Advance to the next chunk, populating its client regions if EFA.
     /// Returns None when all chunks have been consumed.
-    pub fn next_chunk(&mut self) -> Option<&Chunk> {
+    pub fn next_chunk(&mut self) -> Option<&ChunkRef> {
         if self.cursor >= self.chunks.len() {
             return None;
         }
@@ -422,7 +446,7 @@ impl ChunkIterator {
     /// Random access to a chunk by absolute index. Does NOT advance cursor.
     /// Used by completion handlers to look up chunk metadata (buffer_idx, addrs)
     /// after next_chunk() populated it during batch submission.
-    pub fn peek_chunk(&self, idx: u32) -> &Chunk {
+    pub fn peek_chunk(&self, idx: u32) -> &ChunkRef {
         &self.chunks[idx as usize]
     }
 
@@ -434,15 +458,16 @@ impl ChunkIterator {
 
     /// Record a per-chunk CRC32C from an EFA transport completion.
     /// Chunks may arrive out of order; the checksum is stored by chunk index.
-    pub fn record_checksum(&mut self, chunk_index: u32, crc: u32) {
+    pub fn record_checksum(&mut self, chunk_index: u32, crc: Crc) {
         self.checksums
             .as_mut()
             .expect("record_checksum called on TCP path")[chunk_index as usize] = Some(crc);
     }
 
-    /// Combine all recorded checksums in chunk order into a whole-object CRC32C.
+    /// Inter-chunk accumulation: combine each chunk's per-chunk CRC (from
+    /// `record_checksum`) in chunk order into the whole-object CRC32C.
     /// Only valid for EFA paths. Panics if any chunk's checksum has not been recorded.
-    pub fn combine_checksums(&self) -> u32 {
+    pub fn combine_checksums(&self) -> Crc {
         let checksums = self.checksums.as_ref().expect("checksums not initialized");
         let mut combined: u64 = 0;
         for (i, chunk) in self.chunks.iter().enumerate() {

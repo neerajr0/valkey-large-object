@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::context::SegmentBuffer;
 use super::uring;
+use super::Crc;
 use super::NVMePool;
 use crate::data_type::ObjectId;
 
@@ -92,11 +93,11 @@ pub struct FileHeader {
     pub version: u8,
     pub object_id: u64,
     pub len: u64,
-    pub crc32c: u32,
+    pub crc32c: Crc,
 }
 
 impl FileHeader {
-    pub fn new(object_id: ObjectId, len: u64, crc32c: u32) -> Self {
+    pub fn new(object_id: ObjectId, len: u64, crc32c: Crc) -> Self {
         Self {
             magic: *FILE_HEADER_MAGIC,
             version: FILE_HEADER_VERSION,
@@ -210,7 +211,7 @@ pub async fn read_and_verify_file_header(
     pool_buffer_ptr: usize,
     expected_object_id: ObjectId,
     expected_len: u64,
-    crc32c_expected: u32,
+    crc32c_expected: Crc,
 ) {
     assert!(
         pool_buffer_ptr != 0,
@@ -291,7 +292,7 @@ pub async fn write_file_header(
     fd: RawFd,
     object_id: ObjectId,
     obj_len: u64,
-    crc: u32,
+    crc: Crc,
     buf: &SegmentBuffer,
     nvme_pool: &NVMePool,
 ) -> Result<(), super::StorageError> {

@@ -183,6 +183,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
             assert 'dram-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
+    # ─── SMART LOG tests ───────────────────────────────────────────────────
+
+    def test_smartlog_section_absent(self):
+        """Dram mode never starts the SMART log poller"""
+        client = self.server.get_new_client()
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
 
     # ─── LO.INFO tests ───────────────────────────────────────────────────
 
