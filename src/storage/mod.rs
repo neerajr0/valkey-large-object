@@ -288,10 +288,19 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// computed addresses (from ChunkIterator's incremental mapping).
 pub type ClientEFAAddress = (u64, usize, u64);
 
-/// A piece of the overall object. Pure metadata — does not own the underlying buffer.
-/// Created by ChunkIterator and returned by next_chunk().
-#[derive(Debug)]
-pub struct Chunk {
+/// A lightweight reference to one chunk of the object — its position, which
+/// window buffer holds it, and (for EFA) the client memory regions to transfer
+/// into. Pure metadata: it does NOT own the chunk's bytes, and the stream driver
+/// clones one per chunk into its per-chunk futures.
+///
+/// INVARIANT — keep this type cheap to clone. It is cloned once per chunk on the
+/// batch-snapshot hot path, so it must never grow a field that carries a real or
+/// large allocation (payload bytes, buffers, big owned collections). Only small
+/// coordinates belong here: indices, lengths, and the short `addrs` region list.
+/// If you need heavyweight per-chunk state, store it in the owning context/pool
+/// and reference it by `buffer_idx`, not inline here.
+#[derive(Debug, Clone)]
+pub struct ChunkRef {
     /// Absolute chunk index within the object (0-based).
     pub index: u32,
     /// Exact user data bytes in this chunk.
@@ -312,7 +321,7 @@ pub struct Chunk {
 /// Vec<SegmentBuffer>.
 pub struct ChunkIterator {
     /// Pre-computed chunk metadata (user_data_len, buffer_idx). Addresses populated lazily.
-    chunks: Vec<Chunk>,
+    chunks: Vec<ChunkRef>,
     /// Next chunk to return.
     cursor: usize,
     /// Client-provided EFA remote memory addresses. None for TCP paths.
@@ -352,7 +361,7 @@ impl ChunkIterator {
         let total_chunks = user_len.div_ceil(chunk_size as u64) as u32;
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         for i in 0..total_chunks {
-            chunks.push(Chunk {
+            chunks.push(ChunkRef {
                 index: i,
                 user_data_len: chunk_user_data_len(
                     i as usize,
@@ -386,7 +395,7 @@ impl ChunkIterator {
 
     /// Advance to the next chunk, populating its client regions if EFA.
     /// Returns None when all chunks have been consumed.
-    pub fn next_chunk(&mut self) -> Option<&Chunk> {
+    pub fn next_chunk(&mut self) -> Option<&ChunkRef> {
         if self.cursor >= self.chunks.len() {
             return None;
         }
@@ -428,7 +437,7 @@ impl ChunkIterator {
     /// Random access to a chunk by absolute index. Does NOT advance cursor.
     /// Used by completion handlers to look up chunk metadata (buffer_idx, addrs)
     /// after next_chunk() populated it during batch submission.
-    pub fn peek_chunk(&self, idx: u32) -> &Chunk {
+    pub fn peek_chunk(&self, idx: u32) -> &ChunkRef {
         &self.chunks[idx as usize]
     }
 

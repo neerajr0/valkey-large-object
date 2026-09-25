@@ -71,31 +71,9 @@ use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::ObjectId;
 use crate::storage::{
-    self, uring, ChunkIterator, ClientEFAAddress, Crc, ObjectContext, SegmentBuffer,
+    self, uring, ChunkIterator, ChunkRef, ClientEFAAddress, Crc, ObjectContext, SegmentBuffer,
 };
 use crate::transport::Session;
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Chunk descriptor threaded from Source → Target
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// One chunk's coordinates within the object + its window buffer.
-/// Carries no bytes — just where they are and (for EFA) the client addresses,
-/// which the `ChunkIterator` computes lazily when the batch is snapshotted.
-#[derive(Clone)]
-pub struct ChunkRef {
-    /// Chunk position in the object (0-based); the CRC key and file-offset basis.
-    pub index: u32,
-    /// Index into the window's buffer slice.
-    pub buffer_idx: usize,
-    /// Logical bytes in this chunk (last chunk is short).
-    pub user_data_len: usize,
-    /// Client EFA addresses for this chunk. `Some` for EVERY EFA transfer —
-    /// whether the buffers are NVMe- or DRAM-backed — and `None` only on the TCP
-    /// paths (which move bytes inline, not over EFA). Populated by the iterator
-    /// when it was built with `Some(efa_addrs)`.
-    pub addrs: Option<Vec<ClientEFAAddress>>,
-}
 
 // `Crc` (a CRC32C checksum value) is defined in `storage` and imported below —
 // `produce` returns `Option<Crc>` so the value reads as "maybe a checksum".
@@ -479,19 +457,15 @@ async fn drive_window(
     while chunks_done < total_chunks {
         let batch_count = window.min((total_chunks - chunks_done) as usize);
 
-        // Snapshot this batch's chunk refs (advances the iterator by batch_count).
-        // next_chunk() lazily computes the per-chunk EFA addrs; clone them out.
+        // Snapshot this batch's chunks (advances the iterator by batch_count).
+        // next_chunk() lazily computes the per-chunk EFA addrs; clone each out of
+        // the borrowed iterator so it can move into a per-chunk future below.
         let mut batch: Vec<ChunkRef> = Vec::with_capacity(batch_count);
         for _ in 0..batch_count {
             let c = chunk_iter
                 .next_chunk()
                 .expect("ChunkIterator out of bounds");
-            batch.push(ChunkRef {
-                index: c.index,
-                buffer_idx: c.buffer_idx,
-                user_data_len: c.user_data_len,
-                addrs: c.addrs.clone(),
-            });
+            batch.push(c.clone());
         }
 
         // Per-chunk ready stream: fan out every source.produce, and as each
