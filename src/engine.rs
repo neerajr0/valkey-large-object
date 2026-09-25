@@ -57,8 +57,8 @@ use crate::OperatingMode;
 //     blanket rule — the DRAM serve that follows a promotion. The `ObjectFile` pin
 //     is held for the whole request, read plus transfer, via `_keep_alive = (file, fd)`.
 //   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write
-//   path: the `ObjectFile` is created at commit via `cmd_set_finalize`, never read
-//   during the write. An overwritten old `ObjectFile` is protected by refcount
+//   path: the `ObjectFile` is moved into the `LoValue` at commit (`commit_lo_value`),
+//   never read during the write. An overwritten old `ObjectFile` is protected by refcount
 //   on the replaced `LoValue` (via `lo_free`), not by the writer.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -111,7 +111,7 @@ pub(crate) fn reply_err(
     thread_ctx.reply(Err(err));
 }
 
-/// Test hook: pause between NVMe write completion and cmd_set_finalize to allow
+/// Test hook: pause between NVMe write completion and the commit (`commit_lo_value`) to allow
 /// integration tests to inject a DEL and deterministically exercise the
 /// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
 /// config. 0 = disabled (production default).
@@ -144,7 +144,7 @@ fn collect_dram_bytes(
     data
 }
 
-/// Outcome of `cmd_set_finalize` — distinguishes a successful write from a stale discard.
+/// Outcome of `commit_lo_value` — distinguishes a successful write from a stale discard.
 enum SetFinalizeOutcome {
     /// Value was written and attached to the key.
     ValueSet,
