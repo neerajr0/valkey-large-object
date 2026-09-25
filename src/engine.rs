@@ -487,10 +487,10 @@ async fn cmd_get_tiered_run(
     } = get_info;
     let hdr_buf = &buffers[0];
     let job = crate::stream::StreamJob {
-        fd,
+        fd: Some(fd),
         obj_len,
         chunk_size: crate::chunk_size(),
-        object_id,
+        object_id: Some(object_id),
         crc32c_expected,
         hdr_iovec: source_pool.iovec(hdr_buf),
         hdr_ptr: source_pool.ptr(hdr_buf) as usize,
@@ -695,10 +695,10 @@ fn cmd_set_dram_efa(
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
                 let job = crate::stream::StreamJob {
-                    fd: -1,
+                    fd: None,
                     obj_len,
                     chunk_size,
-                    object_id,
+                    object_id: Some(object_id),
                     crc32c_expected: 0,
                     hdr_iovec: 0,
                     hdr_ptr: 0,
@@ -890,10 +890,10 @@ async fn cmd_set_tiered_run(
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
     let job = crate::stream::StreamJob {
-        fd: fd.as_raw_fd(),
+        fd: Some(fd.as_raw_fd()),
         obj_len,
         chunk_size,
-        object_id,
+        object_id: Some(object_id),
         crc32c_expected: 0,
         hdr_iovec: 0,
         hdr_ptr: 0,
@@ -1026,10 +1026,10 @@ fn cmd_get_from_dram(
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
                 let job = crate::stream::StreamJob {
-                    fd: -1,
+                    fd: None,
                     obj_len,
                     chunk_size,
-                    object_id: ObjectId(0), // unused: no fd/header on Dram GET
+                    object_id: None, // no fd/header on Dram GET
                     crc32c_expected: crc32c,
                     hdr_iovec: 0,
                     hdr_ptr: 0,

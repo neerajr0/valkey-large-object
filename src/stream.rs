@@ -159,7 +159,7 @@ impl Source<'_> {
     /// from EFA (fi_read from the client) or TCP (memcpy the inline payload).
     async fn produce(
         &self,
-        fd: RawFd,
+        fd: Option<RawFd>,
         chunk: &ChunkRef,
         chunk_size: usize,
     ) -> Result<Option<Crc>, StreamError> {
@@ -168,7 +168,7 @@ impl Source<'_> {
         match self {
             Source::NvmeRead { .. } => {
                 let rx = uring::submit_read(
-                    fd,
+                    fd.expect("NvmeRead requires an fd"),
                     uring::UringOp {
                         iovec_index: pool.iovec(buf),
                         buf_ptr: pool.ptr(buf),
@@ -262,7 +262,7 @@ impl Target<'_> {
 
     async fn consume(
         &self,
-        fd: RawFd,
+        fd: Option<RawFd>,
         chunk: &ChunkRef,
         buf_ptr: usize,
         chunk_size: usize,
@@ -291,7 +291,7 @@ impl Target<'_> {
             Target::NvmeWrite { buffers, pool } => {
                 let buf = &buffers[chunk.buffer_idx];
                 let rx = uring::submit_write(
-                    fd,
+                    fd.expect("NvmeWrite requires an fd"),
                     uring::UringOp {
                         iovec_index: pool.iovec_index_for_buf(buf),
                         buf_ptr: pool.buffer_ptr(buf),
@@ -395,11 +395,13 @@ pub struct HeaderWrite<'a> {
 
 /// Everything the loop needs that isn't the source/target themselves.
 pub struct StreamJob<'a> {
-    /// NVMe file fd (GET reads, SET writes). Unused/`-1` for Dram paths.
-    pub fd: RawFd,
+    /// NVMe file fd — `Some` on NVMe GET/SET, `None` on DRAM (no file). Only the
+    /// `NvmeRead`/`NvmeWrite` arms read it; other arms never touch it.
+    pub fd: Option<RawFd>,
     pub obj_len: u64,
     pub chunk_size: usize,
-    pub object_id: ObjectId,
+    /// NVMe object id — `Some` when a file header is read/written, `None` on DRAM.
+    pub object_id: Option<ObjectId>,
     /// GET verifies this before the loop; SET-to-NVMe writes it in the header.
     pub crc32c_expected: u32,
     /// GET header-read placement (iovec slot + buffer pointer). 0 for SET/Dram.
@@ -562,10 +564,11 @@ pub async fn run_get(
         // read — submitting both concurrently would overwrite header bytes before
         // validation.
         storage::read_and_verify_file_header(
-            job.fd,
+            job.fd.expect("GET header read requires an fd"),
             job.hdr_iovec,
             job.hdr_ptr,
-            job.object_id,
+            job.object_id
+                .expect("GET header read requires an object_id"),
             job.obj_len,
             job.crc32c_expected,
         )
@@ -603,9 +606,17 @@ pub async fn run_set(
     if let Some(hw) = job.header_write.as_ref() {
         // SET-to-NVMe: persist the FileHeader. A failure is an NVMe write error;
         // the caller's ObjectFile Drop unlinks the file + releases the budget.
-        if storage::write_file_header(job.fd, job.object_id, job.obj_len, crc, hw.hdr_buf, hw.pool)
-            .await
-            .is_err()
+        if storage::write_file_header(
+            job.fd.expect("SET header write requires an fd"),
+            job.object_id
+                .expect("SET header write requires an object_id"),
+            job.obj_len,
+            crc,
+            hw.hdr_buf,
+            hw.pool,
+        )
+        .await
+        .is_err()
         {
             return Err(StreamError::NvmeWrite);
         }
