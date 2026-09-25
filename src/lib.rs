@@ -339,58 +339,119 @@ pub fn max_object_size() -> u64 {
     CFG_MAX_OBJECT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-// ─── Config Validation Callbacks ─────────────────────────────────────────────
+// ─── Config Dependency Graph ─────────────────────────────────────────────────
+//
+// Directed graph of >= constraints between configs. Each edge enforces
+// parent >= child when its condition is true.
+//
+// At module load (before RUNTIME is set), per-config callbacks skip validation
+// (config processing order is non-deterministic across type categories).
+// validate_all_edges() runs in initialize() after all configs are finalized.
+//
+// At runtime (CONFIG SET), the framework stores the new value into the atomic
+// before calling the validation callback. validate_config_edge() then runs
+// validate_all_edges() over the same atomics — no value substitution needed.
 
-/// Cross-config validation for max-object-size.
-/// Rejects if the value would cause chunk count overflow or exceed the storage budget.
-///
-/// At initial load (before RUNTIME is set), config processing order is
-/// non-deterministic across config types (i64, enum, etc.), so the callback may
-/// fire before operating-mode is finalized. In that window we silently clamp
-/// max-object-size to the relevant storage budget instead of rejecting — this
-/// lets users set dram-maxmemory without also having to explicitly lower
-/// max-object-size. At runtime (CONFIG SET), the mode is known and we enforce
-/// strictly.
-fn validate_max_object_size(
-    _ctx: &valkey_module::configuration::ConfigurationContext,
-    _name: &str,
-    val: &'static AtomicI64,
-) -> Result<(), valkey_module::ValkeyError> {
-    let max_obj = val.load(std::sync::atomic::Ordering::Relaxed) as u64;
-    let buf_size = chunk_size() as u64;
-    if max_obj.div_ceil(buf_size) > u32::MAX as u64 {
-        return Err(valkey_module::ValkeyError::Str(
-            "ERR max-object-size too large for the configured chunk-size",
-        ));
-    }
-    let is_initial_load = RUNTIME.get().is_none();
-    match operating_mode() {
-        OperatingMode::Dram => {
-            let dram_max = dram_maxmemory();
-            if dram_max > 0 && max_obj > dram_max {
-                if is_initial_load {
-                    val.store(dram_max as i64, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    return Err(valkey_module::ValkeyError::Str(
-                        "ERR max-object-size exceeds dram-maxmemory",
-                    ));
-                }
-            }
+/// A directed >= constraint: parent >= child must hold when enforce_condition() is true.
+struct ConfigDependencyEdge {
+    parent: &'static AtomicI64,
+    child: &'static AtomicI64,
+    enforce_condition: fn() -> bool,
+    error_msg: &'static str,
+}
+
+// SAFETY: All AtomicI64 references are to lazy_static statics with 'static lifetime.
+// The fn pointers and &str are inherently Send+Sync.
+unsafe impl Sync for ConfigDependencyEdge {}
+
+fn config_graph() -> &'static [ConfigDependencyEdge] {
+    use std::sync::LazyLock;
+    static GRAPH: LazyLock<Vec<ConfigDependencyEdge>> = LazyLock::new(|| {
+        vec![
+            ConfigDependencyEdge {
+                parent: &CFG_DRAM_MAXMEMORY,
+                child: &CFG_SEGMENT_SIZE,
+                enforce_condition: || dram_maxmemory() > 0,
+                error_msg: errors::ERR_DRAM_GE_SEGMENT,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_DRAM_MAXMEMORY,
+                child: &CFG_MAX_OBJECT_SIZE,
+                enforce_condition: || {
+                    dram_maxmemory() > 0 && operating_mode() == OperatingMode::Dram
+                },
+                error_msg: errors::ERR_DRAM_GE_MAX_OBJ,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_DRAM_MAXMEMORY,
+                child: &CFG_MAX_PROMOTE_SIZE,
+                enforce_condition: || {
+                    dram_maxmemory() > 0 && operating_mode() == OperatingMode::Tiered
+                },
+                error_msg: errors::ERR_DRAM_GE_PROMOTE,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_NVME_MAXMEMORY,
+                child: &CFG_MAX_OBJECT_SIZE,
+                enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                error_msg: errors::ERR_NVME_GE_MAX_OBJ,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_NVME_STAGING_SIZE,
+                child: &CFG_SEGMENT_SIZE,
+                enforce_condition: || true,
+                error_msg: errors::ERR_STAGING_GE_SEGMENT,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_SEGMENT_SIZE,
+                child: &CFG_CHUNK_SIZE,
+                enforce_condition: || true,
+                error_msg: errors::ERR_SEGMENT_GE_CHUNK,
+            },
+            // TODO: Add segment-size >= max-object-size edge when we enforce
+            // objects to be allocated on only one segment.
+            ConfigDependencyEdge {
+                parent: &CFG_MAX_BUFFERS_PER_OP,
+                child: &CFG_MIN_BUFFERS_PER_OP,
+                enforce_condition: || true,
+                error_msg: errors::ERR_MAX_BUF_GE_MIN_BUF,
+            },
+        ]
+    });
+    &GRAPH
+}
+
+/// Validate all config edges. Returns the first violated constraint or Ok(()).
+/// Called in initialize() after all configs are finalized, and by
+/// validate_config_edge() at runtime (CONFIG SET) after the framework has
+/// already stored the new value into the atomic.
+fn validate_all_edges() -> Result<(), String> {
+    for edge in config_graph() {
+        if !(edge.enforce_condition)() {
+            continue;
         }
-        OperatingMode::Tiered => {
-            let nvme_max = nvme_maxmemory();
-            if nvme_max > 0 && max_obj > nvme_max {
-                if is_initial_load {
-                    val.store(nvme_max as i64, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    return Err(valkey_module::ValkeyError::Str(
-                        "ERR max-object-size exceeds nvme-maxmemory",
-                    ));
-                }
-            }
+        let p = edge.parent.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let c = edge.child.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        if p < c {
+            return Err(edge.error_msg.into());
         }
     }
     Ok(())
+}
+
+/// Shared validation callback for mutable configs participating in the dependency
+/// graph. At initial load, defers to validate_all_edges() in initialize().
+/// At runtime (CONFIG SET), the framework has already stored the new value, so
+/// we just re-check all edges against current atomics.
+fn validate_config_edge(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    _val: &'static AtomicI64,
+) -> Result<(), valkey_module::ValkeyError> {
+    if RUNTIME.get().is_none() {
+        return Ok(());
+    }
+    validate_all_edges().map_err(valkey_module::ValkeyError::String)
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -413,6 +474,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
     let dir = nvme_dir();
+
+    // Validate cross-config dependency graph now that all configs are finalized.
+    // Per-config callbacks skip validation at load time (non-deterministic processing
+    // order across config types); this is the single enforcement point at startup.
+    if let Err(e) = validate_all_edges() {
+        ctx.log_warning(&format!("largeobj: config validation failed: {e}"));
+        return Status::Err;
+    }
 
     // Reset nvme-dir before use (Tiered mode only; a no-op in Dram, which never
     // touches disk): reclaim any object files a previous run left behind after an
@@ -541,41 +610,23 @@ valkey_module! {
     configurations: [
         i64: [
             ["dram-maxmemory", &*CFG_DRAM_MAXMEMORY, 0, 0, i64::MAX,
-             ConfigurationFlags::MEMORY, None, None],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["segment-size", &*CFG_SEGMENT_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
-             ConfigurationFlags::MEMORY, None, None],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
-             ConfigurationFlags::MEMORY, None, None],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
-             ConfigurationFlags::DEFAULT, None,
-             Some(Box::new(|_ctx, _name, new_val| {
-                 let max = new_val.load(std::sync::atomic::Ordering::Relaxed);
-                 let min = CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
-                 if min > max {
-                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= min-buffers-per-op"))
-                 } else {
-                     Ok(())
-                 }
-             }))],
+             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_edge))],
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
-             ConfigurationFlags::DEFAULT, None,
-             Some(Box::new(|_ctx, _name, new_val| {
-                 let min = new_val.load(std::sync::atomic::Ordering::Relaxed);
-                 let max = CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
-                 if min > max {
-                     Err(valkey_module::ValkeyError::Str("ERR min-buffers-per-op must be <= max-buffers-per-op"))
-                 } else {
-                     Ok(())
-                 }
-             }))],
+             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_edge))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
@@ -583,7 +634,7 @@ valkey_module! {
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
-             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_max_object_size))],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
@@ -607,4 +658,188 @@ valkey_module! {
         ],
         module_args_as_configuration: true,
     ]
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // ─── Test Infrastructure ─────────────────────────────────────────────
+
+    fn set_cfgs(cfgs: &[(&AtomicI64, i64)]) {
+        for &(cfg, val) in cfgs {
+            cfg.store(val, Relaxed);
+        }
+    }
+    fn set_mode(mode: OperatingMode) {
+        *CFG_OPERATING_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+
+    /// All configs that participate in the dependency graph, paired with
+    /// their current value. Used to snapshot defaults and restore between cases.
+    fn all_graph_configs() -> Vec<(&'static AtomicI64, i64)> {
+        vec![
+            (&CFG_DRAM_MAXMEMORY, CFG_DRAM_MAXMEMORY.load(Relaxed)),
+            (&CFG_NVME_MAXMEMORY, CFG_NVME_MAXMEMORY.load(Relaxed)),
+            (&CFG_NVME_STAGING_SIZE, CFG_NVME_STAGING_SIZE.load(Relaxed)),
+            (&CFG_SEGMENT_SIZE, CFG_SEGMENT_SIZE.load(Relaxed)),
+            (&CFG_CHUNK_SIZE, CFG_CHUNK_SIZE.load(Relaxed)),
+            (&CFG_MAX_OBJECT_SIZE, CFG_MAX_OBJECT_SIZE.load(Relaxed)),
+            (&CFG_MAX_PROMOTE_SIZE, CFG_MAX_PROMOTE_SIZE.load(Relaxed)),
+            (&CFG_MAX_BUFFERS_PER_OP, CFG_MAX_BUFFERS_PER_OP.load(Relaxed)),
+            (&CFG_MIN_BUFFERS_PER_OP, CFG_MIN_BUFFERS_PER_OP.load(Relaxed)),
+        ]
+    }
+
+    // ─── validate_all_edges: parametrized test data ────────────────────
+    //
+    // Each entry: (label, mode, config overrides, expected error substring or None).
+    // The runner restores defaults before each case, then applies mode + overrides,
+    // then asserts Ok or Err containing the substring.
+    //
+    // Default values are read from the atomics once at test entry (before any
+    // mutation) and passed in so override expressions like `segment - 1` use
+    // the real defaults without duplicating their numeric values.
+
+    fn edge_test_cases(
+        segment: i64,
+        chunk: i64,
+        max_obj: i64,
+        promote: i64,
+        max_buf: i64,
+        min_buf: i64,
+    ) -> Vec<(
+        &'static str,
+        OperatingMode,
+        Vec<(&'static AtomicI64, i64)>,
+        Option<&'static str>,
+    )> {
+        vec![
+            // ── Happy paths ──────────────────────────────────────────────
+            (
+                "defaults_pass",
+                OperatingMode::Dram,
+                vec![],
+                None,
+            ),
+            (
+                "dram_maxmemory_zero_skips_edges",
+                OperatingMode::Dram,
+                vec![
+                    (&CFG_SEGMENT_SIZE, 999_999_999),
+                    (&CFG_NVME_STAGING_SIZE, 999_999_999),
+                    (&CFG_MAX_OBJECT_SIZE, 1),
+                    (&CFG_CHUNK_SIZE, 1),
+                ],
+                None,
+            ),
+            (
+                "dram_eq_segment_ok",
+                OperatingMode::Dram,
+                vec![
+                    (&CFG_DRAM_MAXMEMORY, segment),
+                    (&CFG_MAX_OBJECT_SIZE, segment),
+                ],
+                None,
+            ),
+            (
+                "equal_buffers_ok",
+                OperatingMode::Dram,
+                vec![(&CFG_MIN_BUFFERS_PER_OP, max_buf)],
+                None,
+            ),
+            (
+                "tiered_max_obj_within_nvme_ok",
+                OperatingMode::Tiered,
+                vec![],
+                None,
+            ),
+            (
+                "mode_conditional_edge_skipped_when_inactive",
+                OperatingMode::Dram,
+                vec![(&CFG_NVME_MAXMEMORY, 1)],
+                None,
+            ),
+            // ── Violation per edge ───────────────────────────────────────
+            (
+                "dram_lt_segment_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_DRAM_MAXMEMORY, segment - 1)],
+                Some("dram-maxmemory must be >= segment-size"),
+            ),
+            (
+                "segment_lt_chunk_rejected",
+                OperatingMode::Dram,
+                vec![
+                    (&CFG_SEGMENT_SIZE, chunk - 1),
+                    (&CFG_NVME_STAGING_SIZE, chunk - 1),
+                ],
+                Some("segment-size must be >= chunk-size"),
+            ),
+            (
+                "staging_lt_segment_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_NVME_STAGING_SIZE, segment - 1)],
+                Some("nvme-staging-size must be >= segment-size"),
+            ),
+            (
+                "buffers_max_lt_min_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_MAX_BUFFERS_PER_OP, min_buf - 1)],
+                Some("max-buffers-per-op must be >= min-buffers-per-op"),
+            ),
+            (
+                "dram_mode_max_obj_exceeds_dram_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_DRAM_MAXMEMORY, max_obj - 1)],
+                Some("dram-maxmemory must be >= max-object-size in Dram mode"),
+            ),
+            (
+                "tiered_mode_promote_exceeds_dram_rejected",
+                OperatingMode::Tiered,
+                vec![
+                    (&CFG_DRAM_MAXMEMORY, segment), // >= segment, but < promote
+                    (&CFG_MAX_PROMOTE_SIZE, segment + 1),
+                ],
+                Some("dram-maxmemory must be >= max-promote-size in Tiered mode"),
+            ),
+            (
+                "tiered_mode_nvme_lt_max_obj_rejected",
+                OperatingMode::Tiered,
+                vec![(&CFG_NVME_MAXMEMORY, max_obj - 1)],
+                Some("nvme-maxmemory must be >= max-object-size in Tiered mode"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_validate_all_edges() {
+        // Capture defaults before any mutation.
+        let defaults = all_graph_configs();
+        let segment = CFG_SEGMENT_SIZE.load(Relaxed);
+        let chunk = CFG_CHUNK_SIZE.load(Relaxed);
+        let max_obj = CFG_MAX_OBJECT_SIZE.load(Relaxed);
+        let promote = CFG_MAX_PROMOTE_SIZE.load(Relaxed);
+        let max_buf = CFG_MAX_BUFFERS_PER_OP.load(Relaxed);
+        let min_buf = CFG_MIN_BUFFERS_PER_OP.load(Relaxed);
+        for (label, mode, overrides, expected_err) in
+            edge_test_cases(segment, chunk, max_obj, promote, max_buf, min_buf)
+        {
+            set_cfgs(&defaults);
+            set_mode(OperatingMode::Dram);
+            set_mode(mode);
+            set_cfgs(&overrides);
+            let result = validate_all_edges();
+            match expected_err {
+                None => assert!(result.is_ok(), "{label}: expected Ok, got {result:?}"),
+                Some(substr) => {
+                    let err = result.expect_err(&format!("{label}: expected Err"));
+                    assert!(err.contains(substr), "{label}: '{err}' missing '{substr}'");
+                }
+            }
+        }
+    }
 }

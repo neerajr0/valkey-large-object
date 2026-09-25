@@ -50,6 +50,13 @@ define_errors! {
 
     // Config Validation Errors
     ERR_OBJECT_TOO_LARGE => "ERR object size exceeds max-object-size limit",
+    ERR_DRAM_GE_SEGMENT => "ERR dram-maxmemory must be >= segment-size",
+    ERR_DRAM_GE_MAX_OBJ => "ERR dram-maxmemory must be >= max-object-size in Dram mode",
+    ERR_DRAM_GE_PROMOTE => "ERR dram-maxmemory must be >= max-promote-size in Tiered mode",
+    ERR_NVME_GE_MAX_OBJ => "ERR nvme-maxmemory must be >= max-object-size in Tiered mode",
+    ERR_STAGING_GE_SEGMENT => "ERR nvme-staging-size must be >= segment-size",
+    ERR_SEGMENT_GE_CHUNK => "ERR segment-size must be >= chunk-size",
+    ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
