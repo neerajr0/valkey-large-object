@@ -41,8 +41,8 @@ use crate::OperatingMode;
 // clone of that state for the whole operation.
 //
 // Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
-//   - Every DRAM serve that transfers a map-resident object — `get_from_dram`'s
-//     EFA path, and the promotion serve in `get_tiered` / `get_tiered_run`. (TCP
+//   - Every DRAM serve that transfers a map-resident object — `cmd_get_from_dram`'s
+//     EFA path, and the promotion serve in `cmd_get_tiered` / `cmd_get_tiered_run`. (TCP
 //     serves copy synchronously with no await via `collect_dram_bytes`, so no pin
 //     is needed.)
 //   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
@@ -53,11 +53,11 @@ use crate::OperatingMode;
 // Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
 // open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
 //   - Every Tiered request that READS the object: the NVMe promotion read and the
-//     transient NVMe read (both in `get_tiered` / `get_tiered_run`), and — by the
+//     transient NVMe read (both in `cmd_get_tiered` / `cmd_get_tiered_run`), and — by the
 //     blanket rule — the DRAM serve that follows a promotion. The `ObjectFile` pin
 //     is held for the whole request, read plus transfer, via `_keep_alive = (file, fd)`.
 //   NOT needed in Dram mode (there is no `ObjectFile`), and NOT on the SET write
-//   path: the `ObjectFile` is created at commit via `set_finalize`, never read
+//   path: the `ObjectFile` is created at commit via `cmd_set_finalize`, never read
 //   during the write. An overwritten old `ObjectFile` is protected by refcount
 //   on the replaced `LoValue` (via `lo_free`), not by the writer.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ pub(crate) fn reply_err(
     thread_ctx.reply(Err(err));
 }
 
-/// Test hook: pause between NVMe write completion and set_finalize to allow
+/// Test hook: pause between NVMe write completion and cmd_set_finalize to allow
 /// integration tests to inject a DEL and deterministically exercise the
 /// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
 /// config. 0 = disabled (production default).
@@ -144,7 +144,7 @@ fn collect_dram_bytes(
     data
 }
 
-/// Outcome of `set_finalize` — distinguishes a successful write from a stale discard.
+/// Outcome of `cmd_set_finalize` — distinguishes a successful write from a stale discard.
 enum SetFinalizeOutcome {
     /// Value was written and attached to the key.
     ValueSet,
@@ -156,7 +156,7 @@ enum SetFinalizeOutcome {
 /// On success the `ObjectFile` is moved into the `LoValue` and lives with the key.
 /// On stale or error the `ObjectFile` drops, which removes the file and releases
 /// the NVMe disk budget automatically.
-fn set_finalize(
+fn cmd_set_finalize(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     key_name: &[u8],
     object_file: Arc<ObjectFile>,
@@ -221,19 +221,19 @@ pub fn execute_get(
     match (mode, &transport) {
         (OperatingMode::Dram, Transport::Tcp) => {
             // Fully sync — serve from DRAMPool, return directly.
-            EngineResult::Sync(get_dram_tcp(object_id, obj_len))
+            EngineResult::Sync(cmd_get_dram_tcp(object_id, obj_len))
         }
         _ => {
             // Async — block client, dispatch to tokio.
             let blocked_client = ctx.block_client();
             match mode {
                 OperatingMode::Dram => {
-                    get_dram_efa(object_id, obj_len, crc32c, transport, blocked_client);
+                    cmd_get_dram_efa(object_id, obj_len, crc32c, transport, blocked_client);
                 }
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
+                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
                 }
             }
             EngineResult::Async
@@ -245,7 +245,7 @@ pub fn execute_get(
 
 /// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
 /// Multi-buffer: collect_dram_bytes iterates all buffers, copying up to obj_len total.
-fn get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
+fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
@@ -273,7 +273,7 @@ fn get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Valkey
 
 /// DRAM-only EFA GET: object MUST be in DRAMPool. If not found → key doesn't exist
 /// (shouldn't happen — LoValue exists implies ObjectContext exists in DRAM-only mode).
-fn get_dram_efa(
+fn cmd_get_dram_efa(
     object_id: ObjectId,
     obj_len: u64,
     crc32c: u32,
@@ -285,7 +285,7 @@ fn get_dram_efa(
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Serve from DRAMPool.
-            get_from_dram(
+            cmd_get_from_dram(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
             );
         }
@@ -302,7 +302,7 @@ fn get_dram_efa(
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
 /// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
-fn get_tiered(
+fn cmd_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
     crc32c: u32,
@@ -315,7 +315,7 @@ fn get_tiered(
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            get_from_dram(
+            cmd_get_from_dram(
                 dram_pool,
                 &obj_ctx,
                 obj_len,
@@ -355,13 +355,13 @@ fn get_tiered(
         // max_sqes_per_batch throttles how many ReadFixed SQEs we submit per
         // io_uring_submit() call — it does NOT control buffer count.
         let max_sqes_per_batch = crate::max_buffers_per_op();
-        let n_buffers = obj_ctx.buffers.len();
+        let batch_width = obj_ctx.buffers.len();
         let get_info = GetObjectInfo {
             object_id,
             obj_len,
             crc32c,
         };
-        let (chunk_iter, target) = get_transport_parts(transport, obj_len, n_buffers);
+        let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
             let _keep_alive = (file, fd);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -372,7 +372,7 @@ fn get_tiered(
                 dram_pool,
                 object_id,
             };
-            get_tiered_run(
+            cmd_get_tiered_run(
                 get_info,
                 &obj_ctx.buffers,
                 crate::stream::Pool::Dram(dram_pool),
@@ -421,27 +421,27 @@ fn get_tiered(
         }
     };
     let raw_fd = fd.as_raw_fd();
-    let batch_size = stream_ctx.buffers.len();
+    let batch_width = stream_ctx.buffers.len();
     let get_info = GetObjectInfo {
         object_id,
         obj_len,
         crc32c,
     };
     let nvme_pool = storage::get_nvme_pool();
-    let (chunk_iter, target) = get_transport_parts(transport, obj_len, batch_size);
+    let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
     crate::runtime_handle().spawn(async move {
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
         let _keep_alive = (file, fd);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-        get_tiered_run(
+        cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,
             crate::stream::Pool::Nvme(nvme_pool),
             None,
             raw_fd,
-            batch_size,
+            batch_width,
             chunk_iter,
             &thread_ctx,
             target,
@@ -463,15 +463,15 @@ enum GetTarget {
 /// Build the per-transport GET pieces once: the chunk iterator (EFA carries the
 /// client addresses, TCP does not) and the matching `GetTarget`. Used by both the
 /// promotion and the streaming Tiered GET paths so the transport branch lives once.
-fn get_transport_parts(
+fn cmd_get_transport_parts(
     transport: Transport,
     obj_len: u64,
-    n_buffers: usize,
+    batch_width: usize,
 ) -> (ChunkIterator, GetTarget) {
     let chunk_size = crate::chunk_size();
     match transport {
         Transport::Tcp => (
-            ChunkIterator::new(obj_len, chunk_size, n_buffers, None),
+            ChunkIterator::new(obj_len, chunk_size, batch_width, None),
             GetTarget::Tcp,
         ),
         Transport::Efa {
@@ -481,7 +481,7 @@ fn get_transport_parts(
         } => {
             let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
             (
-                ChunkIterator::new(obj_len, chunk_size, n_buffers, Some(efa_addrs)),
+                ChunkIterator::new(obj_len, chunk_size, batch_width, Some(efa_addrs)),
                 GetTarget::Efa(session),
             )
         }
@@ -495,7 +495,7 @@ fn get_transport_parts(
 /// collected bytes, EFA the bare object CRC. A latched target error (promotion
 /// continue-filling) or a run error maps through `reply_stream_err`.
 #[allow(clippy::too_many_arguments)]
-async fn get_tiered_run(
+async fn cmd_get_tiered_run(
     get_info: GetObjectInfo,
     buffers: &[storage::SegmentBuffer],
     source_pool: crate::stream::Pool,
@@ -573,7 +573,7 @@ pub fn execute_set(
     match (mode, &data_source) {
         (OperatingMode::Dram, DataSource::Tcp(data)) => {
             // Fully sync — alloc + memcpy + create LoValue inline.
-            EngineResult::Sync(set_dram_tcp(ctx, key_name, obj_len, data, object_id))
+            EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id))
         }
         _ => {
             // Async — block client, dispatch to tokio.
@@ -581,7 +581,7 @@ pub fn execute_set(
             let key_name_bytes = key_name.as_slice().to_vec();
             match mode {
                 OperatingMode::Dram => {
-                    set_dram_efa(
+                    cmd_set_dram_efa(
                         key_name_bytes,
                         obj_len,
                         data_source,
@@ -590,7 +590,7 @@ pub fn execute_set(
                     );
                 }
                 OperatingMode::Tiered => {
-                    set_tiered(
+                    cmd_set_tiered(
                         key_name_bytes,
                         obj_len,
                         data_source,
@@ -607,7 +607,7 @@ pub fn execute_set(
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
 
 /// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
-fn set_dram_tcp(
+fn cmd_set_dram_tcp(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
@@ -678,7 +678,7 @@ pub enum DataSource {
 // ─── DRAM-only EFA SET ───────────────────────────────────────────────────────
 
 /// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
-fn set_dram_efa(
+fn cmd_set_dram_efa(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -793,7 +793,7 @@ fn set_dram_efa(
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
 
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
-fn set_tiered(
+fn cmd_set_tiered(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -817,10 +817,10 @@ fn set_tiered(
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
-    let batch_size = stream_ctx.buffers.len();
+    let batch_width = stream_ctx.buffers.len();
     match data_source {
         DataSource::Tcp(data) => {
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, None);
+            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -829,7 +829,7 @@ fn set_tiered(
                     obj_len,
                     key_name,
                 };
-                set_tiered_run(
+                cmd_set_tiered_run(
                     set_info,
                     stream_ctx,
                     chunk_iter,
@@ -845,7 +845,7 @@ fn set_tiered(
             remote_addr,
         } => {
             let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_size, Some(efa_addrs));
+            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(efa_addrs));
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -854,7 +854,7 @@ fn set_tiered(
                     obj_len,
                     key_name,
                 };
-                set_tiered_run(
+                cmd_set_tiered_run(
                     set_info,
                     stream_ctx,
                     chunk_iter,
@@ -868,7 +868,7 @@ fn set_tiered(
 }
 
 /// The per-transport variant of a Tiered NVMe SET — the ONLY thing that differs
-/// between the TCP and EFA write paths. `set_tiered_run` matches this once to build the
+/// between the TCP and EFA write paths. `cmd_set_tiered_run` matches this once to build the
 /// right source + object-CRC rule; everything else in the envelope is shared.
 enum SetSource {
     /// TCP: inline payload memcpy'd into the buffers; CRC is over the whole payload.
@@ -882,7 +882,7 @@ enum SetSource {
 /// `variant` is the ONLY per-transport difference (source construction + CRC rule);
 /// it is matched once here. On any error the fd + ObjectFile drop on return,
 /// unlinking the file and releasing the disk budget.
-async fn set_tiered_run(
+async fn cmd_set_tiered_run(
     set_info: SetObjectInfo,
     stream_ctx: storage::StreamingContext,
     chunk_iter: ChunkIterator,
@@ -895,7 +895,7 @@ async fn set_tiered_run(
         key_name,
     } = set_info;
     let chunk_size = crate::chunk_size();
-    let batch_size = stream_ctx.buffers.len();
+    let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = chunk_iter;
     let disk_len = storage::object_disk_len(&mut chunk_iter);
@@ -932,7 +932,7 @@ async fn set_tiered_run(
         crc32c_expected: 0,
         hdr_iovec: 0,
         hdr_ptr: 0,
-        batch_width: batch_size,
+        batch_width,
         reads_header: false,
         header_write: Some(crate::stream::HeaderWrite {
             hdr_buf: &stream_ctx.buffers[0],
@@ -976,7 +976,7 @@ async fn set_tiered_run(
         }
     };
     test_pause_before_finalize().await;
-    match set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
+    match cmd_set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
         Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }
@@ -995,7 +995,7 @@ async fn set_tiered_run(
 /// Serve a Ready ObjectContext from DRAMPool. TCP accumulates into Vec;
 /// EFA writes per-chunk to client GPU (parallelized).
 /// On the EFA path, `obj_ctx` and `file` are pinned for the async transfer's duration.
-fn get_from_dram(
+fn cmd_get_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
     obj_len: u64,

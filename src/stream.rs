@@ -417,10 +417,6 @@ pub struct StreamJob<'a> {
 /// The single streaming driver. Moves every chunk from `source` to `target`,
 /// interleaving per chunk within a window, preserving all of main's semantics.
 ///
-/// `object_crc`: SET-TCP checksums the whole payload post-hoc (one pass over the
-/// full `data`, ignoring the iterator); SET-EFA combines the per-chunk transport
-/// CRCs; GET returns `crc32c_expected`. The caller supplies the right closure over
-/// the (finished) chunk iterator.
 /// The shared window loop for BOTH verbs: snapshot each batch, fan out
 /// `source.produce`, and as each chunk lands feed `target.consume` (the
 /// interleave), latching the first source and first target error. This is the
@@ -551,6 +547,14 @@ pub async fn run_get(
     target: &Target<'_>,
     progress: Option<&PromotionProgress<'_>>,
 ) -> Result<Option<StreamError>, StreamError> {
+    // GET pairs a GET source with a GET target; callers guarantee this.
+    assert!(
+        matches!(
+            source,
+            Source::NvmeRead { .. } | Source::DramResident { .. }
+        ) && matches!(target, Target::TcpReply { .. } | Target::EfaWrite { .. }),
+        "run_get called with a non-GET source/target pairing"
+    );
     if job.reads_header {
         // GET reads+verifies the on-disk FileHeader before the data reads.
         // TODO: Parallelize header and data read submission. Currently serialized
@@ -576,6 +580,11 @@ pub async fn run_get(
 /// FileHeader. No header verify, no progress, no target-error latching (a SET has
 /// no progress hook, so any target error already aborted in `drive_window`).
 /// Returns the committed object CRC.
+///
+/// `object_crc`: SET-TCP checksums the whole payload post-hoc (one pass over the
+/// full `data`, ignoring the iterator); SET-EFA combines the per-chunk transport
+/// CRCs. TCP's closure takes `|_|` because it has the whole payload in `data`; only
+/// EFA needs the iterator's per-chunk CRCs.
 pub async fn run_set(
     job: &StreamJob<'_>,
     chunk_iter: ChunkIterator,
@@ -583,6 +592,12 @@ pub async fn run_set(
     target: &Target<'_>,
     object_crc: impl FnOnce(&ChunkIterator) -> u32,
 ) -> Result<u32, StreamError> {
+    // SET pairs a SET source with a SET target; callers guarantee this.
+    assert!(
+        matches!(source, Source::EfaRead { .. } | Source::TcpInline { .. })
+            && matches!(target, Target::NvmeWrite { .. } | Target::DramResident),
+        "run_set called with a non-SET source/target pairing"
+    );
     let (chunk_iter, _target_err) = drive_window(job, chunk_iter, source, target, None).await?;
     let crc = object_crc(&chunk_iter);
     if let Some(hw) = job.header_write.as_ref() {
