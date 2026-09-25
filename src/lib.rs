@@ -49,6 +49,7 @@ pub mod errors;
 pub mod info;
 pub mod smartlog;
 pub mod storage;
+mod stream;
 pub mod transport;
 
 use info::lo_info;
@@ -162,7 +163,7 @@ lazy_static::lazy_static! {
     // ─── Test Hooks ──────────────────────────────────────────────────────
 
     /// Test-only: pause the tiered SET path for this many milliseconds after
-    /// writing data chunks but before calling set_finalize. 0 = disabled.
+    /// writing data chunks but before calling commit_lo_value. 0 = disabled.
     /// Allows integration tests to inject a DEL in the mid-stream window
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);

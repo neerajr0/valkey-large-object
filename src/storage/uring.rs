@@ -17,29 +17,11 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use tokio::sync::oneshot;
 
 use super::StorageError;
 
 // ─── Request Types ───────────────────────────────────────────────────────────
-
-/// Direction for io_uring batch operations (used in log messages).
-#[derive(Debug)]
-pub enum UringDirection {
-    Read,
-    Write,
-}
-
-impl std::fmt::Display for UringDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UringDirection::Read => f.write_str("read"),
-            UringDirection::Write => f.write_str("write"),
-        }
-    }
-}
 
 /// A single buffer operation descriptor for io_uring ReadFixed/WriteFixed.
 /// Constructed from ObjectContext or StreamingContext + their owning pool.
@@ -154,77 +136,6 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
-}
-
-// ─── Batch submit helpers ────────────────────────────────────────────────────
-
-/// Submit multiple ReadFixed ops. Returns one receiver per op.
-pub fn submit_read_batch(
-    fd: RawFd,
-    ops: Vec<UringOp>,
-) -> Vec<oneshot::Receiver<Result<u64, StorageError>>> {
-    ops.into_iter().map(|op| submit_read(fd, op)).collect()
-}
-
-/// Submit multiple WriteFixed ops. Returns one receiver per op.
-pub fn submit_write_batch(
-    fd: RawFd,
-    ops: Vec<UringOp>,
-) -> Vec<oneshot::Receiver<Result<(), StorageError>>> {
-    ops.into_iter().map(|op| submit_write(fd, op)).collect()
-}
-
-/// Convert batch receivers into a stream of (batch_idx, result) pairs
-/// that yields completions as they arrive (unordered). The caller drives
-/// the stream — TCP drains it via `await_batch`, EFA acts on each completion.
-///
-/// RecvError (poller dropped the sender) is unrecoverable — panics with metric.
-pub fn into_completions<T: Send + 'static>(
-    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
-) -> FuturesUnordered<impl std::future::Future<Output = (usize, Result<T, StorageError>)>> {
-    let stream = FuturesUnordered::new();
-    for (i, rx) in receivers.into_iter().enumerate() {
-        stream.push(async move {
-            match rx.await {
-                Ok(result) => (i, result),
-                // RecvError: the io_uring poller dropped the oneshot sender without
-                // sending a result. The poller has panicked or exited — all NVMe I/O
-                // is broken and this is unrecoverable.
-                Err(_) => {
-                    panic!("largeobj: io_uring poller dropped oneshot sender — poller is dead");
-                }
-            }
-        });
-    }
-    stream
-}
-
-/// `op` identifies the direction — used only in suppressed-error log messages.
-/// Used by TCP path for awaiting all batch receivers.
-pub async fn await_batch<T: Send + 'static>(
-    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
-    op: UringDirection,
-) -> Result<(), StorageError> {
-    let mut completions = into_completions(receivers);
-    let mut first_err: Option<StorageError> = None;
-    while let Some((_idx, result)) = completions.next().await {
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                } else {
-                    valkey_module::logging::log_warning(format!(
-                        "largeobj: {op} batch error (suppressed): {e}"
-                    ));
-                }
-            }
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
 }
 
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
