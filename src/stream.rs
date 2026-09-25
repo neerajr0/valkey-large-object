@@ -49,12 +49,14 @@
 //! in-flight WriteFixed / fi_write still references it. That drain-per-batch IS
 //! the bound; there is no separate channel to size.
 //!
-//! ## Cleanup model (unchanged from main)
+//! ## Cleanup model
 //!
-//! The write targets take an owned `fd`; the CALLER holds the `Arc<ObjectFile>`
-//! whose Drop unlinks the file and releases the NVMe disk budget. The driver does
-//! NO teardown — on any error it returns it and the caller's early `return` drops
-//! the ObjectFile+fd. On success the target yields the object CRC to commit.
+//! The write targets take a raw `fd`; the CALLER owns the `Arc<ObjectFile>` (and
+//! its `OwnedFd`), whose Drop unlinks the file and releases the NVMe disk budget,
+//! and keeps that owner alive for the whole transfer. The driver does NO teardown
+//! — on any error it returns it and the caller's early `return` drops the
+//! ObjectFile (closing the fd, unlinking, releasing budget). On success the target
+//! yields the object CRC to commit.
 
 // The pool/transport seams are internal traits used only within this crate; the
 // raw-pointer buffer accessors and async trait methods are idiomatic here.

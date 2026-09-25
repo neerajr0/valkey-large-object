@@ -73,12 +73,6 @@ pub enum Transport {
     },
 }
 
-/// Batch width for a single-shot DRAM-TCP SET: the whole object is copied inline
-/// in one allocation, so there is no sliding window to bound — every chunk gets
-/// its own buffer index (no reuse). Distinct from the NVMe/EFA paths, which pass
-/// a real `buffers.len()` window width.
-const UNBOUNDED_BATCH_WIDTH: usize = u32::MAX as usize;
-
 /// Resolved object identity for GET operations — the subset of LoValue fields
 /// needed by async read tasks.
 struct GetObjectInfo {
@@ -597,7 +591,6 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, UNBOUNDED_BATCH_WIDTH, None);
     let buffers = match dram_pool.alloc_exact(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
@@ -615,6 +608,10 @@ fn cmd_set_dram_tcp(
             }
         }
     };
+    // DRAM-only SET allocates one buffer per chunk (no sliding window), so the
+    // real buffer count is the batch width — the same derivation as the NVMe/EFA
+    // paths, no special-case sentinel needed.
+    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, buffers.len(), None);
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     while let Some(chunk) = chunk_iter.next_chunk() {
         let src_offset = chunk.index as usize * chunk_size;
@@ -625,9 +622,13 @@ fn cmd_set_dram_tcp(
         digest.update(src);
     }
     let crc = digest.finalize() as u32;
-    // set_value BEFORE insert_object — sync path, no version check needed
-    // (single-threaded main thread, our object_id is always the latest).
-    // If set_value fails, only the buffers need freeing — no map entry to undo.
+    // Insert ObjectContext BEFORE set_value so the key is never visible without
+    // its ObjectContext — the same order as the EFA path. On set_value failure,
+    // remove the entry; ObjectContext::Drop returns the buffers to DRAMPool.
+    // (Sync path: single-threaded main thread, our object_id is always the
+    // latest, so no version check is needed — a plain set_value ordered last.)
+    let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
+    dram_pool.insert_object(object_id, obj_ctx);
     let key = ctx.open_key_writable(key_name);
     let lo_value = LoValue {
         object_id,
@@ -636,12 +637,10 @@ fn cmd_set_dram_tcp(
         file: None,
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
-        dram_pool.free_n(&buffers);
+        dram_pool.remove_object(&object_id);
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
-    let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-    dram_pool.insert_object(object_id, obj_ctx);
     VALKEY_OK
 }
 
