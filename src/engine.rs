@@ -152,52 +152,26 @@ enum SetFinalizeOutcome {
     StaleDiscarded,
 }
 
-/// Version check + set_value on the async SET path.
-/// On success the `ObjectFile` is moved into the `LoValue` and lives with the key.
-/// On stale or error the `ObjectFile` drops, which removes the file and releases
-/// the NVMe disk budget automatically.
-fn cmd_set_finalize(
+/// The one shared SET commit: version-guarded `set_value`. Knows nothing about
+/// files, DRAM, accounting, metrics or replies — the caller builds the `LoValue`
+/// (with `file: Some`/`None`), does any accounting BEFORE calling, and handles its
+/// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
+/// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
+fn commit_lo_value(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     key_name: &[u8],
-    object_file: Arc<ObjectFile>,
-    obj_len: u64,
-    crc: u32,
+    object_id: ObjectId,
+    lo_value: LoValue,
 ) -> Result<SetFinalizeOutcome, ValkeyError> {
-    let object_id = object_file.object_id();
-    let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::nvme_dir());
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
         if existing.object_id > object_id {
-            // ObjectFile drops here — removes file + releases disk budget.
             return Ok(SetFinalizeOutcome::StaleDiscarded);
         }
     }
-    let on_disk = std::fs::metadata(&file_path)
-        .unwrap_or_else(|e| {
-            panic!(
-                "NVMe accounting: cannot stat object {:?} at {} \
-                 to verify write size: {e}",
-                object_id, file_path
-            )
-        })
-        .len();
-    assert_eq!(
-        on_disk, disk_len,
-        "NVMe accounting: object {:?} on disk is {on_disk} B but we \
-         reserved {} B — write path and accounting have diverged",
-        object_id, disk_len
-    );
-    let lo_value = LoValue {
-        object_id,
-        len: obj_len,
-        crc32c: crc,
-        file: Some(object_file),
-    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
-        // set_value failed — LoValue dropped, ObjectFile drops, cleanup automatic.
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
     Ok(SetFinalizeOutcome::ValueSet)
@@ -755,36 +729,27 @@ fn cmd_set_dram_efa(
                 // ObjectContext::Drop returns buffers to DRAMPool automatically.
                 let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
                 dram_pool.insert_object(object_id, obj_ctx);
-                {
-                    let ctx = thread_ctx.lock();
-                    let key_str = ctx.create_string(key_name.clone());
-                    let key = ctx.open_key_writable(&key_str);
-                    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-                        if existing.object_id > object_id {
-                            // Stale write — a newer SET already completed.
-                            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-                            dram_pool.remove_object(&object_id);
-                            thread_ctx.reply(VALKEY_OK);
-                            return;
-                        }
+                let lo_value = LoValue {
+                    object_id,
+                    len: obj_len,
+                    crc32c: crc,
+                    file: None,
+                };
+                match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
+                    Ok(SetFinalizeOutcome::ValueSet) => {
+                        thread_ctx.reply(VALKEY_OK);
                     }
-                    let lo_value = LoValue {
-                        object_id,
-                        len: obj_len,
-                        crc32c: crc,
-                        file: None,
-                    };
-                    if key.set_value(&LO_TYPE, lo_value).is_err() {
+                    Ok(SetFinalizeOutcome::StaleDiscarded) => {
+                        // Stale write — a newer SET already completed.
+                        info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
                         dram_pool.remove_object(&object_id);
-                        reply_err(
-                            &thread_ctx,
-                            &info::SET_VALUE_FAILURES,
-                            ValkeyError::Str(errors::ERR_SET_VALUE),
-                        );
-                        return;
+                        thread_ctx.reply(VALKEY_OK);
+                    }
+                    Err(e) => {
+                        dram_pool.remove_object(&object_id);
+                        reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
                     }
                 }
-                thread_ctx.reply(VALKEY_OK);
             });
         }
     }
@@ -976,11 +941,37 @@ async fn cmd_set_tiered_run(
         }
     };
     test_pause_before_finalize().await;
-    match cmd_set_finalize(&thread_ctx, &key_name, object_file, obj_len, crc) {
+    // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
+    let object_id = object_file.object_id();
+    let disk_len = object_file.disk_len();
+    let file_path = object_id.file_path(&crate::nvme_dir());
+    let on_disk = std::fs::metadata(&file_path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "NVMe accounting: cannot stat object {:?} at {} \
+                 to verify write size: {e}",
+                object_id, file_path
+            )
+        })
+        .len();
+    assert_eq!(
+        on_disk, disk_len,
+        "NVMe accounting: object {:?} on disk is {on_disk} B but we \
+         reserved {} B — write path and accounting have diverged",
+        object_id, disk_len
+    );
+    let lo_value = LoValue {
+        object_id,
+        len: obj_len,
+        crc32c: crc,
+        file: Some(object_file),
+    };
+    match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
         Ok(SetFinalizeOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }
         Ok(SetFinalizeOutcome::StaleDiscarded) => {
+            // lo_value dropped in commit_lo_value → ObjectFile drop unlinks + frees budget.
             info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
             thread_ctx.reply(VALKEY_OK);
         }
