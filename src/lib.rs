@@ -726,19 +726,20 @@ mod tests {
     // mutation) and passed in so override expressions like `segment - 1` use
     // the real defaults without duplicating their numeric values.
 
-    fn edge_test_cases(
-        segment: i64,
-        chunk: i64,
-        max_obj: i64,
-        promote: i64,
-        max_buf: i64,
-        min_buf: i64,
-    ) -> Vec<(
+    type EdgeTestCase = (
         &'static str,
         OperatingMode,
         Vec<(&'static AtomicI64, i64)>,
         Option<&'static str>,
-    )> {
+    );
+
+    fn edge_test_cases(
+        segment: i64,
+        chunk: i64,
+        max_obj: i64,
+        max_buf: i64,
+        min_buf: i64,
+    ) -> Vec<EdgeTestCase> {
         vec![
             // ── Happy paths ──────────────────────────────────────────────
             ("defaults_pass", OperatingMode::Dram, vec![], None),
@@ -839,11 +840,10 @@ mod tests {
         let segment = CFG_SEGMENT_SIZE.load(Relaxed);
         let chunk = CFG_CHUNK_SIZE.load(Relaxed);
         let max_obj = CFG_MAX_OBJECT_SIZE.load(Relaxed);
-        let promote = CFG_MAX_PROMOTE_SIZE.load(Relaxed);
         let max_buf = CFG_MAX_BUFFERS_PER_OP.load(Relaxed);
         let min_buf = CFG_MIN_BUFFERS_PER_OP.load(Relaxed);
         for (label, mode, overrides, expected_err) in
-            edge_test_cases(segment, chunk, max_obj, promote, max_buf, min_buf)
+            edge_test_cases(segment, chunk, max_obj, max_buf, min_buf)
         {
             set_cfgs(&defaults);
             set_mode(OperatingMode::Dram);
