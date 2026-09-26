@@ -7,9 +7,15 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     """Dram-only mode: all objects live in DRAMPool, no NVMe."""
 
     def get_module_args(self, data_dir, direct_io):
+        # dram-maxmemory=0 (unlimited) so the pool grows on demand for normal
+        # tests. Tests that need a tight budget set it at runtime via CONFIG SET.
+        # max-object-size must be set explicitly because the default (512 MiB)
+        # would violate dram-maxmemory >= max-object-size when those tests
+        # lower dram-maxmemory.
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
+            f" max-object-size 2097152"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -60,16 +66,19 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_dram_pool_exhaustion(self):
-        """An object larger than segment-size fails with pool exhausted."""
+        """Pool exhaustion when the pool is full and cannot expand."""
         client = self.server.get_new_client()
-        # segment-size is 2MB. A 4MB object cannot be allocated.
-        obj_size = 4 * 1024 * 1024
-        payload = b'D' * obj_size
-        try:
-            client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
-        except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+        # Cap the pool at one 2MB segment so it cannot grow.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
+        # Fill until the pool is saturated, then verify the next write fails.
+        i = 0
+        while True:
+            try:
+                client.execute_command('LO.SET', f'fill{i}', b'D' * 4096)
+                i += 1
+            except ResponseError as e:
+                assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+                break
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -174,9 +183,11 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_max_object_size_dram_rejection(self):
         """CONFIG SET max-object-size > dram-maxmemory is rejected."""
         client = self.server.get_new_client()
-        dram_limit = 1048576  # 1 MiB
+        # Set dram-maxmemory to match max-object-size (2 MiB from module args),
+        # then try to raise max-object-size above it.
+        dram_limit = 2097152  # 2 MiB
         client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', str(dram_limit))
-        obj_limit = 2 * 1048576  # 2 MiB
+        obj_limit = 2 * dram_limit  # 4 MiB — exceeds dram-maxmemory
         try:
             client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(obj_limit))
             assert False, "Expected CONFIG SET to be rejected"

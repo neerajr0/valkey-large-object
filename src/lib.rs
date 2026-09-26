@@ -705,8 +705,14 @@ mod tests {
             (&CFG_CHUNK_SIZE, CFG_CHUNK_SIZE.load(Relaxed)),
             (&CFG_MAX_OBJECT_SIZE, CFG_MAX_OBJECT_SIZE.load(Relaxed)),
             (&CFG_MAX_PROMOTE_SIZE, CFG_MAX_PROMOTE_SIZE.load(Relaxed)),
-            (&CFG_MAX_BUFFERS_PER_OP, CFG_MAX_BUFFERS_PER_OP.load(Relaxed)),
-            (&CFG_MIN_BUFFERS_PER_OP, CFG_MIN_BUFFERS_PER_OP.load(Relaxed)),
+            (
+                &CFG_MAX_BUFFERS_PER_OP,
+                CFG_MAX_BUFFERS_PER_OP.load(Relaxed),
+            ),
+            (
+                &CFG_MIN_BUFFERS_PER_OP,
+                CFG_MIN_BUFFERS_PER_OP.load(Relaxed),
+            ),
         ]
     }
 
@@ -735,12 +741,7 @@ mod tests {
     )> {
         vec![
             // ── Happy paths ──────────────────────────────────────────────
-            (
-                "defaults_pass",
-                OperatingMode::Dram,
-                vec![],
-                None,
-            ),
+            ("defaults_pass", OperatingMode::Dram, vec![], None),
             (
                 "dram_maxmemory_zero_skips_edges",
                 OperatingMode::Dram,
