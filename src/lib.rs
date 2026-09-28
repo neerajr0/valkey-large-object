@@ -411,7 +411,7 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
             ConfigDependencyEdge {
                 parent: &CFG_NVME_STAGING_SIZE,
                 child: &CFG_SEGMENT_SIZE,
-                enforce_condition: || true,
+                enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 error_msg: errors::ERR_STAGING_GE_SEGMENT,
             },
             ConfigDependencyEdge {
@@ -799,7 +799,7 @@ mod tests {
             ),
             (
                 "staging_lt_segment_rejected",
-                OperatingMode::Dram,
+                OperatingMode::Tiered,
                 vec![(&CFG_NVME_STAGING_SIZE, segment - 1)],
                 Some("nvme-staging-size must be >= segment-size"),
             ),
