@@ -50,6 +50,7 @@ define_errors! {
 
     // Config Validation Errors
     ERR_OBJECT_TOO_LARGE => "ERR object size exceeds max-object-size limit",
+    ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
     ERR_DRAM_GE_SEGMENT => "ERR dram-maxmemory must be >= segment-size",
     ERR_DRAM_GE_MAX_OBJ => "ERR dram-maxmemory must be >= max-object-size in Dram mode",
     ERR_DRAM_GE_PROMOTE => "ERR dram-maxmemory must be >= max-promote-size in Tiered mode",
