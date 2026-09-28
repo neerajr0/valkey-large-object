@@ -577,6 +577,22 @@ pub fn execute_set(
     }
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Try alloc_exact, reactive expand on failure, retry once.
+/// Returns the buffers on success, None if pool is still exhausted after expand.
+fn dram_alloc_or_expand(
+    pool: &storage::DRAMPool,
+    ctx: &valkey_module::Context,
+    obj_len: u64,
+) -> Option<Vec<storage::SegmentBuffer>> {
+    if let Some(bufs) = pool.alloc_exact(obj_len as usize) {
+        return Some(bufs);
+    }
+    pool.try_expand(ctx)?;
+    pool.alloc_exact(obj_len as usize)
+}
+
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
 
 /// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
@@ -589,21 +605,11 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_pool.alloc_exact(obj_len as usize) {
+    let buffers = match dram_alloc_or_expand(dram_pool, ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
-            // Reactive expansion: pool exhausted — try adding one segment, then retry.
-            if dram_pool.try_expand(ctx).is_none() {
-                info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
-            }
-            match dram_pool.alloc_exact(obj_len as usize) {
-                Some(bufs) => bufs,
-                None => {
-                    info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                    return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
-                }
-            }
+            info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
         }
     };
     // DRAM-only SET allocates one buffer per chunk (no sliding window), so the
@@ -669,34 +675,17 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact: all-or-nothing.
-    let buffers = match dram_pool.alloc_exact(obj_len as usize) {
+    // DRAMPool::alloc_exact with reactive expand: all-or-nothing.
+    let buffers = match dram_alloc_or_expand(dram_pool, ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
-            // Reactive expansion: pool exhausted — try adding one segment, then retry.
-            if dram_pool.try_expand(ctx).is_none() {
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                reply_err(
-                    &thread_ctx,
-                    &info::DRAM_POOL_EXHAUSTED,
-                    ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
-                );
-                return;
-            }
-            match dram_pool.alloc_exact(obj_len as usize) {
-                Some(bufs) => bufs,
-                None => {
-                    let thread_ctx =
-                        valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                    reply_err(
-                        &thread_ctx,
-                        &info::DRAM_POOL_EXHAUSTED,
-                        ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
-                    );
-                    return;
-                }
-            }
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            reply_err(
+                &thread_ctx,
+                &info::DRAM_POOL_EXHAUSTED,
+                ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
+            );
+            return;
         }
     };
     match data_source {
