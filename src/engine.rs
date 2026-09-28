@@ -554,6 +554,7 @@ pub fn execute_set(
             match mode {
                 OperatingMode::Dram => {
                     cmd_set_dram_efa(
+                        ctx,
                         key_name_bytes,
                         obj_len,
                         data_source,
@@ -656,6 +657,7 @@ pub enum DataSource {
 
 /// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
 fn cmd_set_dram_efa(
+    ctx: &valkey_module::Context,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -671,13 +673,30 @@ fn cmd_set_dram_efa(
     let buffers = match dram_pool.alloc_exact(obj_len as usize) {
         Some(bufs) => bufs,
         None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            reply_err(
-                &thread_ctx,
-                &info::DRAM_POOL_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
-            );
-            return;
+            // Reactive expansion: pool exhausted — try adding one segment, then retry.
+            if dram_pool.try_expand(ctx).is_none() {
+                let thread_ctx =
+                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+                reply_err(
+                    &thread_ctx,
+                    &info::DRAM_POOL_EXHAUSTED,
+                    ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
+                );
+                return;
+            }
+            match dram_pool.alloc_exact(obj_len as usize) {
+                Some(bufs) => bufs,
+                None => {
+                    let thread_ctx =
+                        valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+                    reply_err(
+                        &thread_ctx,
+                        &info::DRAM_POOL_EXHAUSTED,
+                        ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
+                    );
+                    return;
+                }
+            }
         }
     };
     match data_source {

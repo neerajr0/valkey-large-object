@@ -8,11 +8,22 @@ Tests cover:
   - Tiered mode: shrink evicts cached segment but NVMe copy survives
 """
 
+import binascii
 import os
+import subprocess
 import time
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+
+# A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1.
+PEER_ADDRESS = binascii.hexlify(
+    b'\x02\x00' + (1).to_bytes(2, 'big') + bytes([127, 0, 0, 1]) + bytes(8)
+).decode()
+
+# What tests/harness/fabric_target writes (--read mode) or expects (write mode).
+EFA_PATTERN = b'\xab'
+EFA_TARGET_LEN = 4096
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -27,15 +38,31 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         # segment-size=1MB, dram-maxmemory=0 → starts with 1 segment, grows on demand.
         # scaling-poll-ms=60000 → cron fires at most once per minute, won't interfere.
+        # fabric-provider Emulated on loopback for EFA reactive expand test.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" dram-maxmemory 0"
             f" scaling-poll-ms 60000"
-            f" chunk-size 65536"
+            f" chunk-size 4096"
+            f" max-object-size 1048576"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
         )
+
+    def start_target(self, *flags):
+        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        process = subprocess.Popen(
+            [target, '127.0.0.1', *flags],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        line = process.stdout.readline()
+        assert line.startswith('advertisement: '), line
+        address, rkey, remote_addr = line.split()[1:]
+        return process, address, int(rkey), int(remote_addr)
 
     def test_expand_on_segment_full(self):
         """SET that fills a segment triggers reactive expand in serve_set_dram_tcp.
@@ -44,7 +71,9 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         reactive path in the SET handler. Verified via scaling_expand_total.
         """
         client = self.server.get_new_client()
-        obj_size = 900 * 1024
+        # 500KB at chunk-size=4096 → 125 chunks. Fits in one 1MB segment (talc
+        # fits ~127 x 4096 allocs). Two 500KB objects overflow → reactive expand.
+        obj_size = 500 * 1024
 
         before = info_largeobj(client)
         expand_before = before.get('largeobj_scaling_expand_total', 0)
@@ -62,7 +91,9 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
     def test_expand_data_integrity(self):
         """Data written before and after a reactive expand is returned correctly."""
         client = self.server.get_new_client()
-        obj_size = 800 * 1024
+        # 400KB at chunk-size=4096 → 100 chunks per object. 4 objects = 400 chunks,
+        # each segment holds ~127, so expands happen naturally.
+        obj_size = 400 * 1024
         keys_payloads = [(f'key_{i}', bytes([i % 256]) * obj_size) for i in range(4)]
 
         for key, payload in keys_payloads:
@@ -105,6 +136,28 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
                 got = client.execute_command('LO.GET', key)
                 assert got == payload, f"{key} data corrupted under pressure"
 
+    def test_efa_set_triggers_reactive_expand(self):
+        """Fill the 1MB segment with a TCP SET, then an EFA SET triggers expand.
+
+        Same principle as test_expand_on_segment_full but exercises the EFA SET
+        path (cmd_set_dram_efa) which also has reactive expand logic.
+        """
+        client = self.server.get_new_client()
+        expand_before = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
+        # Fill most of the 1MB segment with a TCP SET (900KB).
+        client.execute_command('LO.SET', 'filler', b'F' * (900 * 1024))
+        # EFA SET of 4096 bytes — segment nearly full, must trigger expand.
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client.execute_command('LO.HELLO', address)
+            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
+            assert result == b'OK', f"EFA SET failed: {result}"
+            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
+            expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
+            assert expand_after > expand_before, \
+                "Expected scaling_expand_total to increase from reactive EFA SET expand"
+        finally:
+            process.kill()
 
 
 class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
