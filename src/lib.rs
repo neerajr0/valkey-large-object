@@ -37,7 +37,9 @@ use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
+use valkey_module::{
+    valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
+};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -46,6 +48,7 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod eviction;
 pub mod info;
 pub mod smartlog;
 pub mod storage;
@@ -141,6 +144,29 @@ lazy_static::lazy_static! {
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
 
+    // ─── Eviction Configs ────────────────────────────────────────────────
+
+    /// Eviction aggressiveness when selecting victims. Inspired by Valkey core's
+    /// `maxmemory-eviction-tenacity`. Bounded on a 0–100 scale to determine how much
+    /// eviction effort the main thread should dedicate. Default of 10 translates to
+    /// 500us. 100 is an unbounded wait until eviction reclaimation is sufficient or we
+    /// hit failsafe ``eviction::barren_rounds`.
+    ///
+    /// We cannot use the core tenacity calculation directly because we are using
+    /// different hardware with different latency performance (NVMe vs DRAM).
+    static ref CFG_EVICTION_TENACITY: AtomicI64 = AtomicI64::new(10);
+
+    /// Candidates drawn and scored per eviction sample round. Inspired by Valkey core's
+    /// `maxmemory-samples`, same range and default.
+    static ref CFG_MAXMEMORY_SAMPLES: AtomicI64 = AtomicI64::new(5);
+
+    /// Determines if we are allowed to over-provision memory utilization when using
+    /// DRAM only mode. In Valkey's core eviction path, if evictions cannot sufficiently
+    /// evict memory for a pending write, we allow to over-provision past `maxmemory`.
+    /// Simiarly, in this module, we can allow a temporary over-provisioned segment
+    /// if evictions are not sufficient to free-up memory for an incoming write.
+    static ref CFG_DRAM_OVERPROVISION: AtomicBool = AtomicBool::new(true);
+
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
     /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
@@ -215,6 +241,15 @@ pub fn nvme_dir() -> String {
         .clone()
 }
 
+/// Test-only: point `nvme-dir` at a writable directory. `nvme-dir` is an IMMUTABLE config
+/// set once at module load, which unit tests never reach, so it is the empty string there
+/// — and a unit test that drops an `ObjectFile` would then fail to unlink `/<oid>.dat` and
+/// try to log the failure, which aborts outside a server (`RedisModule_Log` is null).
+#[cfg(test)]
+pub(crate) fn set_nvme_dir_for_test(dir: &str) {
+    *CFG_NVME_DIR.lock().expect("CFG_NVME_DIR lock unavailable") = dir.to_string();
+}
+
 pub fn nvme_staging_size() -> usize {
     CFG_NVME_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -230,6 +265,18 @@ pub fn segment_size() -> usize {
 
 pub fn nvme_maxmemory() -> u64 {
     CFG_NVME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn eviction_tenacity() -> i64 {
+    CFG_EVICTION_TENACITY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn maxmemory_samples() -> usize {
+    CFG_MAXMEMORY_SAMPLES.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn dram_overprovision() -> bool {
+    CFG_DRAM_OVERPROVISION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn worker_threads() -> usize {
@@ -272,6 +319,19 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
     let used = info.field_unsigned("used_memory").unwrap_or(0);
     let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
     (used, maxmemory)
+}
+
+/// Whether the server permits deleting keys to make room. Requires a
+/// `noeviction` policy, `maxmemory > 0`, and being a primary.
+pub fn eviction_allowed(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::EVICTED)
+}
+
+/// Whether the `maxmemory-policy` is one of the `volatile-*` family.
+pub fn volatile_policy(ctx: &Context) -> bool {
+    let info = ctx.server_info("memory");
+    info.field_c("maxmemory_policy")
+        .is_some_and(|policy| policy.starts_with("volatile-"))
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
@@ -686,6 +746,10 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, 1, 1, 1024,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["eviction-tenacity", &*CFG_EVICTION_TENACITY, 10, 0, 100,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["maxmemory-samples", &*CFG_MAXMEMORY_SAMPLES, 5, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
         ],
         string: [
             ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
@@ -694,6 +758,7 @@ valkey_module! {
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
+            ["dram-overprovision", &*CFG_DRAM_OVERPROVISION, true, ConfigurationFlags::DEFAULT, None],
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,

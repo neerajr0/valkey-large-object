@@ -23,7 +23,7 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
-pub use object_file::ObjectFile;
+pub use object_file::{DiskReservation, ObjectFile};
 
 // Re-exports from nvme.rs
 pub use nvme::{

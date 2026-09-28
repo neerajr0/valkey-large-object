@@ -75,6 +75,37 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "dram_uring_registered_segments",
             dram.io_uring_registered_count() as i64,
         )?
+        .field(
+            "evictions_total",
+            crate::eviction::EVICTIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "eviction_failures_total",
+            crate::eviction::EVICTION_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                as i64,
+        )?
+        .field(
+            "eviction_reclaimed_bytes_total",
+            crate::eviction::RECLAIMED_BYTES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                as i64,
+        )?
+        .field(
+            "pinned_skips_total",
+            crate::eviction::PINNED_SKIPS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "overprovisions_total",
+            crate::eviction::OVERPROVISIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "overprovision_refusals_total",
+            crate::eviction::OVERPROVISION_REFUSALS_TOTAL
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        // The flag, not just the counters: a pool that overprovisioned once and never got
+        // the segment back is permanently a segment over the watermark below, and the
+        // counters alone cannot say whether that is still true.
+        .field("overprovisioned", i64::from(dram.is_overprovisioned()))?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -97,6 +128,25 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "nvme_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
+        )?
+        .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
+        .field("disk_maxmemory_bytes", crate::nvme_maxmemory() as i64)?
+        // `disk_` prefixes are load-bearing, not decoration: the builder prefixes every
+        // field with `largeobj_` and nothing else, so a bare `evictions_total` here is the
+        // *same* INFO field as the DRAM section's and one silently masks the other.
+        .field(
+            "disk_evictions_total",
+            crate::eviction::DISK_EVICTIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_eviction_failures_total",
+            crate::eviction::DISK_EVICTION_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                as i64,
+        )?
+        .field(
+            "disk_eviction_reclaimed_bytes_total",
+            crate::eviction::DISK_RECLAIMED_BYTES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                as i64,
         )?
         .build_section()?
         .build_info()

@@ -10,9 +10,13 @@
 //! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks
 //! it draining, and removes its cached objects from the HashMap so GET handlers
 //! fall back to NVMe. The segment releases on the next cron tick when refcount hits 0.
+//!
+//! Shrink leaves the keyspace alone because the data is on NVMe. It is the only thing that
+//! drops promoted copies: an arena too full to serve a promotion skips it instead
+//! (`try_promote_object`), so nothing resident is ever given up for a cache fill.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::context::{ObjectContext, SegmentBuffer};
@@ -28,6 +32,10 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
+    /// Set while the pool holds one segment *more* than `try_expand`'s gates would
+    /// permit. State, not a quota: it is what stops `overprovision` happening twice,
+    /// and it re-arms when a segment is released.
+    overprovisioned: AtomicBool,
 }
 
 impl DRAMPool {
@@ -37,10 +45,17 @@ impl DRAMPool {
             objects: RwLock::new(HashMap::new()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
+            overprovisioned: AtomicBool::new(false),
         }
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
+
+    /// Allocate from the capacity the pool already has. Never expands, so it is also the
+    /// question eviction asks: "is there room *now*".
+    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_exact(size)
+    }
 
     /// Allocate all buffers for an object, expanding once if needed.
     /// Try `alloc_exact`; on failure expand a single segment and retry.
@@ -149,6 +164,20 @@ impl DRAMPool {
             .remove(oid)
     }
 
+    /// True when someone outside the map holds this object — an in-flight transfer
+    /// whose buffer the NIC is still reading. Eviction skips these: the memory is
+    /// genuinely in use, so giving the entry up would free nothing.
+    ///
+    /// Reads through the guard rather than via `get_object`, which clones — and a
+    /// clone is itself a reference, so it could never report anything but pinned.
+    pub fn is_pinned(&self, oid: &ObjectId) -> bool {
+        self.objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable")
+            .get(oid)
+            .is_some_and(|arc| Arc::strong_count(arc) > 1)
+    }
+
     /// Check if object exists (coalesce check — is promotion in progress?).
     pub fn contains_object(&self, oid: &ObjectId) -> bool {
         self.objects
@@ -248,7 +277,9 @@ impl DRAMPool {
     ///
     /// Must be called from the Valkey main event-loop thread only.
     pub fn release_drained_segments(&self) {
-        self.pool.release_all_releasable();
+        if self.pool.release_all_releasable() > 0 {
+            self.overprovisioned.store(false, Ordering::Release);
+        }
     }
 
     /// Add one segment to the pool, gated by the server-wide `maxmemory` (via
@@ -276,6 +307,30 @@ impl DRAMPool {
         // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
         super::uring::submit_reregister(super::uring::PoolType::Dram);
         Some(idx)
+    }
+
+    /// Add one segment *past* `try_expand`'s watermark gate — the deliberate overcommit of
+    /// last resort, when eviction could not free a usable run and the alternative is to
+    /// fail the write. `false` means we are already one segment over and the caller must
+    /// OOM; the flag clears when a segment is released (`release_drained_segments`). The
+    /// extra segment goes into ordinary circulation.
+    pub fn overprovision(&self) -> bool {
+        if self.overprovisioned.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let Some((_, slice)) = self.pool.expand() else {
+            self.overprovisioned.store(false, Ordering::Release);
+            return false;
+        };
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+        crate::efa_register_segment(slice);
+        super::uring::submit_reregister(super::uring::PoolType::Dram);
+        true
+    }
+
+    /// Whether the pool is currently one segment over its gates. Reported by `INFO largeobj`.
+    pub fn is_overprovisioned(&self) -> bool {
+        self.overprovisioned.load(Ordering::Acquire)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.
@@ -317,5 +372,40 @@ impl DRAMPool {
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
+    }
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Eviction skips pinned objects, so `is_pinned` decides whether an object is
+    /// destroyed. Both answers have to be right: a false negative destroys a buffer
+    /// the NIC is reading, and a false positive makes the object permanently
+    /// un-evictable. The map's own reference is what makes the count 1 at rest.
+    #[test]
+    fn is_pinned_tracks_holders_outside_the_map() {
+        let pool = DRAMPool::new(1, 1024 * 1024);
+        let oid = ObjectId::next();
+        let buffers = pool.alloc_exact(4096).expect("fresh pool must serve 4096");
+        pool.insert_object(oid, Arc::new(ObjectContext::new_ready(buffers)));
+
+        assert!(
+            !pool.is_pinned(&oid),
+            "only the map holds it, so it is evictable"
+        );
+
+        // What an in-flight transfer holds. `get_object` clones, which is precisely
+        // why `is_pinned` must not use it to look.
+        let transfer = pool.get_object(&oid).expect("object is resident");
+        assert!(pool.is_pinned(&oid), "a transfer holds it — do not evict");
+
+        drop(transfer);
+        assert!(
+            !pool.is_pinned(&oid),
+            "the transfer's drop returns it to eviction's reach, with no help from us"
+        );
     }
 }

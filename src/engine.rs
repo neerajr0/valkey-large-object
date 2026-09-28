@@ -575,6 +575,7 @@ pub fn execute_set(
                 }
                 OperatingMode::Tiered => {
                     cmd_set_tiered(
+                        ctx,
                         key_name_bytes,
                         obj_len,
                         data_source,
@@ -590,6 +591,38 @@ pub fn execute_set(
 
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
 
+/// Allocate `len` bytes in the DRAM arena. Returns `None` on failure. Runs on the
+/// main thread for both TCP and EFA paths.
+///
+/// Allocation and eviction procedure is as follows:
+///
+/// 1. Attempt to use the free capacity already in the pool.
+/// 2. Try to expand the dram pool if we are under `dram-maxmemory` and the watermark.
+///
+/// If the eviction policy is `noeviction` or `maxmemory` is equal to 0,  we do not attempt
+/// to evict or overprovision.
+///
+/// 3. Try to evict items from the keyspace.
+/// 4. If there's no overprovisioned segment, allocate a new segment. This is a dangerous
+///    operation because it relies on memory headroom beyond maxmemory and can lead to
+///    swapping and/or malloc() failures.
+fn alloc_dram_or_make_room(
+    ctx: &valkey_module::Context,
+    dram_pool: &storage::DRAMPool,
+    len: u64,
+) -> Option<Vec<storage::context::SegmentBuffer>> {
+    if let Some(buffers) = dram_pool.alloc_exact_or_expand(ctx, len) {
+        return Some(buffers);
+    }
+    if !crate::eviction_allowed(ctx) {
+        return None;
+    }
+    if let Some(buffers) = crate::eviction::alloc_by_evicting(ctx, len as usize) {
+        return Some(buffers);
+    }
+    crate::eviction::alloc_by_overprovisioning(dram_pool, len as usize)
+}
+
 /// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
 fn cmd_set_dram_tcp(
     ctx: &valkey_module::Context,
@@ -600,7 +633,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match alloc_dram_or_make_room(ctx, dram_pool, obj_len) {
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -676,8 +709,7 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_or_expand: all-or-nothing with reactive expansion.
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match alloc_dram_or_make_room(ctx, dram_pool, obj_len) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -753,8 +785,26 @@ fn cmd_set_dram_efa(
 
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
 
+/// Reserve `disk_len` of the `nvme-maxmemory` budget. Claiming resident objects for eviction
+/// if enabled and required. `None` means the budget cannot serve this object and the caller
+/// must fail the write.
+///
+/// Main thread only — eviction deletes keys.
+fn reserve_nvme_or_make_room(
+    ctx: &valkey_module::Context,
+    object_id: ObjectId,
+    disk_len: u64,
+) -> Option<storage::DiskReservation> {
+    if nvme::try_reserve_nvme_disk_usage(disk_len) {
+        return Some(storage::DiskReservation::charged(object_id, disk_len));
+    }
+    crate::eviction::claim_disk_victims(ctx, disk_len)
+        .map(|victims| storage::DiskReservation::paid_by(object_id, disk_len, victims))
+}
+
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
 fn cmd_set_tiered(
+    ctx: &valkey_module::Context,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -779,6 +829,22 @@ fn cmd_set_tiered(
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
+    // Disk budget and any eviction it needs are settled here, on the main thread, and travel
+    // with the write task as one pre-paid instruction so the task cannot fail for capacity.
+    let disk_len = {
+        let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
+        storage::object_disk_len(&mut chunk_iter)
+    };
+    let Some(reservation) = reserve_nvme_or_make_room(ctx, object_id, disk_len) else {
+        // `stream_ctx` drops here, handing the staging window back to the pool.
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        reply_err(
+            &thread_ctx,
+            &info::NVME_CAPACITY_EXCEEDED,
+            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
+        );
+        return;
+    };
     match data_source {
         DataSource::Tcp(data) => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
@@ -796,6 +862,7 @@ fn cmd_set_tiered(
                     chunk_iter,
                     thread_ctx,
                     SetSource::Tcp(data),
+                    reservation,
                 )
                 .await;
             });
@@ -816,6 +883,7 @@ fn cmd_set_tiered(
                     chunk_iter,
                     thread_ctx,
                     SetSource::Efa(session),
+                    reservation,
                 )
                 .await;
             });
@@ -844,6 +912,7 @@ async fn cmd_set_tiered_run(
     chunk_iter: ChunkIterator,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     variant: SetSource,
+    mut reservation: storage::DiskReservation,
 ) {
     let SetObjectInfo {
         object_id,
@@ -854,22 +923,23 @@ async fn cmd_set_tiered_run(
     let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = chunk_iter;
-    let disk_len = storage::object_disk_len(&mut chunk_iter);
-    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
-        reply_err(
-            &thread_ctx,
-            &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
-        );
-        return;
-    }
+    // Settle the budget before touching the filesystem: charge the new file, then drop the
+    // victims, which unlinks their files and credits their bytes back. Write tasks cannot borrow
+    // from each other's eviction reservations, so this one cannot fail for capacity.
+    reservation.commit();
+    let disk_len = reservation.disk_len();
+    debug_assert_eq!(
+        disk_len,
+        storage::object_disk_len(&mut chunk_iter),
+        "reserved disk_len must match what this task will actually write"
+    );
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::nvme_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
-            nvme::decrease_nvme_disk_usage(disk_len);
+            // `reservation` drops on return, giving the budget back.
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
@@ -879,7 +949,7 @@ async fn cmd_set_tiered_run(
         }
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
-    let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
+    let object_file = Arc::new(reservation.into_object_file());
     let job = crate::stream::StreamJob::for_nvme_set(
         fd.as_raw_fd(),
         obj_len,
