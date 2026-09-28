@@ -14,7 +14,14 @@ use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use talc::{ErrOnOom, Span, Talc};
+use talc::base::binning::DefaultBinning;
+use talc::base::Talc;
+use talc::source::Manual;
+
+/// This segment's talc allocator type: a manual-source, default-binning `Talc`.
+/// `Manual` provides no backing source — the segment claims its own
+/// `[base, base+size)` range explicitly and never grows beyond it.
+pub type SegmentTalc = Talc<Manual, DefaultBinning>;
 
 /// A contiguous registered memory region with an owned talc allocator.
 pub struct Segment {
@@ -29,14 +36,28 @@ pub struct Segment {
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with
     /// other segments' allocators.
-    pub talc: Mutex<Talc<ErrOnOom>>,
+    pub talc: Mutex<SegmentTalc>,
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
-    /// Bytes currently allocated from this segment (sum of align_up(alloc sizes)).
+    /// Bytes currently allocated from this segment. Mirrors talc's authoritative
+    /// `counters().allocated_bytes`, refreshed under the talc lock on every
+    /// alloc/free — drift-free and overhead-aware (not a hand-summed estimate).
     /// Used for picker (max-loaded packing) and INFO utilization.
-    /// Relaxed ordering — advisory, not correctness.
+    /// Relaxed ordering — advisory, not correctness; the scaling cron reads it
+    /// lock-free.
     pub allocated_bytes: AtomicUsize,
+    /// Number of free gaps (holes) in this segment's heap right now. Mirrors
+    /// talc's authoritative `counters().fragment_count`, refreshed under the
+    /// talc lock on every alloc/free. This is the fragmentation signal: 1 = all
+    /// free space is one contiguous block (healthy); a high value = free space
+    /// scattered into many small holes (fragmented). It is a hole COUNT, not a
+    /// byte figure — read alongside `allocated_bytes` for context (many holes at
+    /// low occupancy = scatter). talc's public counters do not expose a
+    /// largest-free-block, so a jemalloc-style active/allocated ratio is not
+    /// computable; this count is the reliable public signal.
+    /// Relaxed ordering — advisory, read lock-free by the cron/INFO.
+    pub fragment_count: AtomicUsize,
     /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
     /// Whether this segment's buffer is registered with the io_uring kernel
@@ -59,14 +80,16 @@ impl Segment {
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
 
-        let mut talc = Talc::new(ErrOnOom);
-        let span = Span::from_base_size(base, size);
+        let mut talc = Talc::new(Manual);
         // Safety: memory was just allocated exclusively for this Segment; nothing
         // else references [base, base+size), so claim's non-overlap invariant holds.
-        // The claimed span is not retained — a segment is reclaimed by dropping it
-        // whole (its talc metadata lives inside its own memory), so there is no
-        // truncate/get_allocated_span path that needs the returned Span.
-        unsafe { talc.claim(span).expect("talc.claim failed for new segment") };
+        // talc 5.x `claim(base, size)` establishes this segment's only heap; the
+        // returned pointer is not retained — a segment is reclaimed by dropping it
+        // whole (its talc metadata lives inside its own memory).
+        unsafe {
+            talc.claim(base, size)
+                .expect("talc.claim failed for new segment");
+        }
 
         Self {
             base,
@@ -75,6 +98,7 @@ impl Segment {
             talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),
+            fragment_count: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             // A freshly-created segment is NOT in the io_uring kernel buffer table.
             // Startup segments are marked registered after the initial
@@ -101,7 +125,8 @@ impl Segment {
     }
 
     /// Check if safe to release (draining + no live allocations).
-    pub fn is_releasable(&self) -> bool {        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
+    pub fn is_releasable(&self) -> bool {
+        // Acquire pairs with Release in dec_ref: when we see refcount == 0,
         // all buffer writes from prior users are guaranteed visible, making
         // it safe to deallocate the segment.
         self.draining.load(Ordering::Acquire) && self.refcount.load(Ordering::Acquire) == 0

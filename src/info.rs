@@ -37,6 +37,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("draining_segments", draining as i64)?
         .field("unused_segments", unused as i64)?
         .field("allocated_bytes", allocated as i64)?
+        .field("fragment_count", dram.fragment_count() as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
         .field("cached_objects", dram.object_count() as i64)?

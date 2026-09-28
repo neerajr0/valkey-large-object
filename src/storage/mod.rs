@@ -190,10 +190,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
              Increase segment-size or decrease dram-maxmemory",
-            dram_segment_count,
-            nvme_segments,
-            total_segments,
-            MAX_SEGMENTS,
+            dram_segment_count, nvme_segments, total_segments, MAX_SEGMENTS,
         ));
     }
 

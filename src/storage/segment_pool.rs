@@ -13,7 +13,7 @@
 //! `[base, base+size)` range. There is NO shared allocator across segments.
 //! `alloc_one` walks live non-draining segments in least-loaded-first order
 //! under one state lock, picks the least-loaded that clears a fast byte
-//! filter, and allocates from its own talc — `talc.malloc` itself is the exact
+//! filter, and allocates from its own talc — `talc.allocate` itself is the exact
 //! all-or-nothing check (returns Err on OOM without committing). Per-segment
 //! locking means concurrent allocs on different segments never contend.
 //!
@@ -86,7 +86,7 @@ impl SegmentPool {
     /// Allocate up to `count` buffers of `chunk_size` each, requiring at least
     /// `min_required`. Each iteration walks the live non-draining segments in
     /// LEAST-LOADED-first order under one state lock and allocates from the
-    /// least-loaded segment's own talc allocator (`talc.malloc` is the exact
+    /// least-loaded segment's own talc allocator (`talc.allocate` is the exact
     /// fit check). No retries, no poisoning.
     ///
     /// Returns `None` if fewer than `min_required` could be allocated (partial
@@ -121,7 +121,7 @@ impl SegmentPool {
     /// One allocation: pick the least-loaded live, non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
     /// candidate Vec), then allocate from its talc. Returns None if there is no
-    /// eligible segment, or the picked segment's `talc.malloc` returns Err.
+    /// eligible segment, or the picked segment's `talc.allocate` returns None.
     ///
     /// Why not fall back to the next-least-loaded on a failed malloc: the fast
     /// filter already guaranteed `cur + aligned_size <= seg.size`, so malloc can
@@ -154,7 +154,7 @@ impl SegmentPool {
                     .allocated_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
                 // Fast filter — allocated_bytes ignores talc's per-chunk overhead,
-                // so talc.malloc below is still the authoritative fit check.
+                // so talc.allocate below is still the authoritative fit check.
                 if cur + aligned_size > seg.size {
                     return None;
                 }
@@ -166,19 +166,32 @@ impl SegmentPool {
         let seg_base = seg.base;
         let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
 
-        // talc.malloc IS the exact all-or-nothing check: it returns Err on OOM
-        // without committing anything. alloc_one commits to a single segment (the
-        // least-loaded winner above) and never falls through to another, so a
-        // failure here is simply "no room" — return None. No separate precheck is
+        // SAFETY: aligned_size (thus layout.size()) is nonzero — align_up of a
+        // nonzero chunk_size. talc.allocate is the exact all-or-nothing check: it
+        // returns None on OOM without committing. alloc_one commits to a single
+        // segment (the least-loaded winner above) and never falls through, so a
+        // None here is simply "no room" — propagate it. No separate precheck
         // needed; talc's own bin lookup already answers "does this fit?".
-        let ptr = match unsafe { talc.malloc(layout) } {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
+        let ptr = unsafe { talc.allocate(layout) }?;
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
-        seg.allocated_bytes
-            .fetch_add(aligned_size, std::sync::atomic::Ordering::Relaxed);
+        // Mirror talc's authoritative live-allocated figure into the segment's
+        // atomic while we still hold the talc lock. talc updates this inside
+        // allocate(), so it is drift-free and includes per-chunk overhead —
+        // unlike the old hand-computed `+= aligned_size`, which ignored talc's
+        // boundary-tag overhead and could drift if a call site was ever missed.
+        // The read is free here (lock already held); the scaling cron keeps
+        // reading `allocated_bytes` lock-free.
+        seg.allocated_bytes.store(
+            talc.counters().allocated_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Same pattern for the fragmentation signal: mirror talc's hole count
+        // under the lock we already hold. Read lock-free by the cron/INFO.
+        seg.fragment_count.store(
+            talc.counters().fragment_count,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         drop(talc);
         drop(st);
         Some(SegmentBuffer {
@@ -204,14 +217,26 @@ impl SegmentPool {
 
         {
             let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
+            // SAFETY: ptr was returned by this segment's talc.allocate for this
+            // exact layout (aligned_size), and is freed exactly once (the owning
+            // SegmentBuffer drops once). talc 5.x deallocate takes a raw pointer.
             unsafe {
-                talc.free(std::ptr::NonNull::new_unchecked(ptr), layout);
+                talc.deallocate(ptr, layout);
             }
+            // Mirror talc's authoritative post-free figure while holding the lock
+            // (drift-free, overhead-aware) — see alloc_one for the rationale.
+            seg.allocated_bytes.store(
+                talc.counters().allocated_bytes,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // Free may merge or create gaps — refresh the fragmentation signal too.
+            seg.fragment_count.store(
+                talc.counters().fragment_count,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         seg.dec_ref();
-        seg.allocated_bytes
-            .fetch_sub(aligned_size, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
@@ -368,6 +393,23 @@ impl SegmentPool {
             .filter(|seg| !seg.draining.load(std::sync::atomic::Ordering::Relaxed))
             .map(|seg| {
                 seg.allocated_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum()
+    }
+
+    /// Total free-gap count across live (non-draining) segments — the pool's
+    /// fragmentation signal. Sums the per-segment `fragment_count` atomics.
+    /// A count, not a byte figure: rising against flat `allocated_bytes` means
+    /// free space is scattering into small holes.
+    pub fn fragment_count(&self) -> usize {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots
+            .iter()
+            .flatten()
+            .filter(|seg| !seg.draining.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|seg| {
+                seg.fragment_count
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
             .sum()

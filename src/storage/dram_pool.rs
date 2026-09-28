@@ -189,6 +189,12 @@ impl DRAMPool {
         self.pool.allocated_bytes()
     }
 
+    /// Total free-gap count across live segments — the fragmentation signal.
+    /// Used by INFO largeobj.
+    pub fn fragment_count(&self) -> usize {
+        self.pool.fragment_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()

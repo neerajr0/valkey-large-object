@@ -18,7 +18,7 @@ dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = 
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
-talc = { version = "4", default-features = false, features = ["lock_api"] }
+talc = { version = "5", default-features = false, features = ["counters"] }
 
 [dev-dependencies]
 rstest = "0.23.0"
