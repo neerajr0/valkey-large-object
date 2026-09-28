@@ -581,7 +581,7 @@ pub fn execute_set(
 
 /// Try alloc_exact, reactive expand on failure, retry once.
 /// Returns the buffers on success, None if pool is still exhausted after expand.
-fn dram_alloc_or_expand(
+fn dram_alloc_or_expand_once(
     pool: &storage::DRAMPool,
     ctx: &valkey_module::Context,
     obj_len: u64,
@@ -605,7 +605,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_alloc_or_expand(dram_pool, ctx, obj_len) {
+    let buffers = match dram_alloc_or_expand_once(dram_pool, ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -676,7 +676,7 @@ fn cmd_set_dram_efa(
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
     // DRAMPool::alloc_exact with reactive expand: all-or-nothing.
-    let buffers = match dram_alloc_or_expand(dram_pool, ctx, obj_len) {
+    let buffers = match dram_alloc_or_expand_once(dram_pool, ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
