@@ -11,13 +11,16 @@ valkey-module = { version = "0.1.5", features = ["min-valkey-compatibility-versi
 valkey-module-macros = "0"
 linkme = "0"
 libc = "0.2"
+crc-fast = "1"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
-dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "7a4ef176019f5c694f484eb7c8fc6af69b8a0b81" }
-dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "7a4ef176019f5c694f484eb7c8fc6af69b8a0b81" }
+dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
+dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
+nvme-telem = "0.3.3"
+rand = "0.10"
 talc = { version = "5", default-features = false, features = ["counters"] }
 
 [dev-dependencies]
@@ -26,6 +29,12 @@ rstest = "0.23.0"
 [lib]
 crate-type = ["cdylib"]
 name = "valkey_largeobj"
+
+# The passive libfabric peer for integration tests.
+[[bin]]
+name = "fabric_target"
+path = "tests/harness/fabric_target.rs"
+required-features = ["test-harness"]
 
 [profile.release]
 opt-level = 3
@@ -38,3 +47,4 @@ debug = 2
 [features]
 default = []
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
+test-harness = []

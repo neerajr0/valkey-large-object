@@ -1,6 +1,6 @@
 # DMA Command Design: Session Routing + Per-Request Memory Targeting
 
-**Date:** 2026-08-18  **Status:** Option 2 implemented; Option 2 vs 3 decision open  **Author:** @KarthikSubbarao
+**Date:** 2026-08-18  **Status:** Option 2 implemented  **Author:** @KarthikSubbarao
 
 ---
 
@@ -20,6 +20,11 @@ Three designs were evaluated. **Option 2 (per-request rkey with session routing)
 **Why Option 3 might win later:**
 - Zero state management — simpler module code. No Valkey client has a session associated with it.
 - Valkey clients (once HELLO is used) are not pinned to one client EFA addr.
+
+**Option 2 is chosen for the initial integration** for clarity and because it's the natural first step toward option 3, should it be found necessary.
+- The libfabric connection management is still stateful, and without a client lifetime to bind to it, the connection address vector registry grows without bound. Ignoring state does not make it stateless.
+- Swimlanes are easier to debug and understand, and client address errors are better communicated at HELLO during a handshake than at the first LO.GET down in some workflow.
+- Opting into 3 in the future can be done by making the commands modal - HELLO without an address makes LO.GET require a target address.
 
 ---
 
@@ -60,7 +65,7 @@ Each term builds on the previous.
 
 ## 2. Option 2: Per-Request rkey with HELLO
 
-Client establishes a session once via `LO.HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory region to use per request.
+Client establishes a session once via `LO.HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory region to use per request. A second `LO.HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
 
 **Threading model:** The session holds routing handles for all N server EFA devices. Any thread can use any device for a given operation — the server picks the least-loaded device (least-loaded). Threads do not own specific devices.
 

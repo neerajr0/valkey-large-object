@@ -12,66 +12,14 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use tokio::sync::oneshot;
 
 use super::StorageError;
-
-// ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
-
-/// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
-static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
-
-/// Increment NVMe disk usage after a file is created.
-pub fn increase_nvme_disk_usage(bytes: u64) {
-    NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
-}
-
-/// Decrement NVMe disk usage after a file is deleted.
-///
-/// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
-/// must be accurate for capacity checks, so assert on the issue.
-pub fn decrease_nvme_disk_usage(bytes: u64) {
-    if let Err(tracked) =
-        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            cur.checked_sub(bytes)
-        })
-    {
-        panic!(
-            "NVMe disk-usage underflow: tried to free {bytes} B but only {tracked} B tracked \
-             — accounting is corrupt (double-free or size mismatch)"
-        );
-    }
-}
-
-/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
-/// Returns true and increments the counter on success; returns false and leaves the
-/// counter unchanged if the reservation would exceed the cap (or overflow).
-/// Returns true if nvme-maxmemory is 0 (unlimited).
-pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
-    let max = crate::nvme_maxmemory();
-    NVME_DISK_USAGE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            let next = cur.checked_add(bytes)?;
-            if max == 0 || next <= max {
-                Some(next)
-            } else {
-                None
-            }
-        })
-        .is_ok()
-}
-
-/// Current tracked NVMe disk usage in bytes.
-pub fn nvme_disk_usage() -> u64 {
-    NVME_DISK_USAGE.load(Ordering::Relaxed)
-}
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
@@ -196,70 +144,6 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
     rx
 }
 
-// ─── Batch submit helpers ────────────────────────────────────────────────────
-
-/// Submit multiple ReadFixed ops. Returns one receiver per op.
-pub fn submit_read_batch(
-    fd: RawFd,
-    ops: Vec<UringOp>,
-) -> Vec<oneshot::Receiver<Result<u64, StorageError>>> {
-    ops.into_iter().map(|op| submit_read(fd, op)).collect()
-}
-
-/// Submit multiple WriteFixed ops. Returns one receiver per op.
-pub fn submit_write_batch(
-    fd: RawFd,
-    ops: Vec<UringOp>,
-) -> Vec<oneshot::Receiver<Result<(), StorageError>>> {
-    ops.into_iter().map(|op| submit_write(fd, op)).collect()
-}
-
-/// Convert batch receivers into a stream of (batch_idx, result) pairs
-/// that yields completions as they arrive (unordered). The caller drives
-/// the stream — TCP drains it via `await_batch`, EFA acts on each completion.
-pub fn into_completions<T: Send + 'static>(
-    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
-) -> FuturesUnordered<impl std::future::Future<Output = (usize, Result<T, StorageError>)>> {
-    let stream = FuturesUnordered::new();
-    for (i, rx) in receivers.into_iter().enumerate() {
-        stream.push(async move {
-            match rx.await {
-                Ok(result) => (i, result),
-                Err(_) => (i, Err(StorageError::IoError { code: libc::EIO })),
-            }
-        });
-    }
-    stream
-}
-
-/// `op` is "read" or "write" — used only in suppressed-error log messages.
-/// Used by TCP path for awaiting all batch receivers.
-pub async fn await_batch<T: Send + 'static>(
-    receivers: Vec<oneshot::Receiver<Result<T, StorageError>>>,
-    op: &str,
-) -> Result<(), StorageError> {
-    let mut completions = into_completions(receivers);
-    let mut first_err: Option<StorageError> = None;
-    while let Some((_idx, result)) = completions.next().await {
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                } else {
-                    valkey_module::logging::log_warning(format!(
-                        "largeobj: {op} batch error (suppressed): {e}"
-                    ));
-                }
-            }
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
 
 pub struct UringNvmeEngine {
@@ -286,17 +170,14 @@ impl UringNvmeEngine {
         // Create ring on main thread — fail gracefully instead of panicking.
         let ring =
             io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
-
         // Register buffers on main thread.
         if !iovecs.is_empty() {
             unsafe { ring.submitter().register_buffers(&iovecs) }
                 .map_err(|e| format!("IORING_REGISTER_BUFFERS failed: {}", e))?;
         }
-
         let (tx, rx) = bounded::<IoRequest>(4096);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-
         // Pass the fully initialized ring to the poller thread.
         let poller = thread::Builder::new()
             .name("lo-uring-poller".into())
@@ -304,7 +185,6 @@ impl UringNvmeEngine {
                 Self::poller_loop(rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
-
         Ok(Self {
             tx,
             shutdown,
@@ -326,7 +206,6 @@ impl UringNvmeEngine {
         // registered and use plain Read/Write until/unless they are.
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
-
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
@@ -344,7 +223,6 @@ impl UringNvmeEngine {
                 }
                 break;
             }
-
             // Phase 1: Drain channel → build SQEs.
             // Track which tokens belong to this batch so Phase 3b only errors
             // ops from this batch, not in-flight ops from previous iterations
@@ -376,10 +254,9 @@ impl UringNvmeEngine {
                 };
                 let token = next_token;
                 next_token += 1;
-
                 let (sqe, op) = match req {
                     IoRequest::Read { fd, op, tx } => {
-                        let read_len = super::object_disk_len(op.len) as u32;
+                        let read_len = super::align_up(op.len as usize) as u32;
                         let sqe = if op.use_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
@@ -409,7 +286,7 @@ impl UringNvmeEngine {
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
-                        let write_len = super::object_disk_len(op.len) as u32;
+                        let write_len = super::align_up(op.len as usize) as u32;
                         let sqe = if op.use_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
@@ -439,7 +316,6 @@ impl UringNvmeEngine {
                         )
                     }
                 };
-
                 unsafe {
                     if ring.submission().is_full() {
                         let _ = ring.submit();
@@ -453,7 +329,6 @@ impl UringNvmeEngine {
                 }
                 batch += 1;
             }
-
             // Phase 2: Submit + wait. Retry on EINTR (max 3 attempts).
             if !pending.is_empty() {
                 for _ in 0..3 {
@@ -486,13 +361,11 @@ impl UringNvmeEngine {
             } else if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-
             // Phase 3: Reap CQEs → send results on oneshot channels.
             let mut completed = Vec::new();
             for cqe in ring.completion() {
                 completed.push((cqe.user_data(), cqe.result()));
             }
-
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
                     match op {
@@ -519,7 +392,6 @@ impl UringNvmeEngine {
                     }
                 }
             }
-
             // Phase 3b: If submit failed fatally (ENOMEM), error ops from this
             // batch only. In-flight ops from previous iterations stay in pending —
             // their buffers are still being accessed by the kernel via DMA, and
@@ -536,7 +408,6 @@ impl UringNvmeEngine {
                     }
                 }
             }
-
             // Phase 4: CQ overflow detection — if the kernel dropped completions,
             // pending ops will never complete and tasks will hang forever.
             if ring.completion().overflow() > 0 {
@@ -547,67 +418,5 @@ impl UringNvmeEngine {
                 );
             }
         }
-    }
-}
-
-// ─── Unit Tests ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    // NVME_DISK_USAGE is a process-global static shared by every test in this
-    // binary, and cargo runs tests in parallel. Serialize the accounting tests so
-    // their reads/writes don't interleave. Recover from a poisoned lock (the
-    // underflow test panics by design) so one panicking test can't wedge the rest.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    // increase/decrease are exact inverses: an equal amount added and removed must
-    // leave the counter where it started. Asserted as a delta against a fresh
-    // baseline so a corrupt absolute value from another test can't affect it.
-    #[test]
-    fn test_increase_decrease_symmetry() {
-        let _g = lock();
-        let base = nvme_disk_usage();
-
-        increase_nvme_disk_usage(4096);
-        assert_eq!(nvme_disk_usage(), base + 4096);
-        increase_nvme_disk_usage(8192);
-        assert_eq!(nvme_disk_usage(), base + 12288);
-
-        decrease_nvme_disk_usage(8192);
-        assert_eq!(nvme_disk_usage(), base + 4096);
-        decrease_nvme_disk_usage(4096);
-        assert_eq!(nvme_disk_usage(), base, "counter must return to baseline");
-    }
-
-    // Freeing exactly what was reserved must return to baseline — the same
-    // reserve-then-free balance the SET path relies on for aligned disk_len.
-    #[test]
-    fn test_reserve_then_free_returns_to_zero() {
-        let _g = lock();
-        let base = nvme_disk_usage();
-        for len in [1u64, 4095, 4096, 4097, 1_048_576] {
-            let disk_len = super::super::object_disk_len(len);
-            increase_nvme_disk_usage(disk_len);
-            decrease_nvme_disk_usage(disk_len);
-        }
-        assert_eq!(nvme_disk_usage(), base);
-    }
-
-    // Decrementing more than is tracked is a corrupt-accounting bug and MUST abort,
-    // not silently wrap the counter (which would poison every capacity check).
-    #[test]
-    #[should_panic(expected = "underflow")]
-    fn test_decrease_underflow_is_fatal() {
-        let _g = lock();
-        // Subtracting u64::MAX underflows from any real baseline, triggering the
-        // fatal assert regardless of what the counter currently holds.
-        decrease_nvme_disk_usage(u64::MAX);
     }
 }

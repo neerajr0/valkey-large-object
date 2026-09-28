@@ -20,9 +20,10 @@
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
-//                                io_uring engine (Tiered only). All resources are
-//                                created as locals; OnceLock statics are set only
-//                                after everything succeeds. On failure, locals
+//                                io_uring engine and start the smartlog poller
+//                                (Tiered only). All resources are created as
+//                                locals; OnceLock statics are set only after
+//                                everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
 //   3. transport::register_buffers()
 //                              — fi_mr_reg pool buffers with EFA domains.
@@ -34,6 +35,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
+use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
 use valkey_module_macros::shutdown_event_handler;
@@ -45,7 +47,9 @@ pub mod data_type;
 pub mod engine;
 pub mod errors;
 pub mod info;
+pub mod smartlog;
 pub mod storage;
+mod stream;
 pub mod transport;
 
 use info::lo_info;
@@ -108,6 +112,11 @@ lazy_static::lazy_static! {
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
 
+    /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
+    /// entirely: no background reads, and the INFO section never appears.
+    /// Immutable after load — the poller either starts at init or not at all.
+    static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
+
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
     static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
@@ -151,17 +160,25 @@ lazy_static::lazy_static! {
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
 
+    // ─── Test Hooks ──────────────────────────────────────────────────────
+
+    /// Test-only: pause the tiered SET path for this many milliseconds after
+    /// writing data chunks but before calling commit_lo_value. 0 = disabled.
+    /// Allows integration tests to inject a DEL in the mid-stream window
+    /// and deterministically exercise the delete-during-SET race.
+    static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
     /// Determines allocation unit for all I/O operations.
-    static ref CFG_BUFFER_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
+    static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
 
     /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
     static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
-    static ref CFG_STREAMING_MIN_BUFFERS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -235,6 +252,10 @@ pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
+pub fn smartlog_poll_secs() -> u64 {
+    CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
 pub fn scaling_expand_watermark() -> f64 {
     CFG_SCALING_EXPAND_WATERMARK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
 }
@@ -281,16 +302,20 @@ pub fn operating_mode() -> OperatingMode {
         .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
-pub fn buffer_size() -> usize {
-    CFG_BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn chunk_size() -> usize {
+    CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_buffers_per_op() -> usize {
     CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn streaming_min_buffers() -> usize {
-    CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn min_buffers_per_op() -> usize {
+    CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn test_pause_before_finalize_set_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -396,6 +421,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     }
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
+    if let Some(fabric) = &fabric {
+        for (index, address) in fabric.local_addresses().enumerate() {
+            ctx.log_notice(&format!(
+                "largeobj: fabric service {index} address {}",
+                encode_hex(address)
+            ));
+        }
+    }
     transport::commit(fabric);
 
     // All init succeeded — commit runtime to OnceLock.
@@ -424,13 +457,15 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// drop the fabric services, signal the io_uring poller to stop, and — in Tiered
+/// signal the SMART log poller to stop, drop the fabric services, signal the
+/// io_uring poller to stop, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
 /// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
+    smartlog::signal_shutdown();
     transport::shutdown();
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
@@ -453,6 +488,7 @@ valkey_module! {
         ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
         ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
         ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+        ["LO.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
     ],
     configurations: [
         i64: [
@@ -468,14 +504,36 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
-            ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
-             ConfigurationFlags::MEMORY, None, None],
-            ["lo-max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
-             ConfigurationFlags::DEFAULT, None, None],
-            ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
-             ConfigurationFlags::DEFAULT, None, None],
+            ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let max = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let min = CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= min-buffers-per-op"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
+            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let min = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let max = CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR min-buffers-per-op must be <= max-buffers-per-op"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
+            ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
+            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
@@ -490,7 +548,7 @@ valkey_module! {
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
-            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
+            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [

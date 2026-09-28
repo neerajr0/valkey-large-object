@@ -1,4 +1,7 @@
 import binascii
+import crc32c
+import os
+import subprocess
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 
@@ -17,7 +20,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
         )
@@ -30,12 +33,14 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         address = binascii.unhexlify(reply[0])
         assert 0 < len(address)
 
-    def test_hello_is_repeatable(self):
-        """A second HELLO on the same client replaces the session and answers the same."""
+    def test_hello_is_once_per_connection(self):
+        """A second HELLO on the same connection is refused; a new connection may HELLO again."""
         client = self.server.get_new_client()
         first = client.execute_command('LO.HELLO', PEER_ADDRESS)
-        second = client.execute_command('LO.HELLO', PEER_ADDRESS)
-        assert first == second
+        self.verify_error_response(
+            client, f'LO.HELLO {PEER_ADDRESS}',
+            'DMA session already established (one LO.HELLO per connection)')
+        assert self.server.get_new_client().execute_command('LO.HELLO', PEER_ADDRESS) == first
 
     def test_hello_rejects_bad_hex(self):
         client = self.server.get_new_client()
@@ -51,9 +56,6 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         client.execute_command('LO.SET', 'key', b'A' * 4096)
         self.verify_error_response(client, 'LO.GET key 1 0', 'no DMA session (call LO.HELLO first)')
-        client.execute_command('LO.HELLO', PEER_ADDRESS)
-        # Still the stubbed data path: it completes without moving bytes and replies the length.
-        assert client.execute_command('LO.GET', 'key', 1, 0) == 4096
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
@@ -63,7 +65,7 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces no-such-interface"
         )
@@ -72,3 +74,135 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         self.verify_error_response(client, f'LO.HELLO {PEER_ADDRESS}', 'EFA unavailable on this instance')
         assert client.execute_command('LO.SET', 'key', b'A' * 4096) == b'OK'
+
+# What tests/harness/fabric_target waits for (write) or serves (--read): one buffer of this byte.
+PATTERN = b'\xab'
+TARGET_LEN = 4096
+
+
+class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
+    """Bytes actually move: tests/harness/fabric_target, a passive libfabric peer on tcp loopback, is
+    the client's buffer. Its advertisement is what a real client would carry into LO.HELLO and the
+    per-request rkey / remote address."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" dram-segment-size 1048576"
+            f" lo-buffer-size 4096"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def start_target(self, *flags):
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        process = subprocess.Popen(
+            [target, '127.0.0.1', *flags],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        line = process.stdout.readline()
+        assert line.startswith('advertisement: '), line
+        address, rkey, remote_addr = line.split()[1:]
+        return process, address, int(rkey), int(remote_addr)
+
+    def test_get_writes_into_the_target(self):
+        process, address, rkey, remote_addr = self.start_target()
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
+            client.execute_command('LO.HELLO', address)
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(PATTERN * TARGET_LEN)
+            # The target exits once every byte of the pattern has landed.
+            output = process.communicate(timeout=30)[0]
+            assert 'payload verified' in output, output
+        finally:
+            process.kill()
+
+    def test_set_reads_from_the_target(self):
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
+        finally:
+            process.kill()
+
+    def test_multi_transfer_mixed_protocol(self):
+        """Do mixed sets and gets, read the server value into the client, set it back, and
+        read it back in the test"""
+        payload = b'\x5a' * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.SET', 'key', payload)
+            client.execute_command('LO.HELLO', address)
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(payload)
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
+        finally:
+            process.kill()
+
+
+class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion off to run the NVMe paths."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" chunk-size 4096"
+            f" max-promote-size 0"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_set_over_efa_persists_to_nvme(self):
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert len(self._object_files()) == 1
+        finally:
+            process.kill()
+
+
+class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion on."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" chunk-size 4096"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_get_over_efa_cold_then_warm_on_one_session(self):
+        payload = PATTERN * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            # Cold load into dram
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(payload)
+            # Hot load from dram
+            crc2 = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc2 == crc32c.crc32c(payload)
+            # Read back from client and verify literal bytes
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
+        finally:
+            process.kill()

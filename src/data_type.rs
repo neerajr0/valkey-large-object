@@ -14,7 +14,7 @@ use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
 
-use crate::storage::ObjectFile;
+use crate::storage::{Crc, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
@@ -41,6 +41,26 @@ impl ObjectId {
     }
 }
 
+// ─── Tier ────────────────────────────────────────────────────────────────────
+
+/// Storage tier an object is currently served from. Reported by `LO.INFO`.
+pub enum Tier {
+    /// Resident in DRAMPool (Dram mode always; Tiered mode when promoted).
+    Dram,
+    /// On NVMe only, not cached in DRAMPool (Tiered mode).
+    Nvme,
+}
+
+impl Tier {
+    /// Lowercase token used in LO.INFO replies.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Dram => "dram",
+            Tier::Nvme => "nvme",
+        }
+    }
+}
+
 // ─── LoValue ─────────────────────────────────────────────────────────────────
 
 /// LoValue — the Valkey data type value struct, stored in Valkey's keyspace.
@@ -51,7 +71,7 @@ impl ObjectId {
 pub struct LoValue {
     pub object_id: ObjectId, // monotonic per-node OID (used as filename)
     pub len: u64,            // object size in bytes
-    pub crc32c: u32,         // integrity checksum (verified on replication pull)
+    pub crc32c: Crc,         // integrity checksum (verified on replication pull)
     /// The object's `ObjectFile` handle (Tiered mode only; `None` in Dram mode).
     /// Tracks the object's on-disk existence and may hold an open read fd behind
     /// an `Arc`. Dropping the last ref closes the fd and unlinks the file.
@@ -77,6 +97,22 @@ impl LoValue {
                     dram_usage
                 } else {
                     base
+                }
+            }
+        }
+    }
+
+    /// Where a GET issued right now would be served from:
+    /// - Dram mode: always `Dram` (objects live nowhere else).
+    /// - Tiered mode: `Dram` if a Ready ObjectContext is cached in DRAMPool, else
+    ///   `Nvme`.
+    pub fn tier(&self) -> Tier {
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => Tier::Dram,
+            crate::OperatingMode::Tiered => {
+                match crate::storage::get_dram_pool().get_object(&self.object_id) {
+                    Some(ctx) if ctx.is_ready() => Tier::Dram,
+                    _ => Tier::Nvme,
                 }
             }
         }
@@ -120,34 +156,14 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded.
+    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
-        let data_dir = crate::nvme_dir();
-        // On-disk size.
-        let disk_len = crate::storage::object_disk_len(self.len);
-        if !crate::storage::uring::try_reserve_nvme_disk_usage(disk_len) {
-            return None;
-        }
-        let new_oid = ObjectId::next();
-        let src_path = self.object_id.file_path(&data_dir);
-        let dst_path = new_oid.file_path(&data_dir);
-        // A copy failure (ENOSPC, EIO, ...) fails the COPY (lo_copy maps None -> null)
-        // rather than aborting the node. Release the reservation we took above and
-        // best-effort remove any partial destination.
-        if let Err(e) = std::fs::copy(&src_path, &dst_path) {
-            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&dst_path);
-            valkey_module::logging::log_warning(format!(
-                "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
-                self.object_id
-            ));
-            return None;
-        }
+        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
         Some(LoValue {
-            object_id: new_oid,
+            object_id: file.object_id(),
             len: self.len,
             crc32c: self.crc32c,
-            file: Some(Arc::new(ObjectFile::new(new_oid, disk_len))),
+            file: Some(Arc::new(file)),
         })
     }
 }

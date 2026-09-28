@@ -4,6 +4,7 @@
 //! LO.GET key [rkey remote_addr]: engine::execute_get
 //! LO.SET key <data>                (TCP): engine::execute_set
 //! LO.SET key len rkey remote_addr  (EFA): engine::execute_set
+//! LO.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
 
 use std::sync::Arc;
 
@@ -51,10 +52,16 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let client_id = ctx.get_client_id();
+    // One endpoint per connection. A second HELLO would hold the old address-vector entry while
+    // inserting the new one; when the client's old endpoint has died and the new one reuses its
+    // QPN, efa-direct cannot represent both (vdma/.claude/open_issue.md). Reconnect instead.
+    if session::lookup(client_id).is_some() {
+        return Err(ValkeyError::Str(errors::ERR_DMA_SESSION_EXISTS));
+    }
     fabric
         .add_peer(client_id, &peer_address)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    session::insert(client_id, Session::new(peer_address));
+    session::insert(client_id, Session::new(client_id, peer_address));
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
@@ -81,11 +88,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
+    let crc32c = lo_value.crc32c;
 
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
 
     // Determine transport: EFA if rkey+remote_addr provided, else TCP.
+    // TODO: Add a client buffer length argument to LO.GET so the server can
+    // validate the address space covers obj_len before fi_write. Also add
+    // validation when multi-address support lands (sum of address lengths >= obj_len).
     let transport = if args.len() >= 4 {
         let rkey: u64 = args[2]
             .to_string_lossy()
@@ -106,7 +117,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_get(ctx, object_id, obj_len, file, transport) {
+    match engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -165,5 +176,45 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
+}
+
+// ─── LO.INFO ─────────────────────────────────────────────────────────────────
+//
+// LO.INFO key [LEN | CRC | TIER]
+//
+// Parse args → resolve key → return metadata field or all fields as array.
+
+pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(ValkeyError::WrongArity);
+    }
+
+    let key = ctx.open_key(&args[1]);
+    let value = match key.get_value::<LoValue>(&LO_TYPE)? {
+        Some(v) => v,
+        None => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+    };
+
+    let len = ValkeyValue::Integer(value.len as i64);
+    let crc = ValkeyValue::Integer(i64::from(value.crc32c));
+    let tier = ValkeyValue::SimpleStringStatic(value.tier().as_str());
+
+    if args.len() == 2 {
+        return Ok(ValkeyValue::Array(vec![
+            ValkeyValue::SimpleStringStatic("len"),
+            len,
+            ValkeyValue::SimpleStringStatic("crc"),
+            crc,
+            ValkeyValue::SimpleStringStatic("tier"),
+            tier,
+        ]));
+    }
+
+    match args[2].to_string_lossy().to_uppercase().as_str() {
+        "LEN" => Ok(len),
+        "CRC" => Ok(crc),
+        "TIER" => Ok(tier),
+        _ => Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
     }
 }
