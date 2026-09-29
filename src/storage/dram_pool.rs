@@ -258,11 +258,21 @@ impl DRAMPool {
             return None;
         }
 
-        let result = self.pool.expand();
-        if result.is_some() {
-            self.expand_count.fetch_add(1, Ordering::Relaxed);
+        let (idx, slice) = self.pool.expand()?;
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+
+        // Register the new segment with EFA so transfers to it avoid a per-op fi_mr_reg.
+        // Best-effort: if the fabric is up and registration fails, the segment is still fully
+        // usable — the DMA library falls back to registering the operand per transfer (slower,
+        // but correct) — so we log and proceed rather than failing the expand. The registration
+        // is torn down in Segment::drop (via crate::efa_release_segment) before the memory frees.
+        if let Err(e) = crate::efa_register_segment(slice) {
+            ctx.log_warning(&format!(
+                "largeobj: EFA registration of expanded segment {idx} failed \
+                 (using per-transfer fallback): {e}"
+            ));
         }
-        result
+        Some(idx)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.

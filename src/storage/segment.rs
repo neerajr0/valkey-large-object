@@ -155,6 +155,12 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // Tear down any EFA registration for this segment BEFORE freeing its memory: the DMA
+        // library requires deregistration to precede the unmap (fi_close/ibv_dereg_mr over freed
+        // pages is illegal). crate::efa_release_segment drops the segment's MemoryRegion handles,
+        // which invalidate the cache entry and fi_close once no in-flight transfer still leases
+        // them. No-op when no fabric is up or the segment was never EFA-registered.
+        crate::efa_release_segment(self.base as usize);
         // Dropping the Talc first is not required — its metadata lives inside
         // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
         // memory (talc has no external state). Then dealloc the backing memory.

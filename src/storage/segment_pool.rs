@@ -436,7 +436,12 @@ impl SegmentPool {
     /// Each new Segment carries its own fresh talc allocator.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
-    pub fn expand(&self) -> Option<u16> {
+    ///
+    /// Returns `(iovec_index, segment_slice)` on success. The slice is `'static` (segment memory
+    /// is stable for the module's lifetime) so the caller can register it with the transport
+    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if the sparse
+    /// iovec table is already at `MAX_SEGMENTS`.
+    pub fn expand(&self) -> Option<(u16, &'static [u8])> {
         let mut seg = Segment::new(self.segment_size);
         // Register the iovec first. Returns None if the sparse table is already
         // at MAX_SEGMENTS — the single runtime cap check. On None we drop `seg`
@@ -445,6 +450,11 @@ impl SegmentPool {
         // lockstep and the caller (scaling cron / reactive expand) holds size.
         let idx = super::append_iovec(seg.iovec())?;
         seg.iovec_index = idx;
+        // Segment memory is stable for the module's lifetime (never freed until
+        // the segment is released, and a live segment is not released while a
+        // registration references it). SAFETY: base/size describe the just-
+        // allocated backing buffer.
+        let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
 
         let mut st = self.state.lock().expect("state lock unavailable");
         match st.slots.iter().position(|s| s.is_none()) {
@@ -456,7 +466,7 @@ impl SegmentPool {
             }
         };
 
-        Some(idx)
+        Some((idx, slice))
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.

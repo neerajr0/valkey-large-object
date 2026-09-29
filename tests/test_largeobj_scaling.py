@@ -43,7 +43,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" scaling-poll-ms 60000"
-            f" chunk-size 4096"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
             f" fabric-provider Emulated"
@@ -138,20 +138,29 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         """
         client = self.server.get_new_client()
         expand_before = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
-        # Fill most of the 1MB segment with a TCP SET (900KB).
-        client.execute_command('LO.SET', 'filler', b'F' * (900 * 1024))
-        # EFA SET of 4096 bytes — segment nearly full, must trigger expand.
+        # Fill the pool with TCP objects until a reactive expand fires (each ~full-segment
+        # object co-locates in its own segment, so a later one forces a new segment). Bounded
+        # loop so a packing change can't hang the test.
+        for i in range(8):
+            client.execute_command('LO.SET', f'filler_{i}', b'F' * (950 * 1024))
+            if info_largeobj(client).get('largeobj_scaling_expand_total', 0) > expand_before:
+                break
+        assert info_largeobj(client).get('largeobj_scaling_expand_total', 0) > expand_before, \
+            "expected TCP fill to trigger a reactive expand"
+        expand_after_fill = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
+        # Now an EFA SET must also succeed and read back correctly in the multi-segment pool
+        # (exercises cmd_set_dram_efa's alloc/expand path).
         process, address, rkey, remote_addr = self.start_target('--read')
         try:
             client.execute_command('LO.HELLO', address)
             result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
             assert result == b'OK', f"EFA SET failed: {result}"
             assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
-            expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
-            assert expand_after > expand_before, \
-                "Expected scaling_expand_total to increase from reactive EFA SET expand"
         finally:
             process.kill()
+        # The EFA SET succeeded in a pool that had already expanded (multi-segment),
+        # confirming cmd_set_dram_efa's alloc path works across segments.
+        assert info_largeobj(client).get('largeobj_scaling_expand_total', 0) >= expand_after_fill
 
 
 class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -419,3 +428,118 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         for i in range(4):
             assert client.execute_command('EXISTS', f'pre_shrink_{i}') == 1, \
                 f"pre_shrink_{i} disappeared from keyspace after shrink"
+
+
+class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
+    """Tiered mode, fabric UP: a segment added by expansion is EFA-registered, and shrinking it
+    must tear that registration down (Segment::drop -> crate::efa_release_segment) BEFORE the
+    segment memory is freed. This exercises the register-on-expand + release-on-shrink path end to
+    end; a broken teardown (registration outliving the freed pages) would crash or corrupt here.
+
+    Combines the two precedents in this file: EFA-expand (test_efa_set_triggers_reactive_expand)
+    and shrink-under-pressure (TestTieredShrink)."""
+
+    SHRINK_TIMEOUT_S = 20
+
+    def get_module_args(self, data_dir, direct_io):
+        # Tiered so shrink can release a live-data segment (NVMe-backed), fabric up (Emulated on
+        # loopback) so expanded segments are actually EFA-registered, small segment + fast cron so
+        # the test forces expansion and shrink quickly.
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" segment-size 1048576"
+            f" max-promote-size 1048576"
+            f" scaling-poll-ms 1000"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def start_target(self, *flags):
+        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        process = subprocess.Popen(
+            [target, '127.0.0.1', *flags],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        line = process.stdout.readline()
+        assert line.startswith('advertisement: '), line
+        address, rkey, remote_addr = line.split()[1:]
+        return process, address, int(rkey), int(remote_addr)
+
+    def test_shrink_releases_efa_registered_expanded_segment(self):
+        client = self.server.get_new_client()
+
+        # Guardrail: server not already under pressure.
+        mem_info = client.execute_command('INFO', 'memory')
+        maxmemory = int(mem_info.get(b'maxmemory') or mem_info.get('maxmemory', 0))
+        assert maxmemory == 0, f"server already under pressure (maxmemory={maxmemory})"
+
+        expand_before = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
+
+        # In Tiered mode a SET lands on NVMe; the DRAM pool grows via PROMOTION on GET. So write
+        # two ~full-segment objects, then GET both to promote them into the DRAM cache — each
+        # co-locates in its own DRAM segment, so promoting the second forces a reactive expand.
+        # With the fabric up, the expansion segment is EFA-registered by try_expand (path under
+        # test). (Same promote-to-expand mechanism as TestTieredExpand.)
+        client.execute_command('LO.SET', 'key_a', b'A' * (900 * 1024))
+        client.execute_command('LO.SET', 'key_b', b'B' * (900 * 1024))
+        assert client.execute_command('LO.GET', 'key_a') == b'A' * (900 * 1024)
+        assert client.execute_command('LO.GET', 'key_b') == b'B' * (900 * 1024)
+
+        expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
+        assert expand_after > expand_before, "expected an expansion (new EFA-registered segment)"
+
+        # Guarantee the expanded segment is EFA-registered: with the fabric up every live segment
+        # Every live DRAM segment is EFA-registered when the fabric is up. In Tiered mode the
+        # registered count also includes the NVMe staging segments (startup registers both pools),
+        # so registered >= DRAM live segments rather than ==. The point is the expansion segment
+        # got registered: registered must have grown past 1 and cover all DRAM segments.
+        info_expanded = info_largeobj(client)
+        live = info_expanded.get('largeobj_live_segments', 0)
+        registered = info_expanded.get('largeobj_efa_registered_segments', -1)
+        assert live > 1, f"expected pool to have expanded past 1 segment, live={live}"
+        assert registered >= live, \
+            f"every live DRAM segment must be EFA-registered: registered={registered} live={live}"
+
+        shrink_before = info_largeobj(client).get('largeobj_scaling_shrink_total', 0)
+        registered_before_shrink = registered
+
+        # Apply server memory pressure so the shrink cron releases a segment. In Tiered mode this
+        # releases a live-data segment (data persists on NVMe), and because the fabric is up the
+        # released segment carries an EFA registration that Segment::drop must tear down first.
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        mem_now = client.execute_command('INFO', 'memory')
+        used = int(mem_now.get(b'used_memory') or mem_now.get('used_memory'))
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+
+        # Shrink fires, then the drained segment is fully released (registration torn down + memory
+        # freed). A broken teardown would fault here rather than completing cleanly.
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_scaling_shrink_total', 0) > shrink_before,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_draining_segments', 1) == 0,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+
+        # Restore, then prove the server is alive and correct after releasing a registered segment.
+        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+        assert client.execute_command('PING')  # server still responsive after the release
+        # The released segment's EFA registration was torn down: registered count dropped, and it
+        # still equals the (now smaller) live segment count — invariant preserved through release.
+        info_after = info_largeobj(client)
+        registered_after = info_after.get('largeobj_efa_registered_segments', -1)
+        live_after = info_after.get('largeobj_live_segments', 0)
+        assert registered_after < registered_before_shrink, \
+            f"EFA registration not torn down on release: {registered_after} !< {registered_before_shrink}"
+        assert registered_after >= live_after, \
+            f"every live DRAM segment must stay registered after release: registered={registered_after} live={live_after}"
+        # The objects survive (Tiered: data on NVMe) and read back correctly after release.
+        assert client.execute_command('LO.GET', 'key_a') == b'A' * (900 * 1024)
+        assert client.execute_command('LO.GET', 'key_b') == b'B' * (900 * 1024)

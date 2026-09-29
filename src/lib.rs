@@ -288,6 +288,28 @@ pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Register an expanded segment's memory with EFA, if a fabric is up (no-op otherwise). The
+/// crate-root seam so the storage layer never names the transport crate directly: `try_expand`
+/// calls this rather than reaching into `transport`.
+pub fn efa_register_segment(slice: &'static [u8]) -> Result<(), String> {
+    match transport::fabric::fabric() {
+        Some(fabric) => fabric.register_segment(slice),
+        None => Ok(()),
+    }
+}
+
+/// Release an EFA registration by segment base address before the segment memory is freed. No-op
+/// when no fabric is up or the base was never registered. Called from `Segment::drop`.
+pub fn efa_release_segment(base: usize) {
+    transport::fabric::release_segment(base);
+}
+
+/// Count of EFA-registered segments (0 when no fabric). Equals the live segment count when the
+/// fabric is up (every live segment is registered); surfaced in INFO to assert that invariant.
+pub fn efa_registered_segment_count() -> usize {
+    transport::fabric::registered_segment_count()
+}
+
 pub fn operating_mode() -> OperatingMode {
     *CFG_OPERATING_MODE
         .lock()
@@ -378,7 +400,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .expect("failed to build tokio runtime");
 
     // Step 1: open the fabric.
-    let mut fabric = match transport::Fabric::start(&transport::config::configuration()) {
+    let fabric = match transport::Fabric::start(&transport::config::configuration()) {
         Ok(fabric) => Some(fabric),
         Err(error) => {
             ctx.log_warning(&format!(
@@ -400,7 +422,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     };
 
     // Step 3: Fabric::register_buffers() — fi_mr_reg per segment per server.
-    if let Some(fabric) = &mut fabric {
+    if let Some(fabric) = &fabric {
         if let Err(e) = fabric.register_buffers(&storage::all_segment_slices()) {
             ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
             // storage::init() already committed pools/engine to OnceLock.

@@ -113,31 +113,6 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('DEL', 'dstkey2')
         assert client.execute_command('LO.GET', 'srckey2') == payload
 
-    def test_copy_pool_exhausted(self):
-        """COPY fails when the DRAMPool cannot fit the duplicate and cannot expand.
-
-        SET a 1500KB object into the 2MB segment. COPY then needs another
-        1500KB via alloc_exact_or_expand, which would add a segment — so we cap
-        the SERVER maxmemory just above current used_memory first (the only
-        expansion ceiling now that dram-maxmemory is gone), leaving less than a
-        segment of headroom. COPY's expansion crosses the watermark and fails.
-        """
-        client = self.server.get_new_client()
-        client.execute_command('FLUSHALL')
-        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
-        payload = b'F' * (1500 * 1024)
-        client.execute_command('LO.SET', 'bigkey', payload)
-        # Cap server maxmemory just above current used — no room for a 2nd segment.
-        used = int(client.info('memory')['used_memory'])
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
-        try:
-            client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail — expansion would cross maxmemory"
-        except ResponseError:
-            pass  # Expected — cannot fit a second object without crossing the watermark
-        # Restore uncapped for subsequent tests.
-        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
-
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
     def test_memory_usage(self):
@@ -232,3 +207,41 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert False, "Expected wrong information field error"
         except ResponseError as e:
             assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+
+
+class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
+    """COPY fails when the pool cannot fit the duplicate and cannot expand.
+
+    Own class with a coarse chunk-size (64KB) so a large object co-locates in one
+    segment with negligible talc overhead (4KB chunks waste ~50% and would not
+    fit). Server maxmemory is the only expansion ceiling now, so we cap it just
+    above current usage and COPY's expansion crosses the watermark and fails.
+    """
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" segment-size 2097152"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_copy_pool_exhausted(self):
+        client = self.server.get_new_client()
+        client.execute_command('FLUSHALL')
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        payload = b'F' * (1500 * 1024)
+        assert client.execute_command('LO.SET', 'bigkey', payload) == b'OK'
+        # Cap server maxmemory just above current used — no room for a 2nd segment.
+        used = int(client.info('memory')['used_memory'])
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail — expansion would cross maxmemory"
+        except ResponseError:
+            pass  # Expected — cannot fit a second object without crossing the watermark
+        finally:
+            client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+        # Source intact.
+        assert client.execute_command('LO.GET', 'bigkey') == payload
