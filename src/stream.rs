@@ -279,7 +279,7 @@ impl Target<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
-                        use_fixed: pool.is_io_uring_registered_for_buf(buf),
+                        use_fixed: pool.is_buf_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -324,8 +324,8 @@ impl Pool {
     /// register_buffers_update path flips them.
     pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
         match self {
-            Pool::Nvme(p) => p.is_io_uring_registered_for_buf(b),
-            Pool::Dram(p) => p.is_io_uring_registered_for_buf(b),
+            Pool::Nvme(p) => p.is_buf_io_uring_registered(b),
+            Pool::Dram(p) => p.is_buf_io_uring_registered(b),
         }
     }
 }

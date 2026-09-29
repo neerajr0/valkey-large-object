@@ -564,7 +564,7 @@ impl SegmentPool {
     /// plain Read/Write (false). An expanded segment not yet kernel-registered
     /// returns false so its I/O never issues a fixed op against an unregistered
     /// iovec_index (which would EFAULT).
-    pub fn is_io_uring_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
         let st = self.state.lock().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()

@@ -46,8 +46,8 @@ impl NVMePool {
 
     /// Whether the segment owning `buf` is registered in the io_uring kernel
     /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
-    pub fn is_io_uring_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
-        self.pool.is_io_uring_registered_for_buf(buf)
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_buf_io_uring_registered(buf)
     }
 
     /// Mark all current segments io_uring-registered (startup, post-register).

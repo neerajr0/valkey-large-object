@@ -171,11 +171,13 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len == 0 {
         return Err(ValkeyError::Str("ERR object length must be > 0"));
     }
-    // Reject objects larger than a segment. Single-segment invariant: an
-    // object's chunks are always co-located in one segment (see
-    // SegmentPool::alloc_exact), so an object can never exceed segment-size.
-    // Rejecting here (before the engine) gives a clean, deterministic error
-    // rather than a confusing pool-exhausted fallthrough at alloc time.
+    // Reject oversize objects here for a clean, deterministic error rather than
+    // a confusing pool-exhausted failure at alloc time.
+    //
+    // TODO: replace segment_size() with an explicit max-object-size config. That
+    // bound must be *smaller* than segment_size to account for talc's per-chunk
+    // overhead — usable segment capacity is less than nominal, so an object that
+    // passes this nominal check can still fail allocation.
     if obj_len as usize > crate::segment_size() {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }

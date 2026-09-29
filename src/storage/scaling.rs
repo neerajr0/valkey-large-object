@@ -41,21 +41,17 @@ pub fn scaling_cron(ctx: &Context) {
     // try_shrink() is safe in both modes: in Dram mode it only drains segments
     // with zero allocated bytes, so no live data is ever lost.
     //
-    // Shrink signal is SERVER-scoped (crate::server_memory): we release DRAM
-    // segments when Valkey overall is under memory pressure, giving space back to
-    // core data types. The module's own pool utilization drives EXPAND; it must
-    // not gate SHRINK, or a module under its own local pressure would shrink
-    // itself for reasons unrelated to server-wide memory pressure.
+    // Shrink is SERVER-scoped (crate::server_memory), not module-scoped: we give
+    // DRAM back only under Valkey-wide pressure, so the module's own pool pressure
+    // (which drives expand) must not trigger shrink.
     //
-    // Expand takes PRIORITY over shrink within a single tick. The two signals use
-    // different denominators (expand = module pool utilization; shrink = server
-    // used/maxmemory), so both can cross their watermarks on the same tick — pool
-    // at 80% while the server is at 90%. Firing both would add an empty segment
-    // and immediately drain the least-loaded one: pure churn. We err to EXPAND and
-    // suppress shrink for this tick. Gating on expand-SUCCEEDED (not merely
-    // expand-wanted) is deliberate: if expand was capped or failed, shrink is
-    // still allowed to give memory back, so we never deadlock under pressure with
-    // a pool that cannot grow.
+    // Expand takes priority over shrink within a tick. Expand and shrink read
+    // different denominators (module pool utilization vs server used/maxmemory),
+    // so both can cross on the same tick — firing both would add an empty segment
+    // then immediately drain the least-loaded one: pure churn. Gating on
+    // expand-SUCCEEDED (not merely wanted) is deliberate — if expand was capped or
+    // failed, shrink still runs, so a pool that cannot grow never deadlocks under
+    // pressure.
     if expanded {
         rearm_scaling_cron(ctx, poll_ms);
         return;

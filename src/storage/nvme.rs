@@ -314,7 +314,7 @@ pub async fn write_file_header(
         buf_ptr: hdr_ptr,
         file_offset: 0,
         len: FILE_HEADER_SIZE,
-        use_fixed: nvme_pool.is_io_uring_registered_for_buf(buf),
+        use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
     };
     let hdr_rx = uring::submit_write(fd, hdr_op);
     match hdr_rx.await {
