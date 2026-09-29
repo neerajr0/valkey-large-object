@@ -40,23 +40,6 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Atomic and Isolated accounting operation to free bytes of evicted items and charging bytes
-/// of a new allocation in NVMe. This is required to protect the evicted bytes of the current write
-/// operation. The main thread orchestrates evictions, but NVMe operations are conducted on tokio
-/// threads, so this layer of protection is necessary to ensure the success of the async task.
-pub fn exchange_nvme_disk_usage(freed: u64, charged: u64) {
-    if let Err(tracked) =
-        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            cur.checked_sub(freed)?.checked_add(charged)
-        })
-    {
-        panic!(
-            "NVMe disk-usage underflow: tried to free {freed} B (charging {charged} B) but only \
-             {tracked} B tracked — accounting is corrupt (double-free or size mismatch)"
-        );
-    }
-}
-
 /// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
 /// Returns true and increments the counter on success; returns false and leaves the
 /// counter unchanged if the reservation would exceed the cap (or overflow).
@@ -433,34 +416,6 @@ mod tests {
             decrease_nvme_disk_usage(disk_len);
         }
         assert_eq!(nvme_disk_usage(), base);
-    }
-
-    // One release-and-charge transition lands on the same value the two-atomic version would
-    // have, without ever publishing the intermediate `used - freed`.
-    #[test]
-    fn test_exchange_nets_release_against_charge() {
-        let _g = lock();
-        let base = nvme_disk_usage();
-        increase_nvme_disk_usage(12288);
-
-        exchange_nvme_disk_usage(12288, 4096);
-        assert_eq!(nvme_disk_usage(), base + 4096, "3 pages out, 1 in");
-
-        exchange_nvme_disk_usage(0, 8192);
-        assert_eq!(nvme_disk_usage(), base + 12288, "nothing freed, all charged");
-
-        exchange_nvme_disk_usage(12288, 0);
-        assert_eq!(nvme_disk_usage(), base);
-    }
-
-    // The precondition is that the victims cover the newcomer. Freeing more than is tracked
-    // means they did not, and that is the same corrupt accounting `decrease` aborts on —
-    // silently clamping would hand out budget the disk does not have.
-    #[test]
-    #[should_panic(expected = "underflow")]
-    fn test_exchange_underflow_is_fatal() {
-        let _g = lock();
-        exchange_nvme_disk_usage(u64::MAX, 4096);
     }
 
     // Decrementing more than is tracked is a corrupt-accounting bug and MUST abort,

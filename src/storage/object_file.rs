@@ -25,17 +25,16 @@
 //! last ref, except on the main event-loop thread, where blocking would stall the
 //! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
-//! The handle also owns `disk_len` which is its charge against `nvme-maxmemory`. The 
-//! release in `Drop` accounts for freeing this charge in most cases. `DiskReservation`,
-//! can cause the reservation to be free'd before the `Drop` is processed and it is
-//! important to not double count the free. The current use-case for this is evictions.
+//! The handle also owns `disk_len`, its charge against `nvme-maxmemory`, and `Drop` is
+//! the only thing that credits it back — so DEL, overwrite, expiry, flush and eviction
+//! each account for themselves exactly once. Eviction keeps that true by *moving* the
+//! last handle into a `DiskReservation` (instead of cloning the `Arc`).
 //!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
 use std::os::unix::io::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::fd_pool::FdPool;
@@ -54,20 +53,17 @@ pub struct ObjectFile {
     object_id: ObjectId,
     /// True on-disk size, used for NVMe utilization accounting.
     disk_len: u64,
-    /// Whether `Drop` still owes `disk_len` back to the ledger.
-    owes_ledger: AtomicBool,
 }
 
 impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
-    /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
-    /// that many bytes if not already foregone (`owes_ledger` is `true`).
+    /// `ensure_open`. `disk_len` is the true on-disk size, and `Drop` releases exactly
+    /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         Self {
             object_id,
             disk_len,
-            owes_ledger: AtomicBool::new(true),
         }
     }
 
@@ -78,13 +74,6 @@ impl ObjectFile {
     /// On-disk bytes this version is charged for — what releasing it is worth.
     pub fn disk_len(&self) -> u64 {
         self.disk_len
-    }
-
-    /// Hand this handle's ledger obligation to the caller: `Drop` will still unlink the file,
-    /// but will not credit `disk_len`. Only `DiskReservation::commit` calls this, and only
-    /// after folding the bytes into its own single ledger update.
-    fn forgo_ledger(&self) {
-        self.owes_ledger.store(false, Ordering::Release);
     }
 
     /// Returns a cloned `Arc<OwnedFd>`. Calls into the `FdPool`, which owns the fd and
@@ -153,11 +142,8 @@ impl Drop for ObjectFile {
         // unlink the file.
         let object_id = self.object_id;
 
-        // If the deleted bytes have already been accoutned for (ex. Evictions)
-        // we need to prevent double accounting those free'd bytes.
-        if self.owes_ledger.swap(false, Ordering::AcqRel) {
-            super::nvme::decrease_nvme_disk_usage(self.disk_len);
-        }
+        // Return credits back to the NVMe ledger.
+        super::nvme::decrease_nvme_disk_usage(self.disk_len);
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
@@ -192,18 +178,17 @@ impl Drop for ObjectFile {
 /// pending claim's bytes are invisible to the next SET, which frees its own victims instead
 /// of waiting; at a full cache that is one victim per newcomer either way.
 ///
-/// Atomicity: victims are held as `ObjectFile` handles rather than a byte total, which keeps
-/// their `Drop` — and so the `unlink(2)` — inside `commit`, before the new file is written and
-/// before their bytes are released to anyone else. A reservation dropped instead of committed
-/// undoes itself, because the handles still owe their bytes.
+/// Ordering: victims are owned outright — `eviction::take_file` takes the handle out of the
+/// keyspace. `commit` drops them, so the victims' files are gone from the directory before
+/// the new one is created, and a reservation dropped instead of committed undoes itself.
 pub struct DiskReservation {
     /// The version these bytes are for.
     object_id: ObjectId,
     /// Bytes this reservation is for — the new object's on-disk size.
     disk_len: u64,
-    /// Objects gone from the keyspace whose bytes pay for `disk_len`, held as handles so that
-    /// dropping them is both the release and the `unlink(2)`.
-    victims: Vec<Arc<ObjectFile>>,
+    /// Objects gone from the keyspace whose bytes pay for `disk_len`. Dropping them will
+    /// trigger both returning the ledger credit and calling `unlink(2)`.
+    victims: Vec<ObjectFile>,
     /// Whether `disk_len` was charged to the ledger.
     charged: bool,
 }
@@ -221,7 +206,7 @@ impl DiskReservation {
 
     /// The budget was full: `victims` are gone from the keyspace and their still-charged
     /// bytes, which the caller has verified cover `disk_len`, are what will pay for it.
-    pub fn paid_by(object_id: ObjectId, disk_len: u64, victims: Vec<Arc<ObjectFile>>) -> Self {
+    pub fn paid_by(object_id: ObjectId, disk_len: u64, victims: Vec<ObjectFile>) -> Self {
         Self {
             object_id,
             disk_len,
@@ -238,23 +223,17 @@ impl DiskReservation {
         self.disk_len
     }
 
-    /// Release the victims. Next, charge our own bytes minus the victims to the ledger in one
-    /// transaction. This is done to protect the write task by providing accounting isolation
-    /// against competing writes. Free'd victims are marked as no longer being owed to the ledger
-    /// for when they are later dropped.
+    /// Charge our own bytes, then drop the victims. `Drop` runs in-line and is responsible for
+    /// unlinking victim files and crediting their `disk_len` before creating the new file.
+    ///
+    /// Charging first is what keeps a competing SET's `try_reserve` isolated: the ledger briefly
+    /// over-counts by briefly including both the new file and victims whose files are being unlinked.
     pub fn commit(&mut self) {
-        let mut freed = 0;
-        for victim in &self.victims {
-            freed += victim.disk_len();
-            victim.forgo_ledger();
+        if !self.charged {
+            super::nvme::increase_nvme_disk_usage(self.disk_len);
+            self.charged = true;
         }
-        // in-progress note: if this was coded better I think victims.clear() would make
-        // owes_ledger redundant because they'd all get dropped here. It would cut down on
-        // code complexity considerably.
         self.victims.clear();
-        let charge = if self.charged { 0 } else { self.disk_len };
-        super::nvme::exchange_nvme_disk_usage(freed, charge);
-        self.charged = true;
     }
 
     /// Hand the charged bytes to the new version's handle. From here the `ObjectFile` owes
@@ -330,7 +309,7 @@ mod tests {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
 
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 2)));
+        let victim = charged_file(ObjectId(u64::MAX - 2));
         assert_eq!(nvme_disk_usage(), base + DISK_LEN);
 
         let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 3), DISK_LEN, vec![victim]);
@@ -353,34 +332,38 @@ mod tests {
         assert_eq!(nvme_disk_usage(), base, "an abandoned commit leaks nothing");
     }
 
-    /// `commit` settles the victims' bytes itself, so a handle that outlives it — another `Arc`
-    /// still held somewhere — must credit nothing when it finally drops. Without the obligation
-    /// flag this is a double-free: the ledger drifts down by one object per eviction until
-    /// `decrease` underflows and aborts the node.
+    /// The ordering the write path depends on: once `commit` returns, the victims' files are gone
+    /// from the directory, so the caller creates the new one into space that is actually free.
+    /// This is what owning the handles buys — a cloned `Arc` would leave the unlink to whenever
+    /// the keyspace's own reference died on a lazyfree BIO thread.
     #[test]
-    fn a_victim_outliving_commit_does_not_credit_twice() {
+    fn commit_unlinks_the_victims_before_returning() {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
+        let victim_oid = ObjectId(u64::MAX - 8);
+        let newcomer_oid = ObjectId(u64::MAX - 9);
 
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 8)));
-        let held = Arc::clone(&victim);
+        let victim = charged_file(victim_oid);
+        let victim_path = victim_oid.file_path(&crate::nvme_dir());
+        assert!(
+            std::path::Path::new(&victim_path).exists(),
+            "fixture must place the victim's file"
+        );
 
-        let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 9), DISK_LEN, vec![victim]);
-        place_file_for(ObjectId(u64::MAX - 9));
+        let mut res = DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![victim]);
         res.commit();
+
+        assert!(
+            !std::path::Path::new(&victim_path).exists(),
+            "commit must unlink the victim before the caller writes the new file"
+        );
         assert_eq!(
             nvme_disk_usage(),
             base + DISK_LEN,
-            "one object out, one in — netted, never passing through base"
+            "one object out, one in — the charge lands, the victim's credit comes back"
         );
 
-        drop(held);
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "the late drop unlinks and nothing more; commit already paid"
-        );
-
+        place_file_for(newcomer_oid);
         drop(res.into_object_file());
         assert_eq!(nvme_disk_usage(), base);
     }
@@ -393,7 +376,7 @@ mod tests {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
 
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 4)));
+        let victim = charged_file(ObjectId(u64::MAX - 4));
         drop(DiskReservation::paid_by(
             ObjectId(u64::MAX - 5),
             DISK_LEN,

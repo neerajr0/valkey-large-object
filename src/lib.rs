@@ -160,13 +160,6 @@ lazy_static::lazy_static! {
     /// `maxmemory-samples`, same range and default.
     static ref CFG_MAXMEMORY_SAMPLES: AtomicI64 = AtomicI64::new(5);
 
-    /// Determines if we are allowed to over-provision memory utilization when using
-    /// DRAM only mode. In Valkey's core eviction path, if evictions cannot sufficiently
-    /// evict memory for a pending write, we allow to over-provision past `maxmemory`.
-    /// Simiarly, in this module, we can allow a temporary over-provisioned segment
-    /// if evictions are not sufficient to free-up memory for an incoming write.
-    static ref CFG_DRAM_OVERPROVISION: AtomicBool = AtomicBool::new(true);
-
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
     /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
@@ -273,10 +266,6 @@ pub fn eviction_tenacity() -> i64 {
 
 pub fn maxmemory_samples() -> usize {
     CFG_MAXMEMORY_SAMPLES.load(std::sync::atomic::Ordering::Relaxed) as usize
-}
-
-pub fn dram_overprovision() -> bool {
-    CFG_DRAM_OVERPROVISION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn worker_threads() -> usize {
@@ -758,7 +747,6 @@ valkey_module! {
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
-            ["dram-overprovision", &*CFG_DRAM_OVERPROVISION, true, ConfigurationFlags::DEFAULT, None],
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,

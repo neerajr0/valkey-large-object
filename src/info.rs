@@ -93,19 +93,6 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "pinned_skips_total",
             crate::eviction::PINNED_SKIPS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
-        .field(
-            "overprovisions_total",
-            crate::eviction::OVERPROVISIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "overprovision_refusals_total",
-            crate::eviction::OVERPROVISION_REFUSALS_TOTAL
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        // The flag, not just the counters: a pool that overprovisioned once and never got
-        // the segment back is permanently a segment over the watermark below, and the
-        // counters alone cannot say whether that is still true.
-        .field("overprovisioned", i64::from(dram.is_overprovisioned()))?
         .build_section()?
         .build_info()
         .map(|_| ())

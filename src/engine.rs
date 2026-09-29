@@ -599,13 +599,10 @@ pub fn execute_set(
 /// 1. Attempt to use the free capacity already in the pool.
 /// 2. Try to expand the dram pool if we are under `dram-maxmemory` and the watermark.
 ///
-/// If the eviction policy is `noeviction` or `maxmemory` is equal to 0,  we do not attempt
-/// to evict or overprovision.
+/// If the eviction policy is `noeviction` or `maxmemory` is equal to 0, we do not attempt
+/// to evict.
 ///
 /// 3. Try to evict items from the keyspace.
-/// 4. If there's no overprovisioned segment, allocate a new segment. This is a dangerous
-///    operation because it relies on memory headroom beyond maxmemory and can lead to
-///    swapping and/or malloc() failures.
 fn alloc_dram_or_make_room(
     ctx: &valkey_module::Context,
     dram_pool: &storage::DRAMPool,
@@ -617,10 +614,7 @@ fn alloc_dram_or_make_room(
     if !crate::eviction_allowed(ctx) {
         return None;
     }
-    if let Some(buffers) = crate::eviction::alloc_by_evicting(ctx, len as usize) {
-        return Some(buffers);
-    }
-    crate::eviction::alloc_by_overprovisioning(dram_pool, len as usize)
+    crate::eviction::alloc_by_evicting(ctx, len as usize)
 }
 
 /// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.

@@ -137,15 +137,6 @@ def write_until_pinned_skip(client, prefix, payload, batch, timeout=10):
             return before, after
 
 
-def deny_overprovision(client):
-    """Make dram-maxmemory a hard cap by removing the last rung of the ladder.
-
-    Overprovisioning is on by default, so a test that wants the cap enforced to the
-    byte under a permitting policy has to turn it off explicitly.
-    """
-    client.execute_command('CONFIG', 'SET', 'largeobj.dram-overprovision', 'no')
-
-
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
 class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -388,12 +379,11 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
     """Dram mode: what happens at dram-maxmemory, on each rung of the ladder.
 
-    Once the pool is at the cap it cannot grow within its gates, so a further SET
-    has three possible outcomes, and two configs pick between them: evict
-    (maxmemory-policy allows it), overprovision by one segment (dram-overprovision,
-    for a request eviction cannot serve), or error. Both make-room rungs sit behind
-    maxmemory-policy, so `noeviction` gets the error whatever dram-overprovision
-    says. All four combinations are tested here so none can regress into another.
+    Once the pool is at the cap it cannot grow, so a further SET either evicts
+    (maxmemory-policy allows it) or errors. dram-maxmemory is a hard ceiling in
+    both directions: nothing grows the pool past it, so a request eviction cannot
+    serve is refused rather than admitted. All three outcomes are tested here so
+    none can regress into another.
     """
 
     def get_module_args(self, data_dir, direct_io):
@@ -411,7 +401,6 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
     OBJ_SIZE = 900 * 1024
     CAP_BYTES = 2097152
-    SEGMENT_BYTES = 1048576
     # Past what emptying the arena could produce, so the walk declines the request
     # instead of spending the keyspace on it. Fits in three segments, not two.
     OVER_CAP_SIZE = 2304 * 1024
@@ -443,53 +432,12 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             f"dram-maxmemory exceeded: {info['largeobj_capacity_bytes']}"
         assert client.execute_command('BLOB.GET', 'key_c') == payload
 
-    def test_overprovisions_for_a_request_eviction_cannot_serve(self):
-        """A request larger than the whole cap grows the pool past it rather than fail — once.
+    def test_noeviction_errors_at_cap(self):
+        """At the cap under `noeviction`, the SET fails and the keyspace is untouched.
 
-        Emptying the arena would not produce this run, so the walk declines before
-        destroying anything and the last rung is what admits the write. The assertions
-        are about it being *visible* and *bounded*: nothing is destroyed, capacity ends
-        up exactly one segment over, and the next request the walk cannot serve gets the
-        error this one avoided.
-        """
-        client = self.server.get_new_client()
-        allow_evictions(client)
-
-        before = info_largeobj(client)
-        payload = b'C' * self.OVER_CAP_SIZE
-        assert client.execute_command('BLOB.SET', 'over_cap', payload) == b'OK', \
-            "a request past the cap can only be admitted by overprovisioning"
-
-        after = info_largeobj(client)
-        assert after['largeobj_evictions_total'] == before['largeobj_evictions_total'], \
-            "the walk had nothing to give that would have helped, so it took nothing"
-        assert after['largeobj_overprovisions_total'] == \
-            before['largeobj_overprovisions_total'] + 1
-        assert after['largeobj_overprovisioned'] == 1, \
-            "the flag is how an operator sees the pool is over budget right now"
-        assert after['largeobj_capacity_bytes'] == self.CAP_BYTES + self.SEGMENT_BYTES, \
-            f"one segment over, not more: {after['largeobj_capacity_bytes']}"
-        assert client.execute_command('BLOB.GET', 'over_cap') == payload
-
-        # One-shot: only a released segment re-arms the rung, and in Dram mode that needs
-        # eviction to empty one first, so the next unservable request has no rung left.
-        try:
-            client.execute_command('BLOB.SET', 'bigger', b'D' * (self.OVER_CAP_SIZE + self.SEGMENT_BYTES))
-            assert False, "overprovisioning is takeable once, not per SET"
-        except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
-        assert info_largeobj(client)['largeobj_overprovision_refusals_total'] == 1, \
-            "the refusal is counted separately — it means raise dram-maxmemory"
-        assert client.execute_command('BLOB.GET', 'over_cap') == payload, \
-            "a refused SET must not have cost the resident object"
-
-    def test_noeviction_denies_overprovisioning_too(self):
-        """`noeviction` gets the error even with dram-overprovision left on.
-
-        The overcommit destroys nothing, so gating it on the policy is a choice: the
-        segment only comes back once eviction empties one for the shrink path to drain,
-        so on a node that will never evict the pool would simply stay over budget. An
-        operator who forbade eviction gets the refusal instead.
+        The counterpart to the test above: same state, same request, only the policy
+        differs, so this isolates the eviction-policy gate from the making-room path
+        below it.
         """
         client = self.server.get_new_client()
         deny_evictions(client)
@@ -506,9 +454,6 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         after = info_largeobj(client)
         assert after['largeobj_evictions_total'] == before['largeobj_evictions_total'], \
             "noeviction must destroy nothing"
-        assert after['largeobj_overprovisions_total'] == \
-            before['largeobj_overprovisions_total'], \
-            "the policy gate covers the last rung as well, so nothing was taken"
         assert after['largeobj_capacity_bytes'] <= self.CAP_BYTES, \
             f"dram-maxmemory exceeded: {after['largeobj_capacity_bytes']}"
         # Both originals are untouched, and the rejected key was never created.
@@ -516,27 +461,29 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', 'key_b') == b'B' * self.OBJ_SIZE
         assert client.execute_command('EXISTS', 'key_c') == 0
 
-    def test_errors_when_overprovision_is_off(self):
-        """With the last rung switched off, dram-maxmemory is a cap to the byte.
+    def test_errors_when_eviction_cannot_serve_the_request(self):
+        """A request larger than the whole cap is refused, with evictions permitted.
 
-        Same unservable request as the overprovisioning test, same permitting policy —
-        only `dram-overprovision no` differs, so this isolates the off switch from the
-        policy gate above it.
+        Emptying the arena would not produce this run, so the walk declines before
+        destroying anything — and nothing below it grows the pool, which is what makes
+        dram-maxmemory a ceiling rather than a hint. The permitting policy is the point:
+        it isolates "eviction could not serve this" from "eviction was forbidden".
         """
         client = self.server.get_new_client()
         allow_evictions(client)
-        deny_overprovision(client)
 
+        before = info_largeobj(client)
         try:
             client.execute_command('BLOB.SET', 'over_cap', b'C' * self.OVER_CAP_SIZE)
-            assert False, "with overprovisioning off the cap must refuse the write"
+            assert False, "a request past the whole cap must be refused"
         except ResponseError as e:
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
-        info = info_largeobj(client)
-        assert info['largeobj_overprovisions_total'] == 0
-        assert info['largeobj_capacity_bytes'] <= self.CAP_BYTES, \
-            f"dram-maxmemory exceeded: {info['largeobj_capacity_bytes']}"
+        after = info_largeobj(client)
+        assert after['largeobj_evictions_total'] == before['largeobj_evictions_total'], \
+            "the walk had nothing to give that would have helped, so it took nothing"
+        assert after['largeobj_capacity_bytes'] <= self.CAP_BYTES, \
+            f"dram-maxmemory exceeded: {after['largeobj_capacity_bytes']}"
         assert client.execute_command('EXISTS', 'over_cap') == 0
 
 
@@ -946,12 +893,10 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
         Core samples `db->expires` under those policies, so an operator who set
         `volatile-lru` was promised their persistent keys survive. We sample the whole
         keyspace, so that promise is ours to keep: a walk that finds only persistent keys
-        must come back empty, not delete them. Overprovisioning is off so the refusal is
-        visible as an error rather than absorbed by the emergency segment.
+        must come back empty, not delete them.
         """
         client = self.server.get_new_client()
         _set_memory_policy(client, 'volatile-lru')
-        deny_overprovision(client)
         self._fill(client)
 
         before = info_largeobj(client)['largeobj_evictions_total']
@@ -1359,6 +1304,53 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         # The last object written cannot have been anyone's victim.
         last_key, last_payload = list(payloads.items())[-1]
         assert client.execute_command('BLOB.GET', last_key) == last_payload
+
+    def test_a_refused_set_destroys_nothing(self):
+        """A walk that cannot cover the request rolls back, so the SET fails and the
+        keyspace is untouched.
+
+        The walk claims as it samples — it empties each victim's value to take sole
+        ownership of the file handle — but it does not delete the keys until it knows the
+        claims cover the newcomer. Without the rollback this SET would fail *and* take
+        every object with it: the caller gets an error and the cache is empty.
+
+        Engineered so the failure needs no clock and no pins. Three objects resident
+        against a request worth seven: `hopeless_request` lets it through (seven is under
+        the cap and something is resident), the scan then offers every key in the DB and
+        the walk claims all three, and `freed >= need` is still false when the candidates
+        run out. Deterministic, and the failure counter is what proves the walk really did
+        claim and give back rather than never having tried.
+        """
+        client = self.server.get_new_client()
+        allow_evictions(client)
+
+        resident = 3
+        for i in range(resident):
+            r = client.execute_command('BLOB.SET', f'keep_{i}', bytes([i]) * self.OBJ)
+            assert r == b'OK', f"keep_{i} failed: {r}"
+
+        before = info_largeobj(client)
+        files_before = sorted(self._dat_files())
+
+        # disk_len is payload + header, so subtract one header to land on exactly seven
+        # objects' worth of ledger — over what three victims can free, under the cap.
+        oversized = b'X' * (7 * self.DISK_PER_OBJ - self.HEADER)
+        self._assert_capacity_rejected(client, 'too_big', oversized)
+
+        for i in range(resident):
+            assert client.execute_command('BLOB.GET', f'keep_{i}') == bytes([i]) * self.OBJ, \
+                f"keep_{i} must survive a SET that was refused"
+
+        after = info_largeobj(client)
+        assert after['largeobj_disk_used_bytes'] == before['largeobj_disk_used_bytes'], \
+            "a rolled-back walk must leave the ledger where it found it"
+        assert after['largeobj_disk_evictions_total'] == before['largeobj_disk_evictions_total'], \
+            "nothing was evicted, so nothing should be counted as evicted"
+        assert sorted(self._dat_files()) == files_before, \
+            "no file may be unlinked for a SET that never happened"
+        assert (after['largeobj_disk_eviction_failures_total']
+                > before['largeobj_disk_eviction_failures_total']), \
+            "the walk must have claimed victims and rolled them back, not declined to start"
 
     def test_disk_usage_stays_within_cap(self):
         """Eviction keeps the ledger at or under nvme-maxmemory across many writes."""

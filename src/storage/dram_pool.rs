@@ -16,7 +16,7 @@
 //! (`try_promote_object`), so nothing resident is ever given up for a cache fill.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::context::{ObjectContext, SegmentBuffer};
@@ -32,10 +32,6 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Set while the pool holds one segment *more* than `try_expand`'s gates would
-    /// permit. State, not a quota: it is what stops `overprovision` happening twice,
-    /// and it re-arms when a segment is released.
-    overprovisioned: AtomicBool,
 }
 
 impl DRAMPool {
@@ -45,7 +41,6 @@ impl DRAMPool {
             objects: RwLock::new(HashMap::new()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            overprovisioned: AtomicBool::new(false),
         }
     }
 
@@ -277,9 +272,7 @@ impl DRAMPool {
     ///
     /// Must be called from the Valkey main event-loop thread only.
     pub fn release_drained_segments(&self) {
-        if self.pool.release_all_releasable() > 0 {
-            self.overprovisioned.store(false, Ordering::Release);
-        }
+        self.pool.release_all_releasable();
     }
 
     /// Add one segment to the pool, gated by the server-wide `maxmemory` (via
@@ -307,30 +300,6 @@ impl DRAMPool {
         // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
         super::uring::submit_reregister(super::uring::PoolType::Dram);
         Some(idx)
-    }
-
-    /// Add one segment *past* `try_expand`'s watermark gate — the deliberate overcommit of
-    /// last resort, when eviction could not free a usable run and the alternative is to
-    /// fail the write. `false` means we are already one segment over and the caller must
-    /// OOM; the flag clears when a segment is released (`release_drained_segments`). The
-    /// extra segment goes into ordinary circulation.
-    pub fn overprovision(&self) -> bool {
-        if self.overprovisioned.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let Some((_, slice)) = self.pool.expand() else {
-            self.overprovisioned.store(false, Ordering::Release);
-            return false;
-        };
-        self.expand_count.fetch_add(1, Ordering::Relaxed);
-        crate::efa_register_segment(slice);
-        super::uring::submit_reregister(super::uring::PoolType::Dram);
-        true
-    }
-
-    /// Whether the pool is currently one segment over its gates. Reported by `INFO largeobj`.
-    pub fn is_overprovisioned(&self) -> bool {
-        self.overprovisioned.load(Ordering::Acquire)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.

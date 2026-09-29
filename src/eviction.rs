@@ -1,58 +1,74 @@
 //! Eviction — giving up resident objects to free a budget.
 //!
-//! Two budgets, one driver. `alloc_by_evicting` frees DRAM arena bytes for `Dram`-mode SETs
-//! (`alloc_dram_or_make_room`); `claim_disk_victims` claims `nvme-maxmemory` budget for
-//! `Tiered`-mode SETs (`reserve_nvme_or_make_room`). A node runs in one mode for its lifetime,
-//! so it only ever does one of the two. Nothing here frees the DRAM arena in `Tiered` mode — a
-//! promotion that cannot allocate skips itself (`try_promote_object`).
+//! # One driver
 //!
-//! `walk` is the whole policy — search bound, sampling, scoring, skips, termination — and both
-//! budgets go through it, so they cannot drift apart. Each mode injects a `Budget` impl:
+//! `walk` is the entire policy: how long to search, which candidates to sample, how to rank them,
+//! what to skip, when to give up. Both modes go through it, so victim selection cannot drift apart
+//! between them, and both stay aligned with core's policy.
 //!
-//! |  | `Arena` (`Dram`) | `DiskLedger` (`Tiered`) |
-//! |---|---|---|
-//! | Frees | DRAM arena | `nvme-maxmemory` |
-//! | A pin means | the NIC is reading the buffer | a reader holds the unlinked file open |
-//! | `satisfy` | `alloc_exact` — may refuse | `freed >= need` — cannot |
-//! | Bytes come back | in our own drop | later, on the write task |
+//! What `walk` does not decide is what a freed byte *is*. That is where the two modes fork: each
+//! passes in a `Budget` impl with two methods. `claim` gives up one victim and reports the bytes it
+//! yielded; `satisfy` says whether that is enough yet and hands back the result.
 //!
-//! `Arena::satisfy` is the asymmetry that shapes the driver: it *is* the allocation, so it can
-//! refuse after the bytes are already free — in the arena, but not in a contiguous run — and a
-//! refusal resets the credit rather than ending the walk.
+//! # Two budgets
+//!
+//! A node runs in one mode for its lifetime, so it only ever takes one of these. Promotion and
+//! demotion between the tiers do not go through here.
+//!
+//! `[Dram]` — `alloc_by_evicting`, from `engine::alloc_dram_or_make_room`, frees DRAM arena bytes
+//! through `Arena`. Its `satisfy` is `alloc_exact`: asking *is* allocating, so it can refuse even
+//! once enough bytes are free, when they are scattered instead of in one contiguous run. That
+//! forces everything else. Victims must be destroyed as they are claimed, because the memory has to
+//! be genuinely free before the allocator can answer — so a walk that comes up short has spent them
+//! and still fails the SET. A pin is the NIC reading the buffer. The bytes come back in our own
+//! drop, inside this call stack.
+//!
+//! `[Tiered]` — `claim_disk_victims`, from `engine::reserve_nvme_or_make_room`, claims
+//! `nvme-maxmemory` budget through `DiskLedger`. Its `satisfy` compares a running total against the
+//! request and can never refuse, so the deletes can wait until the claims cover it: a walk that
+//! comes up short puts every key back and destroys nothing. A pin is a reader holding the unlinked
+//! file open. The bytes are settled later, by the write task.
 //!
 //! # Search bound
 //!
-//! Time, not traversal: `eviction-tenacity` maps to a microsecond budget as core's
-//! `maxmemory-eviction-tenacity` does (`search_budget`). Termination does not come from the
-//! clock — at tenacity 100 there is no clock — but from `barren_rounds` consecutive sample
-//! rounds that claimed nothing. Core gets that guarantee for free (`goto cant_free` fires the
-//! instant sampling yields no victim, so every iteration frees a key); we sample and may reject
-//! everything we drew, so we count rejections instead. A heuristic where core has a proof, and
-//! the one place we are strictly weaker.
+//! Time based search bound. Module's `eviction-tenacity` maps to a microsecond budget and is
+//! inspired by core Valkey's `maxmemory-eviction-tenacity`. If tenacity reaches 100 there is
+//! no time based timeout, so `barren_rounds` checks for consecutive sample rounds that claimed
+//! nothing in order to exit. `barren_rounds` is not native to core Valkey and is necessary due
+//! to the sampling limitations of the module API. It can cause error replies in cases where
+//! eviction fails to sample items belonging to the module.
 //!
 //! # Victim ranking
 //!
-//! Core's policy through the module API: draw `maxmemory-samples` candidates, score each with
-//! `objectGetIdleness`, claim best-first. See `idleness`. Two deviations, forced by the API:
+//! Valkey Core evictions are recreated within the module. Draw `maxmemory-samples` candidates,
+//! score each with `objectGetIdleness` (based on eviction policy), claim best victims.
 //!
-//! - **Candidates come from a resumable `RM_Scan` cursor, not a random draw**, because the API
-//!   exposes no settable cursor position and `RANDOMKEY` via `ctx.call` costs a command dispatch
-//!   per sample and is not type-filtered. Better on coverage — every key is offered once per
-//!   pass — worse on independence between rounds.
+//! Two limitations due to module API restrictions:
+//!
+//! - **Candidates come from a resumable `RM_Scan` cursor, not a random draw**, because `RANDOMKEY`
+//!   via `ctx.call` costs a command dispatch per sample.
 //! - **The scan visits every key in the DB, not just `LO` keys**, so a keyspace that is mostly
 //!   non-module keys spends its budget on misses and `MAX_EMPTY_STEPS` gives up rather than
-//!   hunting. The eviction-policy follow-up replaces the scan with a candidate index owned by
-//!   `DRAMPool`.
+//!   hunting.
 //!
-//! # Placement
+//! # Threading
 //!
-//! Main-thread only, and never awaits, so the drops below return memory in this call stack. EFA
-//! does not change that — its SET allocates before the tokio spawn and its GET decides promotion
-//! before it. What EFA adds is concurrent `Arc` holders: an in-flight transfer pins its object on
-//! a tokio thread, which is why both `Budget` impls check for pins. Holding the main thread for
-//! the whole command is also what makes check-then-delete atomic against a *new* pin, since
-//! dispatching a GET needs this thread. The reverse race — a reader finishing mid-walk — only
-//! costs us a victim that a later round re-offers.
+//! Eviction selection runs only on the Valkey event-loop thread, and never awaits, so every drop
+//! here returns its memory inside this call stack rather than on a later thread. `alloc_by_evicting`
+//! depends on that: it frees victims and immediately retries the allocation.
+//!
+//! That holds for every mode and transport: a SET allocates before spawning its tokio task, and a
+//! GET decides promotion before spawning, so no eviction ever runs off the event loop.
+//!
+//! Serving a GET is another matter. `Dram` + TCP is the one path that stays on the event loop
+//! (`engine::execute_get`); the other three block the client and move the object's `Arc` onto a
+//! tokio thread — EFA because the NIC is reading the buffer, `Tiered` because an NVMe read holds
+//! the file handle open. That live `Arc` is a pin, and a pinned object is skipped: claiming it
+//! would report bytes that do not come back until the reader is done.
+//!
+//! Skipping is safe in both directions because we hold the event loop. A new pin cannot arrive
+//! between the check and the delete, since making one means dispatching a command. A pin that
+//! *disappears* mid-walk only costs us a candidate the next round re-offers.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -67,7 +83,7 @@ use valkey_module::{raw, Context, KeysCursor, ValkeyString};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::storage::context::SegmentBuffer;
-use crate::storage::{DRAMPool, ObjectFile};
+use crate::storage::ObjectFile;
 
 /// Objects destroyed since module load. All of these are exposed via `INFO largeobj`.
 pub static EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -83,12 +99,6 @@ pub static EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Objects a walk passed over because someone still held them. Rising alongside a failure
 /// counter says the working set is busy rather than full — those bytes come back on their own.
 pub static PINNED_SKIPS_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Times the arena grew one segment past its gates rather than fail a SET
-/// (`alloc_by_overprovisioning`), and times that was wanted and refused because the pool was
-/// already over. Refusals are the OOMs that mean "raise `dram-maxmemory`".
-pub static OVERPROVISIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
-pub static OVERPROVISION_REFUSALS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Disk counterparts, separate statics because `INFO` reports them under the NVMe section.
 /// `PINNED_SKIPS_TOTAL` is shared — a pin means the same thing in both walks.
@@ -126,14 +136,14 @@ const MAX_SATISFY_REFUSALS: usize = 3;
 
 /// Freed bytes are credited at this percentage of face value, in both walks.
 ///
-/// Deliberately one constant rather than a per-mode parameter, and deliberately not 100. A
-/// discount only decides *when to first ask* — `Budget::satisfy` is still the authority — and
-/// what it buys is fewer doomed attempts, which are not free: a multi-chunk `alloc_exact`
-/// allocates the first N−1 chunks before it fails and frees them again
-/// (`segment_pool.rs:143-151`). The case against is that neither credit is imprecise in a way a
-/// percentage models — the DRAM one is exact as a byte count and imprecise only in placement,
-/// and the NVMe ledger has no placement dimension at all, so 90% there just deletes ~11% more
-/// keys than the cap requires.
+/// One constant for both budgets, and not 100. The discount only decides *when to first ask* —
+/// `Budget::satisfy` is still the authority — and what it buys is fewer doomed attempts, which are
+/// not free: a multi-chunk `alloc_exact` allocates the first N−1 chunks before it fails and frees
+/// them again (`segment_pool.rs:143-151`).
+///
+/// It is a blunt instrument, because neither credit is imprecise in a way a percentage models. The
+/// DRAM one is exact as a byte count and imprecise only in placement, and the NVMe ledger has no
+/// placement dimension at all, so 90% there just deletes ~11% more keys than the cap requires.
 const CREDIT_PERCENT: u64 = 90;
 
 // Keyspace cursors, resumed across calls so a request continues the previous walk rather than
@@ -148,8 +158,8 @@ const CREDIT_PERCENT: u64 = 90;
 // One cursor per DB, because `RM_Scan` walks `ctx->client->db` only: a single shared position
 // applied to differently sized kvstores makes "every key offered once per pass" hold for neither.
 //
-// Not fixed: the arena, the NVMe ledger and `object_count()` are process-global while the scan is
-// per-DB, so a client on DB 0 cannot evict DB 5's objects even when they are the whole budget.
+// The arena, the NVMe ledger and `object_count()` are process-global while the scan is per-DB, so
+// a client on DB 0 cannot evict DB 5's objects even when they are the whole budget.
 thread_local! {
     static CURSORS: RefCell<HashMap<c_int, Rc<KeysCursor>>> = RefCell::new(HashMap::new());
 }
@@ -390,15 +400,15 @@ fn hopeless_request(need: u64, ceiling: u64, resident: u64) -> bool {
 trait Budget {
     type Output;
 
-    /// Destroy the object and take its bytes, at face value. `None` leaves it in place —
-    /// pinned, already gone, or not convertible into this budget. Impls own their own
-    /// notion of a pin, and bump `PINNED_SKIPS_TOTAL` when that is why they declined.
-    fn claim(
-        &mut self,
-        ctx: &Context,
-        key_name: &ValkeyString,
-        object_id: &ObjectId,
-    ) -> Option<u64>;
+    /// Take the object's bytes, at face value. `None` leaves it alone — pinned, already gone, or
+    /// not convertible into this budget. Impls own their own notion of a pin, and bump
+    /// `PINNED_SKIPS_TOTAL` when that is why they declined.
+    ///
+    /// Deleting the key is the impl's business: `Arena` must destroy now, since `satisfy` cannot
+    /// answer until the bytes are really free; `DiskLedger` empties the value and defers. Hence
+    /// `key_name` by value, so a deferring impl can keep it.
+    fn claim(&mut self, ctx: &Context, key_name: ValkeyString, object_id: &ObjectId)
+        -> Option<u64>;
 
     /// The authoritative check, asked only once the discounted credit says it is worth
     /// asking. `Some` ends the walk successfully; `None` means keep going, and for the arena
@@ -410,10 +420,10 @@ trait Budget {
 /// the output and how many objects were given up, which callers need to tell a failed run from
 /// a no-op one.
 ///
-/// The final `satisfy` is not belt-and-braces. A refusal resets the credit, so a walk can free
-/// well over `need` in total and still end below the threshold that triggers an attempt — and
-/// the victims freed since that refusal may have coalesced into the run the allocator wanted.
-/// Core does the same, re-checking `getMaxmemoryState` at `cant_free`.
+/// The final `satisfy` is reachable with the request already paid for. A refusal resets the
+/// credit, so a walk can free well over `need` in total and still end below the threshold that
+/// triggers an attempt — and the victims freed since that refusal may have coalesced into the run
+/// the allocator wanted. Core does the same, re-checking `getMaxmemoryState` at `cant_free`.
 fn walk<B: Budget>(
     ctx: &Context,
     cursor: &KeysCursor,
@@ -462,7 +472,7 @@ fn walk<B: Budget>(
         let mut claimed_any = false;
         for (_score, key_name, object_id) in ranked {
             examined += 1;
-            let Some(bytes) = budget.claim(ctx, &key_name, &object_id) else {
+            let Some(bytes) = budget.claim(ctx, key_name, &object_id) else {
                 continue;
             };
             victims += 1;
@@ -499,8 +509,7 @@ fn walk<B: Budget>(
 
 /// Allocate `need` bytes, destroying resident objects to make room.
 ///
-/// The caller checks the eviction policy — this rung and the overprovisioning rung below it
-/// share that gate, so it belongs above both (`engine::alloc_dram_or_make_room`).
+/// The caller checks the eviction policy (`engine::alloc_dram_or_make_room`).
 pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer>> {
     debug_assert_eq!(
         crate::operating_mode(),
@@ -538,7 +547,7 @@ impl Budget for Arena {
     fn claim(
         &mut self,
         ctx: &Context,
-        key_name: &ValkeyString,
+        key_name: ValkeyString,
         object_id: &ObjectId,
     ) -> Option<u64> {
         // A transfer is reading this buffer, so taking the entry would leave it gone and the
@@ -548,7 +557,7 @@ impl Budget for Arena {
             PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        reclaim(ctx, key_name, object_id)
+        reclaim(ctx, &key_name, object_id)
     }
 
     fn satisfy(&mut self, need: u64) -> Option<Vec<SegmentBuffer>> {
@@ -589,47 +598,18 @@ fn arena_bytes(obj_ctx: &crate::storage::context::ObjectContext) -> u64 {
     obj_ctx.buffers.iter().map(|b| b.len as u64).sum()
 }
 
-// ─── DRAM arena: overcommit, once (Dram) ─────────────────────────────────────
-
-/// Grow the arena one segment past its gates rather than fail this SET. The last rung of the
-/// ladder, below eviction: a deliberate overcommit, gated on `dram-overprovision` and takeable
-/// only once until a segment is released.
-///
-/// The caller gates this on the eviction policy even though it destroys nothing: the overcommit
-/// is a bridge, not capacity, and the only thing that gives it back is eviction emptying a
-/// segment for `try_shrink` to drain — a `noeviction` node never relieves the pressure that
-/// forced the segment, so the +1 would be permanent.
-///
-/// Dram mode only: Tiered never touches the arena to make room.
-pub fn alloc_by_overprovisioning(dram_pool: &DRAMPool, need: usize) -> Option<Vec<SegmentBuffer>> {
-    if !crate::dram_overprovision() || crate::operating_mode() != crate::OperatingMode::Dram {
-        return None;
-    }
-    if !dram_pool.overprovision() {
-        OVERPROVISION_REFUSALS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    OVERPROVISIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-
-    // One segment may still not be enough, and we do not pre-check for that. The flag stops us at
-    // +1 either way, and the segment is not wasted: it stays in the pool for the next request.
-    dram_pool.alloc_exact(need)
-}
-
 // ─── Tiered: the nvme-maxmemory budget ───────────────────────────────────────
 
-/// Claim enough resident objects to pay for `need` disk bytes. `None` means the search could not
-/// cover it, in which case the SET must be refused — objects may still have been destroyed, and
-/// their bytes go back to the general ledger rather than to this caller.
+/// Claim enough resident objects to pay for `need` disk bytes. `None` means the search came up
+/// short and the SET must be refused — having destroyed nothing, because keys are deleted only once
+/// the claims cover the request.
 ///
-/// The claim is exclusive: every object returned is already out of the keyspace, so no other
-/// request can select it, and its bytes are still charged, so no other request can spend them
-/// either. That is what lets the write task settle the accounting later without a second
-/// capacity check that could fail (see `DiskReservation`).
+/// The claim is exclusive: the objects are out of the keyspace and their bytes still charged, so no
+/// other request can select them or spend those bytes. That is what lets the write task settle up
+/// without a second capacity check (see `DiskReservation`).
 ///
-/// Main thread only, before the SET's tokio task is spawned: deleting keys belongs to the event
-/// loop.
-pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<Arc<ObjectFile>>> {
+/// Main thread only, before the SET's tokio task is spawned.
+pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<ObjectFile>> {
     let budget = crate::nvme_maxmemory();
 
     // Unreachable in practice — an unlimited budget cannot refuse a reservation, so the caller
@@ -651,81 +631,111 @@ pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<Arc<ObjectFile
     let mut ledger = DiskLedger::default();
     let (claimed, victims) = with_cursor(ctx, |cursor| walk(ctx, cursor, need, &mut ledger));
 
-    // Gated on `victims` like the DRAM counter, so both mean the same thing: a SET that destroyed
-    // something and still came up short. A walk that found nothing to claim spent none of the
-    // keyspace and should not be read as thrashing.
-    if claimed.is_none() && victims > 0 {
+    if let Some(claimed) = claimed {
+        return Some(delete_claimed(ctx, claimed));
+    }
+
+    restore_claimed(ctx, ledger.claimed);
+
+    // A walk that claimed nothing is not thrashing. The keys are back, so this counts wasted
+    // search, not lost data: a rise against `disk_evictions_total` means the working set is too
+    // pinned or too large.
+    if victims > 0 {
         DISK_EVICTION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
-    claimed
+    None
 }
 
 /// Accumulates claimed handles until they cover `need`. Its running total is exact rather than an
 /// allocator's guess, so `satisfy` is a comparison and can never refuse.
 ///
-/// `claimed` dropping unspent is the correct failure behaviour, not a leak: the keys are already
-/// gone and cannot be put back, so returning their bytes to the ledger is all that is left.
+/// Each entry carries its key name because the delete is deferred until `satisfy` succeeds.
 #[derive(Default)]
 struct DiskLedger {
-    claimed: Vec<Arc<ObjectFile>>,
+    claimed: Vec<(ValkeyString, ObjectFile)>,
     freed: u64,
 }
 
 impl Budget for DiskLedger {
-    type Output = Vec<Arc<ObjectFile>>;
+    type Output = Vec<(ValkeyString, ObjectFile)>;
 
     fn claim(
         &mut self,
         ctx: &Context,
-        key_name: &ValkeyString,
+        key_name: ValkeyString,
         _object_id: &ObjectId,
     ) -> Option<u64> {
-        let file = claim_disk(ctx, key_name)?;
+        let file = take_file(ctx, &key_name)?;
         let bytes = file.disk_len();
         self.freed += bytes;
-        self.claimed.push(file);
+        self.claimed.push((key_name, file));
         Some(bytes)
     }
 
-    fn satisfy(&mut self, need: u64) -> Option<Vec<Arc<ObjectFile>>> {
+    fn satisfy(&mut self, need: u64) -> Option<Self::Output> {
         (self.freed >= need).then(|| std::mem::take(&mut self.claimed))
     }
 }
 
-/// Take the `LO` object at `key_name` out of the keyspace and hand its handle to the caller,
-/// still charged. `None` if the key could not be taken.
-fn claim_disk(ctx: &Context, key_name: &ValkeyString) -> Option<Arc<ObjectFile>> {
+/// Take the handle out of the `LO` object at `key_name`, leaving the key in place. `None` if there
+/// is no handle or a reader holds one.
+///
+/// Ownership, not a clone, so the caller picks the moment of the `unlink(2)`. `free_effort` returns
+/// 0, so under the default `lazyfree-lazy-server-del yes` the keyspace's reference outlives
+/// `delete()` by however long a BIO thread takes; emptying the value leaves that thread nothing to
+/// drop.
+///
+/// `try_unwrap` failing *is* the pin check — a reader's `Arc` holds the file's blocks past the
+/// unlink, so claiming it would report budget we never receive.
+///
+/// The emptied value never escapes: the walk holds the event loop, and every handle is deleted with
+/// its key or put back before it returns. A key the scan cursor offers twice finds nothing left to
+/// take the second time, which is how the walk avoids counting it twice.
+fn take_file(ctx: &Context, key_name: &ValkeyString) -> Option<ObjectFile> {
     let key = ctx.open_key_writable(key_name);
-
-    // Clone our own reference *before* unlinking, because when the keyspace drops its own is not
-    // ours to know: `free_effort` returns 0, which core turns into a request to free the value on
-    // a BIO thread, honoured only when `lazyfree-lazy-server-del` is on. Only one of those leaves
-    // `lo.file` there to read afterwards; a clone is correct under both, and it is this reference
-    // that keeps the file alive until the caller spends it.
-    let file = match key.get_value::<LoValue>(&LO_TYPE) {
-        Ok(Some(lo)) => {
-            let file = lo.file.as_ref()?;
-            // A reader's `Arc<ObjectFile>` keeps the file — and so its blocks — alive past the
-            // `unlink(2)`, so the bytes stay charged. Claiming a pinned victim reports budget we
-            // never received and breaks `DiskReservation::commit`'s "victims cover `disk_len` by
-            // construction": usage sits at the cap while each SET destroys more. At rest the
-            // keyspace holds the only reference, so `> 1` is exactly "someone is reading it".
-            if Arc::strong_count(file) > 1 {
-                PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            file.clone()
-        }
-        _ => return None,
-    };
-
-    if key.delete().is_err() {
+    let Ok(Some(lo)) = key.get_value::<LoValue>(&LO_TYPE) else {
         return None;
+    };
+    match Arc::try_unwrap(lo.file.take()?) {
+        Ok(file) => Some(file),
+        Err(pinned) => {
+            lo.file = Some(pinned);
+            PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
+}
 
-    DISK_RECLAIMED_BYTES_TOTAL.fetch_add(file.disk_len(), Ordering::Relaxed);
-    DISK_EVICTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    Some(file)
+/// Spend the claims: delete the keys and hand the handles on. Called only once the walk covered the
+/// request, so this is where eviction becomes irreversible.
+///
+/// The values are already emptied, so the deletes free nothing — the bytes and the `unlink(2)` ride
+/// on the handles instead. `Key::delete` returns `Ok` unconditionally, hence the discard.
+fn delete_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) -> Vec<ObjectFile> {
+    claimed
+        .into_iter()
+        .map(|(key_name, file)| {
+            let _ = ctx.open_key_writable(&key_name).delete();
+            DISK_RECLAIMED_BYTES_TOTAL.fetch_add(file.disk_len(), Ordering::Relaxed);
+            DISK_EVICTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            file
+        })
+        .collect()
+}
+
+/// Undo the claims of a walk that came up short, so a refused SET costs the keyspace nothing — the
+/// object is as it was, still charged, still readable, `lru` untouched because sampling was
+/// `NOTOUCH`.
+///
+/// A key that expired mid-walk has no value left to take its handle back. Letting the handle drop
+/// here is right: the key is gone, so the file and its bytes should go with it.
+fn restore_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) {
+    for (key_name, file) in claimed {
+        let key = ctx.open_key_writable(&key_name);
+        if let Ok(Some(lo)) = key.get_value::<LoValue>(&LO_TYPE) {
+            lo.file = Some(Arc::new(file));
+        }
+    }
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -734,6 +744,7 @@ fn claim_disk(ctx: &Context, key_name: &ValkeyString) -> Option<Arc<ObjectFile>>
 mod tests {
     use super::*;
     use crate::storage::context::ObjectContext;
+    use crate::storage::DRAMPool;
 
     /// The credit a walk gets is the aligned size the arena gave out, not the user length, since
     /// the former is what freeing gives back.
