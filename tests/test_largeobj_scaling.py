@@ -60,7 +60,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
+        address, rkey, remote_addr, _length = line.split()[1:]
         return process, address, int(rkey), int(remote_addr)
 
     def test_expand_on_segment_full(self):

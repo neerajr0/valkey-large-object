@@ -152,7 +152,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Strict arity, decided before the key lookup so a malformed EFA call cannot be
     // answered as if it were a TCP GET (or as a missing key).
     //   2 args: TCP          — LO.GET key
-    //   4 args: legacy EFA   — LO.GET key rkey addr           (single region, no len)
+    //   4 args: legacy EFA   — LO.GET key rkey addr           (single region, no per-region len)
     //  ≥5 args: multi-region — LO.GET key n_regions rkey1 addr1 len1 ...
     let efa = match args.len() {
         2 => false,
@@ -212,7 +212,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Strict arity.
     //   3 args: TCP          — LO.SET key <data>
-    //   5 args: legacy EFA   — LO.SET key total_len rkey addr          (single region, no len)
+    //   5 args: legacy EFA   — LO.SET key total_len rkey addr          (single region, no per-region len)
     //  ≥6 args: multi-region — LO.SET key total_len n_regions rkey1 addr1 len1 ...
     // 4 args is rejected: it is neither a valid TCP call (which is exactly 3) nor a
     // valid EFA call, so falling through to TCP would store the numeric `total_len`
