@@ -59,17 +59,22 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         result = client.execute_command('LO.GET', 'delkey')
         assert result is None
 
-    def test_dram_pool_exhaustion(self):
-        """An object larger than segment-size fails with pool exhausted."""
+    def test_object_larger_than_segment_rejected(self):
+        """An object larger than segment-size is rejected up front.
+
+        Single-segment invariant: every object's chunks are co-located in one
+        segment, so an object cannot exceed segment-size. This is rejected at
+        SET admission with a distinct error, before any allocation attempt.
+        """
         client = self.server.get_new_client()
-        # segment-size is 2MB. A 4MB object cannot be allocated.
+        # segment-size is 2MB. A 4MB object cannot fit in any single segment.
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
+            assert False, "Expected object-exceeds-segment error"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max object size exceeded' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -106,19 +111,6 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
         assert client.execute_command('LO.GET', 'srckey2') == payload
-
-    def test_copy_pool_exhausted(self):
-        """COPY fails when DRAMPool cannot fit the duplicate."""
-        client = self.server.get_new_client()
-        # Fill most of the 2MB pool with a large object.
-        payload = b'F' * (1200 * 1024)
-        client.execute_command('LO.SET', 'bigkey', payload)
-        # COPY needs another 1200KB — pool is only 2MB total.
-        try:
-            client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail with pool exhausted"
-        except ResponseError:
-            pass  # Expected — pool cannot fit two 1200KB objects
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 

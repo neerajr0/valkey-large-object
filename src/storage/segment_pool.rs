@@ -78,81 +78,133 @@ impl SegmentPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
-    /// least `min_required`. All-or-nothing when `min_required == count`.
+    /// Allocate all the buffers needed for an entire object, **all co-located in
+    /// a single segment**. All-or-nothing.
     ///
-    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
-    /// order under one state lock and allocates from the least-loaded segment's
-    /// own talc allocator (`talc.allocate` is the exact fit check). Allocation
-    /// may return `None` when the segment allocator cannot satisfy the request.
+    /// First N-1 buffers are `chunk_size`; the last is trimmed to the remainder
+    /// (or `chunk_size` when `size` is an exact multiple).
     ///
-    /// Returns `None` if fewer than `min_required` could be allocated (partial
-    /// allocation freed internally). Callers never need cleanup logic.
+    /// ## Single-segment invariant
     ///
-    /// Private — callers use `alloc_exact` (ObjectContext) or `alloc_window`
-    /// (StreamingContext) which derive correct geometry from `obj_len`.
-    fn alloc_n(
-        &self,
-        chunk_size: usize,
-        count: usize,
-        min_required: usize,
-    ) -> Option<Vec<SegmentBuffer>> {
-        assert!(chunk_size > 0, "alloc_n: chunk_size must be > 0");
-        assert!(count > 0, "alloc_n: count must be > 0");
-        assert!(min_required > 0, "alloc_n: min_required must be > 0");
-        assert!(
-            min_required <= count,
-            "alloc_n: min_required ({}) > count ({})",
-            min_required,
-            count
-        );
-        let aligned_size = super::align_up(chunk_size);
-        let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
-            .expect("alloc_n: invalid chunk_size layout");
-        let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Some(buf) = self.alloc_one(aligned_size, layout) else {
-                break;
-            };
-            buffers.push(buf);
-        }
-        if buffers.len() < min_required {
-            for buf in &buffers {
-                self.free(buf);
-            }
-            return None;
-        }
-        Some(buffers)
-    }
-
-    /// Allocate all the buffers needed for an entire object. All-or-nothing.
-    /// First N-1 buffers are `chunk_size`; the last is trimmed to the
-    /// remainder (or `chunk_size` when `obj_len` is an exact multiple).
+    /// Every chunk of one object lands in the **same** segment. This is the
+    /// enabling invariant for segment compaction/shrink: an object contributes
+    /// to exactly one segment's refcount, and relocating it is a single
+    /// contiguous move to one target segment. A corollary is that **no object
+    /// can be larger than `segment_size`** — oversized objects are rejected at
+    /// SET admission (`execute_set`), so they never reach here.
     ///
     /// Used for ObjectContext (DRAM cache) allocations.
     pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         assert!(size > 0, "alloc_exact: size must be > 0");
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
-        let last_chunk_size =
-            super::chunk_user_data_len(total_chunks - 1, total_chunks, size, chunk_size);
-        // Fast path: single chunk — allocate and return directly.
-        if total_chunks == 1 {
-            return self.alloc_n(last_chunk_size, 1, 1);
+        // Per-chunk aligned sizes: first N-1 are chunk_size, last is trimmed.
+        let mut sizes: Vec<usize> = Vec::with_capacity(total_chunks);
+        for i in 0..total_chunks {
+            let user_len = super::chunk_user_data_len(i, total_chunks, size, chunk_size);
+            sizes.push(super::align_up(user_len));
         }
-        // Multi-chunk: allocate the first N-1 uniform-sized buffers (all-or-nothing).
-        let full_count = total_chunks - 1;
-        let mut buffers = self.alloc_n(chunk_size, full_count, full_count)?;
-        // Allocate the last (possibly smaller) buffer.
-        let Some(last_buf) = self.alloc_n(last_chunk_size, 1, 1).map(|mut v| v.remove(0)) else {
-            // All-or-nothing: free the uniform buffers we already got.
-            for buf in &buffers {
-                self.free(buf);
-            }
-            return None;
-        };
-        buffers.push(last_buf);
+        self.alloc_object_in_one_segment(&sizes)
+    }
+
+    /// Picks the least-loaded live, non-draining segment whose free space clears
+    /// the fast byte filter for the object's TOTAL aligned size, then allocates
+    /// every chunk from that one segment's talc.
+    ///
+    /// Single `min_by_key` pass, no candidate Vec / sort / fallback loop — the
+    /// same shape as `alloc_one`, and for the same reason: segments are uniform
+    /// size, so if the emptiest eligible segment can't fit the object (only
+    /// possible by talc's per-chunk boundary-tag overhead, which is identical on
+    /// every segment), no other segment can either. The correct answer is then
+    /// "pool full" → `None`, which the caller handles via reactive expand.
+    ///
+    /// Unlike the old per-chunk `alloc_n` loop (which re-picked the least-loaded
+    /// segment for every chunk and could scatter one object across many
+    /// segments), this keeps all of an object's chunks co-located — see the
+    /// single-segment invariant on `alloc_exact`.
+    fn alloc_object_in_one_segment(&self, sizes: &[usize]) -> Option<Vec<SegmentBuffer>> {
+        assert!(
+            !sizes.is_empty(),
+            "alloc_object_in_one_segment: empty sizes"
+        );
+        let total: usize = sizes.iter().sum();
+        let st = self.state.lock().expect("state lock unavailable");
+        // Single O(N) pass: least-loaded eligible segment that fits the object's
+        // TOTAL size (same picker as alloc_one, byte filter widened to `total`).
+        let (_, seg_idx) = st
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| {
+                let seg = opt.as_ref()?;
+                if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                let cur = seg
+                    .allocated_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if cur + total > seg.size {
+                    return None;
+                }
+                Some((cur, i))
+            })
+            .min_by_key(|&(cur, _)| cur)?;
+        let seg = st.slots[seg_idx].as_ref().unwrap();
+        let seg_base = seg.base;
+        let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
+        let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(sizes.len());
+        for &aligned_size in sizes {
+            let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
+                .expect("alloc_object_in_one_segment: invalid chunk layout");
+            // SAFETY: aligned_size is nonzero (align_up of a nonzero chunk).
+            // talc.allocate is the exact all-or-nothing fit check.
+            let Some(ptr) = (unsafe { talc.allocate(layout) }) else {
+                // Partial failure by talc overhead: roll back what we took from
+                // this segment and report pool-full. No next-segment fallback —
+                // uniform segments mean no other segment would fit either.
+                for buf in &buffers {
+                    let l = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
+                        .expect("alloc_object_in_one_segment: rollback layout");
+                    // SAFETY: ptr came from this talc.allocate for this exact
+                    // layout, freed exactly once here in rollback.
+                    unsafe { talc.deallocate(seg_base.add(buf.offset as usize), l) };
+                    seg.dec_ref();
+                }
+                self.mirror_counters(seg, &talc);
+                return None;
+            };
+            let offset = ptr.as_ptr() as usize - seg_base as usize;
+            seg.inc_ref();
+            buffers.push(SegmentBuffer {
+                segment_idx: seg_idx as u16,
+                offset: offset as u64,
+                len: aligned_size as u32,
+            });
+        }
+        // Mirror talc's authoritative figures once, while holding the lock
+        // (drift-free, overhead-aware) — same rationale as alloc_one.
+        self.mirror_counters(seg, &talc);
         Some(buffers)
+    }
+
+    /// Allocate one buffer per entry in `sizes`, **all from a single segment**,
+    /// all-or-nothing.
+    ///
+    /// Mirror talc's authoritative live figures (`allocated_bytes`,
+    /// `fragment_count`) into the segment's atomics. Call while holding the
+    /// segment's talc lock: talc updates these inside allocate/deallocate, so
+    /// the mirror is drift-free and overhead-aware, and the scaling cron / INFO
+    /// read the atomics lock-free. Single source of this two-store pattern —
+    /// used by `alloc_one`, `free_n`, and `alloc_object_in_one_segment`.
+    fn mirror_counters(&self, seg: &Segment, talc: &super::segment::SegmentTalc) {
+        seg.allocated_bytes.store(
+            talc.counters().allocated_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        seg.fragment_count.store(
+            talc.counters().fragment_count,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Allocate a streaming buffer window.
@@ -227,6 +279,56 @@ impl SegmentPool {
         Some(buffers)
     }
 
+    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
+    /// least `min_required`. All-or-nothing when `min_required == count`.
+    ///
+    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
+    /// order under one state lock and allocates from the least-loaded segment's
+    /// own talc allocator (`talc.allocate` is the exact fit check). Allocation
+    /// may return `None` when the segment allocator cannot satisfy the request.
+    ///
+    /// Returns `None` if fewer than `min_required` could be allocated (partial
+    /// allocation freed internally). Callers never need cleanup logic.
+    ///
+    /// Private helper for `alloc_window` (StreamingContext). NOTE: buffers may
+    /// land in DIFFERENT segments — this is fine for the streaming window, which
+    /// is a rotating staging buffer, not a resident object. `alloc_exact`
+    /// deliberately does NOT use this (it requires all chunks co-located in one
+    /// segment; see the single-segment invariant on `alloc_exact`).
+    fn alloc_n(
+        &self,
+        chunk_size: usize,
+        count: usize,
+        min_required: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
+        assert!(chunk_size > 0, "alloc_n: chunk_size must be > 0");
+        assert!(count > 0, "alloc_n: count must be > 0");
+        assert!(min_required > 0, "alloc_n: min_required must be > 0");
+        assert!(
+            min_required <= count,
+            "alloc_n: min_required ({}) > count ({})",
+            min_required,
+            count
+        );
+        let aligned_size = super::align_up(chunk_size);
+        let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
+            .expect("alloc_n: invalid chunk_size layout");
+        let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let Some(buf) = self.alloc_one(aligned_size, layout) else {
+                break;
+            };
+            buffers.push(buf);
+        }
+        if buffers.len() < min_required {
+            for buf in &buffers {
+                self.free(buf);
+            }
+            return None;
+        }
+        Some(buffers)
+    }
+
     /// One allocation: pick the least-loaded live, non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
     /// candidate Vec), then allocate from its talc. Returns None if there is no
@@ -279,23 +381,9 @@ impl SegmentPool {
         let ptr = unsafe { talc.allocate(layout) }?;
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
-        // Mirror talc's authoritative live-allocated figure into the segment's
-        // atomic while we still hold the talc lock. talc updates this inside
-        // allocate(), so it is drift-free and includes per-chunk overhead —
-        // unlike the old hand-computed `+= aligned_size`, which ignored talc's
-        // boundary-tag overhead and could drift if a call site was ever missed.
-        // The read is free here (lock already held); the scaling cron keeps
-        // reading `allocated_bytes` lock-free.
-        seg.allocated_bytes.store(
-            talc.counters().allocated_bytes,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        // Same pattern for the fragmentation signal: mirror talc's hole count
-        // under the lock we already hold. Read lock-free by the cron/INFO.
-        seg.fragment_count.store(
-            talc.counters().fragment_count,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // Mirror talc's authoritative live figures under the lock we hold
+        // (drift-free, overhead-aware) — read lock-free by the cron/INFO.
+        self.mirror_counters(seg, &talc);
         drop(talc);
         drop(st);
         Some(SegmentBuffer {
@@ -331,17 +419,9 @@ impl SegmentPool {
                 unsafe {
                     talc.deallocate(ptr, layout);
                 }
-                // Mirror talc's authoritative post-free figure while holding the lock
-                // (drift-free, overhead-aware) — see alloc_one for the rationale.
-                seg.allocated_bytes.store(
-                    talc.counters().allocated_bytes,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                // Free may merge or create gaps — refresh the fragmentation signal too.
-                seg.fragment_count.store(
-                    talc.counters().fragment_count,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                // Mirror talc's authoritative post-free figures while holding the
+                // lock (drift-free, overhead-aware) — see mirror_counters.
+                self.mirror_counters(seg, &talc);
             }
             seg.dec_ref();
         }
@@ -696,6 +776,67 @@ mod tests {
         for buf in &filler {
             pool.free(buf);
         }
+    }
+
+    #[test]
+    fn test_alloc_exact_co_location_and_no_split_under_pressure() {
+        // Single-segment invariant, white-box (integration can't see segment_idx):
+        // (a) a multi-chunk object's chunks all share ONE segment, and
+        // (b) under pressure it either fits wholly in one segment or fails —
+        //     it never splits across segments to use scattered free chunks.
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        // Generous segments so capacity isn't boundary-tight against talc
+        // per-chunk overhead; 2 segments.
+        let pool = SegmentPool::new(2, 65536);
+        // Drain the pool completely with single-chunk objects, tracking each.
+        let mut singles = Vec::new();
+        while let Some(b) = pool.alloc_exact(4096) {
+            singles.push(b);
+        }
+        assert!(singles.len() >= 4, "expected a multi-chunk pool capacity");
+        // Free exactly ONE chunk in each segment, so every segment has exactly
+        // one free slot — total 2 free chunks, but none contiguous-per-segment
+        // enough for a 2-chunk object.
+        let mut freed_per_seg: std::collections::HashMap<u16, usize> = Default::default();
+        let mut kept = Vec::new();
+        for b in singles {
+            let seg = b[0].segment_idx;
+            let n = freed_per_seg.entry(seg).or_insert(0);
+            if *n < 1 {
+                *n += 1;
+                pool.free_n(&b);
+            } else {
+                kept.push(b);
+            }
+        }
+        // (b) A 2-chunk object cannot fit in any single segment (each has 1 free
+        // chunk) → must return None, NOT split 1+1 across the two segments.
+        assert!(
+            pool.alloc_exact(4096 * 2).is_none(),
+            "2-chunk object must not split across segments with 1 free chunk each"
+        );
+        // Free a second chunk in one segment → that segment now has 2 free →
+        // the 2-chunk object fits wholly in it.
+        let target = kept[0][0].segment_idx;
+        pool.free_n(&kept[0]);
+        let bufs = pool.alloc_exact(4096 * 2).unwrap();
+        assert_eq!(bufs.len(), 2);
+        // (a) co-location: both chunks share one segment — the one that regained
+        // room, proving the allocator committed the whole object to a single seg.
+        let seg = bufs[0].segment_idx;
+        assert!(
+            bufs.iter().all(|b| b.segment_idx == seg),
+            "2-chunk object must be co-located, got {:?}",
+            bufs.iter().map(|b| b.segment_idx).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            seg, target,
+            "object lands in the segment that regained 2 slots"
+        );
+        for b in &kept[1..] {
+            pool.free_n(b);
+        }
+        pool.free_n(&bufs);
     }
 
     // ── alloc_window ─────────────────────────────────────────────────────

@@ -171,6 +171,14 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len == 0 {
         return Err(ValkeyError::Str("ERR object length must be > 0"));
     }
+    // Reject objects larger than a segment. Single-segment invariant: an
+    // object's chunks are always co-located in one segment (see
+    // SegmentPool::alloc_exact), so an object can never exceed segment-size.
+    // Rejecting here (before the engine) gives a clean, deterministic error
+    // rather than a confusing pool-exhausted fallthrough at alloc time.
+    if obj_len as usize > crate::segment_size() {
+        return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
+    }
 
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
