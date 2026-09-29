@@ -83,22 +83,14 @@ impl SegmentPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate all the buffers needed for an entire object, **all co-located in
-    /// a single segment**. All-or-nothing.
+    /// Allocate all buffers for an entire object, **all co-located in a single
+    /// segment**, all-or-nothing. First N-1 buffers are `chunk_size`, the last is
+    /// trimmed to the remainder.
     ///
-    /// First N-1 buffers are `chunk_size`; the last is trimmed to the remainder
-    /// (or `chunk_size` when `size` is an exact multiple).
-    ///
-    /// ## Single-segment invariant
-    ///
-    /// Every chunk of one object lands in the **same** segment. This is the
-    /// enabling invariant for segment compaction/shrink: an object contributes
-    /// to exactly one segment's refcount, and relocating it is a single
-    /// contiguous move to one target segment. A corollary is that **no object
-    /// can be larger than `segment_size`** — oversized objects are rejected at
-    /// SET admission (`lo_set`), so they never reach here.
-    ///
-    /// Used for ObjectContext (DRAM cache) allocations.
+    /// Single-segment is the invariant that enables shrink: an object touches one
+    /// segment's refcount, so relocating it is one contiguous move. Corollary: no
+    /// object can exceed `segment_size` — oversized ones are rejected at SET
+    /// admission (`lo_set`) and never reach here. Used for DRAM ObjectContext.
     pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         assert!(size > 0, "alloc_exact: size must be > 0");
         let chunk_size = crate::chunk_size();
@@ -112,21 +104,12 @@ impl SegmentPool {
         self.alloc_object_in_one_segment(&sizes)
     }
 
-    /// Picks the least-loaded live, non-draining segment whose free space clears
-    /// the fast byte filter for the object's TOTAL aligned size, then allocates
-    /// every chunk from that one segment's talc.
-    ///
-    /// Single `min_by_key` pass, no candidate Vec / sort / fallback loop — the
-    /// same shape as `alloc_one`, and for the same reason: segments are uniform
-    /// size, so if the emptiest eligible segment can't fit the object (only
-    /// possible by talc's per-chunk boundary-tag overhead, which is identical on
-    /// every segment), no other segment can either. The correct answer is then
-    /// "pool full" → `None`, which the caller handles via reactive expand.
-    ///
-    /// Unlike the old per-chunk `alloc_n` loop (which re-picked the least-loaded
-    /// segment for every chunk and could scatter one object across many
-    /// segments), this keeps all of an object's chunks co-located — see the
-    /// single-segment invariant on `alloc_exact`.
+    /// Allocate every chunk of the object from ONE least-loaded eligible segment.
+    /// Single `min_by_key` pass, no fallback loop (same as `alloc_one`): segments
+    /// are uniform, so if the emptiest eligible one can't fit — only possible by
+    /// talc's per-chunk boundary-tag overhead — none can, and `None` = pool full,
+    /// which the caller handles via reactive expand. Keeps an object co-located
+    /// (unlike the old per-chunk `alloc_n` loop) — see `alloc_exact`.
     fn alloc_object_in_one_segment(&self, sizes: &[usize]) -> Option<Vec<SegmentBuffer>> {
         assert!(
             !sizes.is_empty(),

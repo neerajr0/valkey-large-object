@@ -14,13 +14,9 @@ use crate::transport::operand::PoolOperand;
 
 pub struct Fabric {
     services: Vec<FabricService<PoolOperand>>,
-    /// EFA registrations, keyed by segment base address (one `MemoryRegion` per service). A
-    /// segment's registration is retained here for as long as the segment lives; dropping the
-    /// handles (via `release_segment`, before the segment memory is freed) tears down the
-    /// registration in the DMA library's guaranteed order (invalidate the cache entry, then
-    /// `fi_close`). Keyed by base so pool expansion adds and pool shrink removes exactly one
-    /// segment's regions. `Mutex` because segments are added/removed at runtime through the shared
-    /// `Arc<Fabric>`.
+    /// EFA registrations keyed by segment base (one `MemoryRegion` per service), retained for the
+    /// segment's lifetime. `release_segment` drops them before the memory is freed. `Mutex` because
+    /// segments are added/removed at runtime through the shared `Arc<Fabric>`.
     regions: Mutex<std::collections::HashMap<usize, Vec<MemoryRegion<&'static [u8]>>>>,
     /// Runs checksummed completions off the fabric workers. Held so it outlives every service.
     _pool: Arc<Pool>,
@@ -88,16 +84,11 @@ impl Fabric {
             .map_err(|_request| DmaError::Fabric("fabric worker is gone".into()))
     }
 
-    /// Register ONE segment on every service, so any service can carry a transfer to it and the
-    /// engine is free to balance across devices. Pins the segment once per device against
-    /// `RLIMIT_MEMLOCK`. Takes `&self`, so it works both at startup and at runtime (pool
-    /// expansion) through the shared `Arc<Fabric>`.
-    ///
-    /// The returned `MemoryRegion` handles are retained in `self.regions`, keyed by the segment's
-    /// base address, so `release_segment` can find and drop exactly this segment's registration
-    /// when the segment is freed. On a mid-loop failure the regions registered so far in THIS call
-    /// drop (unregistering them) and the error propagates, so a segment is never left
-    /// half-registered across only some services.
+    /// Register ONE segment on every service so any device can carry a transfer to it. Pins it
+    /// once per device against `RLIMIT_MEMLOCK`. `&self` — works at startup and at runtime (pool
+    /// expansion) through the shared `Arc<Fabric>`. Handles are retained in `self.regions` keyed
+    /// by base for `release_segment`. On mid-loop failure the regions taken in THIS call drop and
+    /// the error propagates, so a segment is never left registered on only some services.
     pub fn register_segment(&self, segment: &'static [u8]) -> Result<(), String> {
         let base = segment.as_ptr() as usize;
         let mut new_regions = Vec::with_capacity(self.services.len());
@@ -115,11 +106,10 @@ impl Fabric {
         Ok(())
     }
 
-    /// Drop a segment's EFA registration by base address. MUST be called before the segment's
-    /// memory is freed: dropping the `MemoryRegion` handles triggers the DMA library's teardown
-    /// (retire the cache entry, then `fi_close` once no in-flight transfer still leases it) in the
-    /// correct order, so no registration outlives the pages it named. A no-op if the base was never
-    /// registered (fabric down at expand, or already released).
+    /// Drop a segment's EFA registration by base. MUST run before the segment memory is freed:
+    /// dropping the `MemoryRegion` handles tears the registration down in the DMA library's order
+    /// (invalidate the cache entry, then `fi_close`), so no registration outlives its pages. No-op
+    /// if the base was never registered (fabric down at expand, or already released).
     pub fn release_segment(&self, base: usize) {
         let regions = self
             .regions
@@ -131,9 +121,8 @@ impl Fabric {
         drop(regions);
     }
 
-    /// Number of segments currently EFA-registered (one map entry per registered segment base).
-    /// When the fabric is up this equals the live segment count — the invariant every live segment
-    /// is registered — so it is used to assert that invariant in tests, not as a product metric.
+    /// Count of currently EFA-registered segments (one map entry per base). Equals the live
+    /// segment count when the fabric is up — used to assert that invariant in tests, not a metric.
     pub fn registered_segment_count(&self) -> usize {
         self.regions
             .lock()

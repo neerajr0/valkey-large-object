@@ -104,11 +104,8 @@ use std::sync::{Mutex, OnceLock};
 /// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index (a
 /// hole from a drained segment, reused by the next `append_iovec`).
 ///
-/// This table is index-aligned with the owning pool's `slots`: `IOVECS[i]` is
-/// the `(base, len)` of the `Segment` at `slots[i]`. The alignment holds by
-/// construction — `append_iovec` is the sole index allocator, and `expand()`
-/// places the segment at exactly the index it returns (never a second, separate
-/// hole-search), so the two Vecs cannot pick different positions.
+/// Index-aligned with the owning pool's `slots` (`IOVECS[i]` is the `(base, len)`
+/// of the `Segment` at `slots[i]`), by construction — see `append_iovec`.
 ///
 /// This is the intended registration set. The kernel buffer table is built from
 /// it at startup; segments added later by expand() are recorded here and will be
