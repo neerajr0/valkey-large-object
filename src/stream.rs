@@ -155,7 +155,7 @@ impl Source<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
-                        use_fixed: pool.is_registered(buf),
+                        use_fixed: pool.is_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -279,7 +279,7 @@ impl Target<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
-                        use_fixed: pool.is_segment_registered_for_buf(buf),
+                        use_fixed: pool.is_io_uring_registered_for_buf(buf),
                     },
                 );
                 match rx.await {
@@ -322,10 +322,10 @@ impl Pool {
     /// table — drives the per-op fixed vs non-fixed path. Startup segments are
     /// registered; segments added by expand() are not until a future
     /// register_buffers_update path flips them.
-    pub(crate) fn is_registered(&self, b: &SegmentBuffer) -> bool {
+    pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
         match self {
-            Pool::Nvme(p) => p.is_segment_registered_for_buf(b),
-            Pool::Dram(p) => p.is_segment_registered_for_buf(b),
+            Pool::Nvme(p) => p.is_io_uring_registered_for_buf(b),
+            Pool::Dram(p) => p.is_io_uring_registered_for_buf(b),
         }
     }
 }
@@ -465,7 +465,7 @@ impl<'a> StreamJob<'a> {
             verify_file_header: Some(FileHeaderRead {
                 iovec: pool.iovec(hdr_buf),
                 ptr: pool.ptr(hdr_buf) as usize,
-                use_fixed: pool.is_registered(hdr_buf),
+                use_fixed: pool.is_io_uring_registered(hdr_buf),
             }),
             batch_width,
             persist_file_header: None,

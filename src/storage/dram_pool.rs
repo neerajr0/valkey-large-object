@@ -92,8 +92,8 @@ impl DRAMPool {
 
     /// Whether the segment owning `buf` is registered in the io_uring kernel
     /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
-    pub fn is_segment_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
-        self.pool.is_segment_registered_for_buf(buf)
+    pub fn is_io_uring_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_io_uring_registered_for_buf(buf)
     }
 
     /// Mark all current segments io_uring-registered (startup, post-register).

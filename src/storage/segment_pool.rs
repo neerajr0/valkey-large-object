@@ -373,12 +373,10 @@ impl SegmentPool {
         let seg_base = seg.base;
         let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
 
-        // SAFETY: aligned_size (thus layout.size()) is nonzero — align_up of a
-        // nonzero chunk_size. talc.allocate is the exact all-or-nothing check: it
-        // returns None on OOM without committing. alloc_one commits to a single
-        // segment (the least-loaded winner above) and never falls through, so a
-        // None here is simply "no room" — propagate it. No separate precheck
-        // needed; talc's own bin lookup already answers "does this fit?".
+        // SAFETY: talc::allocate requires layout.size() nonzero — it is, being
+        // align_up of a nonzero chunk_size.
+        // talc.allocate is the all-or-nothing fit check: None means no room (no
+        // commit), which we propagate — no separate precheck needed.
         let ptr = unsafe { talc.allocate(layout) }?;
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
@@ -559,11 +557,12 @@ impl SegmentPool {
     }
 
     /// Whether the segment owning `buf` is registered in the io_uring kernel
-    /// buffer table. Callers use this to pick ReadFixed/WriteFixed (true) vs
+    /// buffer table (NOT EFA — that is tracked separately in the fabric layer).
+    /// Callers use this to pick ReadFixed/WriteFixed (true) vs
     /// plain Read/Write (false). An expanded segment not yet kernel-registered
     /// returns false so its I/O never issues a fixed op against an unregistered
     /// iovec_index (which would EFAULT).
-    pub fn is_segment_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
+    pub fn is_io_uring_registered_for_buf(&self, buf: &SegmentBuffer) -> bool {
         let st = self.state.lock().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()

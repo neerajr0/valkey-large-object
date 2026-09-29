@@ -87,6 +87,7 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("largeobj_nvme_staging")
         .field("live_segments", live as i64)?
         .field("unused_segments", unused as i64)?
+        .field("fragment_count", nvme.fragment_count() as i64)?
         .field("staging_size_bytes", crate::nvme_staging_size() as i64)?
         .field("segment_size_bytes", crate::dram_segment_size() as i64)?
         .build_section()?
