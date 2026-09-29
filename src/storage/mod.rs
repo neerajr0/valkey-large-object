@@ -99,15 +99,22 @@ impl std::fmt::Display for StorageError {
 
 use std::sync::{Mutex, OnceLock};
 
-/// Global sparse iovec table. Slot `i` = iovec_index for io_uring ReadFixed/WriteFixed.
-/// `None` = empty slot (no page pinned, no buffer registered at this index).
-/// `Some((ptr, len))` = live segment registered at this index.
+/// The segment buffers we intend io_uring to have registered, as `(base, len)`
+/// pairs. A segment's index here is its `iovec_index` — the `u16` a
+/// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index (a
+/// hole from a drained segment, reused by the next `append_iovec`).
 ///
-/// Grows as segments are added via `append_iovec`, bounded by `MAX_SEGMENTS`
-/// (the single cap enforced at both startup and runtime expand). iovec_index is
-/// u16, so the table can never exceed `u16::MAX + 1` entries — in practice a
-/// handful. Per-slot updates via `clear_iovec` mirror the io_uring sparse table
-/// model: nulling a slot costs nothing (no page pinning for null entries).
+/// This table is index-aligned with the owning pool's `slots`: `IOVECS[i]` is
+/// the `(base, len)` of the `Segment` at `slots[i]`. The alignment holds by
+/// construction — `append_iovec` is the sole index allocator, and `expand()`
+/// places the segment at exactly the index it returns (never a second, separate
+/// hole-search), so the two Vecs cannot pick different positions.
+///
+/// This is the intended registration set. The kernel buffer table is built from
+/// it at startup; segments added later by expand() are recorded here and will be
+/// pushed to the kernel via the register-on-expand path (see
+/// `Segment::io_uring_registered`), until then taking the non-fixed I/O path.
+/// u16 index ⇒ at most `MAX_SEGMENTS` entries (enforced by `append_iovec`).
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
 /// Maximum number of registered segments (DRAM + NVMe combined), across the
@@ -120,13 +127,11 @@ pub const MAX_SEGMENTS: usize = u16::MAX as usize + 1;
 
 /// Called by SegmentPool when creating each segment.
 /// Fills the first `None` hole in the sparse table (or appends if no hole),
-/// returning the slot index as the segment's `iovec_index`.
-/// This matches the "first None hole, else append" policy used by
-/// `SegmentPool::expand` when placing the new segment in `slots`, so the
-/// returned `iovec_index` always equals the segment's slot index. Callers
-/// depend on `segment.iovec_index == slot_idx`; using a different policy here
-/// would silently violate that invariant when the two Vecs have holes in
-/// different positions.
+/// returning the index as the segment's `iovec_index`.
+/// This is the SOLE allocator of `iovec_index`: `SegmentPool::expand` places the
+/// new segment at exactly the index returned here (`slots[idx]`), so
+/// `segment.iovec_index == slot_idx` holds by construction — the two Vecs can
+/// never pick different positions.
 ///
 /// Returns `None` when the table is already at `MAX_SEGMENTS` and has no hole to
 /// reuse — this is the single runtime cap check. `expand()` propagates the

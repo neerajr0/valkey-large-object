@@ -43,7 +43,9 @@ use super::segment::Segment;
 /// reverse-lookup index — each segment carries its own talc, and the
 /// segment_idx is known at alloc time (from the picker).
 struct SegmentState {
-    /// Segment slots. Slot `i` = iovec_index `i` in the sparse io_uring table.
+    /// Segment slots, index-aligned with the global `IOVECS` table: slot `i` =
+    /// iovec_index `i`. The alignment holds by construction — segments are placed
+    /// at the index `append_iovec` assigns, never a separate hole-search.
     /// `None` = empty slot (hole from a previous drain, or unused capacity).
     slots: Vec<Option<Segment>>,
 }
@@ -432,7 +434,8 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment to the pool. Finds the first `None` slot (or appends).
+    /// Add a new segment to the pool at the `iovec_index` that `append_iovec`
+    /// assigns, so `slots[i]` and `IOVECS[i]` stay index-aligned by construction.
     /// Each new Segment carries its own fresh talc allocator.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
@@ -457,16 +460,17 @@ impl SegmentPool {
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
 
         let mut st = self.state.lock().expect("state lock unavailable");
-        match st.slots.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                st.slots[i] = Some(seg);
-            }
-            None => {
-                st.slots.push(Some(seg));
-            }
-        };
+        // Place the segment at exactly slots[idx] (the index append_iovec
+        // assigned) so slots and IOVECS stay aligned by construction. idx is a
+        // reused hole (< len) or the next append (== len), never > len; pad
+        // defensively so a future divergence can't index out of bounds.
+        let idx = idx as usize;
+        if idx >= st.slots.len() {
+            st.slots.resize_with(idx + 1, || None);
+        }
+        st.slots[idx] = Some(seg);
 
-        Some((idx, slice))
+        Some((idx as u16, slice))
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.
