@@ -262,15 +262,18 @@ impl DRAMPool {
         self.expand_count.fetch_add(1, Ordering::Relaxed);
 
         // Register the new segment with EFA so transfers to it avoid a per-op fi_mr_reg.
-        // Best-effort: if the fabric is up and registration fails, the segment is still fully
-        // usable — the DMA library falls back to registering the operand per transfer (slower,
-        // but correct) — so we log and proceed rather than failing the expand. The registration
-        // is torn down in Segment::drop (via crate::efa_release_segment) before the memory frees.
+        // A registration failure here is FATAL and we panic, consistent with startup
+        // registration (see lib.rs). Rationale: an unregistered segment cannot be served over
+        // EFA — the per-transfer fi_mr_reg fallback would fail for the same reason this did — and
+        // these failures are not transient (confirmed with the DMA owners), so a retry would not
+        // help. The panic hook aborts the process; the operator fixes the EFA environment (e.g.
+        // RLIMIT_MEMLOCK, device MR limits) and restarts, rather than the module silently handing
+        // out a segment it cannot serve.
         if let Err(e) = crate::efa_register_segment(slice) {
             ctx.log_warning(&format!(
-                "largeobj: EFA registration of expanded segment {idx} failed \
-                 (using per-transfer fallback): {e}"
+                "largeobj: EFA registration of expanded segment {idx} failed (fatal): {e}"
             ));
+            panic!("largeobj: EFA registration of expanded segment {idx} failed (fatal): {e}");
         }
         Some(idx)
     }
