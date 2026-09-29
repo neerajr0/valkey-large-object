@@ -430,11 +430,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     };
 
-    // Step 3: register every startup segment with EFA — fi_mr_reg per segment per server.
-    // efa_register_segment owns the fatal-on-failure policy (see its doc); a failure panics there.
-    for segment in storage::all_segment_slices() {
-        efa_register_segment(segment);
-    }
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
@@ -444,7 +439,13 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
             ));
         }
     }
+    // Commit BEFORE registering: efa_register_segment reads the committed global fabric.
     transport::commit(fabric);
+
+    // Register every startup segment with EFA (fatal on failure — see efa_register_segment).
+    for segment in storage::all_segment_slices() {
+        efa_register_segment(segment);
+    }
 
     // All init succeeded — commit runtime to OnceLock.
     if RUNTIME.set(rt).is_err() {
