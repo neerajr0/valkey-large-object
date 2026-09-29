@@ -31,7 +31,10 @@
 //!    talc.truncate is needed.
 
 use std::alloc::Layout;
+use std::ptr::NonNull;
 use std::sync::Mutex;
+
+use allocator_api2::alloc::Allocator;
 
 use super::context::SegmentBuffer;
 use super::segment::Segment;
@@ -151,29 +154,29 @@ impl SegmentPool {
             .min_by_key(|&(cur, _)| cur)?;
         let seg = st.slots[seg_idx].as_ref().unwrap();
         let seg_base = seg.base;
-        let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
+        let talc = seg.talc.lock().expect("segment talc lock unavailable");
         let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(sizes.len());
         for &aligned_size in sizes {
             let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
                 .expect("alloc_object_in_one_segment: invalid chunk layout");
-            // SAFETY: aligned_size is nonzero (align_up of a nonzero chunk).
-            // talc.allocate is the exact all-or-nothing fit check.
-            let Some(ptr) = (unsafe { talc.allocate(layout) }) else {
+            // TalcCell::allocate (Allocator trait) is safe and the all-or-nothing fit check.
+            let Ok(ptr) = talc.allocate(layout) else {
                 // Partial failure by talc overhead: roll back what we took from
                 // this segment and report pool-full. No next-segment fallback —
                 // uniform segments mean no other segment would fit either.
                 for buf in &buffers {
                     let l = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
                         .expect("alloc_object_in_one_segment: rollback layout");
-                    // SAFETY: ptr came from this talc.allocate for this exact
-                    // layout, freed exactly once here in rollback.
-                    unsafe { talc.deallocate(seg_base.add(buf.offset as usize), l) };
+                    // SAFETY: this pointer was returned by this TalcCell's allocate for this
+                    // exact layout, and is freed exactly once here in rollback.
+                    let p = unsafe { NonNull::new_unchecked(seg_base.add(buf.offset as usize)) };
+                    unsafe { talc.deallocate(p, l) };
                     seg.dec_ref();
                 }
                 self.mirror_counters(seg, &talc);
                 return None;
             };
-            let offset = ptr.as_ptr() as usize - seg_base as usize;
+            let offset = ptr.cast::<u8>().as_ptr() as usize - seg_base as usize;
             seg.inc_ref();
             buffers.push(SegmentBuffer {
                 segment_idx: seg_idx as u16,
@@ -371,13 +374,12 @@ impl SegmentPool {
 
         let seg = st.slots[seg_idx].as_ref().unwrap();
         let seg_base = seg.base;
-        let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
+        let talc = seg.talc.lock().expect("segment talc lock unavailable");
 
-        // SAFETY: talc::allocate requires layout.size() nonzero — it is, being
-        // align_up of a nonzero chunk_size.
-        // talc.allocate is the all-or-nothing fit check: None means no room (no
-        // commit), which we propagate — no separate precheck needed.
-        let ptr = unsafe { talc.allocate(layout) }?;
+        // TalcCell::allocate (the Allocator trait) is safe and is the all-or-nothing
+        // fit check: Err(AllocError) means no room (nothing committed), which we map
+        // to None and propagate — no separate precheck needed.
+        let ptr = talc.allocate(layout).ok()?.cast::<u8>();
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
         // Mirror talc's authoritative live figures under the lock we hold
@@ -413,12 +415,12 @@ impl SegmentPool {
                 .expect("segment slot empty for live buffer — invariant broken");
             let ptr = unsafe { seg.base.add(buf.offset as usize) };
             {
-                let mut talc = seg.talc.lock().expect("segment talc lock unavailable");
-                // SAFETY: ptr was returned by this segment's talc.allocate for this
+                let talc = seg.talc.lock().expect("segment talc lock unavailable");
+                // SAFETY: ptr was returned by this segment's TalcCell::allocate for this
                 // exact layout, and is freed exactly once (the owning SegmentBuffer
-                // drops once). talc 5.x deallocate takes a raw pointer.
+                // drops once).
                 unsafe {
-                    talc.deallocate(ptr, layout);
+                    talc.deallocate(NonNull::new_unchecked(ptr), layout);
                 }
                 // Mirror talc's authoritative post-free figures while holding the
                 // lock (drift-free, overhead-aware) — see mirror_counters.

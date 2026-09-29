@@ -14,14 +14,19 @@ use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use talc::base::binning::DefaultBinning;
-use talc::base::Talc;
 use talc::source::Manual;
+use talc::TalcCell;
 
-/// This segment's talc allocator type: a manual-source, default-binning `Talc`.
+/// This segment's talc allocator: a manual-source, default-binning `TalcCell`.
 /// `Manual` provides no backing source — the segment claims its own
 /// `[base, base+size)` range explicitly and never grows beyond it.
-pub type SegmentTalc = Talc<Manual, DefaultBinning>;
+///
+/// `TalcCell` (not the bare `Talc`) is talc's recommended type for using talc as
+/// a Rust allocator: it implements the `Allocator` trait with a SAFE `allocate`
+/// (it does the nonzero-size guard internally) and a SAFE `counters()`. It is
+/// `!Sync`; the `Mutex<SegmentTalc>` on `Segment` provides the cross-thread
+/// exclusion and `Sync`.
+pub type SegmentTalc = TalcCell<Manual>;
 
 /// A contiguous registered memory region with an owned talc allocator.
 pub struct Segment {
@@ -80,7 +85,7 @@ impl Segment {
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
 
-        let mut talc = Talc::new(Manual);
+        let talc = TalcCell::new(Manual);
         // Safety: memory was just allocated exclusively for this Segment; nothing
         // else references [base, base+size), so claim's non-overlap invariant holds.
         // talc 5.x `claim(base, size)` establishes this segment's only heap; the
