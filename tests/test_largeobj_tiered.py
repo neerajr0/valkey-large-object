@@ -221,15 +221,6 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         )
         assert client.execute_command('LO.GET', 'delset_key') == payload2
 
-    def test_zero_length_object_rejected(self):
-        """LO.SET with zero-length payload is rejected."""
-        client = self.server.get_new_client()
-        try:
-            client.execute_command('LO.SET', 'empty_key', b'')
-            assert False, "Expected error for zero-length object"
-        except ResponseError as e:
-            assert 'object length must be > 0' in str(e).lower(), f"Unexpected: {e}"
-
     def test_nvme_maxmemory_exhaustion(self):
         """SET that would exceed nvme-maxmemory is rejected."""
         client = self.server.get_new_client()

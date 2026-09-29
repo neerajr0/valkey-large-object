@@ -19,10 +19,17 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | Command | Description |
 |---------|-------------|
 | `LO.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `LO.SET key len rkey remote_addr` | Store object (EFA). Server reads `len` bytes from client GPU via RDMA. |
-| `LO.GET key` | Retrieve object. Returns bulk string (TCP) or DMA to client GPU (EFA). |
-| `LO.HELLO` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `LO.SET key total_len n_regions rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory regions via RDMA. |
+| `LO.GET key` | Retrieve object over TCP. Returns a bulk string. |
+| `LO.GET key n_regions rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory regions. Replies `[obj_len, crc32c]`. |
+| `LO.HELLO client_efa_addr_hex` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `LO.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
+
+An EFA request names one or more client memory regions as `(rkey, addr, len)` triples
+(`n_regions` of them, 1..=256). A chunk may straddle a region boundary, and the regions
+may total more than the object — `LO.GET`'s reply carries `obj_len` so the client knows
+where the object ends.
 
 ## Build
 

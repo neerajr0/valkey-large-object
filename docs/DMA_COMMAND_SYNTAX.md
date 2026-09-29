@@ -92,31 +92,37 @@ LO.HELLO <client_efa_addr_hex>
 ### LO.GET (DMA)
 
 ```
-LO.GET <key> <rkey> <remote_addr> <len>
+LO.GET <key> <n_regions> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
+
+One or more regions per request, so a client whose object spans several registered
+regions (buffers on several GPUs, or several buffers on one) names them all in one
+command. `n_regions = 1` is the single-region case, not a special form.
 
 | Step | Who | Action |
 |------|-----|--------|
-| 1 | Client | Picks a registered memory region, sends command with its rkey + target address |
-| 2 | Server | Reads object from NVMe/DRAM into a pool buffer |
+| 1 | Client | Picks its registered memory regions, sends command with each region's rkey + address + length |
+| 2 | Server | Validates `sum(len_i) >= obj_len`, then reads the object from NVMe/DRAM |
 | 3 | Server | Picks EFA device (picks least-loaded device) |
-| 4 | Server | `fi_write(buf, len, dest_fi_addr, remote_addr, rkey)` → pushes to client memory |
-| 5 | Server | Waits for CQ completion, replies with integer (bytes written) |
-| 6 | Client | Data is already in GPU memory at remote_addr. Uses it directly. |
+| 4 | Server | Per chunk, `fi_write(buf, len, dest_fi_addr, addr, rkey)` into each region that chunk spans — regions are consumed in order, and a chunk may straddle a boundary |
+| 5 | Server | Waits for CQ completions, replies `[obj_len, crc32c]` |
+| 6 | Client | Data is already in GPU memory across its regions; `obj_len` says where the object ends and any surplus buffer begins. |
 
 ### LO.SET (DMA)
 
 ```
-LO.SET <key> <rkey> <remote_addr> <len>
+LO.SET <key> <total_len> <n_regions> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
+
+`total_len` is the object's length; the regions are where its bytes currently live.
 
 | Step | Who | Action |
 |------|-----|--------|
-| 1 | Client | Places data in a registered memory region, sends command with its rkey + source address |
-| 2 | Server | Allocates a pool buffer |
+| 1 | Client | Places data across its registered memory regions, sends command with each region's rkey + address + length |
+| 2 | Server | Validates `sum(len_i) >= total_len`, then allocates buffers |
 | 3 | Server | Picks EFA device (least-loaded LB) |
-| 4 | Server | `fi_read(buf, len, dest_fi_addr, remote_addr, rkey)` → pulls from client memory |
-| 5 | Server | Waits for CQ completion, writes buffer to NVMe, stores key mapping |
+| 4 | Server | Per chunk, `fi_read(buf, len, dest_fi_addr, addr, rkey)` from each region that chunk spans, in region order |
+| 5 | Server | Waits for CQ completions, writes through to the configured tier, stores key mapping |
 | 6 | Server | Replies OK |
 
 
