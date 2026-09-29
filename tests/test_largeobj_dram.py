@@ -64,7 +64,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
 
         Single-segment invariant: every object's chunks are co-located in one
         segment, so an object cannot exceed segment-size. This is rejected at
-        SET admission with a distinct error, before any allocation attempt.
+        SET admission (lo_set) with a distinct error, before any allocation or
+        expansion attempt — so it does NOT fall through to expand-and-fail.
         """
         client = self.server.get_new_client()
         # segment-size is 2MB. A 4MB object cannot fit in any single segment.
@@ -111,6 +112,28 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
         assert client.execute_command('LO.GET', 'srckey2') == payload
+
+    def test_copy_pool_exhausted(self):
+        """COPY fails when DRAMPool cannot fit the duplicate.
+        Uses a 1500KB object in a 2MB segment. After the SET succeeds,
+        COPY tries alloc_exact_or_expand. The pool has ~500KB free (2MB - 1500KB
+        - talc overhead), which is not enough for a second 1500KB object.
+        Expansion would add a 2MB segment, making COPY succeed — so we cap
+        dram-maxmemory to segment-size first.
+        """
+        client = self.server.get_new_client()
+        client.execute_command('FLUSHALL')
+        payload = b'F' * (1500 * 1024)
+        client.execute_command('LO.SET', 'bigkey', payload)
+        # Now cap so COPY cannot expand.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail with pool exhausted"
+        except ResponseError:
+            pass  # Expected — pool cannot fit two 1500KB objects in 2MB
+        # Restore unlimited expansion for subsequent tests.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 

@@ -91,10 +91,10 @@ impl SegmentPool {
     /// to exactly one segment's refcount, and relocating it is a single
     /// contiguous move to one target segment. A corollary is that **no object
     /// can be larger than `segment_size`** — oversized objects are rejected at
-    /// SET admission (`execute_set`), so they never reach here.
+    /// SET admission (`lo_set`), so they never reach here.
     ///
     /// Used for ObjectContext (DRAM cache) allocations.
-    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+    pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         assert!(size > 0, "alloc_exact: size must be > 0");
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
@@ -280,6 +280,7 @@ impl SegmentPool {
     }
 
     /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
+    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
     /// least `min_required`. All-or-nothing when `min_required == count`.
     ///
     /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
@@ -392,6 +393,8 @@ impl SegmentPool {
             len: aligned_size as u32,
         })
     }
+
+    // ─── Free ────────────────────────────────────────────────────────────────
 
     /// Free a buffer back to its owning segment.
     /// Uses `buf.segment_idx` directly — no reverse lookup needed.
@@ -686,15 +689,6 @@ impl SegmentPool {
 mod tests {
     use super::*;
 
-    // ── alloc_n (private, tested from within module) ───────────────────
-
-    #[test]
-    #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
-    fn test_alloc_n_panics_when_min_exceeds_count() {
-        let pool = SegmentPool::new(1, 65536);
-        pool.alloc_n(4096, 2, 3);
-    }
-
     // ── alloc_exact ──────────────────────────────────────────────────────
 
     #[test]
@@ -837,6 +831,14 @@ mod tests {
             pool.free_n(b);
         }
         pool.free_n(&bufs);
+    }
+
+    #[test]
+    #[should_panic(expected = "alloc_exact: size must be > 0")]
+    fn test_alloc_exact_panics_on_zero_len() {
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = SegmentPool::new(1, 65536);
+        pool.alloc_exact(0);
     }
 
     // ── alloc_window ─────────────────────────────────────────────────────
@@ -990,18 +992,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "alloc_exact: size must be > 0")]
-    fn test_alloc_exact_panics_on_zero_len() {
-        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
-        pool.alloc_exact(0);
-    }
-
-    #[test]
     #[should_panic(expected = "alloc_window: size must be > 0")]
     fn test_alloc_window_panics_on_zero_len() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         let pool = SegmentPool::new(1, 65536);
         pool.alloc_window(0, 8, 2);
+    }
+
+    // ── alloc_n (private, tested from within module) ───────────────────
+
+    #[test]
+    #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
+    fn test_alloc_n_panics_when_min_exceeds_count() {
+        let pool = SegmentPool::new(1, 65536);
+        pool.alloc_n(4096, 2, 3);
     }
 }
