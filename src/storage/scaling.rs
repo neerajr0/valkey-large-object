@@ -44,8 +44,8 @@ pub fn scaling_cron(ctx: &Context) {
     // Shrink signal is SERVER-scoped (crate::server_memory): we release DRAM
     // segments when Valkey overall is under memory pressure, giving space back to
     // core data types. The module's own pool utilization drives EXPAND; it must
-    // not gate SHRINK, or a module with a low dram-maxmemory would shrink itself
-    // under module-local pressure unrelated to server-wide pressure.
+    // not gate SHRINK, or a module under its own local pressure would shrink
+    // itself for reasons unrelated to server-wide memory pressure.
     //
     // Expand takes PRIORITY over shrink within a single tick. The two signals use
     // different denominators (expand = module pool utilization; shrink = server

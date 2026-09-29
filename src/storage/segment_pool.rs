@@ -627,19 +627,6 @@ impl SegmentPool {
         (allocated as f64) / (capacity as f64)
     }
 
-    /// Count of live (non-None, non-draining) segments.
-    pub fn live_segment_count(&self) -> usize {
-        let st = self.state.lock().expect("state lock unavailable");
-        st.slots
-            .iter()
-            .filter(|s| {
-                s.as_ref()
-                    .map(|seg| !seg.draining.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(false)
-            })
-            .count()
-    }
-
     /// Counts of (live, draining, unused) segments.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         let st = self.state.lock().expect("state lock unavailable");

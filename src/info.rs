@@ -66,7 +66,6 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "scaling_shrink_total",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
-        .field("maxmemory_bytes", crate::dram_maxmemory() as i64)?
         .field("segment_size_bytes", seg_size as i64)?
         .build_section()?
         .build_info()

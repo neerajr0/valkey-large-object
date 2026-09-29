@@ -3,7 +3,7 @@ Integration tests for DRAMPool expand/shrink scaling behavior.
 
 Tests cover:
   - Dram mode: reactive expand when segment fills
-  - Dram mode: dram-maxmemory hard cap respected
+  - Dram mode: expansion gated by server maxmemory watermark
   - Tiered mode: reactive expand on DRAMPool fill
   - Tiered mode: shrink evicts cached segment but NVMe copy survives
 """
@@ -36,13 +36,12 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
     """
 
     def get_module_args(self, data_dir, direct_io):
-        # segment-size=1MB, dram-maxmemory=0 → starts with 1 segment, grows on demand.
+        # segment-size=1MB → pool starts with 1 segment, grows on demand.
         # scaling-poll-ms=60000 → cron fires at most once per minute, won't interfere.
         # fabric-provider Emulated on loopback for EFA reactive expand test.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
-            f" dram-maxmemory 0"
             f" scaling-poll-ms 60000"
             f" chunk-size 4096"
             f" bench-mode no"
@@ -99,7 +98,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
             assert got == payload, f"Data mismatch for {key} after expand"
 
     def test_maxmemory_0_no_explicit_cap(self):
-        """dram-maxmemory=0 means no module-level cap; grows up to server ceiling."""
+        """No module-level DRAM cap; the pool grows up to the server maxmemory ceiling."""
         client = self.server.get_new_client()
         for i in range(3):
             r = client.execute_command('LO.SET', f'key_{i}', b'X' * (100 * 1024))
@@ -166,14 +165,13 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
     EXPAND_TIMEOUT_S = 15
 
     def get_module_args(self, data_dir, direct_io):
-        # segment-size=1MB, dram-maxmemory=0 (no cap so shrink never fires).
+        # segment-size=1MB; no module DRAM cap (server maxmemory 0 so shrink never fires).
         # scaling-expand-watermark=50 so filling half a segment triggers proactive expand.
         # scaling-shrink-watermark=99 to ensure shrink never fires during this test.
         # scaling-poll-ms=1000 so the cron fires frequently.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
-            f" dram-maxmemory 0"
             f" scaling-expand-watermark 50"
             f" scaling-shrink-watermark 99"
             f" scaling-poll-ms 1000"
@@ -209,34 +207,47 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
 
 
 
-class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
-    """Dram mode: dram-maxmemory hard cap is respected after expand."""
+class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
+    """Dram mode: expansion is gated by the SERVER maxmemory watermark.
+
+    There is no module-local DRAM budget — the pool grows on demand and the
+    only ceiling is Valkey's own `maxmemory` (via would_cross_memory_watermark).
+    This test sets a server maxmemory low enough that, after the pool has grown,
+    a further object requiring another segment would cross the watermark and is
+    rejected.
+    """
 
     def get_module_args(self, data_dir, direct_io):
-        # 2MB total, 1MB segment. After reactive expand, pool is 2MB (2 segments).
-        # A third 900KB object cannot fit even after a second segment is added.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
-            f" dram-maxmemory 2097152"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
 
-    def test_maxmemory_cap_after_expand(self):
-        """After one reactive expand (now at cap), a third object must be rejected."""
+    def test_expansion_capped_by_server_maxmemory(self):
+        """Once used_memory is near the server maxmemory ceiling, an object that
+        would need a new segment (crossing the watermark) must be rejected."""
         client = self.server.get_new_client()
-        obj_size = 900 * 1024
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
 
+        obj_size = 900 * 1024
+        # Land the first object (pool starts at 1 segment, fits 900KB).
         client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
-        client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
+
+        # Cap server maxmemory just above current used_memory, leaving less than
+        # one segment (1MB) of headroom — so the next object cannot expand.
+        used = int(client.info('memory')['used_memory'])
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
 
         try:
-            client.execute_command('LO.SET', 'key_c', b'C' * obj_size)
-            assert False, "Expected error: pool exhausted or OOM"
+            client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
+            assert False, "Expected rejection: expansion would cross server maxmemory watermark"
         except ResponseError:
             pass
+        # Restore uncapped for teardown safety.
+        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────
@@ -250,7 +261,6 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" dram-maxmemory 4194304"
             f" max-promote-size 1048576"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -308,7 +318,6 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" dram-maxmemory 0"
             f" max-promote-size 1048576"
             f" scaling-poll-ms 1000"
             f" chunk-size 65536"

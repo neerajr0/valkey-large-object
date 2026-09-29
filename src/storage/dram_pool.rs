@@ -44,13 +44,13 @@ impl DRAMPool {
 
     /// Allocate all buffers for an object, expanding the pool as needed.
     /// Try alloc_exact first; on failure, expand one segment and retry.
-    /// Terminates when alloc succeeds, try_expand returns None (dram-maxmemory
-    /// cap or server maxmemory watermark), or the iteration cap is reached.
+    /// Terminates when alloc succeeds, try_expand returns None (server maxmemory
+    /// watermark would be crossed), or the iteration cap is reached.
     ///
     /// The cap — ceil(obj_len / segment_size) + 1 — is a roomy upper bound
-    /// to prevent OOM when both maxmemory and dram-maxmemory are unbounded
-    /// (0). The +1 accounts for per-allocation talc overhead that can push
-    /// the object's real footprint past one segment boundary.
+    /// to prevent runaway looping when the server has no maxmemory (0) and the
+    /// pool can always expand. The +1 accounts for per-allocation talc overhead
+    /// that can push the object's real footprint past one segment boundary.
     ///
     /// Callers on the main thread pass their command `&Context`; callers on
     /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
@@ -243,12 +243,13 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
-    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
-    /// module-local `dram-maxmemory` sub-budget if set.
+    /// Add one segment to the pool, gated by the server-wide `maxmemory` (the
+    /// real OOM boundary, via `would_cross_memory_watermark`). When the server
+    /// has no `maxmemory` configured (0), there is no ceiling and the pool grows
+    /// on demand — the same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// Returns the new iovec_index on success, `None` if the watermark would be
     /// crossed. Must be called on the main event-loop thread (reads server memory).
     pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
         // Server-wide OOM guard: never grow into memory the shrink path would
@@ -257,14 +258,6 @@ impl DRAMPool {
             return None;
         }
 
-        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
-        let dram_max = crate::dram_maxmemory();
-        if dram_max > 0 {
-            let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;
-            if current_bytes as u64 >= dram_max {
-                return None;
-            }
-        }
         let result = self.pool.expand();
         if result.is_some() {
             self.expand_count.fetch_add(1, Ordering::Relaxed);

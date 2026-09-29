@@ -192,15 +192,12 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
 pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
-    let dram_max = crate::dram_maxmemory();
     let nvme_staging = crate::nvme_staging_size();
-    // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
-    // Otherwise pre-allocate maxmemory / segment_size segments.
-    let dram_segment_count = if dram_max == 0 {
-        1
-    } else {
-        ((dram_max as usize) / dram_seg_size).max(1)
-    };
+    // DRAMPool always starts with 1 segment and grows on demand — reactively
+    // when an allocation can't fit, and proactively via the scaling cron. Growth
+    // is gated by server `maxmemory` (unbounded when maxmemory is 0, like core
+    // Valkey). There is no module-local DRAM budget.
+    let dram_segment_count = 1;
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
     //
     // NVMe staging is split into uniform `segment_size` segments (the io_uring/EFA
@@ -218,7 +215,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         return Err(format!(
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
-             Increase segment-size or decrease dram-maxmemory",
+             Increase segment-size or decrease nvme-staging-size",
             dram_segment_count, nvme_segments, total_segments, MAX_SEGMENTS,
         ));
     }
