@@ -298,10 +298,6 @@ pub fn efa_register_segment(slice: &'static [u8]) {
         return; // TCP-only: no fabric, nothing to register.
     };
     if let Err(e) = fabric.register_segment(slice) {
-        valkey_module::logging::log_warning(format!(
-            "largeobj: EFA registration of segment at {:p} failed (fatal): {e}",
-            slice.as_ptr()
-        ));
         panic!(
             "largeobj: EFA registration of segment at {:p} failed (fatal): {e}",
             slice.as_ptr()

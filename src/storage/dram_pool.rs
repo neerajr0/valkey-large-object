@@ -42,15 +42,13 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate all buffers for an object, expanding the pool as needed.
-    /// Try alloc_exact first; on failure, expand one segment and retry.
-    /// Terminates when alloc succeeds, try_expand returns None (server maxmemory
-    /// watermark would be crossed), or the iteration cap is reached.
+    /// Allocate all buffers for an object, expanding once if needed.
+    /// Try `alloc_exact`; on failure expand a single segment and retry.
     ///
-    /// The cap — ceil(obj_len / segment_size) + 1 — is a roomy upper bound
-    /// to prevent runaway looping when the server has no maxmemory (0) and the
-    /// pool can always expand. The +1 accounts for per-allocation talc overhead
-    /// that can push the object's real footprint past one segment boundary.
+    /// One expand suffices: an object is guaranteed <= `segment_size` (oversized
+    /// ones are rejected at SET admission), so a fresh empty segment can hold it.
+    /// If even a fresh segment can't (talc overhead on an object right at the
+    /// boundary), no same-size segment can — so we return None rather than loop.
     ///
     /// Callers on the main thread pass their command `&Context`; callers on
     /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
@@ -60,18 +58,13 @@ impl DRAMPool {
         ctx: &valkey_module::Context,
         obj_len: u64,
     ) -> Option<Vec<super::context::SegmentBuffer>> {
-        let max_expands = (obj_len as usize).div_ceil(self.pool.segment_size) + 1;
-        let mut expands = 0;
-        loop {
-            if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
-                return Some(bufs);
-            }
-            if expands >= max_expands {
-                return None;
-            }
-            self.try_expand(ctx)?;
-            expands += 1;
+        if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
+            return Some(bufs);
         }
+        // Existing segments are full for this object. Expand once (None if the
+        // server maxmemory watermark would be crossed) and try the fresh segment.
+        self.try_expand(ctx)?;
+        self.pool.alloc_exact(obj_len as usize)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -163,8 +156,8 @@ impl DRAMPool {
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
     /// alloc_exact_or_expand with all-or-nothing semantics.
     ///
-    /// Pool full after expansion attempts → returns None. Caller falls back
-    /// to NVMe read (Tiered mode).
+    /// Pool full even after expanding one segment → returns None. Caller falls
+    /// back to NVMe read (Tiered mode).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
