@@ -25,7 +25,7 @@
 //                                locals; OnceLock statics are set only after
 //                                everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
-//   3. transport::register_buffers()
+//   3. fabric.register_segment() per startup segment
 //                              — fi_mr_reg pool buffers with EFA domains.
 //   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
@@ -289,19 +289,32 @@ pub fn direct_io() -> bool {
 }
 
 /// Register an expanded segment's memory with EFA, if a fabric is up (no-op otherwise). The
-/// crate-root seam so the storage layer never names the transport crate directly: `try_expand`
-/// calls this rather than reaching into `transport`.
-pub fn efa_register_segment(slice: &'static [u8]) -> Result<(), String> {
-    match transport::fabric::fabric() {
-        Some(fabric) => fabric.register_segment(slice),
-        None => Ok(()),
+/// Register a segment with EFA on every fabric service; no-op when no fabric is up. A failure is
+/// fatal and panics: an unregistered segment can't be served over EFA (the per-transfer fallback
+/// fails the same way) and the failure isn't transient, so a retry won't help. Single owner of
+/// this fatal-on-failure policy — startup and `try_expand` both call it.
+pub fn efa_register_segment(slice: &'static [u8]) {
+    let Some(fabric) = transport::fabric::fabric() else {
+        return; // TCP-only: no fabric, nothing to register.
+    };
+    if let Err(e) = fabric.register_segment(slice) {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: EFA registration of segment at {:p} failed (fatal): {e}",
+            slice.as_ptr()
+        ));
+        panic!(
+            "largeobj: EFA registration of segment at {:p} failed (fatal): {e}",
+            slice.as_ptr()
+        );
     }
 }
 
-/// Release an EFA registration by segment base address before the segment memory is freed. No-op
-/// when no fabric is up or the base was never registered. Called from `Segment::drop`.
+/// Release a segment's EFA registration before its memory is freed; no-op when no fabric is up or
+/// the base was never registered. Called from `Segment::drop`.
 pub fn efa_release_segment(base: usize) {
-    transport::fabric::release_segment(base);
+    if let Some(fabric) = transport::fabric::fabric() {
+        fabric.release_segment(base);
+    }
 }
 
 /// Count of EFA-registered segments (0 when no fabric). Equals the live segment count when the
@@ -421,18 +434,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     };
 
-    // Step 3: Fabric::register_buffers() — fi_mr_reg per segment per server.
-    if let Some(fabric) = &fabric {
-        if let Err(e) = fabric.register_buffers(&storage::all_segment_slices()) {
-            ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
-            // storage::init() already committed pools/engine to OnceLock.
-            // EFA registration failure after storage commit is fatal.
-            // The user must fix the EFA environment and restart.
-            panic!(
-                "largeobj: EFA buffer registration failed after storage init: {}",
-                e
-            );
-        }
+    // Step 3: register every startup segment with EFA — fi_mr_reg per segment per server.
+    // efa_register_segment owns the fatal-on-failure policy (see its doc); a failure panics there.
+    for segment in storage::all_segment_slices() {
+        efa_register_segment(segment);
     }
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
     if let Some(fabric) = &fabric {

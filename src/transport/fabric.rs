@@ -130,16 +130,6 @@ impl Fabric {
             .len()
     }
 
-    /// Register every given segment on every service. Startup batch — expressed as a loop over the
-    /// single-segment primitive so startup and runtime expansion share one registration path.
-    pub fn register_buffers(&self, segments: &[&'static [u8]]) -> Result<(), String> {
-        for (segment_index, segment) in segments.iter().enumerate() {
-            self.register_segment(segment)
-                .map_err(|error| format!("segment {segment_index}: {error}"))?;
-        }
-        Ok(())
-    }
-
     /// Insert the client's address into every service's address vector at LO.HELLO, so its
     /// transfers post against a known peer and an unusable address fails the hello instead.
     pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), String> {
@@ -184,14 +174,6 @@ pub fn commit(fabric: Option<Fabric>) {
 /// The running fabric, or `None` when this instance has none.
 pub fn fabric() -> Option<Arc<Fabric>> {
     slot().clone()
-}
-
-/// Drop a segment's EFA registration by base address, if a fabric is up. No-op otherwise. Called
-/// from `Segment::drop` (via the `crate::` helper) before the segment memory is freed.
-pub fn release_segment(base: usize) {
-    if let Some(fabric) = fabric() {
-        fabric.release_segment(base);
-    }
 }
 
 /// Number of EFA-registered segments, or 0 when no fabric is up.
