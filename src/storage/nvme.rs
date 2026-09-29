@@ -210,6 +210,7 @@ pub async fn read_and_verify_file_header(
     fd: RawFd,
     iovec_index: u16,
     pool_buffer_ptr: usize,
+    use_fixed: bool,
     expected_object_id: ObjectId,
     expected_len: u64,
     crc32c_expected: Crc,
@@ -223,6 +224,7 @@ pub async fn read_and_verify_file_header(
         buf_ptr: pool_buffer_ptr as *mut u8,
         file_offset: 0,
         len: FILE_HEADER_SIZE,
+        use_fixed,
     };
     let hdr_rx = uring::submit_read(fd, hdr_op);
     // RecvError: the io_uring poller dropped the oneshot sender without calling
@@ -312,6 +314,7 @@ pub async fn write_file_header(
         buf_ptr: hdr_ptr,
         file_offset: 0,
         len: FILE_HEADER_SIZE,
+        use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
     };
     let hdr_rx = uring::submit_write(fd, hdr_op);
     match hdr_rx.await {

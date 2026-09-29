@@ -29,6 +29,7 @@ define_errors! {
     ERR_INVALID_REMOTE_OFFSET => "ERR invalid remote_offset",
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_OBJECT_EXCEEDS_BUF => "ERR object exceeds buffer size",
+    ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call LO.HELLO first)",
     ERR_DMA_SESSION_EXISTS => "ERR DMA session already established (one LO.HELLO per connection)",
     ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",

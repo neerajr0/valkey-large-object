@@ -14,7 +14,14 @@ use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use talc::{ErrOnOom, Span, Talc};
+use talc::source::Manual;
+use talc::TalcCell;
+
+/// This segment's talc allocator: manual-source, default-binning `TalcCell`.
+/// `Manual` has no backing source — the segment claims its own `[base, base+size)`
+/// range once and never grows. `TalcCell` is `!Sync`; the `Mutex<SegmentTalc>` on
+/// `Segment` provides cross-thread exclusion.
+pub type SegmentTalc = TalcCell<Manual>;
 
 /// A contiguous registered memory region with an owned talc allocator.
 pub struct Segment {
@@ -29,16 +36,38 @@ pub struct Segment {
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with
     /// other segments' allocators.
-    pub talc: Mutex<Talc<ErrOnOom>>,
+    pub talc: Mutex<SegmentTalc>,
     /// Number of live allocations from this segment.
     /// +1 on talc alloc, -1 on talc free. When 0 + draining → safe to release.
     pub refcount: AtomicU32,
-    /// Bytes currently allocated from this segment (sum of align_up(alloc sizes)).
+    /// Bytes currently allocated from this segment. Mirrors talc's authoritative
+    /// `counters().allocated_bytes`, refreshed under the talc lock on every
+    /// alloc/free — drift-free and overhead-aware (not a hand-summed estimate).
     /// Used for picker (max-loaded packing) and INFO utilization.
-    /// Relaxed ordering — advisory, not correctness.
+    /// Relaxed ordering — advisory, not correctness; the scaling cron reads it
+    /// lock-free.
     pub allocated_bytes: AtomicUsize,
+    /// Free-hole count in this segment's heap. Mirrors talc's
+    /// `counters().fragment_count`, refreshed under the talc lock on every
+    /// alloc/free. 1 = free space is one contiguous block (healthy); high = many
+    /// scattered holes (fragmented). This is a hole COUNT, not a byte measure of
+    /// fragmentation. Relaxed — advisory, read lock-free by cron/INFO.
+    pub fragment_count: AtomicUsize,
     /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
+    /// Whether this segment's buffer is in the io_uring kernel buffer table
+    /// (IORING_REGISTER_BUFFERS). Startup segments are registered in the initial
+    /// batch (`true`); a segment added later by `expand()` is not in the table
+    /// (`false`), so its I/O uses plain Read/Write, not ReadFixed/WriteFixed — a
+    /// fixed op against an unregistered iovec_index would EFAULT.
+    /// Write-once false→true, so Relaxed suffices: a stale `false` read just takes
+    /// the always-correct non-fixed path.
+    ///
+    /// TODO: register expanded segments with the io_uring table (via
+    /// register_buffers_update on the poller thread that owns the ring) and flip
+    /// this to `true`, so expanded segments get the ReadFixed/WriteFixed fast path
+    /// instead of staying on the slower non-fixed fallback for their whole life.
+    pub io_uring_registered: AtomicBool,
 }
 
 impl Segment {
@@ -49,14 +78,16 @@ impl Segment {
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
 
-        let mut talc = Talc::new(ErrOnOom);
-        let span = Span::from_base_size(base, size);
+        let talc = TalcCell::new(Manual);
         // Safety: memory was just allocated exclusively for this Segment; nothing
         // else references [base, base+size), so claim's non-overlap invariant holds.
-        // The claimed span is not retained — a segment is reclaimed by dropping it
-        // whole (its talc metadata lives inside its own memory), so there is no
-        // truncate/get_allocated_span path that needs the returned Span.
-        unsafe { talc.claim(span).expect("talc.claim failed for new segment") };
+        // `claim(base, size)` establishes this segment's only heap; the returned
+        // pointer is not retained — a segment is reclaimed by dropping it whole
+        // (its talc metadata lives inside its own memory).
+        unsafe {
+            talc.claim(base, size)
+                .expect("talc.claim failed for new segment");
+        }
 
         Self {
             base,
@@ -65,8 +96,28 @@ impl Segment {
             talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),
+            fragment_count: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
+            // Not yet in the io_uring buffer table; marked registered after the
+            // initial IORING_REGISTER_BUFFERS (startup) — see the field's doc.
+            io_uring_registered: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this segment's buffer is registered in the io_uring kernel table.
+    /// A `false` result routes the segment's I/O through plain Read/Write; a
+    /// `true` result allows ReadFixed/WriteFixed. Relaxed: the flag only ever
+    /// goes false→true, and a stale `false` just takes the always-safe path.
+    pub fn is_io_uring_registered(&self) -> bool {
+        self.io_uring_registered.load(Ordering::Relaxed)
+    }
+
+    /// Mark this segment as registered in the io_uring kernel table. Called only
+    /// after a confirmed-successful registration (the initial startup
+    /// IORING_REGISTER_BUFFERS today; a future register_buffers_update for
+    /// expanded segments). Never un-set while the segment is live.
+    pub fn mark_io_uring_registered(&self) {
+        self.io_uring_registered.store(true, Ordering::Relaxed);
     }
 
     /// Check if safe to release (draining + no live allocations).
@@ -100,6 +151,11 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // Tear down EFA registration BEFORE freeing the memory: the DMA library requires
+        // deregistration to precede the unmap (fi_close over freed pages is illegal). Drops
+        // the segment's MemoryRegion handles (invalidate the cache entry, then fi_close once
+        // no in-flight transfer still leases them). No-op if no fabric or never registered.
+        crate::efa_release_segment(self.base as usize);
         // Dropping the Talc first is not required — its metadata lives inside
         // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
         // memory (talc has no external state). Then dealloc the backing memory.

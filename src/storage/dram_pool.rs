@@ -44,13 +44,13 @@ impl DRAMPool {
 
     /// Allocate all buffers for an object, expanding the pool as needed.
     /// Try alloc_exact first; on failure, expand one segment and retry.
-    /// Terminates when alloc succeeds, try_expand returns None (dram-maxmemory
-    /// cap or server maxmemory watermark), or the iteration cap is reached.
+    /// Terminates when alloc succeeds, try_expand returns None (server maxmemory
+    /// watermark would be crossed), or the iteration cap is reached.
     ///
     /// The cap — ceil(obj_len / segment_size) + 1 — is a roomy upper bound
-    /// to prevent OOM when both maxmemory and dram-maxmemory are unbounded
-    /// (0). The +1 accounts for per-allocation talc overhead that can push
-    /// the object's real footprint past one segment boundary.
+    /// to prevent runaway looping when the server has no maxmemory (0) and the
+    /// pool can always expand. The +1 accounts for per-allocation talc overhead
+    /// that can push the object's real footprint past one segment boundary.
     ///
     /// Callers on the main thread pass their command `&Context`; callers on
     /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
@@ -88,6 +88,17 @@ impl DRAMPool {
 
     pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
         self.pool.iovec_index_for_buf(buf)
+    }
+
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_buf_io_uring_registered(buf)
+    }
+
+    /// Mark all current segments io_uring-registered (startup, post-register).
+    pub fn mark_all_registered(&self) {
+        self.pool.mark_all_registered();
     }
 
     // ─── Object Map ──────────────────────────────────────────────────────────
@@ -196,6 +207,12 @@ impl DRAMPool {
         self.pool.allocated_bytes()
     }
 
+    /// Total free-gap count across live segments — the fragmentation signal.
+    /// Used by INFO largeobj.
+    pub fn fragment_count(&self) -> usize {
+        self.pool.fragment_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()
@@ -226,12 +243,13 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
-    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
-    /// module-local `dram-maxmemory` sub-budget if set.
+    /// Add one segment to the pool, gated by the server-wide `maxmemory` (the
+    /// real OOM boundary, via `would_cross_memory_watermark`). When the server
+    /// has no `maxmemory` configured (0), there is no ceiling and the pool grows
+    /// on demand — the same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// Returns the new iovec_index on success, `None` if the watermark would be
     /// crossed. Must be called on the main event-loop thread (reads server memory).
     pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
         // Server-wide OOM guard: never grow into memory the shrink path would
@@ -240,19 +258,21 @@ impl DRAMPool {
             return None;
         }
 
-        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
-        let dram_max = crate::dram_maxmemory();
-        if dram_max > 0 {
-            let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;
-            if current_bytes as u64 >= dram_max {
-                return None;
-            }
+        let (idx, slice) = self.pool.expand()?;
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+
+        // Register the new segment with EFA so transfers to it avoid a per-op fi_mr_reg.
+        // Best-effort: if the fabric is up and registration fails, the segment is still fully
+        // usable — the DMA library falls back to registering the operand per transfer (slower,
+        // but correct) — so we log and proceed rather than failing the expand. The registration
+        // is torn down in Segment::drop (via crate::efa_release_segment) before the memory frees.
+        if let Err(e) = crate::efa_register_segment(slice) {
+            ctx.log_warning(&format!(
+                "largeobj: EFA registration of expanded segment {idx} failed \
+                 (using per-transfer fallback): {e}"
+            ));
         }
-        let result = self.pool.expand();
-        if result.is_some() {
-            self.expand_count.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        Some(idx)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.
