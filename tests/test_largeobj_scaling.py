@@ -45,7 +45,6 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
             f" dram-maxmemory 0"
             f" scaling-poll-ms 60000"
             f" chunk-size 4096"
-            f" max-object-size 1048576"
             f" bench-mode no"
             f" direct-io no"
             f" fabric-provider Emulated"
@@ -71,9 +70,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         reactive path in the SET handler. Verified via scaling_expand_total.
         """
         client = self.server.get_new_client()
-        # 500KB at chunk-size=4096 → 125 chunks. Fits in one 1MB segment (talc
-        # fits ~127 x 4096 allocs). Two 500KB objects overflow → reactive expand.
-        obj_size = 500 * 1024
+        obj_size = 900 * 1024
 
         before = info_largeobj(client)
         expand_before = before.get('largeobj_scaling_expand_total', 0)
@@ -91,9 +88,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
     def test_expand_data_integrity(self):
         """Data written before and after a reactive expand is returned correctly."""
         client = self.server.get_new_client()
-        # 400KB at chunk-size=4096 → 100 chunks per object. 4 objects = 400 chunks,
-        # each segment holds ~127, so expands happen naturally.
-        obj_size = 400 * 1024
+        obj_size = 800 * 1024
         keys_payloads = [(f'key_{i}', bytes([i % 256]) * obj_size) for i in range(4)]
 
         for key, payload in keys_payloads:
