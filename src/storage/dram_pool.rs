@@ -42,15 +42,13 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate all buffers for an object, expanding the pool as needed.
-    /// Try alloc_exact first; on failure, expand one segment and retry.
-    /// Terminates when alloc succeeds, try_expand returns None (dram-maxmemory
-    /// cap or server maxmemory watermark), or the iteration cap is reached.
+    /// Allocate all buffers for an object, expanding once if needed.
+    /// Try `alloc_exact`; on failure expand a single segment and retry.
     ///
-    /// The cap — ceil(obj_len / segment_size) + 1 — is a roomy upper bound
-    /// to prevent OOM when both maxmemory and dram-maxmemory are unbounded
-    /// (0). The +1 accounts for per-allocation talc overhead that can push
-    /// the object's real footprint past one segment boundary.
+    /// One expand suffices: an object is guaranteed <= `segment_size` (oversized
+    /// ones are rejected at SET admission), so a fresh empty segment can hold it.
+    /// If even a fresh segment can't (talc overhead on an object right at the
+    /// boundary), no same-size segment can — so we return None rather than loop.
     ///
     /// Callers on the main thread pass their command `&Context`; callers on
     /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
@@ -60,18 +58,13 @@ impl DRAMPool {
         ctx: &valkey_module::Context,
         obj_len: u64,
     ) -> Option<Vec<super::context::SegmentBuffer>> {
-        let max_expands = (obj_len as usize).div_ceil(self.pool.segment_size) + 1;
-        let mut expands = 0;
-        loop {
-            if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
-                return Some(bufs);
-            }
-            if expands >= max_expands {
-                return None;
-            }
-            self.try_expand(ctx)?;
-            expands += 1;
+        if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
+            return Some(bufs);
         }
+        // Existing segments are full for this object. Expand once (None if the
+        // server maxmemory watermark would be crossed) and try the fresh segment.
+        self.try_expand(ctx)?;
+        self.pool.alloc_exact(obj_len as usize)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -88,6 +81,17 @@ impl DRAMPool {
 
     pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
         self.pool.iovec_index_for_buf(buf)
+    }
+
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_buf_io_uring_registered(buf)
+    }
+
+    /// Mark all current segments io_uring-registered (startup, post-register).
+    pub fn mark_all_registered(&self) {
+        self.pool.mark_all_registered();
     }
 
     // ─── Object Map ──────────────────────────────────────────────────────────
@@ -152,8 +156,8 @@ impl DRAMPool {
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
     /// alloc_exact_or_expand with all-or-nothing semantics.
     ///
-    /// Pool full after expansion attempts → returns None. Caller falls back
-    /// to NVMe read (Tiered mode).
+    /// If we cannot expand (or promote into existing segments), returns None.
+    /// Caller falls back to NVMe read (Tiered mode).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -196,6 +200,12 @@ impl DRAMPool {
         self.pool.allocated_bytes()
     }
 
+    /// Total free-gap count across live segments — the fragmentation signal.
+    /// Used by INFO largeobj.
+    pub fn fragment_count(&self) -> usize {
+        self.pool.fragment_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()
@@ -226,12 +236,13 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
-    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
-    /// module-local `dram-maxmemory` sub-budget if set.
+    /// Add one segment to the pool, gated by the server-wide `maxmemory` (via
+    /// `would_cross_memory_watermark`). When the server has no `maxmemory`
+    /// configured (0), there is no ceiling and the pool grows on demand — the
+    /// same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// Returns the new iovec_index on success, `None` if the watermark would be
     /// crossed. Must be called on the main event-loop thread (reads server memory).
     pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
         // Server-wide OOM guard: never grow into memory the shrink path would
@@ -240,19 +251,12 @@ impl DRAMPool {
             return None;
         }
 
-        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
-        let dram_max = crate::dram_maxmemory();
-        if dram_max > 0 {
-            let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;
-            if current_bytes as u64 >= dram_max {
-                return None;
-            }
-        }
-        let result = self.pool.expand();
-        if result.is_some() {
-            self.expand_count.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        let (idx, slice) = self.pool.expand()?;
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+
+        // Register the new segment with EFA (fatal on failure — see efa_register_segment).
+        crate::efa_register_segment(slice);
+        Some(idx)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.

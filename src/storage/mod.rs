@@ -99,39 +99,59 @@ impl std::fmt::Display for StorageError {
 
 use std::sync::{Mutex, OnceLock};
 
-/// Global sparse iovec table. Slot `i` = iovec_index for io_uring ReadFixed/WriteFixed.
-/// `None` = empty slot (no page pinned, no buffer registered at this index).
-/// `Some((ptr, len))` = live segment registered at this index.
+/// The segment buffers we intend io_uring to have registered, as `(base, len)`
+/// pairs. A segment's index here is its `iovec_index` — the `u16` a
+/// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index (a
+/// hole from a drained segment, reused by the next `append_iovec`).
 ///
-/// Grows as segments are added via `append_iovec`. Bounded by `u16::MAX` (65535)
-/// since iovec_index is u16 — in practice a handful of entries.
-/// Per-slot updates via `clear_iovec` mirror the io_uring sparse table model:
-/// nulling a slot costs nothing (no page pinning for null entries).
+/// Index-aligned with the owning pool's `slots` (`IOVECS[i]` is the `(base, len)`
+/// of the `Segment` at `slots[i]`), by construction — see `append_iovec`.
+///
+/// This is the intended registration set. The kernel buffer table is built from
+/// it at startup; segments added later by expand() are recorded here and will be
+/// pushed to the kernel via the register-on-expand path (see
+/// `Segment::io_uring_registered`), until then taking the non-fixed I/O path.
+/// u16 index ⇒ at most `MAX_SEGMENTS` entries (enforced by `append_iovec`).
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
+/// Maximum number of registered segments (DRAM + NVMe combined), across the
+/// whole module. `init()` validates the startup count against it, and
+/// `append_iovec` enforces it on every runtime growth.
+pub const MAX_SEGMENTS: usize = 16_384;
+
 /// Called by SegmentPool when creating each segment.
-/// Fills the first `None` hole in the sparse table (or appends if no hole).
-/// This matches the "first None hole, else append" policy used by
-/// `SegmentPool::expand` when placing the new segment in `slots`, so the
-/// returned `iovec_index` always equals the segment's slot index. Callers
-/// depend on `segment.iovec_index == slot_idx`; using a different policy here
-/// would silently violate that invariant when the two Vecs have holes in
-/// different positions.
+/// Fills the first `None` hole in the sparse table (or appends if no hole),
+/// returning the index as the segment's `iovec_index`.
+/// This is the SOLE allocator of `iovec_index`: `SegmentPool::expand` places the
+/// new segment at exactly the index returned here (`slots[idx]`), so
+/// `segment.iovec_index == slot_idx` holds by construction — the two Vecs can
+/// never pick different positions.
+///
+/// Returns `None` when the table is already at `MAX_SEGMENTS` and has no hole to
+/// reuse — this is the single runtime cap check. `expand()` propagates the
+/// `None` (expand fails cleanly, pool holds its size); the old code panicked via
+/// `u16::try_from(...).expect(...)`, which would abort the server.
 ///
 /// Only invoked from the main event-loop thread — no cross-thread contention
 /// over which hole to fill.
-pub fn append_iovec(iov: libc::iovec) -> u16 {
+pub fn append_iovec(iov: libc::iovec) -> Option<u16> {
     let mut iovecs = IOVECS.lock().expect("IOVECS lock unavailable");
     let entry = Some((iov.iov_base as usize, iov.iov_len));
     match iovecs.iter().position(|s| s.is_none()) {
+        // Reusing an existing hole never grows the table, so it is always within
+        // the cap (the index already fit in u16 when the slot was created).
         Some(i) => {
             iovecs[i] = entry;
-            u16::try_from(i).expect("iovec index overflow (>65535)")
+            Some(i as u16)
         }
+        // Appending grows the table — reject once it would exceed the cap.
         None => {
+            if iovecs.len() >= MAX_SEGMENTS {
+                return None;
+            }
             let i = iovecs.len();
             iovecs.push(entry);
-            u16::try_from(i).expect("iovec index overflow (>65535)")
+            Some(i as u16)
         }
     }
 }
@@ -171,15 +191,12 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
 pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
-    let dram_max = crate::dram_maxmemory();
     let nvme_staging = crate::nvme_staging_size();
-    // DRAMPool segment count: if maxmemory=0, start with 1 segment (grow later).
-    // Otherwise pre-allocate maxmemory / segment_size segments.
-    let dram_segment_count = if dram_max == 0 {
-        1
-    } else {
-        ((dram_max as usize) / dram_seg_size).max(1)
-    };
+    // DRAMPool always starts with 1 segment and grows on demand — reactively
+    // when an allocation can't fit, and proactively via the scaling cron. Growth
+    // is gated by server `maxmemory` (unbounded when maxmemory is 0, like core
+    // Valkey).
+    let dram_segment_count = 1;
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
     //
     // NVMe staging is split into uniform `segment_size` segments (the io_uring/EFA
@@ -193,15 +210,12 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         0
     };
     let total_segments = dram_segment_count + nvme_segments;
-    if total_segments > u16::MAX as usize + 1 {
+    if total_segments > MAX_SEGMENTS {
         return Err(format!(
             "too many segments ({} DRAM + {} NVMe = {}). \
              Max {} (io_uring iovec_index is u16). \
-             Increase segment-size or decrease dram-maxmemory",
-            dram_segment_count,
-            nvme_segments,
-            total_segments,
-            u16::MAX as usize + 1,
+             Increase segment-size or decrease nvme-staging-size",
+            dram_segment_count, nvme_segments, total_segments, MAX_SEGMENTS,
         ));
     }
     // ── Create all resources as locals (no OnceLock yet) ──
@@ -256,6 +270,20 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     }
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
+        // The engine's constructor ran IORING_REGISTER_BUFFERS over every startup
+        // segment's iovec, so those segments ARE in the kernel buffer table: mark
+        // them registered so their I/O uses the fixed (ReadFixed/WriteFixed) path.
+        // Segments added later by expand() stay unregistered (non-fixed) for their
+        // whole life — the dense table is fixed-size after this call. Tiered-only —
+        // Dram mode has no io_uring engine, so the flag is never consulted there.
+        DRAM_POOL
+            .get()
+            .expect("DRAMPool set above")
+            .mark_all_registered();
+        NVME_POOL
+            .get()
+            .expect("NVMePool set above")
+            .mark_all_registered();
 
         // Background SMART log poller: reads the controllers once per interval;
         // INFO only ever serves the latest snapshot. First read populates it.
