@@ -496,8 +496,15 @@ impl SegmentPool {
                 .filter_map(|(i, opt)| opt.as_ref().filter(|seg| seg.is_releasable()).map(|_| i))
                 .collect()
         };
+        let mut released_any = false;
         for idx in releasable {
             self.release_drained(idx);
+            released_any = true;
+        }
+        if released_any {
+            // A segment left the pool — rebuild + re-register the dense io_uring
+            // table without it (no-op in Dram mode). Whole-table swap on the poller.
+            super::trigger_reregister();
         }
     }
 
@@ -561,6 +568,24 @@ impl SegmentPool {
         let st = self.state.lock().expect("state lock unavailable");
         for slot in st.slots.iter() {
             if let Some(seg) = slot.as_ref() {
+                seg.mark_io_uring_registered();
+            }
+        }
+    }
+
+    /// Whole-table rebuild step: assign each live segment a dense `iovec_index`
+    /// starting at `*next`, push its iovec into `out`, and mark it registered.
+    /// Advances `*next` past this pool's segments. Called (with both pools, in a
+    /// fixed order) by `storage::rebuild_dense_iovecs` during a registration
+    /// swap. Dense by construction — no holes — because 5.10 cannot register a
+    /// sparse table.
+    pub fn collect_dense_iovecs(&self, next: &mut u16, out: &mut Vec<libc::iovec>) {
+        let mut st = self.state.lock().expect("state lock unavailable");
+        for slot in st.slots.iter_mut() {
+            if let Some(seg) = slot.as_mut() {
+                seg.iovec_index = *next;
+                *next += 1;
+                out.push(seg.iovec());
                 seg.mark_io_uring_registered();
             }
         }

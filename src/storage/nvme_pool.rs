@@ -55,6 +55,11 @@ impl NVMePool {
         self.pool.mark_all_registered();
     }
 
+    /// See `SegmentPool::collect_dense_iovecs`.
+    pub fn collect_dense_iovecs(&self, next: &mut u16, out: &mut Vec<libc::iovec>) {
+        self.pool.collect_dense_iovecs(next, out);
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()

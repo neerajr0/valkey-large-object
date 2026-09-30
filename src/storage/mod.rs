@@ -317,6 +317,36 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
     slices
 }
 
+/// Rebuild the io_uring fixed-buffer table densely from ALL currently-live
+/// segments (NVMe staging first, then DRAM), reassigning each segment's
+/// `iovec_index` to its dense position and marking it io_uring-registered.
+/// Returns the iovec array to hand to `register_buffers`.
+///
+/// 5.10 has no sparse tables / per-slot updates, so the swap is whole-table and
+/// the array MUST be dense (no holes) — hence the recompute rather than
+/// gap-preserving. `segment_idx` (the stable `slots[]` id stored in every
+/// `SegmentBuffer`) is untouched; only `iovec_index` moves, and op-build reads
+/// it fresh. Called by the poller during a registration swap. Each pool is
+/// locked briefly, one at a time (never nested), so there is no cross-pool
+/// deadlock.
+pub fn rebuild_dense_iovecs() -> Vec<libc::iovec> {
+    let mut out = Vec::new();
+    let mut next: u16 = 0;
+    if let Some(nvme) = NVME_POOL.get() {
+        nvme.collect_dense_iovecs(&mut next, &mut out);
+    }
+    get_dram_pool().collect_dense_iovecs(&mut next, &mut out);
+    out
+}
+
+/// Ask the io_uring poller to rebuild + re-register the fixed-buffer table after
+/// a segment was added (expand) or removed (release). Fire-and-forget; the swap
+/// runs on the poller once in-flight fixed ops drain. No-op in Dram mode (no
+/// engine) — the fixed path is not used there.
+pub fn trigger_reregister() {
+    uring::submit_reregister();
+}
+
 // ─── Chunk / ChunkIterator ───────────────────────────────────────────────────
 
 /// A client EFA memory address: (remote_addr, size, rkey).

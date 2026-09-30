@@ -94,6 +94,11 @@ impl DRAMPool {
         self.pool.mark_all_registered();
     }
 
+    /// See `SegmentPool::collect_dense_iovecs`.
+    pub fn collect_dense_iovecs(&self, next: &mut u16, out: &mut Vec<libc::iovec>) {
+        self.pool.collect_dense_iovecs(next, out);
+    }
+
     // ─── Object Map ──────────────────────────────────────────────────────────
 
     /// Lookup a cached object.
@@ -256,6 +261,9 @@ impl DRAMPool {
 
         // Register the new segment with EFA (fatal on failure — see efa_register_segment).
         crate::efa_register_segment(slice);
+        // Rebuild + re-register the io_uring fixed-buffer table so the new segment
+        // joins the fixed path (no-op in Dram mode). Whole-table swap on the poller.
+        super::trigger_reregister();
         Some(idx)
     }
 

@@ -59,6 +59,14 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Rebuild the whole io_uring fixed-buffer table densely from all currently-
+    /// live segments (5.10 has no sparse tables / per-slot updates, so the only
+    /// primitive is a whole-table swap and the array must have no holes). The
+    /// poller sets `registration_pending`, forces ops issued during the window
+    /// onto the non-fixed path, waits for in-flight FIXED ops to drain, then
+    /// `unregister_buffers` + `register_buffers(rebuilt)`. Fire-and-forget: sent
+    /// by expand()/release() after a segment is added/removed.
+    Reregister,
 }
 
 // SAFETY: IoRequest contains raw pointers (inside UringOp) referring to segment-allocated memory
@@ -73,15 +81,27 @@ enum PendingOp {
         tx: oneshot::Sender<Result<u64, StorageError>>,
         /// Expected byte count for this I/O op. Short reads are rejected.
         expected_bytes: u64,
+        /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
+        /// gates the whole-table registration swap (see `poller_loop`).
+        fixed: bool,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
         /// Expected byte count for this I/O op. Short writes are rejected.
         expected_bytes: u64,
+        /// True if issued as WriteFixed — counts against `fixed_in_flight`.
+        fixed: bool,
     },
 }
 
 impl PendingOp {
+    /// True if this op was issued on the fixed (ReadFixed/WriteFixed) path.
+    fn is_fixed(&self) -> bool {
+        match self {
+            PendingOp::Read { fixed, .. } | PendingOp::Write { fixed, .. } => *fixed,
+        }
+    }
+
     /// Send an error to the waiting caller. Used when submit fails fatally.
     fn send_error(self, code: i32) {
         match self {
@@ -144,6 +164,15 @@ pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), Stor
     rx
 }
 
+/// Ask the poller to rebuild + re-register the whole fixed-buffer table after a
+/// segment was added (expand) or removed (release). Fire-and-forget, no reply:
+/// the swap runs on the poller once in-flight fixed ops drain. No-op if the
+/// engine is down (Dram mode / not yet initialized) — the fixed path is unused
+/// there anyway.
+pub fn submit_reregister() {
+    let _ = submit(IoRequest::Reregister);
+}
+
 // ─── UringNvmeEngine ─────────────────────────────────────────────────────────
 
 pub struct UringNvmeEngine {
@@ -202,10 +231,31 @@ impl UringNvmeEngine {
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
+        // Whole-table registration swap state (5.10 — see IoRequest::Reregister).
+        // While `registration_pending`, ops are issued NON-fixed (kill-switch); the
+        // swap fires once `fixed_in_flight` (in-flight ReadFixed/WriteFixed) hits 0.
+        let mut registration_pending = false;
+        let mut fixed_in_flight: usize = 0;
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
+            }
+            // Registration swap: once all in-flight FIXED ops have drained, rebuild
+            // the dense buffer table from live segments and re-register it. Ops
+            // issued during the window went non-fixed, so their (possibly stale)
+            // iovec_index is never used — only pre-window fixed ops had to drain.
+            if registration_pending && fixed_in_flight == 0 {
+                let iovecs = super::rebuild_dense_iovecs();
+                unsafe {
+                    let _ = ring.submitter().unregister_buffers();
+                    if !iovecs.is_empty() {
+                        ring.submitter()
+                            .register_buffers(&iovecs)
+                            .expect("largeobj: io_uring re-register_buffers failed");
+                    }
+                }
+                registration_pending = false;
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
             // in an OnceLock for the entire process lifetime. If it's gone without
@@ -251,9 +301,19 @@ impl UringNvmeEngine {
                 let token = next_token;
                 next_token += 1;
                 let (sqe, op) = match req {
+                    IoRequest::Reregister => {
+                        // Enter the swap window. Ops keep flowing but are forced
+                        // non-fixed below until `fixed_in_flight` drains and the
+                        // top-of-loop swap re-registers the table. No SQE to build.
+                        registration_pending = true;
+                        continue;
+                    }
                     IoRequest::Read { fd, op, tx } => {
                         let read_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if op.use_fixed {
+                        // Kill-switch: while a swap is pending, issue non-fixed so a
+                        // stale iovec_index against the about-to-change table is never used.
+                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr,
@@ -278,12 +338,14 @@ impl UringNvmeEngine {
                             PendingOp::Read {
                                 tx,
                                 expected_bytes: op.len,
+                                fixed: issue_fixed,
                             },
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if op.use_fixed {
+                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr as *const u8,
@@ -308,10 +370,12 @@ impl UringNvmeEngine {
                             PendingOp::Write {
                                 tx,
                                 expected_bytes: op.len,
+                                fixed: issue_fixed,
                             },
                         )
                     }
                 };
+                let op_is_fixed = op.is_fixed();
                 unsafe {
                     if ring.submission().is_full() {
                         let _ = ring.submit();
@@ -321,6 +385,9 @@ impl UringNvmeEngine {
                         op.send_error(libc::EAGAIN);
                     } else {
                         pending.insert(token, op);
+                        if op_is_fixed {
+                            fixed_in_flight += 1;
+                        }
                     }
                 }
                 batch += 1;
@@ -364,8 +431,15 @@ impl UringNvmeEngine {
             }
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
+                    if op.is_fixed() {
+                        fixed_in_flight -= 1;
+                    }
                     match op {
-                        PendingOp::Read { tx, expected_bytes } => {
+                        PendingOp::Read {
+                            tx,
+                            expected_bytes,
+                            ..
+                        } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(result as u64));
                             } else if result < 0 {
@@ -375,7 +449,11 @@ impl UringNvmeEngine {
                                 let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
-                        PendingOp::Write { tx, expected_bytes } => {
+                        PendingOp::Write {
+                            tx,
+                            expected_bytes,
+                            ..
+                        } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(()));
                             } else if result < 0 {
@@ -400,6 +478,9 @@ impl UringNvmeEngine {
                     .collect();
                 for token in batch_tokens {
                     if let Some(op) = pending.remove(&token) {
+                        if op.is_fixed() {
+                            fixed_in_flight -= 1;
+                        }
                         op.send_error(code);
                     }
                 }
