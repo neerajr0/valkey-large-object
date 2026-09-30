@@ -55,18 +55,12 @@ pub struct Segment {
     pub fragment_count: AtomicUsize,
     /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
-    /// Whether this segment's buffer is in the io_uring kernel buffer table
-    /// (IORING_REGISTER_BUFFERS). Startup segments are registered in the initial
-    /// batch (`true`); a segment added later by `expand()` is not in the table
-    /// (`false`), so its I/O uses plain Read/Write, not ReadFixed/WriteFixed — a
-    /// fixed op against an unregistered iovec_index would EFAULT.
+    /// Whether this segment's buffer is in the io_uring kernel table
+    /// (IORING_REGISTER_BUFFERS). A segment starts `false` (its I/O uses plain
+    /// Read/Write) and is flipped `true` once its memory is in the table — at
+    /// startup, or after the post-expand rebuild for a segment added later.
     /// Write-once false→true, so Relaxed suffices: a stale `false` read just takes
     /// the always-correct non-fixed path.
-    ///
-    /// TODO: register expanded segments with the io_uring table (via
-    /// register_buffers_update on the poller thread that owns the ring) and flip
-    /// this to `true`, so expanded segments get the ReadFixed/WriteFixed fast path
-    /// instead of staying on the slower non-fixed fallback for their whole life.
     pub io_uring_registered: AtomicBool,
 }
 
@@ -150,7 +144,11 @@ impl Drop for Segment {
         // the segment's MemoryRegion handles (invalidate the cache entry, then fi_close once
         // no in-flight transfer still leases them). No-op if no fabric or never registered.
         crate::efa_release_segment(self.base as usize);
-        // TODO: Deregister with IO_URING once the dynamic submission is supported.
+        // No io_uring deregistration here: on 5.10 the only removal is the whole-
+        // table rebuild fired after the segment leaves its slot. Freeing now is
+        // safe — a segment reaches drop only at refcount == 0, so no in-flight
+        // fixed op carries its iovec_index and the stale table entry is never used
+        // before the next unregister_buffers drops it.
         // Dropping the Talc first is not required — its metadata lives inside
         // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
         // memory (talc has no external state). Then dealloc the backing memory.

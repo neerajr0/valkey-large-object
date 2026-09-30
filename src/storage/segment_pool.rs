@@ -591,6 +591,20 @@ impl SegmentPool {
         }
     }
 
+    /// Number of live segments currently marked io_uring-registered (their
+    /// iovec is in the kernel fixed-buffer table). Equals this pool's live
+    /// segment count once a post-expand registration swap has completed; a
+    /// lower value means an expanded segment is not yet registered. Read-only;
+    /// surfaced in INFO to assert the swap covered every segment.
+    pub fn io_uring_registered_count(&self) -> usize {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|seg| seg.is_io_uring_registered())
+            .count()
+    }
+
     /// Total allocated bytes across live (non-draining) segments.
     /// Sums the per-segment atomics directly — the exact figure INFO reports,
     /// with no ratio round-trip.

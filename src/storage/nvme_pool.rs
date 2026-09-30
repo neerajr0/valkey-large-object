@@ -60,6 +60,11 @@ impl NVMePool {
         self.pool.collect_dense_iovecs(next, out);
     }
 
+    /// See `SegmentPool::io_uring_registered_count`.
+    pub fn io_uring_registered_count(&self) -> usize {
+        self.pool.io_uring_registered_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()

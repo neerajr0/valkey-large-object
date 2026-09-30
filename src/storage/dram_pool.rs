@@ -99,6 +99,11 @@ impl DRAMPool {
         self.pool.collect_dense_iovecs(next, out);
     }
 
+    /// See `SegmentPool::io_uring_registered_count`.
+    pub fn io_uring_registered_count(&self) -> usize {
+        self.pool.io_uring_registered_count()
+    }
+
     // ─── Object Map ──────────────────────────────────────────────────────────
 
     /// Lookup a cached object.
