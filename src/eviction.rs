@@ -777,10 +777,11 @@ mod tests {
         );
     }
 
-    /// Each segment of core's curve, since this is the one number an operator tunes. The
-    /// endpoints matter most: 0 must not mean "unbounded" and 100 must.
+    /// Both halves of the search bound, over core's curve. `eviction-tenacity` is the one number an
+    /// operator tunes and the clock and the round count have to move together, so they are asserted
+    /// together. The endpoints matter most: 0 must not mean "unbounded" and 100 must.
     #[test]
-    fn search_budget_matches_cores_curve() {
+    fn tenacity_bounds_the_search() {
         assert_eq!(
             search_budget(0),
             Duration::ZERO,
@@ -805,12 +806,6 @@ mod tests {
             search_budget(50) > search_budget(20) && search_budget(20) > search_budget(10),
             "monotone, so raising the knob can only buy more search"
         );
-    }
-
-    /// The other half of the search bound, and the only one that binds when every candidate is
-    /// pinned. Asserted alongside the clock because the two have to move together.
-    #[test]
-    fn barren_rounds_scales_with_tenacity() {
         assert_eq!(barren_rounds(10), 8, "the default is what this started as");
         assert_eq!(
             barren_rounds(0),
@@ -827,12 +822,8 @@ mod tests {
             barren_rounds(-5) == barren_rounds(0) && barren_rounds(500) == barren_rounds(100),
             "clamped, so an out-of-range config cannot shift the whole curve"
         );
-    }
-
-    /// `Duration::MAX` cannot be added to an `Instant`, and handling that is what keeps tenacity
-    /// 100 the loosest setting rather than a deadline in the past.
-    #[test]
-    fn an_unbounded_budget_yields_a_deadline_that_never_arrives() {
+        // `Duration::MAX` cannot be added to an `Instant`; handling that is what keeps tenacity 100
+        // the loosest setting rather than a deadline in the past.
         assert!(
             deadline_from_now(search_budget(100)).is_none(),
             "no deadline at all, not a saturated one"

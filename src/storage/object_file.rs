@@ -289,30 +289,27 @@ mod tests {
         file_with_real_path(oid)
     }
 
-    /// `Drop` is the only thing that credits the ledger, so this is the whole of the release
-    /// path. Without it every DEL, overwrite and expiry would leak budget until the ledger was
-    /// full of objects that no longer exist.
-    #[test]
-    fn drop_releases_the_charge() {
-        let _g = accounting_test_lock();
-        let base = nvme_disk_usage();
-
-        drop(charged_file(ObjectId(u64::MAX - 1)));
-
-        assert_eq!(nvme_disk_usage(), base, "Drop alone must return the bytes");
-    }
-
-    /// The whole point of the type: a victim's bytes pay for its replacement, and the ledger
-    /// ends up charged for exactly one object rather than two or zero.
+    /// The whole point of the type: a victim's bytes pay for its replacement, the ledger ends up
+    /// charged for exactly one object rather than two or zero, and the victim's file is gone from
+    /// the directory before `commit` returns so the caller writes into space that is actually free.
+    /// That ordering is what owning the handles buys — a cloned `Arc` would leave the unlink to
+    /// whenever the keyspace's own reference died on a lazyfree BIO thread.
     #[test]
     fn commit_spends_victims_on_the_newcomer() {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
+        let victim_oid = ObjectId(u64::MAX - 8);
+        let newcomer_oid = ObjectId(u64::MAX - 9);
 
-        let victim = charged_file(ObjectId(u64::MAX - 2));
+        let victim = charged_file(victim_oid);
+        let victim_path = victim_oid.file_path(&crate::nvme_dir());
         assert_eq!(nvme_disk_usage(), base + DISK_LEN);
+        assert!(
+            std::path::Path::new(&victim_path).exists(),
+            "fixture must place the victim's file"
+        );
 
-        let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 3), DISK_LEN, vec![victim]);
+        let mut res = DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![victim]);
         assert_eq!(
             nvme_disk_usage(),
             base + DISK_LEN,
@@ -321,38 +318,6 @@ mod tests {
         );
 
         res.commit();
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "one object out, one object in"
-        );
-
-        // Nothing wrote a file, so the reservation dies still owing the bytes.
-        drop(res);
-        assert_eq!(nvme_disk_usage(), base, "an abandoned commit leaks nothing");
-    }
-
-    /// The ordering the write path depends on: once `commit` returns, the victims' files are gone
-    /// from the directory, so the caller creates the new one into space that is actually free.
-    /// This is what owning the handles buys — a cloned `Arc` would leave the unlink to whenever
-    /// the keyspace's own reference died on a lazyfree BIO thread.
-    #[test]
-    fn commit_unlinks_the_victims_before_returning() {
-        let _g = accounting_test_lock();
-        let base = nvme_disk_usage();
-        let victim_oid = ObjectId(u64::MAX - 8);
-        let newcomer_oid = ObjectId(u64::MAX - 9);
-
-        let victim = charged_file(victim_oid);
-        let victim_path = victim_oid.file_path(&crate::nvme_dir());
-        assert!(
-            std::path::Path::new(&victim_path).exists(),
-            "fixture must place the victim's file"
-        );
-
-        let mut res = DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![victim]);
-        res.commit();
-
         assert!(
             !std::path::Path::new(&victim_path).exists(),
             "commit must unlink the victim before the caller writes the new file"
@@ -363,16 +328,31 @@ mod tests {
             "one object out, one in — the charge lands, the victim's credit comes back"
         );
 
+        // After `into_object_file` the *handle* owes the bytes. If the reservation's `Drop` also
+        // released, the new object would be accounted for by nobody and the ledger would drift down
+        // by one object per SET. `Drop` on the handle is then the whole of the release path: without
+        // it every DEL, overwrite and expiry would leak budget.
         place_file_for(newcomer_oid);
-        drop(res.into_object_file());
-        assert_eq!(nvme_disk_usage(), base);
+        let file = res.into_object_file();
+        assert_eq!(
+            nvme_disk_usage(),
+            base + DISK_LEN,
+            "the object is charged, exactly once"
+        );
+        drop(file);
+        assert_eq!(
+            nvme_disk_usage(),
+            base,
+            "and the handle is what releases it"
+        );
     }
 
-    /// A reservation dropped before `commit` — the EFA read failed, say — must undo itself.
-    /// The victims are still destroyed, because the keyspace lost them before the reservation
-    /// existed, but their bytes go back to the ledger rather than being lost to it.
+    /// A reservation that never hands its file over must undo itself: the EFA read failed, say, or
+    /// nothing ever wrote the file. The victims are still destroyed, because the keyspace lost them
+    /// before the reservation existed, but their bytes go back to the ledger rather than being lost
+    /// to it. Both constructors, and both sides of `commit`.
     #[test]
-    fn drop_before_commit_returns_everything() {
+    fn a_reservation_that_never_hands_over_its_file_undoes_itself() {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
 
@@ -384,40 +364,18 @@ mod tests {
         ));
         assert_eq!(nvme_disk_usage(), base, "victim bytes returned, none taken");
 
-        // The other constructor: budget had room, so the bytes are charged up front and the
-        // drop has to give them back itself.
+        // `charged` means the caller's `try_reserve` already succeeded, so the bytes are charged up
+        // front and the drop has to give them back itself.
         super::super::nvme::increase_nvme_disk_usage(DISK_LEN);
         drop(DiskReservation::charged(ObjectId(u64::MAX - 6), DISK_LEN));
         assert_eq!(nvme_disk_usage(), base, "un-reserved on the way out");
-    }
 
-    /// The handoff. After `into_object_file` the bytes stay charged and the *handle* owes
-    /// them — if the reservation's `Drop` also released, the new object would be accounted
-    /// for by nobody and the ledger would drift down by one object per SET.
-    #[test]
-    fn into_object_file_transfers_the_charge() {
-        let _g = accounting_test_lock();
-        let base = nvme_disk_usage();
-
-        // `charged` means the caller's `try_reserve` already succeeded, so charge first.
-        let oid = ObjectId(u64::MAX - 7);
-        super::super::nvme::increase_nvme_disk_usage(DISK_LEN);
-        let mut res = DiskReservation::charged(oid, DISK_LEN);
+        // Past `commit` and still abandoned: nothing wrote a file, so the reservation dies owing
+        // the bytes it charged and has to credit them itself.
+        let victim = charged_file(ObjectId(u64::MAX - 2));
+        let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 3), DISK_LEN, vec![victim]);
         res.commit();
-
-        place_file_for(oid);
-        let file = res.into_object_file();
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "the object is charged, exactly once"
-        );
-
-        drop(file);
-        assert_eq!(
-            nvme_disk_usage(),
-            base,
-            "and the handle is what releases it"
-        );
+        drop(res);
+        assert_eq!(nvme_disk_usage(), base, "an abandoned commit leaks nothing");
     }
 }
