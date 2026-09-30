@@ -46,5 +46,5 @@ debug = 2
 
 [features]
 default = []
-enable-system-alloc = ["valkey-module/enable-system-alloc"]
+enable-system-alloc = ["valkey-module/enable-system-alloc", "valkey-module/test-shims"]
 test-harness = []

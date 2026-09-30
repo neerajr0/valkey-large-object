@@ -19,15 +19,15 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | Command | Description |
 |---------|-------------|
 | `LO.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `LO.SET key total_len n_regions rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory regions via RDMA. |
+| `LO.SET key total_len rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
 | `LO.GET key` | Retrieve object over TCP. Returns a bulk string. |
-| `LO.GET key n_regions rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory regions. Replies `[obj_len, crc32c]`. |
+| `LO.GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
 | `LO.HELLO client_efa_addr_hex` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
 | `LO.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
-An EFA request names one or more client memory regions as `(rkey, addr, len)` triples
-(`n_regions` of them, 1..=256). A chunk may straddle a region boundary, and the regions
+An EFA request names one or more client memory addresses as `(rkey, addr, len)` triples
+(1..=256 addresses, inferred from the argument count). A chunk may straddle an address boundary, and the addresses
 may total more than the object — `LO.GET`'s reply carries `obj_len` so the client knows
 where the object ends.
 

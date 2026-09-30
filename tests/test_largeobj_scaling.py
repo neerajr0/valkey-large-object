@@ -52,7 +52,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
 
     def start_target(self, *flags):
-        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
+        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr, length)."""
         target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
         process = subprocess.Popen(
             [target, '127.0.0.1', *flags],
@@ -60,8 +60,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr, _length = line.split()[1:]
-        return process, address, int(rkey), int(remote_addr)
+        address, rkey, remote_addr, length = line.split()[1:]
+        return process, address, int(rkey), int(remote_addr), int(length)
 
     def test_expand_on_segment_full(self):
         """SET that fills a segment triggers reactive expand in serve_set_dram_tcp.
@@ -142,10 +142,10 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         # Fill most of the 1MB segment with a TCP SET (900KB).
         client.execute_command('LO.SET', 'filler', b'F' * (900 * 1024))
         # EFA SET of 4096 bytes — segment nearly full, must trigger expand.
-        process, address, rkey, remote_addr = self.start_target('--read')
+        process, address, rkey, remote_addr, length = self.start_target('--read')
         try:
             client.execute_command('LO.HELLO', address)
-            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
+            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
             assert result == b'OK', f"EFA SET failed: {result}"
             assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
             expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)

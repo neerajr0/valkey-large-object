@@ -53,33 +53,32 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
             assert str(e) == 'peer address must not be empty'
 
     def test_efa_get_needs_hello(self):
-        """Both the legacy and multi-region EFA arities of LO.GET are refused until this
-        client has a session."""
+        """The EFA arity of LO.GET is refused until this client has a session."""
         client = self.server.get_new_client()
         client.execute_command('LO.SET', 'key', b'A' * 4096)
-        # Multi-region form.
         self.verify_error_response(
-            client, 'LO.GET key 1 999 0 4096', 'no DMA session (call LO.HELLO first)')
-        # Legacy form.
-        self.verify_error_response(
-            client, 'LO.GET key 999 0', 'no DMA session (call LO.HELLO first)')
+            client, 'LO.GET key 999 0 4096', 'no DMA session (call LO.HELLO first)')
 
     def test_arity_gaps_are_refused(self):
-        """Arg counts that are neither TCP, legacy EFA, nor multi-region EFA are rejected.
+        """Arg counts that are neither TCP nor EFA with complete triples are rejected.
 
-        GET: 2=TCP, 4=legacy EFA, >=5=multi-region EFA. So 3 args is invalid.
-        SET: 3=TCP, 5=legacy EFA, >=6=multi-region EFA. So 4 args is invalid.
-        A well-formed region list with trailing args past the declared count is also
-        refused, rather than transferring against a region set the client did not send."""
+        GET: 2=TCP, >=5=EFA (triplets). So 3 or 4 args is invalid.
+        SET: 3=TCP, >=6=EFA (total_len + triplets). So 4 or 5 args is invalid.
+        Trailing args that break a triplet boundary are also refused."""
         client = self.server.get_new_client()
         client.execute_command('LO.SET', 'key', b'A' * 4096)
         for command in ('LO.GET key 999',
+                        'LO.GET key 999 0',
                         'LO.SET key 4096 999',
-                        # Trailing arg past a well-formed single-region list.
-                        'LO.GET key 1 999 0 4096 7'):
+                        'LO.SET key 4096 999 0'):
             name = command.split()[0]
             self.verify_error_response(
                 client, command, f"wrong number of arguments for '{name}' command")
+        # Trailing arg past a well-formed single-address list: 6 args enters the EFA
+        # parser (>=5), but 4 tail fields is not divisible by 3.
+        self.verify_error_response(
+            client, 'LO.GET key 999 0 4096 7',
+            'address args must be (rkey, addr, len) triples')
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
@@ -104,17 +103,17 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
 PATTERN = b'\xab'
 TARGET_LEN = 4096
 
-# One advertised client memory region: the fabric address to HELLO with, plus the
-# (rkey, addr, len) triple that LO.GET / LO.SET carries per region.
+# One advertised client memory address: the fabric address to HELLO with, plus the
+# (rkey, addr, len) triple that LO.GET / LO.SET carries per address.
 Region = collections.namedtuple('Region', 'address rkey addr len')
 
 
-def region_args(regions):
-    """The regions as the EFA commands carry them: n_regions, then a triple each.
+def address_args(regions):
+    """The addresses as the EFA commands carry them: a (rkey, addr, len) triple each.
 
-    Order is load-bearing — the object's bytes are laid across the regions in this
+    Order is load-bearing — the object's bytes are laid across the addresses in this
     order, so it must match the order the target registered them."""
-    args = [len(regions)]
+    args = []
     for region in regions:
         args += [region.rkey, region.addr, region.len]
     return args
@@ -161,7 +160,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
             client.execute_command('LO.HELLO', regions[0].address)
-            reply = client.execute_command('LO.GET', 'key', *region_args(regions))
+            reply = client.execute_command('LO.GET', 'key', *address_args(regions))
             assert reply == [TARGET_LEN, crc32c.crc32c(PATTERN * TARGET_LEN)]
             # The target exits once every byte of the pattern has landed.
             output = process.communicate(timeout=30)[0]
@@ -175,7 +174,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.HELLO', regions[0].address)
             assert client.execute_command(
-                'LO.SET', 'key', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
         finally:
             process.kill()
@@ -189,54 +188,20 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.SET', 'key', payload)
             client.execute_command('LO.HELLO', regions[0].address)
-            reply = client.execute_command('LO.GET', 'key', *region_args(regions))
+            reply = client.execute_command('LO.GET', 'key', *address_args(regions))
             assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
             assert client.execute_command(
-                'LO.SET', 'copy', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('LO.GET', 'copy') == payload
         finally:
             process.kill()
 
-    def test_legacy_single_region_get(self):
-        """LO.GET with the legacy 2-arg EFA syntax: key rkey addr (no len, no n_regions).
-
-        The server synthesizes a single region with obj_len as the length. Verifies
-        that the object lands in the target and the reply is [obj_len, crc32c]."""
-        process, regions = self.start_target()
-        try:
-            client = self.server.get_new_client()
-            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
-            client.execute_command('LO.HELLO', regions[0].address)
-            r = regions[0]
-            reply = client.execute_command('LO.GET', 'key', r.rkey, r.addr)
-            assert reply == [TARGET_LEN, crc32c.crc32c(PATTERN * TARGET_LEN)]
-            output = process.communicate(timeout=30)[0]
-            assert 'payload verified' in output, output
-        finally:
-            process.kill()
-
-    def test_legacy_single_region_set(self):
-        """LO.SET with the legacy 3-arg EFA syntax: key total_len rkey addr (no n_regions).
-
-        The server synthesizes a single region with total_len as the length. Verifies
-        the object is persisted and readable back over TCP."""
-        process, regions = self.start_target('--read')
-        try:
-            client = self.server.get_new_client()
-            client.execute_command('LO.HELLO', regions[0].address)
-            r = regions[0]
-            assert client.execute_command(
-                'LO.SET', 'key', TARGET_LEN, r.rkey, r.addr) == b'OK'
-            assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
-        finally:
-            process.kill()
-
-    def test_multi_region_transfer(self):
-        """GET and SET across several separate client regions.
+    def test_multi_address_transfer(self):
+        """GET and SET across several separate client addresses.
 
         Covers equal and unequal splits, and a boundary that falls mid-chunk: 1024 is not
         a multiple of chunk-size 4096, so the first chunk must be scattered across both
-        regions. The target reports 'payload verified' only once EVERY region has filled,
+        addresses. The target reports 'payload verified' only once EVERY address has filled,
         so a transfer that wrote the head and dropped the tail fails here."""
         payload = PATTERN * TARGET_LEN
         for sizes in ([2048, 2048], [1024, 3072]):
@@ -248,25 +213,25 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 client = self.server.get_new_client()
                 client.execute_command('LO.SET', 'key', payload)
                 client.execute_command('LO.HELLO', regions[0].address)
-                reply = client.execute_command('LO.GET', 'key', *region_args(regions))
+                reply = client.execute_command('LO.GET', 'key', *address_args(regions))
                 assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
                 output = process.communicate(timeout=30)[0]
                 assert 'payload verified' in output, output
             finally:
                 process.kill()
-        # SET gathers the object back out of unequal regions, verified byte for byte.
+        # SET gathers the object back out of unequal addresses, verified byte for byte.
         process, regions = self.start_target('--read', split=[1024, 3072])
         try:
             client = self.server.get_new_client()
             client.execute_command('LO.HELLO', regions[0].address)
             assert client.execute_command(
-                'LO.SET', 'copy', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('LO.GET', 'copy') == payload
         finally:
             process.kill()
 
-    def test_region_coverage_is_validated(self):
-        """Regions must cover the object, and may exceed it.
+    def test_address_coverage_is_validated(self):
+        """Addresses must cover the object, and may exceed it.
 
         Validation is sum(len_i) >= obj_len, so surplus space is accepted and the reply's
         obj_len is how the client knows where the object ends. A shortfall is refused
@@ -278,16 +243,16 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.HELLO', regions[0].address)
             # 4096 bytes of advertised space for a 2048-byte object.
             client.execute_command('LO.SET', 'short', PATTERN * short_len)
-            assert client.execute_command('LO.GET', 'short', *region_args(regions)) == [
+            assert client.execute_command('LO.GET', 'short', *address_args(regions)) == [
                 short_len, crc32c.crc32c(PATTERN * short_len)]
-            # The 1024-byte region alone cannot hold a 4096-byte object.
+            # The 1024-byte address alone cannot hold a 4096-byte object.
             client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
             first = f'{regions[0].rkey} {regions[0].addr} {regions[0].len}'
             self.verify_error_response(
-                client, f'LO.GET key 1 {first}',
+                client, f'LO.GET key {first}',
                 'client address space smaller than object length')
             self.verify_error_response(
-                client, f'LO.SET key {TARGET_LEN} 1 {first}',
+                client, f'LO.SET key {TARGET_LEN} {first}',
                 'client address space smaller than object length')
         finally:
             process.kill()
@@ -315,7 +280,7 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
             client = self.server.get_new_client()
             client.execute_command('LO.HELLO', regions[0].address)
             assert client.execute_command(
-                'LO.SET', 'key', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
             assert len(self._object_files()) == 1
         finally:
             process.kill()
@@ -343,16 +308,16 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
             client = self.server.get_new_client()
             client.execute_command('LO.HELLO', regions[0].address)
             assert client.execute_command(
-                'LO.SET', 'key', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
             # Cold load into dram
             assert client.execute_command(
-                'LO.GET', 'key', *region_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
+                'LO.GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
             # Hot load from dram
             assert client.execute_command(
-                'LO.GET', 'key', *region_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
+                'LO.GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
             # Read back from client and verify literal bytes
             assert client.execute_command(
-                'LO.SET', 'copy', TARGET_LEN, *region_args(regions)) == b'OK'
+                'LO.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('LO.GET', 'copy') == payload
         finally:
             process.kill()
