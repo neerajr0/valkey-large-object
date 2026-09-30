@@ -436,9 +436,7 @@ impl UringNvmeEngine {
                     }
                     match op {
                         PendingOp::Read {
-                            tx,
-                            expected_bytes,
-                            ..
+                            tx, expected_bytes, ..
                         } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(result as u64));
@@ -450,9 +448,7 @@ impl UringNvmeEngine {
                             }
                         }
                         PendingOp::Write {
-                            tx,
-                            expected_bytes,
-                            ..
+                            tx, expected_bytes, ..
                         } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(()));
