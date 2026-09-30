@@ -115,12 +115,9 @@ use std::sync::{Mutex, OnceLock};
 static IOVECS: Mutex<Vec<Option<(usize, usize)>>> = Mutex::new(Vec::new());
 
 /// Maximum number of registered segments (DRAM + NVMe combined), across the
-/// whole module. The `iovec_index` handed to io_uring ReadFixed/WriteFixed is a
-/// `u16`, so the sparse `IOVECS` table can hold at most `u16::MAX + 1` (65536)
-/// entries. This is the SINGLE cap: `init()` validates the startup segment count
-/// against it, and `append_iovec` enforces it on every runtime growth so a
-/// runaway `expand()` fails cleanly instead of panicking.
-pub const MAX_SEGMENTS: usize = u16::MAX as usize + 1;
+/// whole module. `init()` validates the startup count against it, and
+/// `append_iovec` enforces it on every runtime growth.
+pub const MAX_SEGMENTS: usize = 16_384;
 
 /// Called by SegmentPool when creating each segment.
 /// Fills the first `None` hole in the sparse table (or appends if no hole),
@@ -276,16 +273,17 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         // The engine's constructor ran IORING_REGISTER_BUFFERS over every startup
         // segment's iovec, so those segments ARE in the kernel buffer table: mark
         // them registered so their I/O uses the fixed (ReadFixed/WriteFixed) path.
-        // Segments added later by expand() stay unregistered (non-fixed) until a
-        // future register_buffers_update path flips them. Tiered-only — Dram mode
-        // has no io_uring engine, so the flag is never consulted there.
+        // Segments added later by expand() stay unregistered (non-fixed) for their
+        // whole life — the dense table is fixed-size after this call. Tiered-only —
+        // Dram mode has no io_uring engine, so the flag is never consulted there.
         DRAM_POOL
             .get()
             .expect("DRAMPool set above")
             .mark_all_registered();
-        if let Some(pool) = NVME_POOL.get() {
-            pool.mark_all_registered();
-        }
+        NVME_POOL
+            .get()
+            .expect("NVMePool set above")
+            .mark_all_registered();
 
         // Background SMART log poller: reads the controllers once per interval;
         // INFO only ever serves the latest snapshot. First read populates it.
