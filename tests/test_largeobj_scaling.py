@@ -137,6 +137,28 @@ def write_until_pinned_skip(client, prefix, payload, batch, timeout=10):
             return before, after
 
 
+def write_until_key_is_claimed(client, prefix, payload, batch, key, timeout=10):
+    """SET `payload` under `prefix` until a walk destroys `key`. False if it never does.
+
+    The other half of `write_until_pinned_skip`: a skip has to be the pin and not a
+    permanent refusal. The reference a transfer holds is gone once that transfer resolves,
+    so the walks that were declining `key` must start claiming it — otherwise it is
+    un-evictable for the node's lifetime and its bytes are lost to the budget.
+    """
+    deadline = time.time() + timeout
+    i = 0
+    while client.execute_command('EXISTS', key) == 1:
+        if time.time() >= deadline:
+            return False
+        for _ in range(batch):
+            try:
+                client.execute_command('BLOB.SET', f'{prefix}{i}', payload)
+            except ResponseError:
+                pass
+            i += 1
+    return True
+
+
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
 class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -708,6 +730,9 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('BLOB.GET', 'fill_0') == payload, \
             "declining a victim must leave it readable, not half-unlinked"
+        assert write_until_key_is_claimed(
+            client, 'after_', payload, 2 * self.PINNED_OBJECTS, 'fill_0'), \
+            "with the transfer over, fill_0 must be a candidate again, not pinned for good"
 
 
 class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
@@ -1391,6 +1416,9 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('BLOB.GET', 'fill_0') == b'F' * self.OBJ, \
             "declining a victim must leave it readable, not half-unlinked"
+        assert write_until_key_is_claimed(
+            client, 'after_', b'N' * self.OBJ, 2 * self.OBJECTS_PER_CAP, 'fill_0'), \
+            "with the reader gone, fill_0 must be a candidate again, not pinned for good"
 
 
 class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):

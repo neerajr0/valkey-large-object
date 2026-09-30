@@ -343,38 +343,3 @@ impl DRAMPool {
         true
     }
 }
-
-// ─── Unit Tests ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Eviction skips pinned objects, so `is_pinned` decides whether an object is
-    /// destroyed. Both answers have to be right: a false negative destroys a buffer
-    /// the NIC is reading, and a false positive makes the object permanently
-    /// un-evictable. The map's own reference is what makes the count 1 at rest.
-    #[test]
-    fn is_pinned_tracks_holders_outside_the_map() {
-        let pool = DRAMPool::new(1, 1024 * 1024);
-        let oid = ObjectId::next();
-        let buffers = pool.alloc_exact(4096).expect("fresh pool must serve 4096");
-        pool.insert_object(oid, Arc::new(ObjectContext::new_ready(buffers)));
-
-        assert!(
-            !pool.is_pinned(&oid),
-            "only the map holds it, so it is evictable"
-        );
-
-        // What an in-flight transfer holds. `get_object` clones, which is precisely
-        // why `is_pinned` must not use it to look.
-        let transfer = pool.get_object(&oid).expect("object is resident");
-        assert!(pool.is_pinned(&oid), "a transfer holds it — do not evict");
-
-        drop(transfer);
-        assert!(
-            !pool.is_pinned(&oid),
-            "the transfer's drop returns it to eviction's reach, with no help from us"
-        );
-    }
-}

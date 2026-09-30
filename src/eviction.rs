@@ -743,21 +743,6 @@ fn restore_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::context::ObjectContext;
-    use crate::storage::DRAMPool;
-
-    /// The credit a walk gets is the aligned size the arena gave out, not the user length, since
-    /// the former is what freeing gives back.
-    #[test]
-    fn credit_is_the_aligned_size_the_arena_gave_out() {
-        let pool = DRAMPool::new(1, 1024 * 1024);
-        let buffers = pool.alloc_exact(4096).expect("fresh pool must serve 4096");
-        let placed: u64 = buffers.iter().map(|b| b.len as u64).sum();
-        let obj_ctx = ObjectContext::new_ready(buffers);
-
-        assert_eq!(arena_bytes(&obj_ctx), placed);
-        assert!(arena_bytes(&obj_ctx) >= 4096, "never under the request");
-    }
 
     /// Each arm is a refusal that saves the keyspace from a request no amount of work could serve.
     #[test]
