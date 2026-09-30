@@ -200,10 +200,6 @@ impl UringNvmeEngine {
     ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
-        // Fixed vs non-fixed is now a PER-OP decision (op.use_fixed), set by the
-        // caller from the buffer's segment registration flag. Startup segments
-        // are kernel-registered (fixed); segments added by expand() are not yet
-        // registered and use plain Read/Write until/unless they are.
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
         loop {

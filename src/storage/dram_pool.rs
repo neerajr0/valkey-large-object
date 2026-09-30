@@ -156,8 +156,8 @@ impl DRAMPool {
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
     /// alloc_exact_or_expand with all-or-nothing semantics.
     ///
-    /// Pool full even after expanding one segment → returns None. Caller falls
-    /// back to NVMe read (Tiered mode).
+    /// If we cannot expand (or promote into existing segments), returns None.
+    /// Caller falls back to NVMe read (Tiered mode).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -236,10 +236,10 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, gated by the server-wide `maxmemory` (the
-    /// real OOM boundary, via `would_cross_memory_watermark`). When the server
-    /// has no `maxmemory` configured (0), there is no ceiling and the pool grows
-    /// on demand — the same unbounded behavior as core Valkey with `maxmemory 0`.
+    /// Add one segment to the pool, gated by the server-wide `maxmemory` (via
+    /// `would_cross_memory_watermark`). When the server has no `maxmemory`
+    /// configured (0), there is no ceiling and the pool grows on demand — the
+    /// same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
     /// Returns the new iovec_index on success, `None` if the watermark would be

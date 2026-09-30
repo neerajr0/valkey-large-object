@@ -45,13 +45,11 @@ pub fn scaling_cron(ctx: &Context) {
     // DRAM back only under Valkey-wide pressure, so the module's own pool pressure
     // (which drives expand) must not trigger shrink.
     //
-    // Expand takes priority over shrink within a tick. Expand and shrink read
-    // different denominators (module pool utilization vs server used/maxmemory),
-    // so both can cross on the same tick — firing both would add an empty segment
-    // then immediately drain the least-loaded one: pure churn. Gating on
-    // expand-SUCCEEDED (not merely wanted) is deliberate — if expand was capped or
-    // failed, shrink still runs, so a pool that cannot grow never deadlocks under
-    // pressure.
+    // Expand takes priority within a tick: expand and shrink read different
+    // denominators (module utilization vs server memory), so both can cross on
+    // the same tick, and firing both would add a segment then immediately drain
+    // one — pure churn. Gated on expand-SUCCEEDED, not merely wanted, so a pool
+    // that can't grow still shrinks under pressure.
     if expanded {
         rearm_scaling_cron(ctx, poll_ms);
         return;

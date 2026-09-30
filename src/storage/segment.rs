@@ -104,18 +104,12 @@ impl Segment {
         }
     }
 
-    /// Whether this segment's buffer is registered in the io_uring kernel table.
-    /// A `false` result routes the segment's I/O through plain Read/Write; a
-    /// `true` result allows ReadFixed/WriteFixed. Relaxed: the flag only ever
-    /// goes false→true, and a stale `false` just takes the always-safe path.
+    /// Whether this segment's buffer is registered in the io_uring kernel table — see the field's doc.
     pub fn is_io_uring_registered(&self) -> bool {
         self.io_uring_registered.load(Ordering::Relaxed)
     }
 
-    /// Mark this segment as registered in the io_uring kernel table. Called only
-    /// after a confirmed-successful registration (the initial startup
-    /// IORING_REGISTER_BUFFERS today; a future register_buffers_update for
-    /// expanded segments). Never un-set while the segment is live.
+    /// Mark this segment as registered — see the field's doc. Never un-set while the segment is live.
     pub fn mark_io_uring_registered(&self) {
         self.io_uring_registered.store(true, Ordering::Relaxed);
     }
@@ -156,6 +150,7 @@ impl Drop for Segment {
         // the segment's MemoryRegion handles (invalidate the cache entry, then fi_close once
         // no in-flight transfer still leases them). No-op if no fabric or never registered.
         crate::efa_release_segment(self.base as usize);
+        // TODO: Deregister with IO_URING once the dynamic submission is supported.
         // Dropping the Talc first is not required — its metadata lives inside
         // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
         // memory (talc has no external state). Then dealloc the backing memory.

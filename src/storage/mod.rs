@@ -195,7 +195,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     // DRAMPool always starts with 1 segment and grows on demand — reactively
     // when an allocation can't fit, and proactively via the scaling cron. Growth
     // is gated by server `maxmemory` (unbounded when maxmemory is 0, like core
-    // Valkey). There is no module-local DRAM budget.
+    // Valkey).
     let dram_segment_count = 1;
     // Total registered iovecs (DRAM + NVMe) must fit in u16 for io_uring IORING_REGISTER_BUFFERS.
     //

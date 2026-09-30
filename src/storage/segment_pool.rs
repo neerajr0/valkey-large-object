@@ -43,9 +43,7 @@ use super::segment::Segment;
 /// reverse-lookup index — each segment carries its own talc, and the
 /// segment_idx is known at alloc time (from the picker).
 struct SegmentState {
-    /// Segment slots, index-aligned with the global `IOVECS` table: slot `i` =
-    /// iovec_index `i`. The alignment holds by construction — segments are placed
-    /// at the index `append_iovec` assigns, never a separate hole-search.
+    /// Segment slots. Slot `i` = iovec_index `i` in the sparse io_uring table.
     /// `None` = empty slot (hole from a previous drain, or unused capacity).
     slots: Vec<Option<Segment>>,
 }
@@ -108,8 +106,8 @@ impl SegmentPool {
     /// Single `min_by_key` pass, no fallback loop (same as `alloc_one`): segments
     /// are uniform, so if the emptiest eligible one can't fit — only possible by
     /// talc's per-chunk boundary-tag overhead — none can, and `None` = pool full,
-    /// which the caller handles via reactive expand. Keeps an object co-located
-    /// (unlike the old per-chunk `alloc_n` loop) — see `alloc_exact`.
+    /// which the caller handles via reactive expand. Keeps an object co-located —
+    /// see `alloc_exact`.
     fn alloc_object_in_one_segment(&self, sizes: &[usize]) -> Option<Vec<SegmentBuffer>> {
         assert!(
             !sizes.is_empty(),
@@ -175,9 +173,6 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// Allocate one buffer per entry in `sizes`, **all from a single segment**,
-    /// all-or-nothing.
-    ///
     /// Mirror talc's authoritative live figures (`allocated_bytes`,
     /// `fragment_count`) into the segment's atomics. Call while holding the
     /// segment's talc lock: talc updates these inside allocate/deallocate, so
@@ -402,8 +397,8 @@ impl SegmentPool {
             {
                 let talc = seg.talc.lock().expect("segment talc lock unavailable");
                 // SAFETY: ptr was returned by this segment's TalcCell::allocate for this
-                // exact layout, and is freed exactly once (the owning SegmentBuffer
-                // drops once).
+                // exact layout, and is freed exactly once -- the buffer's sole owner
+                // (ObjectContext/StreamingContext) calls free once in its Drop.
                 unsafe {
                     talc.deallocate(NonNull::new_unchecked(ptr), layout);
                 }
