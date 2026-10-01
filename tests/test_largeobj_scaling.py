@@ -456,18 +456,6 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
             f" fabric-interfaces lo"
         )
 
-    def start_target(self, *flags):
-        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
-        process = subprocess.Popen(
-            [target, '127.0.0.1', *flags],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        line = process.stdout.readline()
-        assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
-        return process, address, int(rkey), int(remote_addr)
-
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()
 
