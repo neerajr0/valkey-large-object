@@ -1,7 +1,7 @@
 //! io_uring engine — one independent instance PER POOL (Tiered mode only).
 //!
 //! Each engine owns its own ring, registered-buffer table, and CQ poller thread.
-//! `submit(PoolId, IoRequest)` routes to that pool's ring; the poller submits
+//! `submit(PoolType, IoRequest)` routes to that pool's ring; the poller submits
 //! ReadFixed/WriteFixed and returns results on a oneshot channel. The two tables
 //! are independent (IORING_REGISTER_BUFFERS is per-ring-fd) and `iovec_index` is
 //! pool-local. Every op names exactly one buffer + a raw file fd/offset, so no op
@@ -24,7 +24,7 @@ use super::StorageError;
 /// Which pool's ring an op or reregister targets. The whole generic seam: one
 /// `UringEngine` type, two instances keyed by this field — no trait, no dyn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PoolId {
+pub enum PoolType {
     Dram,
     Nvme,
 }
@@ -68,7 +68,7 @@ enum IoRequest {
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
     /// Rebuild this ring's fixed-buffer table from its live segments. 5.10 has
-    /// only a whole-table swap: the poller sets `registration_pending` (new ops
+    /// only a whole-table re-register: the poller sets `registration_pending` (new ops
     /// go non-fixed), waits for in-flight fixed ops to drain, then
     /// unregister + register. Fire-and-forget from expand()/release().
     Reregister,
@@ -87,7 +87,7 @@ enum PendingOp {
         /// Expected byte count for this I/O op. Short reads are rejected.
         expected_bytes: u64,
         /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
-        /// gates the whole-table registration swap (see `poller_loop`).
+        /// gates the whole-table re-registration (see `poller_loop`).
         fixed: bool,
     },
     Write {
@@ -128,27 +128,27 @@ static DRAM_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
 /// Install the engine for `pool`. Panics if already set (init runs once).
-pub fn set_engine(pool: PoolId, engine: UringEngine) {
+pub fn set_engine(pool: PoolType, engine: UringEngine) {
     let slot = match pool {
-        PoolId::Dram => &DRAM_ENGINE,
-        PoolId::Nvme => &NVME_ENGINE,
+        PoolType::Dram => &DRAM_ENGINE,
+        PoolType::Nvme => &NVME_ENGINE,
     };
     if slot.set(engine).is_err() {
         panic!("{:?} engine already initialized", pool);
     }
 }
 
-fn engine(pool: PoolId) -> Option<&'static UringEngine> {
+fn engine(pool: PoolType) -> Option<&'static UringEngine> {
     match pool {
-        PoolId::Dram => DRAM_ENGINE.get(),
-        PoolId::Nvme => NVME_ENGINE.get(),
+        PoolType::Dram => DRAM_ENGINE.get(),
+        PoolType::Nvme => NVME_ENGINE.get(),
     }
 }
 
 /// Submit an IoRequest to the poller thread of `pool`'s ring.
 /// Returns SendError with the request back on failure (channel disconnected)
 /// so the caller can extract the oneshot sender and fire an explicit error.
-fn submit(pool: PoolId, req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
+fn submit(pool: PoolType, req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
     match engine(pool) {
         Some(engine) => engine.tx.send(req),
         None => Err(crossbeam_channel::SendError(req)),
@@ -163,7 +163,7 @@ fn submit(pool: PoolId, req: IoRequest) -> Result<(), crossbeam_channel::SendErr
 /// Submit a ReadFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
 pub fn submit_read(
-    pool: PoolId,
+    pool: PoolType,
     fd: RawFd,
     op: UringOp,
 ) -> oneshot::Receiver<Result<u64, StorageError>> {
@@ -179,7 +179,7 @@ pub fn submit_read(
 /// Submit a WriteFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
 pub fn submit_write(
-    pool: PoolId,
+    pool: PoolType,
     fd: RawFd,
     op: UringOp,
 ) -> oneshot::Receiver<Result<(), StorageError>> {
@@ -196,11 +196,10 @@ pub fn submit_write(
 /// Fire-and-forget; no-op if that pool has no engine (Dram mode). Only `Dram` in
 /// practice — the NVMe pool is fixed-size.
 ///
-/// The send runs on a tokio worker, never the caller's thread: crossbeam's send
-/// inits a per-thread waker thread-local freed only on thread exit. The callers
-/// (expand/release) run on the main valkey thread, which never exits before the
-/// process does → that 48-byte cell leaks (ASan). Workers reclaim it.
-pub fn submit_reregister(pool: PoolId) {
+/// Spawned on a tokio worker, not the caller: crossbeam's send inits a
+/// thread-local reclaimed only on thread exit, and the main valkey thread (the
+/// caller) never exits — a worker does.
+pub fn submit_reregister(pool: PoolType) {
     if engine(pool).is_none() {
         return; // Dram mode / not initialized — nothing to reregister.
     }
@@ -230,7 +229,7 @@ impl Drop for UringEngine {
 impl UringEngine {
     /// Create an engine for `pool`: init the ring, register its buffers, spawn the
     /// CQ poller. Err if the kernel lacks io_uring or registration fails.
-    pub fn new(pool: PoolId, iovecs: Vec<libc::iovec>) -> Result<Self, String> {
+    pub fn new(pool: PoolType, iovecs: Vec<libc::iovec>) -> Result<Self, String> {
         // Create ring on main thread — fail gracefully instead of panicking.
         let ring =
             io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
@@ -257,10 +256,10 @@ impl UringEngine {
     }
 
     /// The CQ poller loop — owns one pool's io_uring ring (received fully
-    /// initialized). `pool` selects which pool's table a registration swap
+    /// initialized). `pool` selects which pool's table a re-registration
     /// rebuilds.
     fn poller_loop(
-        pool: PoolId,
+        pool: PoolType,
         rx: Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
@@ -269,7 +268,7 @@ impl UringEngine {
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
-        // Registration swap state: while pending, ops go non-fixed; the swap fires
+        // Re-registration state: while pending, ops go non-fixed; the re-register fires
         // once in-flight fixed ops drain to 0.
         let mut registration_pending = false;
         let mut fixed_in_flight: usize = 0;
@@ -278,7 +277,7 @@ impl UringEngine {
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
             }
-            // Swap: once in-flight fixed ops have drained, rebuild + re-register
+            // Re-register: once in-flight fixed ops have drained, rebuild + re-register
             // the table. In-window ops went non-fixed, so stale indices are unused.
             if registration_pending && fixed_in_flight == 0 {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
@@ -337,15 +336,15 @@ impl UringEngine {
                 next_token += 1;
                 let (sqe, op) = match req {
                     IoRequest::Reregister => {
-                        // Enter the swap window. Ops keep flowing but are forced
+                        // Enter the re-register window. Ops keep flowing but are forced
                         // non-fixed below until `fixed_in_flight` drains and the
-                        // top-of-loop swap re-registers the table. No SQE to build.
+                        // top-of-loop re-register rebuilds the table. No SQE to build.
                         registration_pending = true;
                         continue;
                     }
                     IoRequest::Read { fd, op, tx } => {
                         let read_len = super::align_up(op.len as usize) as u32;
-                        // Kill-switch: while a swap is pending, issue non-fixed so a
+                        // Kill-switch: while a re-register is pending, issue non-fixed so a
                         // stale iovec_index against the about-to-change table is never used.
                         let issue_fixed = op.use_fixed && !registration_pending;
                         let sqe = if issue_fixed {

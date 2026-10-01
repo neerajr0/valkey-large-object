@@ -207,7 +207,7 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub async fn read_and_verify_file_header(
     fd: RawFd,
-    pool_id: uring::PoolId,
+    pool_id: uring::PoolType,
     iovec_index: u16,
     pool_buffer_ptr: usize,
     use_fixed: bool,
@@ -316,7 +316,7 @@ pub async fn write_file_header(
         len: FILE_HEADER_SIZE,
         use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
     };
-    let hdr_rx = uring::submit_write(uring::PoolId::Nvme, fd, hdr_op);
+    let hdr_rx = uring::submit_write(uring::PoolType::Nvme, fd, hdr_op);
     match hdr_rx.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),

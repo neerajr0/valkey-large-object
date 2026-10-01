@@ -120,9 +120,9 @@ impl std::fmt::Display for StorageError {
 
 use std::sync::OnceLock;
 
-/// Maximum number of registered segments in ANY single pool's io_uring buffer
-/// table. Each pool (DRAM, NVMe) has its OWN ring and OWN table with its own
-/// pool-local `iovec_index` space, so this bounds each table independently.
+/// Maximum number of registered segments in ANY single pool.
+/// In tiered mode, each pool (DRAM, NVMe) has its OWN ring and OWN iovecs table,
+/// so this bounds each table independently.
 /// `init()` validates each pool's startup count against it, and
 /// `SegmentPool::expand` enforces it on every runtime growth (a `u16`
 /// iovec_index also caps a table at 65536; 16384 is the tighter io_uring
@@ -160,13 +160,9 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     // is gated by server `maxmemory` (unbounded when maxmemory is 0, like core
     // Valkey).
     let dram_segment_count = 1;
-    // Each pool has its OWN io_uring ring + registered-buffer table with its own
-    // pool-local u16 iovec_index space, so the per-pool count (not the sum) must
-    // fit MAX_SEGMENTS. NVMe staging is split into uniform `segment_size`
-    // segments (the io_uring/EFA per-buffer cap is 1 GiB, and segment-size is
-    // bounded to ≤1 GiB). Ceiling division so total NVMe staging capacity is
-    // never less than the requested nvme-staging-size (floor would under-
-    // provision: e.g. 100MB staging / 64MB segment = 1 segment = 64MB, 36MB short).
+    // NVMe staging is split into uniform `segment_size` segments (based on startup configs).
+    // Ceiling division so total staging capacity is never below the requested
+    // nvme-staging-size (floor would under-provision: 100MB / 64MB = 1 seg = 64MB).
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
         (nvme_staging.div_ceil(dram_seg_size)).max(1)
     } else {
@@ -175,7 +171,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     if dram_segment_count > MAX_SEGMENTS || nvme_segments > MAX_SEGMENTS {
         return Err(format!(
             "too many segments (DRAM {}, NVMe {}). \
-             Max {} per pool (io_uring iovec_index is u16, per-ring table). \
+             Max {} per pool. \
              Increase segment-size or decrease nvme-staging-size",
             dram_segment_count, nvme_segments, MAX_SEGMENTS,
         ));
@@ -197,26 +193,18 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     // io_uring engines: only in Tiered mode. TWO independent engines — one for
     // the DRAM ring, one for the NVMe ring — each registering ONLY its own pool's
     // segments. Ring creation + buffer registration happen on this (main) thread
-    // so failures return Err, not panic in the poller. On any failure the local
-    // pools drop naturally and we clear their iovec tables so a retry starts fresh.
+    // so failures return Err, not panic in the poller. On failure the local pools
+    // drop naturally, so a module-load retry starts fresh.
     let engines = if mode == crate::OperatingMode::Tiered {
         let nvme_pool_ref = nvme_pool.as_ref().expect("NVMePool exists in Tiered mode");
-        let dram_engine = uring::UringEngine::new(uring::PoolId::Dram, dram_pool.startup_iovecs())
-            .map_err(|e| {
-                dram_pool.clear_iovecs();
-                nvme_pool_ref.clear_iovecs();
-                format!("io_uring DRAM engine: {}", e)
-            })?;
+        let dram_engine =
+            uring::UringEngine::new(uring::PoolType::Dram, dram_pool.startup_iovecs())
+                .map_err(|e| format!("io_uring DRAM engine: {}", e))?;
         let nvme_engine =
-            uring::UringEngine::new(uring::PoolId::Nvme, nvme_pool_ref.startup_iovecs()).map_err(
-                |e| {
-                    // dram_engine drops here (Drop sets its shutdown flag) as the
-                    // Err short-circuits before we move it into `engines`.
-                    dram_pool.clear_iovecs();
-                    nvme_pool_ref.clear_iovecs();
-                    format!("io_uring NVMe engine: {}", e)
-                },
-            )?;
+            uring::UringEngine::new(uring::PoolType::Nvme, nvme_pool_ref.startup_iovecs())
+                // dram_engine drops here (Drop sets its shutdown flag) as the Err
+                // short-circuits before we move it into `engines`.
+                .map_err(|e| format!("io_uring NVMe engine: {}", e))?;
         Some((dram_engine, nvme_engine))
     } else {
         None
@@ -236,8 +224,8 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         panic!("DRAMPool already initialized");
     }
     if let Some((dram_engine, nvme_engine)) = engines {
-        uring::set_engine(uring::PoolId::Dram, dram_engine);
-        uring::set_engine(uring::PoolId::Nvme, nvme_engine);
+        uring::set_engine(uring::PoolType::Dram, dram_engine);
+        uring::set_engine(uring::PoolType::Nvme, nvme_engine);
         // Each engine's constructor ran IORING_REGISTER_BUFFERS over its own
         // pool's startup segments, so those segments ARE in that ring's kernel
         // buffer table: mark them registered so their I/O uses the fixed
@@ -288,17 +276,12 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// Rebuild ONE pool's dense io_uring fixed-buffer table from its live segments,
 /// reassigning each a dense pool-local `iovec_index`, marking it registered, and
 /// returning the iovec array for that ring's `register_buffers`. Dense because
-/// 5.10 can only swap the whole table. Only `PoolId::Dram` swaps in practice;
-/// NVMe is fixed-size.
-pub fn rebuild_dense_iovecs_for(pool: uring::PoolId) -> Vec<libc::iovec> {
+/// 5.10 can only re-register the whole table. Only `PoolType::Dram` re-registers
+/// in practice; NVMe is fixed-size.
+pub fn rebuild_dense_iovecs_for(pool: uring::PoolType) -> Vec<libc::iovec> {
     match pool {
-        uring::PoolId::Dram => get_dram_pool().rebuild_dense_iovecs(),
-        // NVMe never expands/shrinks, so this is unreachable in practice, but
-        // rebuild its own table faithfully if ever asked.
-        uring::PoolId::Nvme => NVME_POOL
-            .get()
-            .map(|p| p.rebuild_dense_iovecs())
-            .unwrap_or_default(),
+        uring::PoolType::Dram => get_dram_pool().rebuild_dense_iovecs(),
+        uring::PoolType::Nvme => unreachable!("NVMe ring never reregisters"),
     }
 }
 

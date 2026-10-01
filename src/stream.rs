@@ -273,7 +273,7 @@ impl Target<'_> {
             Target::NvmeWrite { buffers, pool } => {
                 let buf = &buffers[chunk.buffer_idx];
                 let rx = uring::submit_write(
-                    uring::PoolId::Nvme,
+                    uring::PoolType::Nvme,
                     fd.expect("NvmeWrite requires an fd"),
                     uring::UringOp {
                         iovec_index: pool.iovec_index_for_buf(buf),
@@ -323,7 +323,7 @@ impl Pool {
     /// Whether the buffer's segment is registered in the kernel io_uring buffer
     /// table — drives the per-op fixed vs non-fixed path. Startup segments are
     /// registered; a segment added by expand() is not until the pool's poller
-    /// runs the whole-table unregister + re-register swap.
+    /// runs the whole-table unregister + re-register.
     pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
         match self {
             Pool::Nvme(p) => p.is_buf_io_uring_registered(b),
@@ -332,10 +332,10 @@ impl Pool {
     }
     /// Which pool's io_uring ring backs these buffers — routes each op to the
     /// engine that owns its buffer's registered table.
-    pub(crate) fn pool_id(&self) -> uring::PoolId {
+    pub(crate) fn pool_id(&self) -> uring::PoolType {
         match self {
-            Pool::Nvme(_) => uring::PoolId::Nvme,
-            Pool::Dram(_) => uring::PoolId::Dram,
+            Pool::Nvme(_) => uring::PoolType::Nvme,
+            Pool::Dram(_) => uring::PoolType::Dram,
         }
     }
 }
@@ -407,7 +407,7 @@ pub struct FileHeaderRead {
     pub use_fixed: bool,
     /// Which pool's ring owns the header buffer (DRAM promotion buffer vs NVMe
     /// streaming buffer) — routes the header read to the correct engine.
-    pub pool_id: uring::PoolId,
+    pub pool_id: uring::PoolType,
 }
 
 /// Everything the loop needs that isn't the source/target themselves.

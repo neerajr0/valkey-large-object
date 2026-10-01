@@ -199,7 +199,7 @@ print_scaling() {
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
     # io_uring registration coverage, per pool: each should equal that pool's live
-    # count once the post-expand swap has completed. Dram mode shows dram=0 (no
+    # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
     # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
     # it is reported once against total_live.
     echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
