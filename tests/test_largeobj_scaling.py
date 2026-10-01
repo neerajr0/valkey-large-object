@@ -42,6 +42,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
+            f" max-object-size 983040"
             f" scaling-poll-ms 60000"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -59,7 +60,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
+        address, rkey, remote_addr = line.split()[1:4]
         return process, address, int(rkey), int(remote_addr)
 
     def test_expand_on_segment_full(self):
@@ -181,6 +182,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
+            f" max-object-size 983040"
             f" scaling-expand-watermark 50"
             f" scaling-shrink-watermark 99"
             f" scaling-poll-ms 1000"
@@ -230,6 +232,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
+            f" max-object-size 983040"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -270,7 +273,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 983040"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -327,7 +330,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 983040"
             f" scaling-poll-ms 1000"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -447,7 +450,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 983040"
             f" scaling-poll-ms 1000"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -465,7 +468,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
+        address, rkey, remote_addr = line.split()[1:4]
         return process, address, int(rkey), int(remote_addr)
 
     def test_shrink_releases_efa_registered_expanded_segment(self):

@@ -49,6 +49,27 @@ pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
 }
 
+/// Whether an object of `obj_len` is guaranteed allocatable in a single empty
+/// segment. `alloc_exact` co-locates every chunk of an object in one segment,
+/// and talc charges one IO_ALIGN block of boundary tag per allocation plus one
+/// for the segment's heap header.
+pub fn object_fits_segment(segment_size: usize, obj_len: usize, chunk_size: usize) -> bool {
+    if obj_len == 0 {
+        return true;
+    }
+    if chunk_size == 0 {
+        return false;
+    }
+    let chunks = obj_len.div_ceil(chunk_size);
+    // What we allocate: each chunk is aligned up to IO_ALIGN for O_DIRECT.
+    let full = (chunks - 1).saturating_mul(align_up(chunk_size));
+    let last = align_up(obj_len - (chunks - 1) * chunk_size);
+    // What talc needs: one IO_ALIGN boundary tag per allocation plus one for
+    // the segment's heap header.
+    let slack = chunks.saturating_add(1).saturating_mul(IO_ALIGN);
+    full.saturating_add(last).saturating_add(slack) <= segment_size
+}
+
 /// User data length for a given chunk. All chunks are `chunk_size` except
 /// the last, which may be shorter (the remainder of `total_len / chunk_size`).
 pub(crate) fn chunk_user_data_len(
