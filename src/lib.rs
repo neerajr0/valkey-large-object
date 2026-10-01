@@ -374,24 +374,24 @@ pub fn max_object_size() -> u64 {
     CFG_MAX_OBJECT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-// ─── Config Dependency Graph ─────────────────────────────────────────────────
+// ─── Config Constraints ──────────────────────────────────────────────────────
 //
-// Directed graph of constraints between configs. Each edge enforces
+// List of constraints between configs. Each constraint enforces
 // parent >= child when its condition is true, unless it supplies a custom
 // validator predicate.
 //
 // At module load (before RUNTIME is set), per-config callbacks skip validation
 // (config processing order is non-deterministic across type categories).
-// validate_all_edges() runs in initialize() after all configs are finalized.
+// validate_all_constraints() runs in initialize() after all configs are finalized.
 //
 // At runtime (CONFIG SET), the framework stores the new value into the atomic
-// before calling the validation callback. validate_config_edge() then runs
-// validate_all_edges() over the same atomics — no value substitution needed.
+// before calling the validation callback. validate_config_constraint() then runs
+// validate_all_constraints() over the same atomics — no value substitution needed.
 
-/// A directed constraint between two configs, enforced when enforce_condition()
-/// is true. By default the constraint is `parent >= child`; an edge may override
-/// it with a `validator` predicate taking (parent_value, child_value).
-struct ConfigDependencyEdge {
+/// A constraint between two configs, enforced when enforce_condition()
+/// is true. By default the constraint is `parent >= child`; a constraint may
+/// override it with a `validator` predicate taking (parent_value, child_value).
+struct ConfigConstraint {
     parent: &'static AtomicI64,
     child: &'static AtomicI64,
     enforce_condition: fn() -> bool,
@@ -403,13 +403,13 @@ struct ConfigDependencyEdge {
 
 // SAFETY: All AtomicI64 references are to lazy_static statics with 'static lifetime.
 // The fn pointers and &str are inherently Send+Sync.
-unsafe impl Sync for ConfigDependencyEdge {}
+unsafe impl Sync for ConfigConstraint {}
 
-fn config_graph() -> &'static [ConfigDependencyEdge] {
+fn config_constraints() -> &'static [ConfigConstraint] {
     use std::sync::LazyLock;
-    static GRAPH: LazyLock<Vec<ConfigDependencyEdge>> = LazyLock::new(|| {
+    static CONSTRAINTS: LazyLock<Vec<ConfigConstraint>> = LazyLock::new(|| {
         vec![
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_NVME_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
@@ -417,35 +417,35 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
                 validator: Some(|p, c| p == 0 || p >= c),
                 error_msg: errors::ERR_NVME_GE_MAX_OBJ,
             },
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_NVME_STAGING_SIZE,
                 child: &CFG_SEGMENT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 validator: None,
                 error_msg: errors::ERR_STAGING_GE_SEGMENT,
             },
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
                 validator: None,
                 error_msg: errors::ERR_SEGMENT_GE_CHUNK,
             },
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Dram,
                 validator: Some(object_fits_segment),
                 error_msg: errors::ERR_SEGMENT_GE_MAX_OBJ,
             },
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_MAX_PROMOTE_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 validator: Some(object_fits_segment),
                 error_msg: errors::ERR_SEGMENT_GE_PROMOTE,
             },
-            ConfigDependencyEdge {
+            ConfigConstraint {
                 parent: &CFG_MAX_BUFFERS_PER_OP,
                 child: &CFG_MIN_BUFFERS_PER_OP,
                 enforce_condition: || true,
@@ -454,10 +454,10 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
             },
         ]
     });
-    &GRAPH
+    &CONSTRAINTS
 }
 
-/// Edge validator: an object of `object_size` must fit in one empty segment of
+/// Constraint validator: an object of `object_size` must fit in one empty segment of
 /// `segment_size` after talc's per-chunk metadata, since `alloc_exact`
 /// co-locates all of an object's chunks in a single segment.
 fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
@@ -465,33 +465,33 @@ fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
     storage::object_fits_segment(segment_size as usize, object_size as usize, chunk_size)
 }
 
-/// Validate all config edges. Returns the first violated constraint or Ok(()).
+/// Validate all config constraints. Returns the first violated constraint or Ok(()).
 /// Called in initialize() after all configs are finalized, and by
-/// validate_config_edge() at runtime (CONFIG SET) after the framework has
+/// validate_config_constraint() at runtime (CONFIG SET) after the framework has
 /// already stored the new value into the atomic.
-fn validate_all_edges() -> Result<(), String> {
-    for edge in config_graph() {
-        if !(edge.enforce_condition)() {
+fn validate_all_constraints() -> Result<(), String> {
+    for constraint in config_constraints() {
+        if !(constraint.enforce_condition)() {
             continue;
         }
-        let p = edge.parent.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        let c = edge.child.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        let holds = match edge.validator {
+        let p = constraint.parent.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let c = constraint.child.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let holds = match constraint.validator {
             Some(validator) => validator(p, c),
             None => p >= c,
         };
         if !holds {
-            return Err(edge.error_msg.into());
+            return Err(constraint.error_msg.into());
         }
     }
     Ok(())
 }
 
-/// Shared validation callback for mutable configs participating in the dependency
-/// graph. At initial load, defers to validate_all_edges() in initialize().
+/// Shared validation callback for mutable configs participating in the config
+/// constraints. At initial load, defers to validate_all_constraints() in initialize().
 /// At runtime (CONFIG SET), the framework has already stored the new value, so
-/// we just re-check all edges against current atomics.
-fn validate_config_edge(
+/// we just re-check all constraints against current atomics.
+fn validate_config_constraint(
     _ctx: &valkey_module::configuration::ConfigurationContext,
     _name: &str,
     _val: &'static AtomicI64,
@@ -499,7 +499,7 @@ fn validate_config_edge(
     if RUNTIME.get().is_none() {
         return Ok(());
     }
-    validate_all_edges().map_err(valkey_module::ValkeyError::String)
+    validate_all_constraints().map_err(valkey_module::ValkeyError::String)
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -523,10 +523,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     let mode = operating_mode();
     let dir = nvme_dir();
 
-    // Validate cross-config dependency graph now that all configs are finalized.
+    // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
     // order across config types); this is the single enforcement point at startup.
-    if let Err(e) = validate_all_edges() {
+    if let Err(e) = validate_all_constraints() {
         ctx.log_warning(&format!("largeobj: config validation failed: {e}"));
         return Status::Err;
     }
@@ -657,17 +657,17 @@ valkey_module! {
             ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
-             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
-             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
-             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_edge))],
+             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
-             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_edge))],
+             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
@@ -677,7 +677,7 @@ valkey_module! {
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
-             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
+             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
@@ -712,9 +712,9 @@ mod tests {
 
     // ─── Test Infrastructure ─────────────────────────────────────────────
 
-    /// Reset all graph configs to their compile-time defaults. Other tests
+    /// Reset all constrained configs to their compile-time defaults. Other tests
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
-    fn reset_graph_defaults() {
+    fn reset_constrained_defaults() {
         CFG_NVME_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
         CFG_NVME_STAGING_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
         CFG_SEGMENT_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
@@ -734,9 +734,9 @@ mod tests {
         *CFG_OPERATING_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
 
-    /// All configs that participate in the dependency graph, paired with
+    /// All configs that participate in config constraints, paired with
     /// their current value. Used to snapshot defaults and restore between cases.
-    fn all_graph_configs() -> Vec<(&'static AtomicI64, i64)> {
+    fn all_constrained_configs() -> Vec<(&'static AtomicI64, i64)> {
         vec![
             (&CFG_NVME_MAXMEMORY, CFG_NVME_MAXMEMORY.load(Relaxed)),
             (&CFG_NVME_STAGING_SIZE, CFG_NVME_STAGING_SIZE.load(Relaxed)),
@@ -755,7 +755,7 @@ mod tests {
         ]
     }
 
-    // ─── validate_all_edges: parametrized test data ────────────────────
+    // ─── validate_all_constraints: parametrized test data ─────────────
     //
     // Each entry: (label, mode, config overrides, expected error substring or None).
     // The runner restores defaults before each case, then applies mode + overrides,
@@ -765,20 +765,20 @@ mod tests {
     // mutation) and passed in so override expressions like `segment - 1` use
     // the real defaults without duplicating their numeric values.
 
-    type EdgeTestCase = (
+    type ConstraintTestCase = (
         &'static str,
         OperatingMode,
         Vec<(&'static AtomicI64, i64)>,
         Option<&'static str>,
     );
 
-    fn edge_test_cases(
+    fn constraint_test_cases(
         segment: i64,
         chunk: i64,
         max_obj: i64,
         max_buf: i64,
         min_buf: i64,
-    ) -> Vec<EdgeTestCase> {
+    ) -> Vec<ConstraintTestCase> {
         vec![
             // ── Happy paths ──────────────────────────────────────────────
             ("defaults_pass", OperatingMode::Dram, vec![], None),
@@ -795,7 +795,7 @@ mod tests {
                 None,
             ),
             (
-                "mode_conditional_edge_skipped_when_inactive",
+                "mode_conditional_constraint_skipped_when_inactive",
                 OperatingMode::Dram,
                 vec![(&CFG_NVME_MAXMEMORY, 1)],
                 None,
@@ -806,7 +806,7 @@ mod tests {
                 vec![(&CFG_MAX_OBJECT_SIZE, segment + 1)],
                 None,
             ),
-            // ── Violation per edge ───────────────────────────────────────
+            // ── Violation per constraint ──────────────────────────────────
             (
                 "segment_lt_chunk_rejected",
                 OperatingMode::Dram,
@@ -854,24 +854,24 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_all_edges() {
+    fn test_validate_all_constraints() {
         // Restore compile-time defaults in case prior tests mutated statics.
-        reset_graph_defaults();
+        reset_constrained_defaults();
         // Capture defaults before any mutation.
-        let defaults = all_graph_configs();
+        let defaults = all_constrained_configs();
         let segment = CFG_SEGMENT_SIZE.load(Relaxed);
         let chunk = CFG_CHUNK_SIZE.load(Relaxed);
         let max_obj = CFG_MAX_OBJECT_SIZE.load(Relaxed);
         let max_buf = CFG_MAX_BUFFERS_PER_OP.load(Relaxed);
         let min_buf = CFG_MIN_BUFFERS_PER_OP.load(Relaxed);
         for (label, mode, overrides, expected_err) in
-            edge_test_cases(segment, chunk, max_obj, max_buf, min_buf)
+            constraint_test_cases(segment, chunk, max_obj, max_buf, min_buf)
         {
             set_cfgs(&defaults);
             set_mode(OperatingMode::Dram);
             set_mode(mode);
             set_cfgs(&overrides);
-            let result = validate_all_edges();
+            let result = validate_all_constraints();
             match expected_err {
                 None => assert!(result.is_ok(), "{label}: expected Ok, got {result:?}"),
                 Some(substr) => {
