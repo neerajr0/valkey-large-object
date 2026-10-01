@@ -145,14 +145,9 @@ impl Drop for Segment {
         // the segment's MemoryRegion handles (invalidate the cache entry, then fi_close once
         // no in-flight transfer still leases them). No-op if no fabric or never registered.
         crate::efa_release_segment(self.base as usize);
-        // No io_uring deregistration here: on 5.10 the only removal is the whole-
-        // table rebuild fired after the segment leaves its slot. Freeing now is
-        // safe — a segment reaches drop only at refcount == 0, so no in-flight
-        // fixed op carries its iovec_index and the stale table entry is never used
-        // before the next unregister_buffers drops it.
-        // Dropping the Talc first is not required — its metadata lives inside
-        // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
-        // memory (talc has no external state). Then dealloc the backing memory.
+        // No io_uring deregistration: on 5.10 the only removal is the whole-table
+        // rebuild. Safe at refcount == 0 — no in-flight fixed op references it.
+        // talc's metadata lives inside this memory, so nothing to drop before dealloc.
         let layout = Layout::from_size_align(self.size, 4096).expect("Segment layout");
         unsafe { std::alloc::dealloc(self.base, layout) };
     }

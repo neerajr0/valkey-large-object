@@ -1,29 +1,12 @@
-//! io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//! io_uring engine — one independent instance PER POOL (Tiered mode only).
 //!
-//! Only used in Tiered mode. Dram-only mode has no io_uring engine.
-//!
-//! Architecture (split poller — one independent engine PER POOL):
-//!   Caller: submit(PoolId, IoRequest) via that pool's channel → returns immediately
-//!   Poller thread (one per pool): owns its OWN io_uring ring + its OWN registered-
-//!                  buffer table, submits ReadFixed/WriteFixed, polls its CQ, sends
-//!                  the completion result via a oneshot channel.
-//!
-//! There are TWO engines: one for the DRAM pool, one for the NVMe staging pool.
-//! Each registers ONLY its own pool's segments (IORING_REGISTER_BUFFERS is
-//! per-ring-fd, so the two tables are fully independent), and `iovec_index` is
-//! POOL-LOCAL — an index into that ring's own table. Every op references exactly
-//! one registered buffer (its `iovec_index` + `buf_ptr`) and a raw file fd +
-//! offset; no op spans both pools, so each op routes cleanly to the ring that
-//! owns its buffer's pool (`PoolId`).
-//!
-//! Only the DRAM pool expands/shrinks, so only the DRAM ring ever rebuilds its
-//! table (`submit_reregister(PoolId::Dram)`); the NVMe ring is fixed-size after
-//! startup and never rebuilds, so a DRAM-ring swap never stalls the NVMe serving
-//! path.
-//!
-//! Segments are registered with IORING_REGISTER_BUFFERS at startup (per ring).
-//! ReadFixed/WriteFixed use buf_index (pool-local segment index) + offset within
-//! segment.
+//! Each engine owns its own ring, registered-buffer table, and CQ poller thread.
+//! `submit(PoolId, IoRequest)` routes to that pool's ring; the poller submits
+//! ReadFixed/WriteFixed and returns results on a oneshot channel. The two tables
+//! are independent (IORING_REGISTER_BUFFERS is per-ring-fd) and `iovec_index` is
+//! pool-local. Every op names exactly one buffer + a raw file fd/offset, so no op
+//! spans both pools. Only the DRAM pool scales, so only the DRAM ring rebuilds —
+//! the NVMe ring never stalls.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -38,10 +21,8 @@ use super::StorageError;
 
 // ─── Pool identity ───────────────────────────────────────────────────────────
 
-/// Which pool (and therefore which io_uring ring + registered-buffer table) an
-/// op or a reregister targets. This is the whole generic seam: one `UringEngine`
-/// type, two instances distinguished by this field — no trait, no dyn. The
-/// poller reads it to know which pool's segments to rebuild on a swap.
+/// Which pool's ring an op or reregister targets. The whole generic seam: one
+/// `UringEngine` type, two instances keyed by this field — no trait, no dyn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolId {
     Dram,
@@ -86,15 +67,10 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Rebuild THIS ring's fixed-buffer table densely from its OWN pool's
-    /// currently-live segments (5.10 has no sparse tables / per-slot updates, so
-    /// the only primitive is a whole-table swap and the array must have no
-    /// holes). The poller sets `registration_pending`, forces ops issued during
-    /// the window onto the non-fixed path, waits for THIS ring's in-flight FIXED
-    /// ops to drain, then `unregister_buffers` + `register_buffers(rebuilt)`.
-    /// Only this ring is affected — the other pool's ring keeps serving. Fire-
-    /// and-forget: sent by expand()/release() after a segment is added/removed
-    /// (DRAM ring only in practice).
+    /// Rebuild this ring's fixed-buffer table from its live segments. 5.10 has
+    /// only a whole-table swap: the poller sets `registration_pending` (new ops
+    /// go non-fixed), waits for in-flight fixed ops to drain, then
+    /// unregister + register. Fire-and-forget from expand()/release().
     Reregister,
 }
 
@@ -216,15 +192,21 @@ pub fn submit_write(
     rx
 }
 
-/// Ask `pool`'s poller to rebuild + re-register its fixed-buffer table after a
-/// segment was added (expand) or removed (release). Fire-and-forget, no reply:
-/// the swap runs on that ring's poller once its in-flight fixed ops drain, and
-/// touches ONLY that ring — the other pool's ring keeps serving uninterrupted.
-/// No-op if that pool's engine is down (Dram mode / not yet initialized) — the
-/// fixed path is unused there anyway. Only ever called for `PoolId::Dram` today
-/// (the NVMe pool is fixed-size and never rebuilds after startup).
+/// Ask `pool`'s poller to rebuild its fixed-buffer table after an expand/release.
+/// Fire-and-forget; no-op if that pool has no engine (Dram mode). Only `Dram` in
+/// practice — the NVMe pool is fixed-size.
+///
+/// The send runs on a tokio worker, never the caller's thread: crossbeam's send
+/// inits a per-thread waker thread-local freed only on thread exit. The callers
+/// (expand/release) run on the main valkey thread, which never exits before the
+/// process does → that 48-byte cell leaks (ASan). Workers reclaim it.
 pub fn submit_reregister(pool: PoolId) {
-    let _ = submit(pool, IoRequest::Reregister);
+    if engine(pool).is_none() {
+        return; // Dram mode / not initialized — nothing to reregister.
+    }
+    crate::runtime_handle().spawn(async move {
+        let _ = submit(pool, IoRequest::Reregister);
+    });
 }
 
 // ─── UringEngine ─────────────────────────────────────────────────────────────
@@ -246,11 +228,8 @@ impl Drop for UringEngine {
 }
 
 impl UringEngine {
-    /// Create an engine for `pool`: init its io_uring ring + register its pool's
-    /// buffers on the calling thread, then spawn a CQ poller owning that ring.
-    /// Returns Err if the kernel doesn't support io_uring or buffer registration
-    /// fails. `pool` is captured so the poller's registration swaps rebuild the
-    /// correct pool's table.
+    /// Create an engine for `pool`: init the ring, register its buffers, spawn the
+    /// CQ poller. Err if the kernel lacks io_uring or registration fails.
     pub fn new(pool: PoolId, iovecs: Vec<libc::iovec>) -> Result<Self, String> {
         // Create ring on main thread — fail gracefully instead of panicking.
         let ring =
@@ -290,9 +269,8 @@ impl UringEngine {
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
-        // Whole-table registration swap state (5.10 — see IoRequest::Reregister).
-        // While `registration_pending`, ops are issued NON-fixed (kill-switch); the
-        // swap fires once `fixed_in_flight` (in-flight ReadFixed/WriteFixed) hits 0.
+        // Registration swap state: while pending, ops go non-fixed; the swap fires
+        // once in-flight fixed ops drain to 0.
         let mut registration_pending = false;
         let mut fixed_in_flight: usize = 0;
         loop {
@@ -300,10 +278,8 @@ impl UringEngine {
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
             }
-            // Registration swap: once all in-flight FIXED ops have drained, rebuild
-            // the dense buffer table from live segments and re-register it. Ops
-            // issued during the window went non-fixed, so their (possibly stale)
-            // iovec_index is never used — only pre-window fixed ops had to drain.
+            // Swap: once in-flight fixed ops have drained, rebuild + re-register
+            // the table. In-window ops went non-fixed, so stale indices are unused.
             if registration_pending && fixed_in_flight == 0 {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {

@@ -39,27 +39,15 @@ use allocator_api2::alloc::Allocator;
 use super::context::SegmentBuffer;
 use super::segment::Segment;
 
-/// Mutable segment state: the slot vector plus this pool's OWN io_uring iovec
-/// table. No shared allocator, no reverse-lookup index — each segment carries
-/// its own talc, and the segment_idx is known at alloc time (from the picker).
+/// Mutable segment state: the slot vector plus this pool's own io_uring iovec
+/// table.
 struct SegmentState {
-    /// Segment slots. Slot `i` = this pool's LOCAL iovec_index `i` in its own
-    /// io_uring buffer table (the ring that serves this pool).
-    /// `None` = empty slot (hole from a previous drain, or unused capacity).
+    /// Segment slots. `None` = empty slot (a drained hole or unused capacity).
     slots: Vec<Option<Segment>>,
-    /// This pool's io_uring registered-buffer table, as `(base, len)` pairs. A
-    /// segment's index here is its POOL-LOCAL `iovec_index` — the `u16` a
-    /// ReadFixed/WriteFixed op passes to name its buffer within THIS pool's ring.
-    /// `None` = a free index (a hole from a drained segment, reused by the next
-    /// segment added by `expand`). Index-aligned with `slots` by construction
-    /// (see `expand`): `iovecs[i]` is the `(base, len)` of the `Segment` at
-    /// `slots[i]`.
-    ///
-    /// Each pool owns its OWN table because each pool has its OWN io_uring ring
-    /// with its OWN IORING_REGISTER_BUFFERS set (the DRAM ring and the NVMe ring
-    /// are fully independent). The kernel table for this pool's ring is built
-    /// from this at startup; segments added later by `expand()` are recorded
-    /// here and pushed to the kernel by the register-on-expand swap.
+    /// This pool's io_uring registered-buffer table as `(base, len)` pairs,
+    /// index-aligned with `slots`. The index is the pool-local `iovec_index` a
+    /// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index
+    /// reused by the next expand.
     iovecs: Vec<Option<(usize, usize)>>,
 }
 
@@ -108,11 +96,8 @@ impl SegmentPool {
 
     // ─── io_uring iovec table (pool-local) ─────────────────────────────────────
 
-    /// Snapshot this pool's iovec table as a dense `Vec<libc::iovec>` (holes
-    /// skipped) to hand to its ring's `IORING_REGISTER_BUFFERS` at startup.
-    /// Dense because 5.10 cannot register a sparse table; startup has no holes
-    /// anyway (segments are appended contiguously). Marks nothing — the caller
-    /// (`init`) marks the segments registered after the syscall succeeds.
+    /// Dense snapshot of this pool's iovec table (holes skipped) for the ring's
+    /// startup `IORING_REGISTER_BUFFERS`. Dense because 5.10 has no sparse table.
     pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
         let st = self.state.lock().expect("state lock unavailable");
         st.iovecs
@@ -490,13 +475,8 @@ impl SegmentPool {
         let iov = seg.iovec();
 
         let mut st = self.state.lock().expect("state lock unavailable");
-        // Allocate a pool-local iovec index: reuse the first hole, else append.
-        // Reusing a hole never grows the table (already within the cap); an
-        // append is rejected once it would exceed MAX_SEGMENTS — the single
-        // runtime cap check. On None we drop `seg` here (freeing its just-
-        // allocated backing memory) and report expand failure; nothing is
-        // inserted into `slots`, so the two Vecs stay in lockstep and the caller
-        // (scaling cron / reactive expand) holds size.
+        // Pool-local iovec index: reuse the first hole, else append (rejected at
+        // MAX_SEGMENTS). On None, `seg` drops here and nothing enters `slots`.
         let entry = Some((iov.iov_base as usize, iov.iov_len));
         let idx = match st.iovecs.iter().position(|s| s.is_none()) {
             Some(i) => {
@@ -513,10 +493,8 @@ impl SegmentPool {
         };
         let mut seg = seg;
         seg.iovec_index = idx as u16;
-        // Place the segment at exactly slots[idx] (the index just assigned) so
-        // slots and iovecs stay aligned by construction. idx is a reused hole
-        // (< len) or the next append (== len), never > len; pad defensively so a
-        // future divergence can't index out of bounds.
+        // Place at slots[idx] so slots and iovecs stay index-aligned. Pad in case
+        // idx is past the current len.
         if idx >= st.slots.len() {
             st.slots.resize_with(idx + 1, || None);
         }
@@ -576,10 +554,8 @@ impl SegmentPool {
             released_any = true;
         }
         if released_any {
-            // A segment left THIS pool — rebuild + re-register its ring's dense
-            // io_uring table without it (no-op in Dram mode / if no engine for
-            // this pool). Whole-table swap on that ring's poller only; the other
-            // pool's ring is untouched and keeps serving.
+            // A segment left this pool — rebuild its ring's table without it
+            // (no-op in Dram mode). Touches only this ring.
             super::uring::submit_reregister(self.pool_id);
         }
     }
@@ -652,13 +628,9 @@ impl SegmentPool {
         }
     }
 
-    /// Whole-table rebuild for THIS pool's ring: assign each live segment a dense
-    /// pool-local `iovec_index` starting at 0, resync this pool's iovec table to
-    /// match, and return the iovec array to hand to the ring's `register_buffers`.
-    /// Marks each live segment registered. Called by the poller (via
-    /// `uring::submit_reregister`) during a registration swap on this pool's ring
-    /// only. Dense by construction — no holes — because 5.10 cannot register a
-    /// sparse table.
+    /// Rebuild this pool's ring table: reindex live segments densely from 0, mark
+    /// them registered, and return the iovec array for `register_buffers`. Dense
+    /// because 5.10 cannot register a sparse table.
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
         let mut st = self.state.lock().expect("state lock unavailable");
         let mut out = Vec::new();
@@ -674,17 +646,12 @@ impl SegmentPool {
                 seg.mark_io_uring_registered();
             }
         }
-        // The dense rebuild also compacts this pool's iovec table (drops holes),
-        // keeping it index-aligned with the now-densely-indexed live segments.
-        st.iovecs = new_iovecs;
+        st.iovecs = new_iovecs; // compacted to match the dense reindex above
         out
     }
 
-    /// Number of live segments currently marked io_uring-registered (their
-    /// iovec is in the kernel fixed-buffer table). Equals this pool's live
-    /// segment count once a post-expand registration swap has completed; a
-    /// lower value means an expanded segment is not yet registered. Read-only;
-    /// surfaced in INFO to assert the swap covered every segment.
+    /// Count of live segments marked io_uring-registered. Below this pool's live
+    /// count means an expanded segment's swap hasn't completed yet. INFO metric.
     pub fn io_uring_registered_count(&self) -> usize {
         let st = self.state.lock().expect("state lock unavailable");
         st.slots
