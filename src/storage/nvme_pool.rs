@@ -15,7 +15,7 @@ pub struct NVMePool {
 impl NVMePool {
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
         Self {
-            pool: SegmentPool::new(segment_count, segment_size),
+            pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolId::Nvme),
         }
     }
 
@@ -55,9 +55,21 @@ impl NVMePool {
         self.pool.mark_all_registered();
     }
 
-    /// See `SegmentPool::collect_dense_iovecs`.
-    pub fn collect_dense_iovecs(&self, next: &mut u16, out: &mut Vec<libc::iovec>) {
-        self.pool.collect_dense_iovecs(next, out);
+    /// Startup iovec snapshot for this pool's ring. See `SegmentPool::startup_iovecs`.
+    pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.startup_iovecs()
+    }
+
+    /// Clear this pool's iovec table (ring-init failure cleanup).
+    pub fn clear_iovecs(&self) {
+        self.pool.clear_iovecs();
+    }
+
+    /// See `SegmentPool::rebuild_dense_iovecs`. The NVMe pool never expands or
+    /// shrinks, so its ring never actually swaps; provided only so the poller's
+    /// pool-generic rebuild path is total.
+    pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.rebuild_dense_iovecs()
     }
 
     /// See `SegmentPool::io_uring_registered_count`.

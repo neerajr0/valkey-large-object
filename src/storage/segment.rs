@@ -66,7 +66,8 @@ pub struct Segment {
 
 impl Segment {
     /// Allocate a new segment via ValkeyAlloc, create its talc, claim its range.
-    /// `iovec_index` is set to 0 initially; caller assigns after `append_iovec`.
+    /// `iovec_index` is set to 0 initially; the owning pool assigns the real
+    /// pool-local index after creation (`SegmentPool::new` / `expand`).
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -86,7 +87,7 @@ impl Segment {
         Self {
             base,
             size,
-            iovec_index: 0, // set by caller after append_iovec
+            iovec_index: 0, // set by owning pool after creation
             talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),

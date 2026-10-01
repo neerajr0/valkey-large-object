@@ -1,14 +1,29 @@
-//! NVMe io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//! io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
 //!
 //! Only used in Tiered mode. Dram-only mode has no io_uring engine.
 //!
-//! Architecture:
-//!   Caller: submit(IoRequest) via channel → returns immediately
-//!   Poller thread: owns io_uring ring, submits ReadFixed/WriteFixed, polls CQ,
-//!                  sends completion result via oneshot channel.
+//! Architecture (split poller — one independent engine PER POOL):
+//!   Caller: submit(PoolId, IoRequest) via that pool's channel → returns immediately
+//!   Poller thread (one per pool): owns its OWN io_uring ring + its OWN registered-
+//!                  buffer table, submits ReadFixed/WriteFixed, polls its CQ, sends
+//!                  the completion result via a oneshot channel.
 //!
-//! Segments are registered with IORING_REGISTER_BUFFERS at startup.
-//! ReadFixed/WriteFixed use buf_index (segment index) + offset within segment.
+//! There are TWO engines: one for the DRAM pool, one for the NVMe staging pool.
+//! Each registers ONLY its own pool's segments (IORING_REGISTER_BUFFERS is
+//! per-ring-fd, so the two tables are fully independent), and `iovec_index` is
+//! POOL-LOCAL — an index into that ring's own table. Every op references exactly
+//! one registered buffer (its `iovec_index` + `buf_ptr`) and a raw file fd +
+//! offset; no op spans both pools, so each op routes cleanly to the ring that
+//! owns its buffer's pool (`PoolId`).
+//!
+//! Only the DRAM pool expands/shrinks, so only the DRAM ring ever rebuilds its
+//! table (`submit_reregister(PoolId::Dram)`); the NVMe ring is fixed-size after
+//! startup and never rebuilds, so a DRAM-ring swap never stalls the NVMe serving
+//! path.
+//!
+//! Segments are registered with IORING_REGISTER_BUFFERS at startup (per ring).
+//! ReadFixed/WriteFixed use buf_index (pool-local segment index) + offset within
+//! segment.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -20,6 +35,18 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::StorageError;
+
+// ─── Pool identity ───────────────────────────────────────────────────────────
+
+/// Which pool (and therefore which io_uring ring + registered-buffer table) an
+/// op or a reregister targets. This is the whole generic seam: one `UringEngine`
+/// type, two instances distinguished by this field — no trait, no dyn. The
+/// poller reads it to know which pool's segments to rebuild on a swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolId {
+    Dram,
+    Nvme,
+}
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
@@ -59,13 +86,15 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Rebuild the whole io_uring fixed-buffer table densely from all currently-
-    /// live segments (5.10 has no sparse tables / per-slot updates, so the only
-    /// primitive is a whole-table swap and the array must have no holes). The
-    /// poller sets `registration_pending`, forces ops issued during the window
-    /// onto the non-fixed path, waits for in-flight FIXED ops to drain, then
-    /// `unregister_buffers` + `register_buffers(rebuilt)`. Fire-and-forget: sent
-    /// by expand()/release() after a segment is added/removed.
+    /// Rebuild THIS ring's fixed-buffer table densely from its OWN pool's
+    /// currently-live segments (5.10 has no sparse tables / per-slot updates, so
+    /// the only primitive is a whole-table swap and the array must have no
+    /// holes). The poller sets `registration_pending`, forces ops issued during
+    /// the window onto the non-fixed path, waits for THIS ring's in-flight FIXED
+    /// ops to drain, then `unregister_buffers` + `register_buffers(rebuilt)`.
+    /// Only this ring is affected — the other pool's ring keeps serving. Fire-
+    /// and-forget: sent by expand()/release() after a segment is added/removed
+    /// (DRAM ring only in practice).
     Reregister,
 }
 
@@ -115,21 +144,36 @@ impl PendingOp {
     }
 }
 
-// ─── Global NVMe Engine ──────────────────────────────────────────────────────
+// ─── Per-Pool Engines ────────────────────────────────────────────────────────
 
-static NVME_ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
+/// One engine per pool: the DRAM ring and the NVMe ring are fully independent
+/// (separate ring fd, separate registered-buffer table, separate poller thread).
+static DRAM_ENGINE: OnceLock<UringEngine> = OnceLock::new();
+static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
-pub fn set_nvme_engine(engine: UringNvmeEngine) {
-    if NVME_ENGINE.set(engine).is_err() {
-        panic!("NVMe engine already initialized");
+/// Install the engine for `pool`. Panics if already set (init runs once).
+pub fn set_engine(pool: PoolId, engine: UringEngine) {
+    let slot = match pool {
+        PoolId::Dram => &DRAM_ENGINE,
+        PoolId::Nvme => &NVME_ENGINE,
+    };
+    if slot.set(engine).is_err() {
+        panic!("{:?} engine already initialized", pool);
     }
 }
 
-/// Submit an IoRequest to the poller thread.
+fn engine(pool: PoolId) -> Option<&'static UringEngine> {
+    match pool {
+        PoolId::Dram => DRAM_ENGINE.get(),
+        PoolId::Nvme => NVME_ENGINE.get(),
+    }
+}
+
+/// Submit an IoRequest to the poller thread of `pool`'s ring.
 /// Returns SendError with the request back on failure (channel disconnected)
 /// so the caller can extract the oneshot sender and fire an explicit error.
-fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
-    match NVME_ENGINE.get() {
+fn submit(pool: PoolId, req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
+    match engine(pool) {
         Some(engine) => engine.tx.send(req),
         None => Err(crossbeam_channel::SendError(req)),
     }
@@ -137,51 +181,61 @@ fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>>
 
 // ─── Async submit helpers ────────────────────────────────────────────────────
 //
-// Create a oneshot channel, send the tx inside the IoRequest to the poller.
+// Create a oneshot channel, send the tx inside the IoRequest to the pool's poller.
 // Poller fires tx.send() on CQE completion. Caller awaits rx.
 
-/// Submit a ReadFixed and return a oneshot receiver.
+/// Submit a ReadFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_read(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<u64, StorageError>> {
+pub fn submit_read(
+    pool: PoolId,
+    fd: RawFd,
+    op: UringOp,
+) -> oneshot::Receiver<Result<u64, StorageError>> {
     let (tx, rx) = oneshot::channel();
     if let Err(crossbeam_channel::SendError(IoRequest::Read { tx, .. })) =
-        submit(IoRequest::Read { fd, op, tx })
+        submit(pool, IoRequest::Read { fd, op, tx })
     {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
 }
 
-/// Submit a WriteFixed and return a oneshot receiver.
+/// Submit a WriteFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), StorageError>> {
+pub fn submit_write(
+    pool: PoolId,
+    fd: RawFd,
+    op: UringOp,
+) -> oneshot::Receiver<Result<(), StorageError>> {
     let (tx, rx) = oneshot::channel();
     if let Err(crossbeam_channel::SendError(IoRequest::Write { tx, .. })) =
-        submit(IoRequest::Write { fd, op, tx })
+        submit(pool, IoRequest::Write { fd, op, tx })
     {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
 }
 
-/// Ask the poller to rebuild + re-register the whole fixed-buffer table after a
+/// Ask `pool`'s poller to rebuild + re-register its fixed-buffer table after a
 /// segment was added (expand) or removed (release). Fire-and-forget, no reply:
-/// the swap runs on the poller once in-flight fixed ops drain. No-op if the
-/// engine is down (Dram mode / not yet initialized) — the fixed path is unused
-/// there anyway.
-pub fn submit_reregister() {
-    let _ = submit(IoRequest::Reregister);
+/// the swap runs on that ring's poller once its in-flight fixed ops drain, and
+/// touches ONLY that ring — the other pool's ring keeps serving uninterrupted.
+/// No-op if that pool's engine is down (Dram mode / not yet initialized) — the
+/// fixed path is unused there anyway. Only ever called for `PoolId::Dram` today
+/// (the NVMe pool is fixed-size and never rebuilds after startup).
+pub fn submit_reregister(pool: PoolId) {
+    let _ = submit(pool, IoRequest::Reregister);
 }
 
-// ─── UringNvmeEngine ─────────────────────────────────────────────────────────
+// ─── UringEngine ─────────────────────────────────────────────────────────────
 
-pub struct UringNvmeEngine {
+pub struct UringEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
     _poller: Option<thread::JoinHandle<()>>,
 }
 
-impl Drop for UringNvmeEngine {
+impl Drop for UringEngine {
     fn drop(&mut self) {
         // Set shutdown flag BEFORE tx drops. This ensures the poller sees
         // shutdown=true when the channel disconnects, and exits cleanly
@@ -191,11 +245,13 @@ impl Drop for UringNvmeEngine {
     }
 }
 
-impl UringNvmeEngine {
-    /// Create engine: init io_uring ring + register buffers on the calling thread,
-    /// then spawn CQ poller with the working ring. Returns Err if the kernel
-    /// doesn't support io_uring or buffer registration fails.
-    pub fn new(iovecs: Vec<libc::iovec>) -> Result<Self, String> {
+impl UringEngine {
+    /// Create an engine for `pool`: init its io_uring ring + register its pool's
+    /// buffers on the calling thread, then spawn a CQ poller owning that ring.
+    /// Returns Err if the kernel doesn't support io_uring or buffer registration
+    /// fails. `pool` is captured so the poller's registration swaps rebuild the
+    /// correct pool's table.
+    pub fn new(pool: PoolId, iovecs: Vec<libc::iovec>) -> Result<Self, String> {
         // Create ring on main thread — fail gracefully instead of panicking.
         let ring =
             io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
@@ -209,9 +265,9 @@ impl UringNvmeEngine {
         let shutdown_clone = shutdown.clone();
         // Pass the fully initialized ring to the poller thread.
         let poller = thread::Builder::new()
-            .name("lo-uring-poller".into())
+            .name(format!("lo-uring-poller-{:?}", pool))
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, ring);
+                Self::poller_loop(pool, rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
         Ok(Self {
@@ -221,8 +277,11 @@ impl UringNvmeEngine {
         })
     }
 
-    /// The CQ poller loop — owns the io_uring ring (received fully initialized).
+    /// The CQ poller loop — owns one pool's io_uring ring (received fully
+    /// initialized). `pool` selects which pool's table a registration swap
+    /// rebuilds.
     fn poller_loop(
+        pool: PoolId,
         rx: Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
@@ -246,7 +305,7 @@ impl UringNvmeEngine {
             // issued during the window went non-fixed, so their (possibly stale)
             // iovec_index is never used — only pre-window fixed ops had to drain.
             if registration_pending && fixed_in_flight == 0 {
-                let iovecs = super::rebuild_dense_iovecs();
+                let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
                     let _ = ring.submitter().unregister_buffers();
                     if !iovecs.is_empty() {
