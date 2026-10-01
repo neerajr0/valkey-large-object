@@ -91,8 +91,8 @@ lazy_static::lazy_static! {
     /// Default: 64MB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 
-    /// Max disk usage in nvme-dir. Default: 10GB.
-    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(10 * 1024 * 1024 * 1024);
+    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
+    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(2);
@@ -416,7 +416,8 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
                 parent: &CFG_NVME_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
-                validator: None,
+                // 0 = unlimited; skip the check.
+                validator: Some(|p, c| p == 0 || p >= c),
                 error_msg: errors::ERR_NVME_GE_MAX_OBJ,
             },
             ConfigDependencyEdge {
@@ -658,7 +659,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 10_737_418_240, 1_048_576, i64::MAX,
+            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
@@ -717,7 +718,7 @@ mod tests {
     /// Reset all graph configs to their compile-time defaults. Other tests
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_graph_defaults() {
-        CFG_NVME_MAXMEMORY.store(10 * 1024 * 1024 * 1024, Relaxed); // 10 GiB
+        CFG_NVME_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
         CFG_NVME_STAGING_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
         CFG_SEGMENT_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
         CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed); // 8 MiB
