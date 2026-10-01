@@ -266,7 +266,7 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "enable-system-alloc"))]
 mod tests {
     use super::*;
 
