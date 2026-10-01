@@ -20,10 +20,10 @@
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
-//                                io_uring engine and start the smartlog poller
-//                                (Tiered only). All resources are created as
-//                                locals; OnceLock statics are set only after
-//                                everything succeeds. On failure, locals
+//                                the per-pool io_uring engines and start the
+//                                smartlog poller (Tiered only). All resources are
+//                                created as locals; OnceLock statics are set only
+//                                after everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
 //   3. fabric.register_segment() per startup segment
 //                              — fi_mr_reg pool buffers with EFA domains.
@@ -473,9 +473,9 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// signal the SMART log poller to stop, drop the fabric services, signal the
-/// io_uring poller to stop, and — in Tiered
+/// signal the SMART log poller to stop, drop the fabric services, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
+/// The io_uring engines live in process-lifetime statics and are not torn down here.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
 /// those leftovers are reclaimed by the startup reset in `initialize`.

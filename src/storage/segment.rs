@@ -29,9 +29,9 @@ pub struct Segment {
     pub base: *mut u8,
     /// Total size in bytes.
     pub size: usize,
-    /// Index into the sparse iovec table (io_uring ReadFixed/WriteFixed) and
-    /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector.
-    /// Write-once at creation; immutable for the segment's lifetime.
+    /// Index into this pool's io_uring iovec table (ReadFixed/WriteFixed) and
+    /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector. Assigned at
+    /// creation and recomputed on each dense table rebuild.
     pub iovec_index: u16,
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with

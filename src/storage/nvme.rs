@@ -229,11 +229,11 @@ pub async fn read_and_verify_file_header(
         use_fixed,
     };
     let hdr_rx = uring::submit_read(pool_id, fd, hdr_op);
-    // RecvError: the io_uring poller dropped the oneshot sender without calling
-    // send(). This only happens if the poller thread panicked or exited — the
-    // poller owns all senders in its pending HashMap. Since the poller is a
-    // single long-lived thread, its loss is permanent: no future NVMe I/O can
-    // complete. Increment metric and abort.
+    // RecvError: this pool's io_uring poller dropped the oneshot sender without
+    // calling send(). This only happens if that poller thread panicked or exited
+    // — it owns all senders in its pending HashMap. Each pool has its own
+    // long-lived poller, so losing the one for `pool_id` is permanent: no future
+    // I/O on that ring can complete. Abort.
     match hdr_rx.await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {

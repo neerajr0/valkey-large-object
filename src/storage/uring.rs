@@ -222,7 +222,7 @@ impl Drop for UringEngine {
         // Set shutdown flag BEFORE tx drops. This ensures the poller sees
         // shutdown=true when the channel disconnects, and exits cleanly
         // instead of panicking on unexpected disconnect.
-        // Fires on: (1) init failure (local engine dropped), (2) process exit.
+        // Fires on init failure (local engine dropped) upon the rollback.
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
