@@ -718,11 +718,11 @@ mod tests {
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_graph_defaults() {
         CFG_NVME_MAXMEMORY.store(10 * 1024 * 1024 * 1024, Relaxed); // 10 GiB
-        CFG_NVME_STAGING_SIZE.store(64 * 1024 * 1024, Relaxed);   // 64 MiB
-        CFG_SEGMENT_SIZE.store(64 * 1024 * 1024, Relaxed);        // 64 MiB
-        CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed);           // 8 MiB
-        CFG_MAX_OBJECT_SIZE.store(63 * 1024 * 1024, Relaxed);     // 63 MiB
-        CFG_MAX_PROMOTE_SIZE.store(63 * 1024 * 1024, Relaxed);    // 63 MiB
+        CFG_NVME_STAGING_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
+        CFG_SEGMENT_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
+        CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed); // 8 MiB
+        CFG_MAX_OBJECT_SIZE.store(63 * 1024 * 1024, Relaxed); // 63 MiB
+        CFG_MAX_PROMOTE_SIZE.store(63 * 1024 * 1024, Relaxed); // 63 MiB
         CFG_MAX_BUFFERS_PER_OP.store(8, Relaxed);
         CFG_MIN_BUFFERS_PER_OP.store(2, Relaxed);
     }
