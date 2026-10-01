@@ -15,6 +15,7 @@ Tests cover:
   - Tiered mode: a promotion into a full arena skips itself and serves from NVMe,
     giving up nothing resident and leaving every key in place
   - Both modes: an object a transfer is reading is skipped, not destroyed
+  - Both modes: COPY at the cap evicts for room like a SET, but never its own source
 """
 
 import binascii
@@ -598,6 +599,39 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             == before['largeobj_eviction_failures_total'], \
             "the guard rejected before evicting, so this is not an eviction failure"
         assert client.execute_command('BLOB.GET', keeper) == payloads[keeper]
+
+    def test_copy_at_the_segment_evicts_another_key_and_never_its_source(self):
+        """COPY makes room like a SET does, but never out of the key it is copying.
+
+        Two 384KB objects leave the segment too full for a third, so COPY has to evict:
+        the only other key is the victim, and the source stays. With the source alone in
+        the segment, nothing may be taken and COPY fails with the source untouched.
+        """
+        client = self.server.get_new_client()
+        allow_evictions(client)
+        obj = b'A' * (384 * 1024)
+
+        big = b'S' * (640 * 1024)
+        assert client.execute_command('BLOB.SET', 'src', big) == b'OK'
+        before = info_largeobj(client)
+        try:
+            client.execute_command('COPY', 'src', 'dst')
+            assert False, "Expected COPY to fail: the source is the only thing to evict"
+        except ResponseError:
+            pass
+        assert client.execute_command('BLOB.GET', 'src') == big, "the source must survive"
+        assert client.execute_command('EXISTS', 'dst') == 0
+        assert info_largeobj(client)['largeobj_evictions_total'] == before['largeobj_evictions_total']
+
+        client.execute_command('FLUSHALL')
+        assert client.execute_command('BLOB.SET', 'src', obj) == b'OK'
+        assert client.execute_command('BLOB.SET', 'other', b'O' * len(obj)) == b'OK'
+        evictions_before = info_largeobj(client)['largeobj_evictions_total']
+        assert client.execute_command('COPY', 'src', 'dst') in (1, True)
+        assert info_largeobj(client)['largeobj_evictions_total'] == evictions_before + 1
+        assert client.execute_command('EXISTS', 'other') == 0
+        assert client.execute_command('BLOB.GET', 'src') == obj
+        assert client.execute_command('BLOB.GET', 'dst') == obj
 
     def test_tenacity_zero_still_evicts(self):
         """A zero search budget must not degenerate into noeviction.
@@ -1373,6 +1407,53 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
                 f"fill_{i} was destroyed for a SET that could never succeed"
         assert client.execute_command('EXISTS', 'huge') == 0
         assert client.execute_command('EXISTS', 'overflow') == 0
+
+    def test_copy_at_the_cap_evicts_another_key_and_never_its_source(self):
+        """COPY makes room like a SET does, but never out of the key it is copying.
+
+        Core holds the source value for the whole `copyCommand`, so a walk that took it
+        would free a value core is still reading. COPY pins its source like any reader, which
+        is what makes the walk skip it. With the source the only resident key, the walk has
+        nothing it may take: COPY fails cleanly and the source is untouched. With other keys
+        resident, COPY succeeds by evicting one of them.
+        """
+        client = self.server.get_new_client()
+        allow_evictions(client)
+
+        big = b'S' * (5 * self.OBJ)
+        assert client.execute_command('BLOB.SET', 'src', big) == b'OK'
+        before = info_largeobj(client)
+        try:
+            client.execute_command('COPY', 'src', 'dst')
+            assert False, "Expected COPY to fail: the source is the only thing to evict"
+        except ResponseError:
+            pass
+        after = info_largeobj(client)
+        assert client.execute_command('BLOB.GET', 'src') == big, "the source must survive"
+        assert client.execute_command('EXISTS', 'dst') == 0
+        assert after['largeobj_disk_evictions_total'] == before['largeobj_disk_evictions_total']
+        assert after['largeobj_disk_used_bytes'] == before['largeobj_disk_used_bytes'], \
+            "a refused COPY must give its reservation back"
+
+        client.execute_command('FLUSHALL')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes'] == 0)
+        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+
+        evictions_before = info_largeobj(client)['largeobj_disk_evictions_total']
+        assert client.execute_command('COPY', 'fill_0', 'dst') in (1, True)
+        info = info_largeobj(client)
+        victims = info['largeobj_disk_evictions_total'] - evictions_before
+        assert victims >= 1, "the cap was full, so COPY had to evict"
+        assert info['largeobj_disk_used_bytes'] <= info['largeobj_disk_maxmemory_bytes']
+        assert client.execute_command('BLOB.GET', 'dst') == payloads['fill_0']
+        assert client.execute_command('BLOB.GET', 'fill_0') == payloads['fill_0']
+        survivors = [k for k in payloads if client.execute_command('EXISTS', k) == 1]
+        assert len(survivors) == self.OBJECTS_PER_CAP - victims
+        for key in survivors:
+            assert client.execute_command('BLOB.GET', key) == payloads[key]
+        wait_for_true(lambda: len(self._dat_files()) == len(survivors) + 1, timeout=10)
 
     def test_a_pinned_object_is_not_claimed_for_the_disk_budget(self):
         """An object a GET is reading is skipped, and the ledger still stays under the cap.

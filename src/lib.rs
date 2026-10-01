@@ -32,7 +32,7 @@
 // After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr};
 use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
@@ -223,6 +223,18 @@ pub fn is_main_thread() -> bool {
         .get()
         // SAFETY: pthread_self/pthread_equal take no pointers and always succeed.
         .is_some_and(|&main| unsafe { libc::pthread_equal(libc::pthread_self(), main) != 0 })
+}
+
+/// A detached context for data-type callbacks, which are handed none.
+static CALLBACK_CTX: AtomicPtr<valkey_module::raw::RedisModuleCtx> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+/// Run `f` with the callback context. Main thread only, inside a callback: the event loop already
+/// holds the lock the context nominally needs, and taking it again deadlocks.
+pub fn with_callback_ctx<T>(f: impl FnOnce(&Context) -> T) -> T {
+    let ptr = CALLBACK_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    debug_assert!(is_main_thread() && !ptr.is_null());
+    f(&Context::new(ptr))
 }
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
@@ -569,6 +581,11 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Record the main event-loop thread. SAFETY: pthread_self takes no arguments
     // and always succeeds; we store the opaque handle for later pthread_equal.
     let _ = MAIN_THREAD.set(unsafe { libc::pthread_self() });
+    // SAFETY: `ctx` is the live load-time context.
+    CALLBACK_CTX.store(
+        unsafe { valkey_module::raw::RedisModule_GetDetachedThreadSafeContext.unwrap()(ctx.ctx) },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();

@@ -125,27 +125,26 @@ impl LoValue {
         0
     }
 
-    /// Deep-copy for the COPY command callback.
-    /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
-    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
-    pub fn create_copy(&self) -> Option<LoValue> {
+    /// Deep-copy for the COPY command callback, evicting other keys for room if the budget is
+    /// full. The copy holds its source like any reader, so eviction skips it as pinned.
+    /// Dram mode: copy the ObjectContext's buffers. Tiered mode: copy the NVMe file.
+    /// Returns None on capacity exhaustion (nothing evictable, or the copy fails).
+    pub fn create_copy(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         match crate::operating_mode() {
-            crate::OperatingMode::Dram => self.create_copy_dram(),
-            crate::OperatingMode::Tiered => self.create_copy_tiered(),
+            crate::OperatingMode::Dram => self.create_copy_dram(ctx),
+            crate::OperatingMode::Tiered => self.create_copy_tiered(ctx),
         }
     }
 
-    /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
-    fn create_copy_dram(&self) -> Option<LoValue> {
-        use crate::storage::TryClone;
+    /// Dram mode: deep-copy ObjectContext into fresh buffers, insert with new OID.
+    fn create_copy_dram(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         let dram_pool = crate::storage::get_dram_pool();
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
-        // Returns None if object is Filling (incomplete) or pool is full.
-        let new_ctx = src_ctx.try_clone()?;
+        let buffers = crate::engine::alloc_dram_or_make_room(ctx, dram_pool, self.len)?;
         let new_oid = ObjectId::next();
-        dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
+        dram_pool.insert_object(new_oid, Arc::new(src_ctx.copy_into(buffers)));
         Some(LoValue {
             object_id: new_oid,
             len: self.len,
@@ -156,11 +155,14 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
-    fn create_copy_tiered(&self) -> Option<LoValue> {
-        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
+    fn create_copy_tiered(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
+        let src_file = Arc::clone(self.file.as_ref()?);
+        let new_oid = ObjectId::next();
+        let reservation =
+            crate::engine::reserve_nvme_or_make_room(ctx, new_oid, src_file.disk_len())?;
+        let file = src_file.copy(reservation, self.len, self.crc32c)?;
         Some(LoValue {
-            object_id: file.object_id(),
+            object_id: new_oid,
             len: self.len,
             crc32c: self.crc32c,
             file: Some(Arc::new(file)),
@@ -211,7 +213,7 @@ unsafe extern "C" fn lo_copy(
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match src.create_copy() {
+    match crate::with_callback_ctx(|ctx| src.create_copy(ctx)) {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }

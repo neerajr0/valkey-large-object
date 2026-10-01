@@ -83,27 +83,27 @@ impl ObjectFile {
         pool.get_or_open(self.object_id, dir)
     }
 
-    /// Copy this file into a new object version: allocates a fresh `ObjectId`, writes a
-    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
-    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
-    /// durable before it is exposed to O_DIRECT reads via io_uring.
+    /// Copy this file into the new object version `reservation` pays for: commits the
+    /// reservation, writes a header carrying the new OID with this object's `len`/`crc32c`,
+    /// then copies the payload past the header byte-for-byte. `fsync`s before returning so the
+    /// file is durable before it is exposed to O_DIRECT reads via io_uring.
     ///
-    /// Reserves `disk_len` against nvme-maxmemory up front; the returned handle's `Drop`
-    /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
-    /// the command rather than aborting the node), leaving no partial file behind.
-    pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
-        let dir = crate::nvme_dir();
-        let disk_len = self.disk_len;
-        if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
-            return None;
-        }
-        let new_oid = ObjectId::next();
-        let dst_path = new_oid.file_path(&dir);
+    /// The returned handle's `Drop` releases the reservation's bytes. Returns `None` if any I/O
+    /// fails (COPY then fails the command rather than aborting the node), leaving no partial
+    /// file behind and the bytes returned to the budget.
+    pub fn copy(
+        &self,
+        mut reservation: DiskReservation,
+        len: u64,
+        crc32c: Crc,
+    ) -> Option<ObjectFile> {
+        let new_oid = reservation.object_id();
+        let dst_path = new_oid.file_path(&crate::nvme_dir());
+        reservation.commit();
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
-            Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
+            Ok(()) => Some(reservation.into_object_file()),
             Err(e) => {
                 let _ = std::fs::remove_file(&dst_path);
-                super::nvme::decrease_nvme_disk_usage(disk_len);
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id

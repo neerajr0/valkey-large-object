@@ -61,8 +61,8 @@ impl DRAMPool {
     /// boundary), no same-size segment can — so we return None rather than loop.
     ///
     /// Callers on the main thread pass their command `&Context`; callers on
-    /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
-    /// is accepted by RM_GetServerInfo for the memory watermark check).
+    /// tokio workers pass `&Context::dummy()` (null ctx is accepted by
+    /// RM_GetServerInfo for the memory watermark check).
     pub fn alloc_exact_or_expand(
         &self,
         ctx: &valkey_module::Context,

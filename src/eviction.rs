@@ -685,8 +685,9 @@ impl Budget for DiskLedger {
 /// `delete()` by however long a BIO thread takes; emptying the value leaves that thread nothing to
 /// drop.
 ///
-/// `try_unwrap` failing *is* the pin check — a reader's `Arc` holds the file's blocks past the
-/// unlink, so claiming it would report budget we never receive.
+/// A second `Arc` *is* the pin check — a reader's reference holds the file's blocks past the
+/// unlink, so claiming it would report budget we never receive. Checked before taking, so a pinned
+/// value is never written to: COPY holds its own source through a `&LoValue` while the walk runs.
 ///
 /// The emptied value never escapes: the walk holds the event loop, and every handle is deleted with
 /// its key or put back before it returns. A key the scan cursor offers twice finds nothing left to
@@ -696,14 +697,11 @@ fn take_file(ctx: &Context, key_name: &ValkeyString) -> Option<ObjectFile> {
     let Ok(Some(lo)) = key.get_value::<LoValue>(&LO_TYPE) else {
         return None;
     };
-    match Arc::try_unwrap(lo.file.take()?) {
-        Ok(file) => Some(file),
-        Err(pinned) => {
-            lo.file = Some(pinned);
-            PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+    if Arc::strong_count(lo.file.as_ref()?) > 1 {
+        PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return None;
     }
+    Arc::try_unwrap(lo.file.take()?).ok()
 }
 
 /// Spend the claims: delete the keys and hand the handles on. Called only once the walk covered the

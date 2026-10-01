@@ -603,7 +603,7 @@ pub fn execute_set(
 /// to evict.
 ///
 /// 3. Try to evict items from the keyspace.
-fn alloc_dram_or_make_room(
+pub(crate) fn alloc_dram_or_make_room(
     ctx: &valkey_module::Context,
     dram_pool: &storage::DRAMPool,
     len: u64,
@@ -784,7 +784,7 @@ fn cmd_set_dram_efa(
 /// must fail the write.
 ///
 /// Main thread only — eviction deletes keys.
-fn reserve_nvme_or_make_room(
+pub(crate) fn reserve_nvme_or_make_room(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
     disk_len: u64,
