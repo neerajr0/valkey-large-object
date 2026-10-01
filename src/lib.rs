@@ -394,6 +394,8 @@ pub fn max_object_size() -> u64 {
 struct ConfigConstraint {
     parent: &'static AtomicI64,
     child: &'static AtomicI64,
+    /// Whether to enforce this constraint. Some constraints only apply in
+    /// certain operating modes (e.g. Tiered-only); returns false to skip.
     enforce_condition: fn() -> bool,
     /// Returns true when the constraint holds. `None` means the default
     /// `parent >= child`. A validator may also read other configs.
