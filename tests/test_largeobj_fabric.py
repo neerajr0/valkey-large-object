@@ -98,10 +98,11 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         self.verify_error_response(client, f'LO.HELLO {PEER_ADDRESS}', 'EFA unavailable on this instance')
         assert client.execute_command('LO.SET', 'key', b'A' * 4096) == b'OK'
 
-# What tests/harness/fabric_target waits for (write) or serves (--read): buffers of this byte
-# totalling TARGET_LEN, in one region by default or several under --split.
-PATTERN = b'\xab'
+# Position-dependent payload for fabric transfers: cycling 0x00..0xFF so that byte-ordering
+# across multi-region splits is verified, not just fill. Must match fabric_target's
+# generate_pattern().
 TARGET_LEN = 4096
+PATTERN = bytes(i % 256 for i in range(TARGET_LEN))
 
 # One advertised client memory address: the fabric address to HELLO with, plus the
 # (rkey, addr, len) triple that LO.GET / LO.SET carries per address.
@@ -158,10 +159,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target()
         try:
             client = self.server.get_new_client()
-            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
+            client.execute_command('LO.SET', 'key', PATTERN)
             client.execute_command('LO.HELLO', regions[0].address)
             reply = client.execute_command('LO.GET', 'key', *address_args(regions))
-            assert reply == [TARGET_LEN, crc32c.crc32c(PATTERN * TARGET_LEN)]
+            assert reply == [TARGET_LEN, crc32c.crc32c(PATTERN)]
             # The target exits once every byte of the pattern has landed.
             output = process.communicate(timeout=30)[0]
             assert 'payload verified' in output, output
@@ -175,7 +176,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.HELLO', regions[0].address)
             assert client.execute_command(
                 'LO.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
-            assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
+            assert client.execute_command('LO.GET', 'key') == PATTERN
         finally:
             process.kill()
 
@@ -203,7 +204,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         a multiple of chunk-size 4096, so the first chunk must be scattered across both
         addresses. The target reports 'payload verified' only once EVERY address has filled,
         so a transfer that wrote the head and dropped the tail fails here."""
-        payload = PATTERN * TARGET_LEN
+        payload = PATTERN
         for sizes in ([2048, 2048], [1024, 3072]):
             process, regions = self.start_target(split=sizes)
             try:
@@ -242,11 +243,11 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.HELLO', regions[0].address)
             # 4096 bytes of advertised space for a 2048-byte object.
-            client.execute_command('LO.SET', 'short', PATTERN * short_len)
+            client.execute_command('LO.SET', 'short', PATTERN[:short_len])
             assert client.execute_command('LO.GET', 'short', *address_args(regions)) == [
-                short_len, crc32c.crc32c(PATTERN * short_len)]
+                short_len, crc32c.crc32c(PATTERN[:short_len])]
             # The 1024-byte address alone cannot hold a 4096-byte object.
-            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
+            client.execute_command('LO.SET', 'key', PATTERN)
             first = f'{regions[0].rkey} {regions[0].addr} {regions[0].len}'
             self.verify_error_response(
                 client, f'LO.GET key {first}',
@@ -302,7 +303,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
         )
 
     def test_get_over_efa_cold_then_warm_on_one_session(self):
-        payload = PATTERN * TARGET_LEN
+        payload = PATTERN
         process, regions = self.start_target('--read')
         try:
             client = self.server.get_new_client()

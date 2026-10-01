@@ -42,8 +42,11 @@ use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
 
 const BUFFER_LEN: usize = 4096;
 
-/// That which `one_transfer` writes and `read_from_peer` fetches.
-const PATTERN: u8 = 0xab;
+/// Position-dependent payload: cycling 0x00..0xFF so that byte-ordering across multi-region
+/// splits is verified, not just fill. Must match the Python test's PATTERN.
+fn generate_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 256) as u8).collect()
+}
 
 /// Everything opened, closed on drop in reverse construction order.
 struct Target {
@@ -266,8 +269,18 @@ fn main() -> Result<(), String> {
     // Remote-accessible, unlike the initiator's local-only operands. Prefilled when the initiator is
     // the one fetching it. One allocation per region, all allocated before the first registration
     // because a registration holds a raw pointer into its buffer.
-    let fill = if serve_read { PATTERN } else { 0 };
-    let buffers: Vec<Vec<u8>> = sizes.iter().map(|&size| vec![fill; size]).collect();
+    let pattern = generate_pattern(BUFFER_LEN);
+    let buffers: Vec<Vec<u8>> = if serve_read {
+        // Prefill each region with its slice of the position-dependent pattern.
+        let mut offset = 0;
+        sizes.iter().map(|&size| {
+            let buf = pattern[offset..offset + size].to_vec();
+            offset += size;
+            buf
+        }).collect()
+    } else {
+        sizes.iter().map(|&size| vec![0u8; size]).collect()
+    };
 
     let mut advertisements = Vec::with_capacity(buffers.len());
     for (index, buffer) in buffers.iter().enumerate() {
@@ -353,7 +366,7 @@ fn main() -> Result<(), String> {
     let contents = |buffers: &[Vec<u8>]| -> Vec<u8> { buffers.concat() };
     if serve_read {
         println!(
-            "serving {BUFFER_LEN} bytes of {PATTERN:#04x} across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
+            "serving {BUFFER_LEN} bytes (cycling 0x00..0xFF) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
             advertisements.len(),
             checksum(&contents(&buffers))
         );
@@ -387,9 +400,14 @@ fn main() -> Result<(), String> {
         // would otherwise look like success.
         // Volatile: the NIC writes these bytes outside the compiler's model.
         // SAFETY: each index is in bounds of its own live registered buffer.
+        let mut offset = 0;
         let landed = buffers.iter().all(|buffer| {
             let pointer = buffer.as_ptr();
-            (0..buffer.len()).all(|index| PATTERN == unsafe { pointer.add(index).read_volatile() })
+            let matches = (0..buffer.len()).all(|index| {
+                pattern[offset + index] == unsafe { pointer.add(index).read_volatile() }
+            });
+            offset += buffer.len();
+            matches
         });
         if landed {
             // The CRC the initiator also prints, so the pair cross-checks.
