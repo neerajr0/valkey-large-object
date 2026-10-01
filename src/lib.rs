@@ -25,7 +25,7 @@
 //                                locals; OnceLock statics are set only after
 //                                everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
-//   3. transport::register_buffers()
+//   3. fabric.register_segment() per startup segment
 //                              — fi_mr_reg pool buffers with EFA domains.
 //   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
@@ -85,10 +85,6 @@ lazy_static::lazy_static! {
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
     static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
-
-    /// Total DRAM budget for cached objects. 0 = no limit (grow on demand).
-    /// In Dram mode: all objects live here. In Tiered mode: promotion cache.
-    static ref CFG_DRAM_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Uniform segment size for all pools (DRAMPool and NVMePool).
     /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
@@ -223,10 +219,6 @@ pub fn nvme_staging_size() -> usize {
     CFG_NVME_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn dram_maxmemory() -> u64 {
-    CFG_DRAM_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
-}
-
 pub fn dram_segment_size() -> usize {
     CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -298,6 +290,37 @@ pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
 
 pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register an expanded segment's memory with EFA, if a fabric is up (no-op otherwise). The
+/// Register a segment with EFA on every fabric service; no-op when no fabric is up. A failure is
+/// fatal and panics: an unregistered segment can't be served over EFA (the per-transfer fallback
+/// fails the same way) and the failure isn't transient, so a retry won't help. Single owner of
+/// this fatal-on-failure policy — startup and `try_expand` both call it.
+pub fn efa_register_segment(slice: &'static [u8]) {
+    let Some(fabric) = transport::fabric::fabric() else {
+        return; // TCP-only: no fabric, nothing to register.
+    };
+    if let Err(e) = fabric.register_segment(slice) {
+        panic!(
+            "largeobj: EFA registration of segment at {:p} failed (fatal): {e}",
+            slice.as_ptr()
+        );
+    }
+}
+
+/// Release a segment's EFA registration before its memory is freed; no-op when no fabric is up or
+/// the base was never registered. Called from `Segment::drop`.
+pub fn efa_release_segment(base: usize) {
+    if let Some(fabric) = transport::fabric::fabric() {
+        fabric.release_segment(base);
+    }
+}
+
+/// Count of EFA-registered segments (0 when no fabric). Equals the live segment count when the
+/// fabric is up (every live segment is registered); surfaced in INFO to assert that invariant.
+pub fn efa_registered_segment_count() -> usize {
+    transport::fabric::registered_segment_count()
 }
 
 pub fn operating_mode() -> OperatingMode {
@@ -517,7 +540,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .expect("failed to build tokio runtime");
 
     // Step 1: open the fabric.
-    let mut fabric = match transport::Fabric::start(&transport::config::configuration()) {
+    let fabric = match transport::Fabric::start(&transport::config::configuration()) {
         Ok(fabric) => Some(fabric),
         Err(error) => {
             ctx.log_warning(&format!(
@@ -538,19 +561,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     };
 
-    // Step 3: Fabric::register_buffers() — fi_mr_reg per segment per server.
-    if let Some(fabric) = &mut fabric {
-        if let Err(e) = fabric.register_buffers(&storage::all_segment_slices()) {
-            ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
-            // storage::init() already committed pools/engine to OnceLock.
-            // EFA registration failure after storage commit is fatal.
-            // The user must fix the EFA environment and restart.
-            panic!(
-                "largeobj: EFA buffer registration failed after storage init: {}",
-                e
-            );
-        }
-    }
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
@@ -560,7 +570,13 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
             ));
         }
     }
+    // Commit BEFORE registering: efa_register_segment reads the committed global fabric.
     transport::commit(fabric);
+
+    // Register every startup segment with EFA (fatal on failure — see efa_register_segment).
+    for segment in storage::all_segment_slices() {
+        efa_register_segment(segment);
+    }
 
     // All init succeeded — commit runtime to OnceLock.
     if RUNTIME.set(rt).is_err() {
@@ -623,8 +639,6 @@ valkey_module! {
     ],
     configurations: [
         i64: [
-            ["dram-maxmemory", &*CFG_DRAM_MAXMEMORY, 0, 0, i64::MAX,
-             ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["segment-size", &*CFG_SEGMENT_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,

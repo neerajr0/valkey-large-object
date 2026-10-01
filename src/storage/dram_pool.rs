@@ -42,8 +42,29 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_exact(size)
+    /// Allocate all buffers for an object, expanding once if needed.
+    /// Try `alloc_exact`; on failure expand a single segment and retry.
+    ///
+    /// One expand suffices: an object is guaranteed <= `segment_size` (oversized
+    /// ones are rejected at SET admission), so a fresh empty segment can hold it.
+    /// If even a fresh segment can't (talc overhead on an object right at the
+    /// boundary), no same-size segment can — so we return None rather than loop.
+    ///
+    /// Callers on the main thread pass their command `&Context`; callers on
+    /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
+    /// is accepted by RM_GetServerInfo for the memory watermark check).
+    pub fn alloc_exact_or_expand(
+        &self,
+        ctx: &valkey_module::Context,
+        obj_len: u64,
+    ) -> Option<Vec<super::context::SegmentBuffer>> {
+        if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
+            return Some(bufs);
+        }
+        // Existing segments are full for this object. Expand once (None if the
+        // server maxmemory watermark would be crossed) and try the fresh segment.
+        self.try_expand(ctx)?;
+        self.pool.alloc_exact(obj_len as usize)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -60,6 +81,17 @@ impl DRAMPool {
 
     pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
         self.pool.iovec_index_for_buf(buf)
+    }
+
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_buf_io_uring_registered(buf)
+    }
+
+    /// Mark all current segments io_uring-registered (startup, post-register).
+    pub fn mark_all_registered(&self) {
+        self.pool.mark_all_registered();
     }
 
     // ─── Object Map ──────────────────────────────────────────────────────────
@@ -121,11 +153,11 @@ impl DRAMPool {
     /// Returns None if pool is full or object exceeds max-promote-size.
     /// On success returns Arc<ObjectContext> in Filling state — caller reads
     /// NVMe data into the buffers, then calls mark_ready().
-    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_exact
-    /// with all-or-nothing semantics.
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
+    /// alloc_exact_or_expand with all-or-nothing semantics.
     ///
-    /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
-    /// Expansion is the scaling cron's responsibility, not the GET hot path.
+    /// If we cannot expand (or promote into existing segments), returns None.
+    /// Caller falls back to NVMe read (Tiered mode).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -135,10 +167,12 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        // All-or-nothing: alloc_exact rolls back internally if pool can't satisfy.
+        // All-or-nothing with reactive expansion via dummy context (promotion
+        // runs on tokio workers — null ctx is accepted by RM_GetServerInfo).
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let buffers = self.alloc_exact(obj_len as usize)?;
+        let dummy = valkey_module::Context::dummy();
+        let buffers = self.alloc_exact_or_expand(&dummy, obj_len)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -164,6 +198,12 @@ impl DRAMPool {
     /// Total allocated bytes across live segments. Used by INFO largeobj.
     pub fn allocated_bytes(&self) -> usize {
         self.pool.allocated_bytes()
+    }
+
+    /// Total free-gap count across live segments — the fragmentation signal.
+    /// Used by INFO largeobj.
+    pub fn fragment_count(&self) -> usize {
+        self.pool.fragment_count()
     }
 
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
@@ -196,12 +236,13 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Add one segment to the pool, gated by BOTH the server-wide `maxmemory`
-    /// (the real OOM boundary, via `would_cross_memory_watermark`) and the
-    /// module-local `dram-maxmemory` sub-budget if set.
+    /// Add one segment to the pool, gated by the server-wide `maxmemory` (via
+    /// `would_cross_memory_watermark`). When the server has no `maxmemory`
+    /// configured (0), there is no ceiling and the pool grows on demand — the
+    /// same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, `None` if either ceiling would be
+    /// Returns the new iovec_index on success, `None` if the watermark would be
     /// crossed. Must be called on the main event-loop thread (reads server memory).
     pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
         // Server-wide OOM guard: never grow into memory the shrink path would
@@ -210,19 +251,12 @@ impl DRAMPool {
             return None;
         }
 
-        // Module-local sub-budget (optional): honor dram-maxmemory if set > 0.
-        let dram_max = crate::dram_maxmemory();
-        if dram_max > 0 {
-            let current_bytes = self.pool.live_segment_count() * self.pool.segment_size;
-            if current_bytes as u64 >= dram_max {
-                return None;
-            }
-        }
-        let result = self.pool.expand();
-        if result.is_some() {
-            self.expand_count.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        let (idx, slice) = self.pool.expand()?;
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+
+        // Register the new segment with EFA (fatal on failure — see efa_register_segment).
+        crate::efa_register_segment(slice);
+        Some(idx)
     }
 
     /// Mark the segment with the least cached bytes draining and remove its objects.
