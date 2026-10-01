@@ -826,13 +826,13 @@ mod tests {
                     (&CFG_SEGMENT_SIZE, max_obj - 1),
                     (&CFG_NVME_STAGING_SIZE, max_obj - 1),
                 ],
-                Some("max-object-size does not fit in one segment"),
+                Some("segment-size is insufficient for max-object-size"),
             ),
             (
                 "segment_lt_promote_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_MAX_PROMOTE_SIZE, segment + 1)],
-                Some("max-promote-size does not fit in one segment"),
+                Some("segment-size is insufficient for max-promote-size"),
             ),
             (
                 "staging_lt_segment_rejected",
