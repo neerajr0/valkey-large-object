@@ -61,8 +61,11 @@ pub fn object_fits_segment(segment_size: usize, obj_len: usize, chunk_size: usiz
         return false;
     }
     let chunks = obj_len.div_ceil(chunk_size);
+    // What we allocate: each chunk is aligned up to IO_ALIGN for O_DIRECT.
     let full = (chunks - 1).saturating_mul(align_up(chunk_size));
-    let last = align_up(obj_len) - full;
+    let last = align_up(obj_len - (chunks - 1) * chunk_size);
+    // What talc needs: one IO_ALIGN boundary tag per allocation plus one for
+    // the segment's heap header.
     let slack = chunks.saturating_add(1).saturating_mul(IO_ALIGN);
     full.saturating_add(last).saturating_add(slack) <= segment_size
 }
