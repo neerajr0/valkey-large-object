@@ -273,11 +273,14 @@ fn main() -> Result<(), String> {
     let buffers: Vec<Vec<u8>> = if serve_read {
         // Prefill each region with its slice of the position-dependent pattern.
         let mut offset = 0;
-        sizes.iter().map(|&size| {
-            let buf = pattern[offset..offset + size].to_vec();
-            offset += size;
-            buf
-        }).collect()
+        sizes
+            .iter()
+            .map(|&size| {
+                let buf = pattern[offset..offset + size].to_vec();
+                offset += size;
+                buf
+            })
+            .collect()
     } else {
         sizes.iter().map(|&size| vec![0u8; size]).collect()
     };

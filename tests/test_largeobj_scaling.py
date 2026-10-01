@@ -22,8 +22,9 @@ PEER_ADDRESS = binascii.hexlify(
 ).decode()
 
 # What tests/harness/fabric_target writes (--read mode) or expects (write mode).
-EFA_PATTERN = b'\xab'
+# Must match fabric_target's generate_pattern(): cycling 0x00..0xFF.
 EFA_TARGET_LEN = 4096
+EFA_PATTERN = bytes(i % 256 for i in range(EFA_TARGET_LEN))
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -155,7 +156,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.HELLO', address)
             result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
             assert result == b'OK', f"EFA SET failed: {result}"
-            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
+            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN
         finally:
             process.kill()
         # The EFA SET succeeded in a pool that had already expanded (multi-segment),
