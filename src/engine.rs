@@ -541,10 +541,6 @@ pub fn execute_set(
     obj_len: u64,
     data_source: DataSource,
 ) -> EngineResult {
-    // Reject zero-length values / 0-byte cases.
-    if obj_len == 0 {
-        return EngineResult::Sync(Err(ValkeyError::Str("ERR object length must be > 0")));
-    }
     let mode = crate::operating_mode();
     // Assign object_id at command dispatch time (main thread) — establishes
     // ordering by arrival, not completion. Used for version checks on async paths.
