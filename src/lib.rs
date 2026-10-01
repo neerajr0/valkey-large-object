@@ -84,12 +84,12 @@ lazy_static::lazy_static! {
     /// Used in Tiered mode for read/write staging. Split into uniform
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
-    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
     /// Uniform segment size for all pools (DRAMPool and NVMePool).
     /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
-    /// Default: 64MB. Immutable after load.
-    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    /// Default: 1 GiB. Immutable after load.
+    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
     /// Max disk usage in nvme-dir. Default: 0 (unlimited).
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
@@ -99,11 +99,9 @@ lazy_static::lazy_static! {
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
-    /// Must be < segment-size (an object is staged as one contiguous buffer in one
-    /// segment). Default: 63 MiB — must fit in one segment after talc overhead,
-    /// so we leave ~1 MiB headroom below segment-size. Supports memory notation
-    /// (e.g., "63mb"). Refer to object_fits_segment().
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(63 * 1024 * 1024);
+    /// Must fit in one segment (object_fits_segment check). Default: 256 MiB.
+    /// Supports memory notation (e.g., "256mb"). Refer to object_fits_segment().
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
 
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
@@ -178,10 +176,9 @@ lazy_static::lazy_static! {
     static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 
     /// Maximum allowed object size for LO.SET. Rejects writes exceeding this limit.
-    /// Default: 63 MiB.  Must fit in one segment (64 MiB) after talc
-    /// per-chunk boundary-tag overhead, so we leave ~1 MiB headroom.
-    /// Supports memory notation (e.g., "63mb").
-    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(63 * 1024 * 1024);
+    /// Default: 512 MiB. Must fit in one segment in Dram mode (object_fits_segment
+    /// check). Supports memory notation (e.g., "512mb").
+    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -655,15 +652,15 @@ valkey_module! {
     ],
     configurations: [
         i64: [
-            ["segment-size", &*CFG_SEGMENT_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
+            ["segment-size", &*CFG_SEGMENT_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 67_108_864, 1_048_576, 1_073_741_824,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 66_060_288, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
@@ -679,7 +676,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 66_060_288, 1, i64::MAX,
+            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
@@ -719,11 +716,11 @@ mod tests {
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_graph_defaults() {
         CFG_NVME_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
-        CFG_NVME_STAGING_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
-        CFG_SEGMENT_SIZE.store(64 * 1024 * 1024, Relaxed); // 64 MiB
+        CFG_NVME_STAGING_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
+        CFG_SEGMENT_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
         CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed); // 8 MiB
-        CFG_MAX_OBJECT_SIZE.store(63 * 1024 * 1024, Relaxed); // 63 MiB
-        CFG_MAX_PROMOTE_SIZE.store(63 * 1024 * 1024, Relaxed); // 63 MiB
+        CFG_MAX_OBJECT_SIZE.store(512 * 1024 * 1024, Relaxed); // 512 MiB
+        CFG_MAX_PROMOTE_SIZE.store(256 * 1024 * 1024, Relaxed); // 256 MiB
         CFG_MAX_BUFFERS_PER_OP.store(8, Relaxed);
         CFG_MIN_BUFFERS_PER_OP.store(2, Relaxed);
     }
