@@ -250,6 +250,7 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
+            f" max-object-size 2097152"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"

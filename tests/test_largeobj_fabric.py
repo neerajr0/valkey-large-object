@@ -102,7 +102,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
+        address, rkey, remote_addr = line.split()[1:4]
         return process, address, int(rkey), int(remote_addr)
 
     def test_get_writes_into_the_target(self):
@@ -182,6 +182,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
+            f" max-promote-size 1048576"
             f" chunk-size 4096"
             f" direct-io no"
             f" fabric-provider Emulated"

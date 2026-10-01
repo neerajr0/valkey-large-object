@@ -177,8 +177,9 @@ lazy_static::lazy_static! {
     static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 
     /// Maximum allowed object size for LO.SET. Rejects writes exceeding this limit.
-    /// Default: 512 MiB. Supports memory notation (e.g., "512mb").
-    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
+    /// Default: 64 MiB (matches segment-size default, since segment-size >= max-object-size
+    /// is enforced). Supports memory notation (e.g., "64mb").
+    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -404,28 +405,6 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
     static GRAPH: LazyLock<Vec<ConfigDependencyEdge>> = LazyLock::new(|| {
         vec![
             ConfigDependencyEdge {
-                parent: &CFG_DRAM_MAXMEMORY,
-                child: &CFG_SEGMENT_SIZE,
-                enforce_condition: || dram_maxmemory() > 0,
-                error_msg: errors::ERR_DRAM_GE_SEGMENT,
-            },
-            ConfigDependencyEdge {
-                parent: &CFG_DRAM_MAXMEMORY,
-                child: &CFG_MAX_OBJECT_SIZE,
-                enforce_condition: || {
-                    dram_maxmemory() > 0 && operating_mode() == OperatingMode::Dram
-                },
-                error_msg: errors::ERR_DRAM_GE_MAX_OBJ,
-            },
-            ConfigDependencyEdge {
-                parent: &CFG_DRAM_MAXMEMORY,
-                child: &CFG_MAX_PROMOTE_SIZE,
-                enforce_condition: || {
-                    dram_maxmemory() > 0 && operating_mode() == OperatingMode::Tiered
-                },
-                error_msg: errors::ERR_DRAM_GE_PROMOTE,
-            },
-            ConfigDependencyEdge {
                 parent: &CFG_NVME_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
@@ -443,8 +422,18 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
                 enforce_condition: || true,
                 error_msg: errors::ERR_SEGMENT_GE_CHUNK,
             },
-            // TODO: Add segment-size >= max-object-size edge when we enforce
-            // objects to be allocated on only one segment.
+            ConfigDependencyEdge {
+                parent: &CFG_SEGMENT_SIZE,
+                child: &CFG_MAX_OBJECT_SIZE,
+                enforce_condition: || operating_mode() == OperatingMode::Dram,
+                error_msg: errors::ERR_SEGMENT_GE_MAX_OBJ,
+            },
+            ConfigDependencyEdge {
+                parent: &CFG_SEGMENT_SIZE,
+                child: &CFG_MAX_PROMOTE_SIZE,
+                enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                error_msg: errors::ERR_SEGMENT_GE_PROMOTE,
+            },
             ConfigDependencyEdge {
                 parent: &CFG_MAX_BUFFERS_PER_OP,
                 child: &CFG_MIN_BUFFERS_PER_OP,
@@ -663,7 +652,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
+            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 67_108_864, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
@@ -712,7 +701,6 @@ mod tests {
     /// their current value. Used to snapshot defaults and restore between cases.
     fn all_graph_configs() -> Vec<(&'static AtomicI64, i64)> {
         vec![
-            (&CFG_DRAM_MAXMEMORY, CFG_DRAM_MAXMEMORY.load(Relaxed)),
             (&CFG_NVME_MAXMEMORY, CFG_NVME_MAXMEMORY.load(Relaxed)),
             (&CFG_NVME_STAGING_SIZE, CFG_NVME_STAGING_SIZE.load(Relaxed)),
             (&CFG_SEGMENT_SIZE, CFG_SEGMENT_SIZE.load(Relaxed)),
@@ -758,26 +746,6 @@ mod tests {
             // ── Happy paths ──────────────────────────────────────────────
             ("defaults_pass", OperatingMode::Dram, vec![], None),
             (
-                "dram_maxmemory_zero_skips_edges",
-                OperatingMode::Dram,
-                vec![
-                    (&CFG_SEGMENT_SIZE, 999_999_999),
-                    (&CFG_NVME_STAGING_SIZE, 999_999_999),
-                    (&CFG_MAX_OBJECT_SIZE, 1),
-                    (&CFG_CHUNK_SIZE, 1),
-                ],
-                None,
-            ),
-            (
-                "dram_eq_segment_ok",
-                OperatingMode::Dram,
-                vec![
-                    (&CFG_DRAM_MAXMEMORY, segment),
-                    (&CFG_MAX_OBJECT_SIZE, segment),
-                ],
-                None,
-            ),
-            (
                 "equal_buffers_ok",
                 OperatingMode::Dram,
                 vec![(&CFG_MIN_BUFFERS_PER_OP, max_buf)],
@@ -795,21 +763,37 @@ mod tests {
                 vec![(&CFG_NVME_MAXMEMORY, 1)],
                 None,
             ),
-            // ── Violation per edge ───────────────────────────────────────
             (
-                "dram_lt_segment_rejected",
-                OperatingMode::Dram,
-                vec![(&CFG_DRAM_MAXMEMORY, segment - 1)],
-                Some("dram-maxmemory must be >= segment-size"),
+                "tiered_max_obj_above_segment_ok",
+                OperatingMode::Tiered,
+                vec![(&CFG_MAX_OBJECT_SIZE, segment + 1)],
+                None,
             ),
+            // ── Violation per edge ───────────────────────────────────────
             (
                 "segment_lt_chunk_rejected",
                 OperatingMode::Dram,
                 vec![
                     (&CFG_SEGMENT_SIZE, chunk - 1),
                     (&CFG_NVME_STAGING_SIZE, chunk - 1),
+                    (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
                 Some("segment-size must be >= chunk-size"),
+            ),
+            (
+                "segment_lt_max_obj_rejected",
+                OperatingMode::Dram,
+                vec![
+                    (&CFG_SEGMENT_SIZE, max_obj - 1),
+                    (&CFG_NVME_STAGING_SIZE, max_obj - 1),
+                ],
+                Some("segment-size must be >= max-object-size in Dram mode"),
+            ),
+            (
+                "segment_lt_promote_rejected",
+                OperatingMode::Tiered,
+                vec![(&CFG_MAX_PROMOTE_SIZE, segment + 1)],
+                Some("segment-size must be >= max-promote-size in Tiered mode"),
             ),
             (
                 "staging_lt_segment_rejected",
@@ -822,21 +806,6 @@ mod tests {
                 OperatingMode::Dram,
                 vec![(&CFG_MAX_BUFFERS_PER_OP, min_buf - 1)],
                 Some("max-buffers-per-op must be >= min-buffers-per-op"),
-            ),
-            (
-                "dram_mode_max_obj_exceeds_dram_rejected",
-                OperatingMode::Dram,
-                vec![(&CFG_DRAM_MAXMEMORY, max_obj - 1)],
-                Some("dram-maxmemory must be >= max-object-size in Dram mode"),
-            ),
-            (
-                "tiered_mode_promote_exceeds_dram_rejected",
-                OperatingMode::Tiered,
-                vec![
-                    (&CFG_DRAM_MAXMEMORY, segment), // >= segment, but < promote
-                    (&CFG_MAX_PROMOTE_SIZE, segment + 1),
-                ],
-                Some("dram-maxmemory must be >= max-promote-size in Tiered mode"),
             ),
             (
                 "tiered_mode_nvme_lt_max_obj_rejected",
