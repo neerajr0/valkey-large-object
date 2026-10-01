@@ -11,12 +11,14 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     """Tiered mode with DRAMPool promotion enabled (default max-promote-size)."""
 
     def get_module_args(self, data_dir, direct_io):
+        # max-promote-size must fit in one segment after talc overhead.
+        # With seg=4M and chunk=4K the max is 2093056 (~2044 KiB).
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 4194304"
-            f" max-promote-size 4194304"
+            f" max-promote-size 2093056"
             f" max-object-size 1048576"
             f" bench-mode no"
             f" direct-io no"
@@ -558,6 +560,8 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
     OBJ = 256 * 1024
 
     def get_module_args(self, data_dir, direct_io):
+        # max-promote-size must fit in segment after talc overhead.
+        # seg=1M, chunk=OBJ=256K → max 1028096.
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
@@ -565,7 +569,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             f" max-object-size {self.CAP}"
             f" nvme-staging-size {self.CAP}"
             f" segment-size 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 1028096"
             f" chunk-size {self.OBJ}"
             f" bench-mode no"
             f" direct-io no"
@@ -636,6 +640,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         # segment-size must exceed the largest staged object (object < segment):
         # this test stages 1 MiB and ~1 MiB+2KiB objects, so use 2 MiB segments.
         # nvme-staging-size 4 MiB -> ceil(4MiB / 2MiB) = 2 NVMe staging segments.
+        # max-promote-size must fit in segment after talc overhead (max 2084864).
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
@@ -643,7 +648,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
             f" max-object-size {self.CAP}"
             f" nvme-staging-size 4194304"
             f" segment-size 2097152"
-            f" max-promote-size 2097152"
+            f" max-promote-size 2084864"
             f" chunk-size 1048576"
             f" bench-mode no"
             f" direct-io no"
@@ -780,7 +785,7 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 520192"
             f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"

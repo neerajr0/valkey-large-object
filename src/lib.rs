@@ -100,9 +100,10 @@ lazy_static::lazy_static! {
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
     /// Must be < segment-size (an object is staged as one contiguous buffer in one
-    /// segment). Default: 64MB, matching the default segment-size. Supports memory
-    /// notation (e.g., "64mb").
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    /// segment). Default: 63 MiB — must fit in one segment after talc overhead,
+    /// so we leave ~1 MiB headroom below segment-size. Supports memory notation
+    /// (e.g., "63mb"). Refer to object_fits_segment().
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(63 * 1024 * 1024);
 
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
@@ -177,9 +178,10 @@ lazy_static::lazy_static! {
     static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 
     /// Maximum allowed object size for LO.SET. Rejects writes exceeding this limit.
-    /// Default: 64 MiB (matches segment-size default, since segment-size >= max-object-size
-    /// is enforced). Supports memory notation (e.g., "64mb").
-    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(64 * 1024 * 1024);
+    /// Default: 63 MiB.  Must fit in one segment (64 MiB) after talc
+    /// per-chunk boundary-tag overhead, so we leave ~1 MiB headroom.
+    /// Supports memory notation (e.g., "63mb").
+    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(63 * 1024 * 1024);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -377,8 +379,9 @@ pub fn max_object_size() -> u64 {
 
 // ─── Config Dependency Graph ─────────────────────────────────────────────────
 //
-// Directed graph of >= constraints between configs. Each edge enforces
-// parent >= child when its condition is true.
+// Directed graph of constraints between configs. Each edge enforces
+// parent >= child when its condition is true, unless it supplies a custom
+// validator predicate.
 //
 // At module load (before RUNTIME is set), per-config callbacks skip validation
 // (config processing order is non-deterministic across type categories).
@@ -388,11 +391,16 @@ pub fn max_object_size() -> u64 {
 // before calling the validation callback. validate_config_edge() then runs
 // validate_all_edges() over the same atomics — no value substitution needed.
 
-/// A directed >= constraint: parent >= child must hold when enforce_condition() is true.
+/// A directed constraint between two configs, enforced when enforce_condition()
+/// is true. By default the constraint is `parent >= child`; an edge may override
+/// it with a `validator` predicate taking (parent_value, child_value).
 struct ConfigDependencyEdge {
     parent: &'static AtomicI64,
     child: &'static AtomicI64,
     enforce_condition: fn() -> bool,
+    /// Returns true when the constraint holds. `None` means the default
+    /// `parent >= child`. A validator may also read other configs.
+    validator: Option<fn(u64, u64) -> bool>,
     error_msg: &'static str,
 }
 
@@ -408,41 +416,55 @@ fn config_graph() -> &'static [ConfigDependencyEdge] {
                 parent: &CFG_NVME_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                validator: None,
                 error_msg: errors::ERR_NVME_GE_MAX_OBJ,
             },
             ConfigDependencyEdge {
                 parent: &CFG_NVME_STAGING_SIZE,
                 child: &CFG_SEGMENT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                validator: None,
                 error_msg: errors::ERR_STAGING_GE_SEGMENT,
             },
             ConfigDependencyEdge {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
+                validator: None,
                 error_msg: errors::ERR_SEGMENT_GE_CHUNK,
             },
             ConfigDependencyEdge {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Dram,
+                validator: Some(object_fits_segment),
                 error_msg: errors::ERR_SEGMENT_GE_MAX_OBJ,
             },
             ConfigDependencyEdge {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_MAX_PROMOTE_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                validator: Some(object_fits_segment),
                 error_msg: errors::ERR_SEGMENT_GE_PROMOTE,
             },
             ConfigDependencyEdge {
                 parent: &CFG_MAX_BUFFERS_PER_OP,
                 child: &CFG_MIN_BUFFERS_PER_OP,
                 enforce_condition: || true,
+                validator: None,
                 error_msg: errors::ERR_MAX_BUF_GE_MIN_BUF,
             },
         ]
     });
     &GRAPH
+}
+
+/// Edge validator: an object of `object_size` must fit in one empty segment of
+/// `segment_size` after talc's per-chunk metadata, since `alloc_exact`
+/// co-locates all of an object's chunks in a single segment.
+fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
+    let chunk_size = CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    storage::object_fits_segment(segment_size as usize, object_size as usize, chunk_size)
 }
 
 /// Validate all config edges. Returns the first violated constraint or Ok(()).
@@ -456,7 +478,11 @@ fn validate_all_edges() -> Result<(), String> {
         }
         let p = edge.parent.load(std::sync::atomic::Ordering::Relaxed) as u64;
         let c = edge.child.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        if p < c {
+        let holds = match edge.validator {
+            Some(validator) => validator(p, c),
+            None => p >= c,
+        };
+        if !holds {
             return Err(edge.error_msg.into());
         }
     }
@@ -636,7 +662,7 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 66_060_288, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
@@ -652,7 +678,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 67_108_864, 1, i64::MAX,
+            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 66_060_288, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_edge))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
@@ -687,6 +713,19 @@ mod tests {
     use std::sync::atomic::Ordering::Relaxed;
 
     // ─── Test Infrastructure ─────────────────────────────────────────────
+
+    /// Reset all graph configs to their compile-time defaults. Other tests
+    /// (e.g. segment_pool) may mutate shared statics without restoring them.
+    fn reset_graph_defaults() {
+        CFG_NVME_MAXMEMORY.store(10 * 1024 * 1024 * 1024, Relaxed); // 10 GiB
+        CFG_NVME_STAGING_SIZE.store(64 * 1024 * 1024, Relaxed);   // 64 MiB
+        CFG_SEGMENT_SIZE.store(64 * 1024 * 1024, Relaxed);        // 64 MiB
+        CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed);           // 8 MiB
+        CFG_MAX_OBJECT_SIZE.store(63 * 1024 * 1024, Relaxed);     // 63 MiB
+        CFG_MAX_PROMOTE_SIZE.store(63 * 1024 * 1024, Relaxed);    // 63 MiB
+        CFG_MAX_BUFFERS_PER_OP.store(8, Relaxed);
+        CFG_MIN_BUFFERS_PER_OP.store(2, Relaxed);
+    }
 
     fn set_cfgs(cfgs: &[(&AtomicI64, i64)]) {
         for &(cfg, val) in cfgs {
@@ -787,13 +826,13 @@ mod tests {
                     (&CFG_SEGMENT_SIZE, max_obj - 1),
                     (&CFG_NVME_STAGING_SIZE, max_obj - 1),
                 ],
-                Some("segment-size must be >= max-object-size in Dram mode"),
+                Some("max-object-size does not fit in one segment"),
             ),
             (
                 "segment_lt_promote_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_MAX_PROMOTE_SIZE, segment + 1)],
-                Some("segment-size must be >= max-promote-size in Tiered mode"),
+                Some("max-promote-size does not fit in one segment"),
             ),
             (
                 "staging_lt_segment_rejected",
@@ -818,6 +857,8 @@ mod tests {
 
     #[test]
     fn test_validate_all_edges() {
+        // Restore compile-time defaults in case prior tests mutated statics.
+        reset_graph_defaults();
         // Capture defaults before any mutation.
         let defaults = all_graph_configs();
         let segment = CFG_SEGMENT_SIZE.load(Relaxed);

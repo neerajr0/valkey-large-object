@@ -7,12 +7,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     """Dram-only mode: all objects live in DRAMPool, no NVMe."""
 
     def get_module_args(self, data_dir, direct_io):
-        # max-object-size set to segment-size so the config dependency edge
-        # (segment-size >= max-object-size) is satisfied at load time.
+        # max-object-size must fit in one segment after talc per-chunk overhead.
+        # With seg=2M and chunk=4K the maximum is 1044480 (~1020 KiB).
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
-            f" max-object-size 2097152"
+            f" max-object-size 1044480"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -63,16 +63,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_object_larger_than_segment_rejected(self):
-        """max-object-size is enforced at init and runtime to be <= segment-size.
-        An object larger than the segment is therefore larger than max-object-size
-        and is rejected with that error.
-
-        Compare with test_max_object_size where max-object-size is set below
-        segment-size, so the max-object-size limit is hit without reaching the
-        segment-size boundary.
+        """An object larger than max-object-size is rejected.
+        Compare with test_max_object_size where max-object-size is lowered at
+        runtime via CONFIG SET.
         """
         client = self.server.get_new_client()
-        # segment-size and max-object-size are both 2MB. A 4MB object exceeds both.
+        # max-object-size is 1044480 (~1020 KiB). A 4MB object exceeds it.
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
@@ -247,10 +243,12 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
     """
 
     def get_module_args(self, data_dir, direct_io):
+        # max-object-size must fit in one segment after talc overhead.
+        # With seg=2M and chunk=64K the max is 1966080 (~1920 KiB).
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
-            f" max-object-size 2097152"
+            f" max-object-size 1966080"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
