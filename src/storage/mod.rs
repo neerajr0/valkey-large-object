@@ -264,18 +264,11 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
     slices
 }
 
-/// Rebuild the dense io_uring fixed-buffer table for ONE pool's ring, from that
-/// pool's currently-live segments, reassigning each to a dense pool-local
-/// `iovec_index` and marking it registered. Returns the iovec array to hand to
-/// that ring's `register_buffers`. Called by the pool's poller during a
-/// registration swap (see `uring::poller_loop`).
-///
-/// 5.10 has no sparse tables / per-slot updates, so the swap is whole-table and
-/// the array MUST be dense (no holes) — hence the recompute rather than gap-
-/// preserving. `segment_idx` (the stable `slots[]` id stored in every
-/// `SegmentBuffer`) is untouched; only the pool-local `iovec_index` moves, and
-/// op-build reads it fresh. Only `PoolId::Dram` ever swaps today (the NVMe pool
-/// is fixed-size); a swap touches ONLY the named pool's table, never the other's.
+/// Rebuild ONE pool's dense io_uring fixed-buffer table from its live segments,
+/// reassigning each a dense pool-local `iovec_index`, marking it registered, and
+/// returning the iovec array for that ring's `register_buffers`. Dense because
+/// 5.10 can only swap the whole table. Only `PoolId::Dram` swaps in practice;
+/// NVMe is fixed-size.
 pub fn rebuild_dense_iovecs_for(pool: uring::PoolId) -> Vec<libc::iovec> {
     match pool {
         uring::PoolId::Dram => get_dram_pool().rebuild_dense_iovecs(),

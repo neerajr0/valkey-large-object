@@ -7,7 +7,8 @@
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
 //! `Some(segment)` (live) or `None` (empty/removed). Slot index == this pool's
 //! LOCAL iovec index in its own io_uring buffer table (each pool has its own
-//! ring). Segments have `iovec_index` set write-once at birth.
+//! ring). A segment's `iovec_index` is assigned at creation and recomputed on
+//! each dense table rebuild.
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
