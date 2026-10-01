@@ -7,9 +7,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     """Dram-only mode: all objects live in DRAMPool, no NVMe."""
 
     def get_module_args(self, data_dir, direct_io):
+        # max-object-size must fit in one segment after talc per-chunk overhead.
+        # With seg=2M and chunk=4K the maximum is 1044480 (~1020 KiB).
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
+            f" max-object-size 1044480"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -60,22 +63,19 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_object_larger_than_segment_rejected(self):
-        """An object larger than segment-size is rejected up front.
-
-        Single-segment invariant: every object's chunks are co-located in one
-        segment, so an object cannot exceed segment-size. This is rejected at
-        SET admission (lo_set) with a distinct error, before any allocation or
-        expansion attempt — so it does NOT fall through to expand-and-fail.
+        """An object larger than max-object-size is rejected.
+        Compare with test_max_object_size where max-object-size is lowered at
+        runtime via CONFIG SET.
         """
         client = self.server.get_new_client()
-        # segment-size is 2MB. A 4MB object cannot fit in any single segment.
+        # max-object-size is 1044480 (~1020 KiB). A 4MB object exceeds it.
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected object-exceeds-segment error"
+            assert False, "Expected max-object-size rejection"
         except ResponseError as e:
-            assert 'max object size exceeded' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -139,6 +139,30 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         # Nonexistent key returns nil digest
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
+
+    # ─── max-object-size tests ───────────────────────────────────────────
+
+    def test_max_object_size(self):
+        """max-object-size rejects oversized SETs, allows at-limit SETs,
+        and does not affect reads of already-stored objects."""
+        client = self.server.get_new_client()
+        limit = 8192
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit))
+        # Oversized SET is rejected.
+        try:
+            client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
+            assert False, "Expected max object size rejection"
+        except ResponseError as e:
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+        # Rejected SET must not leave a phantom key.
+        assert client.execute_command('DBSIZE') == 0
+        assert client.execute_command('LO.GET', 'bigkey') is None
+        # At-limit SET succeeds.
+        assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        # Lowering limit below stored object size does not affect reads.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
 
     # ─── SMART LOG tests ───────────────────────────────────────────────────
 
@@ -219,9 +243,12 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
     """
 
     def get_module_args(self, data_dir, direct_io):
+        # max-object-size must fit in one segment after talc overhead.
+        # With seg=2M and chunk=64K the max is 1966080 (~1920 KiB).
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
+            f" max-object-size 1966080"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"

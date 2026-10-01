@@ -30,11 +30,9 @@ pub fn increase_nvme_disk_usage(bytes: u64) {
 /// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
 /// must be accurate for capacity checks, so assert on the issue.
 pub fn decrease_nvme_disk_usage(bytes: u64) {
-    if let Err(tracked) =
-        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            cur.checked_sub(bytes)
-        })
-    {
+    if let Err(tracked) = NVME_DISK_USAGE.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur.checked_sub(bytes)
+    }) {
         panic!(
             "NVMe disk-usage underflow: tried to free {bytes} B but only {tracked} B tracked \
              — accounting is corrupt (double-free or size mismatch)"
@@ -49,7 +47,7 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             let next = cur.checked_add(bytes)?;
             if max == 0 || next <= max {
                 Some(next)
