@@ -35,6 +35,12 @@ pub struct UringOp {
     pub file_offset: u64,
     /// Number of bytes to read/write.
     pub len: u64,
+    /// Whether this op's buffer segment is registered in the io_uring kernel
+    /// table. `true` → ReadFixed/WriteFixed (fast path, segment in the
+    /// IORING_REGISTER_BUFFERS set); `false` → plain Read/Write (a segment
+    /// added after startup that is not yet kernel-registered). Set by the caller
+    /// from the owning segment's registration flag at construction time.
+    pub use_fixed: bool,
 }
 
 // SAFETY: buf_ptr points to segment memory that is stable for module lifetime.
@@ -194,8 +200,6 @@ impl UringNvmeEngine {
     ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
-        // Buffer registration is guaranteed by the caller (main thread).
-        let use_fixed = true;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
         loop {
@@ -249,7 +253,7 @@ impl UringNvmeEngine {
                 let (sqe, op) = match req {
                     IoRequest::Read { fd, op, tx } => {
                         let read_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if use_fixed {
+                        let sqe = if op.use_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr,
@@ -279,7 +283,7 @@ impl UringNvmeEngine {
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if use_fixed {
+                        let sqe = if op.use_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr as *const u8,

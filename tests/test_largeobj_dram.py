@@ -59,27 +59,23 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         result = client.execute_command('LO.GET', 'delkey')
         assert result is None
 
-    def test_dram_pool_exhaustion(self):
-        """Pool exhaustion when dram-maxmemory caps expansion.
-        alloc_exact_or_expand loops expanding until the budget is hit.
-        A 4MB object needs >1 segment of 2MB; capping dram-maxmemory at
-        segment-size (2MB) blocks expansion, so the second segment never
-        appears and alloc fails.
+    def test_object_larger_than_segment_rejected(self):
+        """An object larger than segment-size is rejected up front.
+
+        Single-segment invariant: every object's chunks are co-located in one
+        segment, so an object cannot exceed segment-size. This is rejected at
+        SET admission (lo_set) with a distinct error, before any allocation or
+        expansion attempt — so it does NOT fall through to expand-and-fail.
         """
         client = self.server.get_new_client()
-        # Clear leftover keys from prior tests so the pool has known capacity.
-        client.execute_command('FLUSHALL')
-        # Cap dram-maxmemory to segment-size (2MB) so expansion is blocked.
-        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
+        # segment-size is 2MB. A 4MB object cannot fit in any single segment.
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
+            assert False, "Expected object-exceeds-segment error"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
-        # Restore unlimited expansion for subsequent tests.
-        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
+            assert 'max object size exceeded' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -116,28 +112,6 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
         assert client.execute_command('LO.GET', 'srckey2') == payload
-
-    def test_copy_pool_exhausted(self):
-        """COPY fails when DRAMPool cannot fit the duplicate.
-        Uses a 1500KB object in a 2MB segment. After the SET succeeds,
-        COPY tries alloc_exact_or_expand. The pool has ~500KB free (2MB - 1500KB
-        - talc overhead), which is not enough for a second 1500KB object.
-        Expansion would add a 2MB segment, making COPY succeed — so we cap
-        dram-maxmemory to segment-size first.
-        """
-        client = self.server.get_new_client()
-        client.execute_command('FLUSHALL')
-        payload = b'F' * (1500 * 1024)
-        client.execute_command('LO.SET', 'bigkey', payload)
-        # Now cap so COPY cannot expand.
-        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
-        try:
-            client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail with pool exhausted"
-        except ResponseError:
-            pass  # Expected — pool cannot fit two 1500KB objects in 2MB
-        # Restore unlimited expansion for subsequent tests.
-        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -233,3 +207,41 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert False, "Expected wrong information field error"
         except ResponseError as e:
             assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+
+
+class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
+    """COPY fails when the pool cannot fit the duplicate and cannot expand.
+
+    Own class with a coarse chunk-size (64KB) so a large object co-locates in one
+    segment with negligible talc overhead (4KB chunks waste ~50% and would not
+    fit). Server maxmemory is the only expansion ceiling now, so we cap it just
+    above current usage and COPY's expansion crosses the watermark and fails.
+    """
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" segment-size 2097152"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_copy_pool_exhausted(self):
+        client = self.server.get_new_client()
+        client.execute_command('FLUSHALL')
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        payload = b'F' * (1500 * 1024)
+        assert client.execute_command('LO.SET', 'bigkey', payload) == b'OK'
+        # Cap server maxmemory just above current used — no room for a 2nd segment.
+        used = int(client.info('memory')['used_memory'])
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail — expansion would cross maxmemory"
+        except ResponseError:
+            pass  # Expected — cannot fit a second object without crossing the watermark
+        finally:
+            client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+        # Source intact.
+        assert client.execute_command('LO.GET', 'bigkey') == payload

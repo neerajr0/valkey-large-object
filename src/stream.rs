@@ -155,6 +155,7 @@ impl Source<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
+                        use_fixed: pool.is_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -278,6 +279,7 @@ impl Target<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
+                        use_fixed: pool.is_buf_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -314,6 +316,16 @@ impl Pool {
         match self {
             Pool::Nvme(p) => p.iovec_index_for_buf(b),
             Pool::Dram(p) => p.iovec_index_for_buf(b),
+        }
+    }
+    /// Whether the buffer's segment is registered in the kernel io_uring buffer
+    /// table — drives the per-op fixed vs non-fixed path. Startup segments are
+    /// registered; segments added by expand() are not until a future
+    /// register_buffers_update path flips them.
+    pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
+        match self {
+            Pool::Nvme(p) => p.is_buf_io_uring_registered(b),
+            Pool::Dram(p) => p.is_buf_io_uring_registered(b),
         }
     }
 }
@@ -380,6 +392,9 @@ pub struct FileHeaderRead {
     pub iovec: u16,
     /// Pool buffer pointer the header is read into.
     pub ptr: usize,
+    /// Whether the header buffer's segment is registered in the io_uring buffer
+    /// table — drives the fixed vs non-fixed read path for the header op.
+    pub use_fixed: bool,
 }
 
 /// Everything the loop needs that isn't the source/target themselves.
@@ -450,6 +465,7 @@ impl<'a> StreamJob<'a> {
             verify_file_header: Some(FileHeaderRead {
                 iovec: pool.iovec(hdr_buf),
                 ptr: pool.ptr(hdr_buf) as usize,
+                use_fixed: pool.is_io_uring_registered(hdr_buf),
             }),
             batch_width,
             persist_file_header: None,
@@ -629,6 +645,7 @@ pub async fn run_get(
             job.fd.expect("GET header read requires an fd"),
             fh.iovec,
             fh.ptr,
+            fh.use_fixed,
             job.object_id
                 .expect("GET header read requires an object_id"),
             job.obj_len,

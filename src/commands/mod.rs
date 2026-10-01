@@ -202,6 +202,21 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         (obj_len, DataSource::Tcp(data))
     };
 
+    // Reject zero-length values / 0-byte cases.
+    if obj_len == 0 {
+        return Err(ValkeyError::Str("ERR object length must be > 0"));
+    }
+    // Reject oversize objects here for a clean, deterministic error rather than
+    // a confusing pool-exhausted failure at alloc time.
+    //
+    // TODO: replace segment_size() with an explicit max-object-size config. That
+    // bound must be *smaller* than segment_size to account for talc's per-chunk
+    // overhead — usable segment capacity is less than nominal, so an object that
+    // passes this nominal check can still fail allocation.
+    if obj_len as usize > crate::segment_size() {
+        return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
+    }
+
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,
