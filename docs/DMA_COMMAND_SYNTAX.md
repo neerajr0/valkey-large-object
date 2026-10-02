@@ -65,7 +65,7 @@ Each term builds on the previous.
 
 ## 2. Option 2: Per-Request rkey with HELLO
 
-Client establishes a session once via `LO.HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory region to use per request. A second `LO.HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
+Client establishes a session once via `LO.HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `LO.HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
 
 **Threading model:** The session holds routing handles for all N server EFA devices. Any thread can use any device for a given operation — the server picks the least-loaded device (least-loaded). Threads do not own specific devices.
 
@@ -92,31 +92,38 @@ LO.HELLO <client_efa_addr_hex>
 ### LO.GET (DMA)
 
 ```
-LO.GET <key> <rkey> <remote_addr> <len>
+LO.GET <key> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
+
+One or more addresses per request, so a client whose object spans several registered
+buffers (on several GPUs, or several buffers on one) names them all in one
+command. The address count is inferred from the argument count (must be a multiple of 3).
 
 | Step | Who | Action |
 |------|-----|--------|
-| 1 | Client | Picks a registered memory region, sends command with its rkey + target address |
-| 2 | Server | Reads object from NVMe/DRAM into a pool buffer |
+| 1 | Client | Picks its registered memory addresses, sends command with each address's rkey + addr + length |
+| 2 | Server | Validates `sum(len_i) >= obj_len`, then reads the object from NVMe/DRAM |
 | 3 | Server | Picks EFA device (picks least-loaded device) |
-| 4 | Server | `fi_write(buf, len, dest_fi_addr, remote_addr, rkey)` → pushes to client memory |
-| 5 | Server | Waits for CQ completion, replies with integer (bytes written) |
-| 6 | Client | Data is already in GPU memory at remote_addr. Uses it directly. |
+| 4 | Server | Per chunk, `fi_write(buf, len, dest_fi_addr, addr, rkey)` into each address that chunk spans — addresses are consumed in order, and a chunk may straddle a boundary |
+| 5 | Server | Waits for CQ completions, replies `[obj_len, crc32c]` |
+| 6 | Client | Data is already in GPU memory across its addresses; `obj_len` says where the object ends and any surplus buffer begins. |
 
 ### LO.SET (DMA)
 
 ```
-LO.SET <key> <rkey> <remote_addr> <len>
+LO.SET <key> <total_len> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
+
+`total_len` is the object's length; the addresses are where its bytes currently live.
+The address count is inferred from the argument count (must be a multiple of 3).
 
 | Step | Who | Action |
 |------|-----|--------|
-| 1 | Client | Places data in a registered memory region, sends command with its rkey + source address |
-| 2 | Server | Allocates a pool buffer |
+| 1 | Client | Places data across its registered memory addresses, sends command with each address's rkey + addr + length |
+| 2 | Server | Validates `sum(len_i) >= total_len`, then allocates buffers |
 | 3 | Server | Picks EFA device (least-loaded LB) |
-| 4 | Server | `fi_read(buf, len, dest_fi_addr, remote_addr, rkey)` → pulls from client memory |
-| 5 | Server | Waits for CQ completion, writes buffer to NVMe, stores key mapping |
+| 4 | Server | Per chunk, `fi_read(buf, len, dest_fi_addr, addr, rkey)` from each address that chunk spans, in address order |
+| 5 | Server | Waits for CQ completions, writes through to the configured tier, stores key mapping |
 | 6 | Server | Replies OK |
 
 

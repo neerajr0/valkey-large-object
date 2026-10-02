@@ -75,7 +75,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.SET', 'toobig', payload)
             assert False, "Expected max-object-size rejection"
         except ResponseError as e:
-            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -153,7 +153,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
             assert False, "Expected max object size rejection"
         except ResponseError as e:
-            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
         # Rejected SET must not leave a phantom key.
         assert client.execute_command('DBSIZE') == 0
         assert client.execute_command('LO.GET', 'bigkey') is None

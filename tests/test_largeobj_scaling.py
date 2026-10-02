@@ -22,8 +22,9 @@ PEER_ADDRESS = binascii.hexlify(
 ).decode()
 
 # What tests/harness/fabric_target writes (--read mode) or expects (write mode).
-EFA_PATTERN = b'\xab'
+# Must match fabric_target's generate_pattern(): cycling 0x00..0xFF.
 EFA_TARGET_LEN = 4096
+EFA_PATTERN = bytes(i % 256 for i in range(EFA_TARGET_LEN))
 
 
 def wait_uring_registered_matches_live(client, timeout=10):
@@ -63,7 +64,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
 
     def start_target(self, *flags):
-        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
+        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr, length)."""
         target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
         process = subprocess.Popen(
             [target, '127.0.0.1', *flags],
@@ -71,8 +72,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:4]
-        return process, address, int(rkey), int(remote_addr)
+        address, rkey, remote_addr, length = line.split()[1:]
+        return process, address, int(rkey), int(remote_addr), int(length)
 
     def test_expand_on_segment_full(self):
         """SET that fills a segment triggers reactive expand in serve_set_dram_tcp.
@@ -165,12 +166,12 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         expand_after_fill = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
         # Now an EFA SET must also succeed and read back correctly in the multi-segment pool
         # (exercises cmd_set_dram_efa's alloc/expand path).
-        process, address, rkey, remote_addr = self.start_target('--read')
+        process, address, rkey, remote_addr, length = self.start_target('--read')
         try:
             client.execute_command('LO.HELLO', address)
-            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
+            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
             assert result == b'OK', f"EFA SET failed: {result}"
-            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
+            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN
         finally:
             process.kill()
         # The EFA SET succeeded in a pool that had already expanded (multi-segment),
@@ -480,18 +481,6 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
         )
-
-    def start_target(self, *flags):
-        """Launch the fabric_target peer process and return (process, address, rkey, remote_addr)."""
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
-        process = subprocess.Popen(
-            [target, '127.0.0.1', *flags],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        line = process.stdout.readline()
-        assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:4]
-        return process, address, int(rkey), int(remote_addr)
 
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()

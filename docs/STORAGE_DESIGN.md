@@ -621,7 +621,7 @@ Server does:   alloc 4-8 buffers (pipeline depth)
                EFA: transport.write each chunk to client at addr + i*chunk_size
 ```
 
-**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / chunk-size)` internal operations. The last operation uses `len = total_len % chunk-size` (partial chunk). O_DIRECT write path pads the final write to the 4KB boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
+**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA address). The server partitions into `ceil(total_len / chunk-size)` internal operations. The last operation uses `len = total_len % chunk-size` (partial chunk). O_DIRECT write path pads the final write to the 4KB boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
 
 ### 7.3 Chunked Streaming I/O
 
@@ -867,26 +867,26 @@ bytes `[i*chunk_size, (i+1)*chunk_size)`). Before any I/O, it computes a plan ma
 each chunk to where it lands in client memory — `chunk_index → [(rkey, addr, len), …]`
 — using inputs all known at command time (`total_len`, `chunk-size`, and the
 client's destination). The I/O loop then just executes that plan. The two cases
-differ only in what the destination is: a single region (Case 2) or a list of
-regions (Case 1).
+differ only in what the destination is: a single address (Case 2) or a list of
+addresses (Case 1).
 
 Two cases for how EFA handles large objects:
 
 **Case 1: Client provides multiple address/len pairs in the command**
 
-The command includes multiple client regions:
+The command includes multiple client addresses:
 
 ```
-LO.SET key <total_len> <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
-LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+LO.SET key <total_len> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+LO.GET key <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 
-- The server treats the regions as **one logical contiguous destination** (region1
-  then region2 …) and chunks that logical space by `chunk-size` — the server
-  owns the chunking; the client's region sizes need no alignment.
-- The upfront plan maps each chunk to its region(s): a chunk that fits inside one
-  region is one transport post; a chunk that **straddles** a region boundary is split
-  into two posts (tail of one region + head of the next). This is the only extra work
+- The server treats the addresses as **one logical contiguous destination** (address1
+  then address2 …) and chunks that logical space by `chunk-size` — the server
+  owns the chunking; the client's address sizes need no alignment.
+- The upfront plan maps each chunk to its address(es): a chunk that fits inside one
+  address is one transport post; a chunk that **straddles** an address boundary is split
+  into two posts (tail of one address + head of the next). This is the only extra work
   Case 1 adds over Case 2.
 - Client memory layout is just a destination map — it does **not** control the
   server's chunking or parallelism.
@@ -895,13 +895,13 @@ LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 
 **Case 2: Client provides a single large address/len that exceeds comfortable buffer size**
 
-The client provides one region larger than the server's buffer size. This is the
-**trivial instance of the same plan** — one destination region, so every chunk maps
+The client provides one address larger than the server's buffer size. This is the
+**trivial instance of the same plan** — one destination address, so every chunk maps
 to exactly one post with no straddling: chunk `i` → `addr + i*chunk_size`. Two
 sub-options:
 
 - **Reject:** Return ERR if `len > max_efa_transfer_size`. Simple, forces client to use Case 1.
-- **Accept and split (preferred — product requirement):** Server internally splits the single large region into chunk-sized fi_write/fi_read calls at sequential offsets within the client's region:
+- **Accept and split (preferred — product requirement):** Server internally splits the single large address into chunk-sized fi_write/fi_read calls at sequential offsets within the client's address:
 
 ```
 Client provides: rkey=R, remote_addr=A, len=10GB
@@ -916,7 +916,7 @@ Server internally:
 - Server pipelines: NVMe ReadFixed fills buffer[i], fi_write sends it, buffer returned to pool
 - No API change from the small-object case — same command syntax, server detects large size and splits
 
-**v1 decision:** Reject over TCP for large objects. Accept over EFA using Case 2 (server-side split) to meet the product requirement. Case 1 deferred to v2 if multi-GPU clients need explicit region control.
+**v1 decision:** Reject over TCP for large objects. Accept over EFA using Case 2 (server-side split) to meet the product requirement. Case 1 deferred to v2 if multi-GPU clients need explicit address control.
 
 ### 7.7 TCP Path: Large Object Rejection
 
