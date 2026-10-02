@@ -47,7 +47,6 @@ define_errors! {
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors
-    ERR_OBJECT_TOO_LARGE => "ERR object size exceeds max-object-size limit",
     ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
     ERR_NVME_GE_MAX_OBJ => "ERR nvme-maxmemory must be >= max-object-size in Tiered mode",
     ERR_SEGMENT_GE_MAX_OBJ => "ERR segment-size is insufficient for max-object-size",

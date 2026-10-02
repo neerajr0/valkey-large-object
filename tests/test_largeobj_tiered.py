@@ -372,7 +372,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             assert False, "Expected max object size rejection"
         except ResponseError as e:
             err = str(e).lower()
-            assert 'max-object-size' in err, f"Unexpected error: {e}"
+            assert 'max object size' in err, f"Unexpected error: {e}"
             assert 'nvme' not in err, f"Should not hit NVMe error: {e}"
         # Rejected SET must not leave a .dat file or phantom key.
         assert self._dat_count() == 0

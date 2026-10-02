@@ -212,7 +212,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // covers objects that would not fit in a single segment.
     let max_obj_size = crate::max_object_size();
     if obj_len > max_obj_size {
-        return Err(ValkeyError::Str(errors::ERR_OBJECT_TOO_LARGE));
+        return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
 
     // Dispatch to engine — it decides sync vs async internally.
