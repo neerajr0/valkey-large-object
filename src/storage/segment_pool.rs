@@ -529,9 +529,8 @@ impl SegmentPool {
     }
 
     /// Scan all segments and release any that are draining with refcount == 0.
-    /// Called from the scaling cron on the main thread each tick. Returns how many
-    /// segments left the pool, which is what tells a caller the live count fell.
-    pub fn release_all_releasable(&self) -> usize {
+    /// Called from the scaling cron on the main thread each tick.
+    pub fn release_all_releasable(&self) {
         let releasable: Vec<usize> = {
             let st = self.state.lock().expect("state lock unavailable");
             st.slots
@@ -541,7 +540,6 @@ impl SegmentPool {
                 .collect()
         };
         let mut released_any = false;
-        let count = releasable.len();
         for idx in releasable {
             self.release_drained(idx);
             released_any = true;
@@ -551,7 +549,6 @@ impl SegmentPool {
             // (no-op in Dram mode). Touches only this ring.
             super::uring::submit_reregister(self.pool_id);
         }
-        count
     }
 
     /// Complete the drain: pull the Segment out of its slot, clear this pool's
