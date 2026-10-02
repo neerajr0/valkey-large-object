@@ -141,7 +141,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         """Launch the passive peer and return it with the regions it advertised.
 
         `split` is a list of region sizes totalling TARGET_LEN; the target then registers
-        one separate buffer per size, each with its own rkey. Omitted, it registers the
+        one separate buffer per region, each with its own rkey. Omitted, it registers the
         single whole-buffer region."""
         target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
         command = [target, '127.0.0.1', *flags]
