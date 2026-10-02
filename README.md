@@ -26,11 +26,6 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | `LO.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
-An EFA request names one or more client memory addresses as `(rkey, addr, len)` triples
-(1..=256 addresses, inferred from the argument count). A chunk may straddle an address boundary, and the addresses
-may total more than the object — `LO.GET`'s reply carries `obj_len` so the client knows
-where the object ends.
-
 ## Build
 
 ```bash
