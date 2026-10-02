@@ -5,9 +5,10 @@
 //! ## Design
 //!
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
-//! `Some(segment)` (live) or `None` (empty/removed). Slot index == iovec index
-//! in the sparse io_uring buffer table. Segments have `iovec_index` set
-//! write-once at birth.
+//! `Some(segment)` (live) or `None` (empty/removed). Slot index == this pool's
+//! LOCAL iovec index in its own io_uring buffer table (each pool has its own
+//! ring). A segment's `iovec_index` is assigned at creation and recomputed on
+//! each dense table rebuild.
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
@@ -39,44 +40,76 @@ use allocator_api2::alloc::Allocator;
 use super::context::SegmentBuffer;
 use super::segment::Segment;
 
-/// Mutable segment state: just the slot vector. No shared allocator, no
-/// reverse-lookup index — each segment carries its own talc, and the
-/// segment_idx is known at alloc time (from the picker).
+/// Mutable segment state: the slot vector plus this pool's own io_uring iovec
+/// table.
 struct SegmentState {
-    /// Segment slots. Slot `i` = iovec_index `i` in the sparse io_uring table.
-    /// `None` = empty slot (hole from a previous drain, or unused capacity).
+    /// Segment slots. `None` = empty slot (a drained hole or unused capacity).
     slots: Vec<Option<Segment>>,
+    /// This pool's io_uring registered-buffer table as `(base, len)` pairs,
+    /// index-aligned with `slots`. The index is the pool-local `iovec_index` a
+    /// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index
+    /// reused by the next expand.
+    iovecs: Vec<Option<(usize, usize)>>,
 }
 
 pub struct SegmentPool {
     state: Mutex<SegmentState>,
     /// Size of each segment (uniform within a pool).
     pub segment_size: usize,
+    /// Which pool (ring) this is — routes reregister to the correct io_uring
+    /// engine, since each pool has its own ring + registered-buffer table.
+    pool_id: super::uring::PoolType,
 }
 
 impl SegmentPool {
     /// Create a new SegmentPool with `segment_count` pre-allocated segments of
-    /// `segment_size` bytes. Each segment's iovec_index = its position in the
-    /// sparse slot table, registered via `super::append_iovec`.
-    pub fn new(segment_count: usize, segment_size: usize) -> Self {
+    /// `segment_size` bytes. Each segment's iovec_index = its position in this
+    /// pool's own local iovec table (assigned in-order here), which lines
+    /// up with its position in the slot table.
+    pub fn new(segment_count: usize, segment_size: usize, pool_id: super::uring::PoolType) -> Self {
         assert!(
             segment_count >= 1,
             "SegmentPool requires at least 1 segment"
         );
 
         let mut slots: Vec<Option<Segment>> = Vec::with_capacity(segment_count);
+        let mut iovecs: Vec<Option<(usize, usize)>> = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
             let mut seg = Segment::new(segment_size);
-            let idx = super::append_iovec(seg.iovec())
-                .expect("startup segment count exceeds MAX_SEGMENTS — init validation bypassed");
-            seg.iovec_index = idx;
+            let iov = seg.iovec();
+            // Pool-local index: position in this pool's own iovec table.
+            let idx = iovecs.len();
+            assert!(
+                idx < super::MAX_SEGMENTS,
+                "startup segment count exceeds MAX_SEGMENTS — init validation bypassed"
+            );
+            iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
+            seg.iovec_index = idx as u16;
             slots.push(Some(seg));
         }
 
         Self {
-            state: Mutex::new(SegmentState { slots }),
+            state: Mutex::new(SegmentState { slots, iovecs }),
             segment_size,
+            pool_id,
         }
+    }
+
+    // ─── io_uring iovec table (pool-local) ─────────────────────────────────────
+
+    /// Dense snapshot of this pool's iovec table (holes skipped) for the ring's
+    /// startup `IORING_REGISTER_BUFFERS`. Dense because 5.10 has no sparse table.
+    pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.iovecs
+            .iter()
+            .filter_map(|opt| {
+                opt.map(|(ptr, len)| libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: len,
+                })
+            })
+            .collect()
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
@@ -412,37 +445,47 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment to the pool at the `iovec_index` that `append_iovec`
-    /// assigns, so `slots[i]` and `IOVECS[i]` stay index-aligned by construction.
-    /// Each new Segment carries its own fresh talc allocator.
+    /// Add a new segment to the pool at the pool-local `iovec_index` that the
+    /// first-free-hole search assigns, so `slots[i]` and this pool's `iovecs[i]`
+    /// stay index-aligned by construction. Each new Segment carries its own fresh
+    /// talc allocator.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
     ///
     /// Returns `(iovec_index, segment_slice)` on success. The slice is `'static` (segment memory
     /// is stable for the module's lifetime) so the caller can register it with the transport
-    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if the sparse
+    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool's
     /// iovec table is already at `MAX_SEGMENTS`.
     pub fn expand(&self) -> Option<(u16, &'static [u8])> {
-        let mut seg = Segment::new(self.segment_size);
-        // Register the iovec first. Returns None if the sparse table is already
-        // at MAX_SEGMENTS — the single runtime cap check. On None we drop `seg`
-        // here (freeing its just-allocated backing memory) and report expand
-        // failure; nothing is inserted into `slots`, so the two Vecs stay in
-        // lockstep and the caller (scaling cron / reactive expand) holds size.
-        let idx = super::append_iovec(seg.iovec())?;
-        seg.iovec_index = idx;
+        let seg = Segment::new(self.segment_size);
         // Segment memory is stable for the module's lifetime (never freed until
         // the segment is released, and a live segment is not released while a
         // registration references it). SAFETY: base/size describe the just-
         // allocated backing buffer.
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
+        let iov = seg.iovec();
 
         let mut st = self.state.lock().expect("state lock unavailable");
-        // Place the segment at exactly slots[idx] (the index append_iovec
-        // assigned) so slots and IOVECS stay aligned by construction. idx is a
-        // reused hole (< len) or the next append (== len), never > len; pad
-        // defensively so a future divergence can't index out of bounds.
-        let idx = idx as usize;
+        // Pool-local iovec index: reuse the first hole, else append (rejected at
+        // MAX_SEGMENTS). On None, `seg` drops here and nothing enters `slots`.
+        let entry = Some((iov.iov_base as usize, iov.iov_len));
+        let idx = match st.iovecs.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                st.iovecs[i] = entry;
+                i
+            }
+            None => {
+                if st.iovecs.len() >= super::MAX_SEGMENTS {
+                    return None;
+                }
+                st.iovecs.push(entry);
+                st.iovecs.len() - 1
+            }
+        };
+        let mut seg = seg;
+        seg.iovec_index = idx as u16;
+        // Place at slots[idx] so slots and iovecs stay index-aligned. Pad in case
+        // idx is past the current len.
         if idx >= st.slots.len() {
             st.slots.resize_with(idx + 1, || None);
         }
@@ -496,25 +539,35 @@ impl SegmentPool {
                 .filter_map(|(i, opt)| opt.as_ref().filter(|seg| seg.is_releasable()).map(|_| i))
                 .collect()
         };
+        let mut released_any = false;
         for idx in releasable {
             self.release_drained(idx);
+            released_any = true;
+        }
+        if released_any {
+            // A segment left this pool — rebuild its ring's table without it
+            // (no-op in Dram mode). Touches only this ring.
+            super::uring::submit_reregister(self.pool_id);
         }
     }
 
-    /// Complete the drain: pull the Segment out of its slot, clear iovec,
-    /// drop it. Segment::drop deallocates the backing memory (its talc's
-    /// metadata lived inside that memory and vanishes with it).
+    /// Complete the drain: pull the Segment out of its slot, clear this pool's
+    /// iovec entry, drop it. Segment::drop deallocates the backing memory (its
+    /// talc's metadata lived inside that memory and vanishes with it).
     fn release_drained(&self, seg_idx: usize) {
-        let seg = {
-            let mut st = self.state.lock().expect("state lock unavailable");
-            let Some(seg) = st.slots[seg_idx].take() else {
-                return; // already released
-            };
-            seg
+        let mut st = self.state.lock().expect("state lock unavailable");
+        let Some(seg) = st.slots[seg_idx].take() else {
+            return; // already released
         };
-        super::clear_iovec(seg.iovec_index);
+        let iovec_index = seg.iovec_index as usize;
+        // Null this pool's iovec slot so the ring's dense rebuild omits it.
+        if iovec_index < st.iovecs.len() {
+            st.iovecs[iovec_index] = None;
+        }
+        drop(st);
         // seg dropped here → Segment::drop → talc drops (no external state) →
         // std::alloc::dealloc frees backing memory.
+        drop(seg);
     }
 
     // ─── Segment Helpers ─────────────────────────────────────────────────────
@@ -564,6 +617,39 @@ impl SegmentPool {
                 seg.mark_io_uring_registered();
             }
         }
+    }
+
+    /// Rebuild this pool's ring table: reindex live segments densely from 0, mark
+    /// them registered, and return the iovec array for `register_buffers`. Dense
+    /// because 5.10 cannot register a sparse table.
+    pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
+        let mut st = self.state.lock().expect("state lock unavailable");
+        let mut out = Vec::new();
+        let mut next: u16 = 0;
+        let mut new_iovecs: Vec<Option<(usize, usize)>> = Vec::new();
+        for slot in st.slots.iter_mut() {
+            if let Some(seg) = slot.as_mut() {
+                seg.iovec_index = next;
+                next += 1;
+                let iov = seg.iovec();
+                out.push(iov);
+                new_iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
+                seg.mark_io_uring_registered();
+            }
+        }
+        st.iovecs = new_iovecs; // compacted to match the dense reindex above
+        out
+    }
+
+    /// Count of live segments marked io_uring-registered. Below this pool's live
+    /// count means an expanded segment's re-register hasn't completed yet. INFO metric.
+    pub fn io_uring_registered_count(&self) -> usize {
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|seg| seg.is_io_uring_registered())
+            .count()
     }
 
     /// Total allocated bytes across live (non-draining) segments.
@@ -675,7 +761,7 @@ mod tests {
     fn test_alloc_exact_single_chunk_trimmed() {
         // obj_len < chunk_size → 1 buffer sized to obj_len (aligned).
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_exact(1000).unwrap();
         assert_eq!(bufs.len(), 1);
         // len is aligned up from 1000 to IO_ALIGN (4096).
@@ -686,7 +772,7 @@ mod tests {
     fn test_alloc_exact_single_chunk_exact_multiple() {
         // obj_len == chunk_size → 1 buffer of chunk_size.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_exact(4096).unwrap();
         assert_eq!(bufs.len(), 1);
         assert_eq!(bufs[0].len as usize, 4096);
@@ -696,7 +782,7 @@ mod tests {
     fn test_alloc_exact_multi_chunk_with_tail() {
         // obj_len = 3.5 * chunk_size → 3 full + 1 trimmed tail.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_exact(4096 * 3 + 2048).unwrap();
         assert_eq!(bufs.len(), 4);
         for buf in &bufs[..3] {
@@ -710,7 +796,7 @@ mod tests {
     fn test_alloc_exact_multi_chunk_exact_multiple() {
         // obj_len = 3 * chunk_size → all 3 buffers are chunk_size (no trim).
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_exact(4096 * 3).unwrap();
         assert_eq!(bufs.len(), 3);
         for buf in &bufs {
@@ -722,7 +808,7 @@ mod tests {
     fn test_alloc_exact_pool_full_returns_none() {
         // Tiny pool that can't fit the request.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 8192);
+        let pool = SegmentPool::new(1, 8192, super::super::uring::PoolType::Dram);
         // Request 3 * 4096 = 12288 — exceeds single 8192 segment.
         assert!(pool.alloc_exact(4096 * 3).is_none());
     }
@@ -731,7 +817,7 @@ mod tests {
     fn test_alloc_exact_tail_failure_frees_uniform() {
         // Verify alloc_exact is all-or-nothing when the pool can't satisfy.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         // Determine actual capacity by filling the pool one block at a time.
         let mut filler = Vec::new();
         while let Some(mut v) = pool.alloc_n(4096, 1, 1) {
@@ -761,7 +847,7 @@ mod tests {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         // Generous segments so capacity isn't boundary-tight against talc
         // per-chunk overhead; 2 segments.
-        let pool = SegmentPool::new(2, 65536);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         // Drain the pool completely with single-chunk objects, tracking each.
         let mut singles = Vec::new();
         while let Some(b) = pool.alloc_exact(4096) {
@@ -817,7 +903,7 @@ mod tests {
     #[should_panic(expected = "alloc_exact: size must be > 0")]
     fn test_alloc_exact_panics_on_zero_len() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         pool.alloc_exact(0);
     }
 
@@ -827,7 +913,7 @@ mod tests {
     fn test_alloc_window_single_chunk() {
         // obj_len < chunk_size → 1 trimmed buffer.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_window(1000, 8, 2).unwrap();
         assert_eq!(bufs.len(), 1);
         assert_eq!(bufs[0].len as usize, super::super::align_up(1000));
@@ -837,7 +923,7 @@ mod tests {
     fn test_alloc_window_wrapping_uniform() {
         // total_chunks (7) > max_buffers (4) → wrapping, all uniform chunk_size.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(2, 65536);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_window(4096 * 7, 4, 2).unwrap();
         assert!(bufs.len() >= 2 && bufs.len() <= 4);
         for buf in &bufs {
@@ -850,7 +936,7 @@ mod tests {
         // Verify elastic allocation respects min_buffers. Pool pressure means
         // we may get fewer than max_buffers but at least min_buffers.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         // total_chunks = 20 > max_buffers = 8 → wrapping path.
         let bufs = pool.alloc_window(4096 * 20, 8, 2).unwrap();
         assert!(bufs.len() >= 2);
@@ -862,7 +948,7 @@ mod tests {
         // total_chunks (3) <= max_buffers (8) → non-wrapping, trimmed tail.
         // obj_len = 2 * chunk_size + 100 → 2 uniform + 1 trimmed.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_window(4096 * 2 + 100, 8, 2).unwrap();
         assert_eq!(bufs.len(), 3);
         assert_eq!(bufs[0].len as usize, 4096);
@@ -874,7 +960,7 @@ mod tests {
     fn test_alloc_window_non_wrapping_exact_multiple() {
         // obj_len = 3 * chunk_size → tail == chunk_size → 3 uniform buffers.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_window(4096 * 3, 8, 2).unwrap();
         assert_eq!(bufs.len(), 3);
         for buf in &bufs {
@@ -887,7 +973,7 @@ mod tests {
         // total_chunks=2, min_buffers=2 → uniform_count=1, uniform_min=min(2,1)=1.
         // Must not panic on alloc_n(chunk_size, 1, 2).
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         let bufs = pool.alloc_window(4096 + 100, 8, 2).unwrap();
         // Either 2 buffers (uniform + tail) or 1 (degraded, uniform only).
         assert!(bufs.len() == 1 || bufs.len() == 2);
@@ -904,7 +990,7 @@ mod tests {
         // returned buffers are all uniform chunk_size (safe for wrapping).
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         // Small pool: 16384 bytes. With talc overhead, ~3 × 4096 allocs fit.
-        let pool = SegmentPool::new(1, 16384);
+        let pool = SegmentPool::new(1, 16384, super::super::uring::PoolType::Dram);
         // Fill most of the pool first.
         let filler = pool.alloc_n(4096, 1, 1).unwrap();
         // Request 5 chunks (4 uniform + tail), max=8, min=1.
@@ -924,7 +1010,7 @@ mod tests {
     #[test]
     fn test_alloc_window_pool_full_returns_none() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 8192);
+        let pool = SegmentPool::new(1, 8192, super::super::uring::PoolType::Dram);
         // Fill the pool.
         let filler = pool.alloc_n(4096, 2, 1);
         let result = pool.alloc_window(4096 * 5, 8, 2);
@@ -938,7 +1024,7 @@ mod tests {
     fn test_alloc_window_boundary_total_equals_max() {
         // total_chunks == max_buffers → non-wrapping path.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(2, 65536);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         // 4 chunks, max=4 → non-wrapping. 3 uniform + 1 tail.
         let bufs = pool.alloc_window(4096 * 3 + 100, 4, 2).unwrap();
         assert_eq!(bufs.len(), 4);
@@ -953,7 +1039,7 @@ mod tests {
     fn test_alloc_window_boundary_total_equals_max_plus_one() {
         // total_chunks == max_buffers + 1 → wrapping path.
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(2, 65536);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         // 5 chunks, max=4 → wrapping, all uniform.
         let bufs = pool.alloc_window(4096 * 5, 4, 2).unwrap();
         assert!(bufs.len() >= 2 && bufs.len() <= 4);
@@ -967,7 +1053,7 @@ mod tests {
     #[should_panic(expected = "alloc_window: min_buffers (3) > max_buffers (2)")]
     fn test_alloc_window_panics_when_min_exceeds_max() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         pool.alloc_window(4096, 2, 3);
     }
 
@@ -975,7 +1061,7 @@ mod tests {
     #[should_panic(expected = "alloc_window: size must be > 0")]
     fn test_alloc_window_panics_on_zero_len() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         pool.alloc_window(0, 8, 2);
     }
 
@@ -984,7 +1070,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
     fn test_alloc_n_panics_when_min_exceeds_count() {
-        let pool = SegmentPool::new(1, 65536);
+        let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         pool.alloc_n(4096, 2, 3);
     }
 }

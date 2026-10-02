@@ -33,7 +33,7 @@ pub struct DRAMPool {
 impl DRAMPool {
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
         Self {
-            pool: SegmentPool::new(segment_count, segment_size),
+            pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Dram),
             objects: RwLock::new(HashMap::new()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
@@ -92,6 +92,22 @@ impl DRAMPool {
     /// Mark all current segments io_uring-registered (startup, post-register).
     pub fn mark_all_registered(&self) {
         self.pool.mark_all_registered();
+    }
+
+    /// Startup iovec snapshot for this pool's ring. See `SegmentPool::startup_iovecs`.
+    pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.startup_iovecs()
+    }
+
+    /// See `SegmentPool::rebuild_dense_iovecs`. Called by this pool's io_uring
+    /// engine on a re-registration.
+    pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.rebuild_dense_iovecs()
+    }
+
+    /// See `SegmentPool::io_uring_registered_count`.
+    pub fn io_uring_registered_count(&self) -> usize {
+        self.pool.io_uring_registered_count()
     }
 
     // ─── Object Map ──────────────────────────────────────────────────────────
@@ -219,17 +235,16 @@ impl DRAMPool {
         self.pool.with_live_segment_slices(f);
     }
 
-    /// Free segments that finished draining since the last cron tick.
+    /// Free segments that finished draining since the last scaling cron tick.
     ///
     /// A segment marked draining is freed asynchronously: its memory is not
     /// reclaimed until all in-flight Arc holders drop and refcount reaches 0.
     /// This function scans for segments where `draining && refcount == 0` and
-    /// physically frees them: takes the Segment out of its slot, clears the
-    /// io_uring iovec slot (`clear_iovec`), and drops it. Each segment owns its
+    /// physically frees them: takes the Segment out of its slot, nulls this
+    /// pool's io_uring iovec slot, and drops it. Each segment owns its
     /// own talc whose metadata lives inside the segment's memory, so dropping
     /// the Segment deallocates that memory and the talc vanishes with it — no
-    /// `talc.truncate` or free-list surgery is needed (unlike the old shared
-    /// allocator).
+    /// `talc.truncate` is needed.
     ///
     /// Must be called from the Valkey main event-loop thread only.
     pub fn release_drained_segments(&self) {
@@ -256,6 +271,10 @@ impl DRAMPool {
 
         // Register the new segment with EFA (fatal on failure — see efa_register_segment).
         crate::efa_register_segment(slice);
+        // Rebuild + re-register the DRAM ring's fixed-buffer table so the new
+        // segment joins the fixed path (no-op in Dram mode). The iovecs table rebuild runs
+        // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
+        super::uring::submit_reregister(super::uring::PoolType::Dram);
         Some(idx)
     }
 

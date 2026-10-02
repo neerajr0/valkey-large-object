@@ -29,9 +29,9 @@ pub struct Segment {
     pub base: *mut u8,
     /// Total size in bytes.
     pub size: usize,
-    /// Index into the sparse iovec table (io_uring ReadFixed/WriteFixed) and
-    /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector.
-    /// Write-once at creation; immutable for the segment's lifetime.
+    /// Index into this pool's io_uring iovec table (ReadFixed/WriteFixed) and
+    /// into the SegmentPool's `slots: Vec<Option<Segment>>` vector. Assigned at
+    /// creation and recomputed on each dense table rebuild.
     pub iovec_index: u16,
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with
@@ -55,24 +55,19 @@ pub struct Segment {
     pub fragment_count: AtomicUsize,
     /// When true, no new allocations land on this segment. Set during shrink.
     pub draining: AtomicBool,
-    /// Whether this segment's buffer is in the io_uring kernel buffer table
-    /// (IORING_REGISTER_BUFFERS). Startup segments are registered in the initial
-    /// batch (`true`); a segment added later by `expand()` is not in the table
-    /// (`false`), so its I/O uses plain Read/Write, not ReadFixed/WriteFixed — a
-    /// fixed op against an unregistered iovec_index would EFAULT.
+    /// Whether this segment's buffer is in the io_uring kernel table
+    /// (IORING_REGISTER_BUFFERS). A segment starts `false` (its I/O uses plain
+    /// Read/Write) and is flipped `true` once its memory is in the table — at
+    /// startup, or after the post-expand rebuild for a segment added later.
     /// Write-once false→true, so Relaxed suffices: a stale `false` read just takes
     /// the always-correct non-fixed path.
-    ///
-    /// TODO: register expanded segments with the io_uring table (via
-    /// register_buffers_update on the poller thread that owns the ring) and flip
-    /// this to `true`, so expanded segments get the ReadFixed/WriteFixed fast path
-    /// instead of staying on the slower non-fixed fallback for their whole life.
     pub io_uring_registered: AtomicBool,
 }
 
 impl Segment {
     /// Allocate a new segment via ValkeyAlloc, create its talc, claim its range.
-    /// `iovec_index` is set to 0 initially; caller assigns after `append_iovec`.
+    /// `iovec_index` is set to 0 initially; the owning pool assigns the real
+    /// pool-local index after creation (`SegmentPool::new` / `expand`).
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -92,7 +87,7 @@ impl Segment {
         Self {
             base,
             size,
-            iovec_index: 0, // set by caller after append_iovec
+            iovec_index: 0, // set by owning pool after creation
             talc: Mutex::new(talc),
             refcount: AtomicU32::new(0),
             allocated_bytes: AtomicUsize::new(0),
@@ -150,10 +145,9 @@ impl Drop for Segment {
         // the segment's MemoryRegion handles (invalidate the cache entry, then fi_close once
         // no in-flight transfer still leases them). No-op if no fabric or never registered.
         crate::efa_release_segment(self.base as usize);
-        // TODO: Deregister with IO_URING once the dynamic submission is supported.
-        // Dropping the Talc first is not required — its metadata lives inside
-        // the segment's own memory, so dropping the Mutex<Talc> is a no-op wrt
-        // memory (talc has no external state). Then dealloc the backing memory.
+        // No io_uring deregistration: on 5.10 the only removal is the whole-table
+        // rebuild. Safe at refcount == 0 — no in-flight fixed op references it.
+        // talc's metadata lives inside this memory, so nothing to drop before dealloc.
         let layout = Layout::from_size_align(self.size, 4096).expect("Segment layout");
         unsafe { std::alloc::dealloc(self.base, layout) };
     }

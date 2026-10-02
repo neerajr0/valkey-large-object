@@ -204,8 +204,10 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
 /// `pool_buffer_ptr` passed as usize for Send safety (raw pointer is not Send).
 /// chunk-size config enforces min 4096, so every pool buffer can hold a full
 /// FileHeader page.
+#[allow(clippy::too_many_arguments)]
 pub async fn read_and_verify_file_header(
     fd: RawFd,
+    pool_id: uring::PoolType,
     iovec_index: u16,
     pool_buffer_ptr: usize,
     use_fixed: bool,
@@ -224,12 +226,12 @@ pub async fn read_and_verify_file_header(
         len: FILE_HEADER_SIZE,
         use_fixed,
     };
-    let hdr_rx = uring::submit_read(fd, hdr_op);
-    // RecvError: the io_uring poller dropped the oneshot sender without calling
-    // send(). This only happens if the poller thread panicked or exited — the
-    // poller owns all senders in its pending HashMap. Since the poller is a
-    // single long-lived thread, its loss is permanent: no future NVMe I/O can
-    // complete. Increment metric and abort.
+    let hdr_rx = uring::submit_read(pool_id, fd, hdr_op);
+    // RecvError: this pool's io_uring poller dropped the oneshot sender without
+    // calling send(). This only happens if that poller thread panicked or exited
+    // — it owns all senders in its pending HashMap. Each pool has its own
+    // long-lived poller, so losing the one for `pool_id` is permanent: no future
+    // I/O on that ring can complete. Abort.
     match hdr_rx.await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
@@ -314,7 +316,7 @@ pub async fn write_file_header(
         len: FILE_HEADER_SIZE,
         use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
     };
-    let hdr_rx = uring::submit_write(fd, hdr_op);
+    let hdr_rx = uring::submit_write(uring::PoolType::Nvme, fd, hdr_op);
     match hdr_rx.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
