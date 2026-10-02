@@ -186,11 +186,19 @@ pub struct DiskReservation {
     object_id: ObjectId,
     /// Bytes this reservation is for — the new object's on-disk size.
     disk_len: u64,
-    /// Objects gone from the keyspace whose bytes pay for `disk_len`. Dropping them will
-    /// trigger both returning the ledger credit and calling `unlink(2)`.
-    victims: Vec<ObjectFile>,
-    /// Whether `disk_len` was charged to the ledger.
-    charged: bool,
+    payment: Payment,
+}
+
+/// How `disk_len` is paid for, and so who owes the ledger credit.
+enum Payment {
+    /// Charged to the ledger, by a successful `try_reserve` or by `commit`. Dropping the
+    /// reservation credits it back.
+    Charged,
+    /// Not charged yet. Objects gone from the keyspace, their bytes still charged, pay for
+    /// `disk_len` on `commit`. Dropping them returns their own credit and calls `unlink(2)`.
+    PaidBy(Vec<ObjectFile>),
+    /// The new `ObjectFile` owes the credit.
+    HandedOff,
 }
 
 impl DiskReservation {
@@ -199,8 +207,7 @@ impl DiskReservation {
         Self {
             object_id,
             disk_len,
-            victims: Vec::new(),
-            charged: true,
+            payment: Payment::Charged,
         }
     }
 
@@ -210,8 +217,7 @@ impl DiskReservation {
         Self {
             object_id,
             disk_len,
-            victims,
-            charged: false,
+            payment: Payment::PaidBy(victims),
         }
     }
 
@@ -229,17 +235,17 @@ impl DiskReservation {
     /// Charging first is what keeps a competing SET's `try_reserve` isolated: the ledger briefly
     /// over-counts by briefly including both the new file and victims whose files are being unlinked.
     pub fn commit(&mut self) {
-        if !self.charged {
+        if let Payment::PaidBy(victims) = std::mem::replace(&mut self.payment, Payment::Charged) {
             super::nvme::increase_nvme_disk_usage(self.disk_len);
-            self.charged = true;
+            drop(victims);
         }
-        self.victims.clear();
     }
 
     /// Hand the charged bytes to the new version's handle. From here the `ObjectFile` owes
     /// the release, which is where every other delete path already expects it to live.
     pub fn into_object_file(mut self) -> ObjectFile {
-        self.charged = false;
+        debug_assert!(matches!(self.payment, Payment::Charged), "commit first");
+        self.payment = Payment::HandedOff;
         ObjectFile::new(self.object_id, self.disk_len)
     }
 }
@@ -247,10 +253,10 @@ impl DiskReservation {
 impl Drop for DiskReservation {
     fn drop(&mut self) {
         // The write never got as far as an `ObjectFile`, so give the budget back. Victims
-        // drop with `self.victims` and release their own — and they stay destroyed, because
+        // drop with `self.payment` and release their own — and they stay destroyed, because
         // the keyspace lost them before this reservation existed and no reply promised
         // otherwise.
-        if self.charged {
+        if matches!(self.payment, Payment::Charged) {
             super::nvme::decrease_nvme_disk_usage(self.disk_len);
         }
     }
