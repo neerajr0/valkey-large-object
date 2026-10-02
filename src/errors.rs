@@ -20,7 +20,7 @@ define_errors! {
     ERR_INVALID_PEER_ADDR_HEX => "ERR invalid peer address hex",
     ERR_PEER_ADDR_LEN => "ERR peer address must be 32 bytes",
     ERR_PEER_ADDR_EMPTY => "ERR peer address must not be empty",
-    ERR_MALFORMED_ADDR_ARGS => "ERR address args must be (rkey, addr, len) triples",
+    ERR_MALFORMED_ADDR_ARGS => "ERR address args must be rkey, addr, len triples",
     ERR_TOO_MANY_ADDRESSES => "ERR too many addresses (max 256)",
     ERR_INVALID_RKEY => "ERR invalid rkey",
     ERR_INVALID_REMOTE_ADDR => "ERR invalid remote_addr",

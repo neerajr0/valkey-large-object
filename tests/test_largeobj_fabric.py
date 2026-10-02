@@ -79,7 +79,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         # parser (>=5), but 4 tail fields is not divisible by 3.
         self.verify_error_response(
             client, 'LO.GET key 999 0 4096 7',
-            'address args must be (rkey, addr, len) triples')
+            'address args must be rkey, addr, len triples')
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
