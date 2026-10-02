@@ -26,6 +26,17 @@ EFA_PATTERN = b'\xab'
 EFA_TARGET_LEN = 4096
 
 
+def wait_uring_registered_matches_live(client, timeout=10):
+    """Tiered: each pool's io_uring ring registers its own live segments
+    (dram_uring==dram_live, nvme_uring==nvme_live). wait_for because the
+    re-register on expand/shrink is fire-and-forget on the poller."""
+    def _match():
+        i = info_largeobj(client)
+        return (i.get('largeobj_dram_uring_registered_segments') == i.get('largeobj_dram_live_segments')
+                and i.get('largeobj_nvme_uring_registered_segments') == i.get('largeobj_nvme_live_segments'))
+    wait_for_true(_match, timeout=timeout)
+
+
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
 class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -84,6 +95,9 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         after = info_largeobj(client)
         assert after.get('largeobj_scaling_expand_total', 0) > expand_before, \
             "Expected scaling_expand_total to increase — cron is disabled so this must be reactive"
+        # Dram mode has no io_uring ring, so nothing is ever io_uring-registered —
+        # confirms submit_reregister's engine-none guard no-ops here (even after expand).
+        assert after.get('largeobj_dram_uring_registered_segments') == 0
 
     def test_expand_data_integrity(self):
         """Data written before and after a reactive expand is returned correctly."""
@@ -289,6 +303,8 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('LO.GET', 'key_a') == b'A' * obj_size
         assert client.execute_command('LO.GET', 'key_b') == b'B' * obj_size
+        # The expanded DRAM segment joins its ring's io_uring table (per-pool).
+        wait_uring_registered_matches_live(client)
 
     def test_tiered_multiple_segments(self):
         """Objects spread across multiple segments are all readable."""
@@ -302,6 +318,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         for i in range(4):
             got = client.execute_command('LO.GET', f'key_{i}')
             assert got == bytes([i % 256]) * obj_size, f"Data mismatch for key_{i}"
+        wait_uring_registered_matches_live(client)
 
     def test_tiered_nvme_fallback_on_dram_full(self):
         """When DRAMPool is at cap, further SETs still persist to NVMe and are readable."""
@@ -313,6 +330,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
 
         for key, fill in [('key_a', b'A'), ('key_b', b'B'), ('key_c', b'C'), ('key_d', b'D')]:
             assert client.execute_command('LO.GET', key) == fill * obj_size
+        wait_uring_registered_matches_live(client)
 
 
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
@@ -395,6 +413,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         for key in keys:
             assert client.execute_command('EXISTS', key) == 1, \
                 f"Key {key} disappeared from keyspace after shrink (data loss)"
+        # The released segment left its ring's io_uring table too (per-pool invariant holds post-shrink).
+        wait_uring_registered_matches_live(client, timeout=self.SHRINK_TIMEOUT_S)
 
     def test_shrink_then_expand(self):
         """After a shrink, new SETs succeed."""
@@ -431,6 +451,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         for i in range(4):
             assert client.execute_command('EXISTS', f'pre_shrink_{i}') == 1, \
                 f"pre_shrink_{i} disappeared from keyspace after shrink"
+        # io_uring tables track live segments per pool through shrink + the follow-up expand.
+        wait_uring_registered_matches_live(client, timeout=self.SHRINK_TIMEOUT_S)
 
 
 class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
@@ -504,6 +526,9 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         # EFA registration spans BOTH pools: every live segment (DRAM + NVMe staging) is registered.
         assert registered == dram_live + nvme_live, \
             f"every live segment must be EFA-registered: registered={registered} dram={dram_live} nvme={nvme_live}"
+        # io_uring registration is per-pool (independent of EFA): the expanded DRAM segment
+        # joined its ring's table.
+        wait_uring_registered_matches_live(client, timeout=self.SHRINK_TIMEOUT_S)
 
         shrink_before = info_largeobj(client).get('largeobj_scaling_shrink_total', 0)
         registered_before_shrink = registered
@@ -540,6 +565,8 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
             f"EFA registration not torn down on release: {registered_after} !< {registered_before_shrink}"
         assert registered_after == dram_live_after + nvme_live_after, \
             f"every live segment must stay registered after release: registered={registered_after} dram={dram_live_after} nvme={nvme_live_after}"
+        # io_uring tables also dropped the released segment, per-pool.
+        wait_uring_registered_matches_live(client, timeout=self.SHRINK_TIMEOUT_S)
         # The objects survive (Tiered: data on NVMe) and read back correctly after release.
         assert client.execute_command('LO.GET', 'key_a') == b'A' * (900 * 1024)
         assert client.execute_command('LO.GET', 'key_b') == b'B' * (900 * 1024)

@@ -30,6 +30,7 @@ DURATION=10
 NUM_KEYS=500
 MAXMEMORY="34359738368"            # 32GB — server maxmemory; DRAM pool scales up toward this
 SEGMENT_SIZE="67108864"      # 64MB
+MAX_OBJECT_SIZE="58720256"   # 56MB — must be >= largest SIZES entry (50MB) and fit segment-size (64MB, minus talc overhead)
 NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
 WORKER_THREADS=2
@@ -359,6 +360,7 @@ for BENCH_MODE in $MODES_STR; do
             Dram)
                 MODULE_ARGS="operating-mode Dram"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
@@ -366,6 +368,8 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS max-promote-size $MAX_OBJECT_SIZE"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
@@ -373,6 +377,7 @@ for BENCH_MODE in $MODES_STR; do
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
                 ;;
             *)
