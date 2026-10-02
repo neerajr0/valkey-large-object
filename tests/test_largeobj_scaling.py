@@ -633,6 +633,31 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', 'src') == obj
         assert client.execute_command('BLOB.GET', 'dst') == obj
 
+    def test_eviction_takes_victims_from_every_db(self):
+        """The arena is node-wide, so a SET evicts from any db, not just its own.
+
+        Two 384KB objects, one in db 1 and one in db 2, leave no room for a third, and the SET
+        comes from db 0, so a walk confined to the client's db has nothing to take. The walk must
+        also leave the client on its own db, so the newcomer is read back from a fresh connection.
+        """
+        db0 = self.server.get_new_client()
+        dbs = {1: self.server.create_from_server(db=1), 2: self.server.create_from_server(db=2)}
+        allow_evictions(db0)
+        payloads = {1: b'A' * (384 * 1024), 2: b'B' * (384 * 1024)}
+        for db, payload in payloads.items():
+            assert dbs[db].execute_command('BLOB.SET', 'obj', payload) == b'OK'
+
+        before = info_largeobj(db0)['largeobj_evictions_total']
+        assert db0.execute_command('BLOB.SET', 'newcomer', b'N' * (384 * 1024)) == b'OK'
+        assert info_largeobj(db0)['largeobj_evictions_total'] > before
+        fresh = self.server.get_new_client()
+        assert fresh.execute_command('BLOB.GET', 'newcomer') == b'N' * (384 * 1024)
+        assert all(c.execute_command('EXISTS', 'newcomer') == 0 for c in dbs.values())
+        survivors = [db for db in payloads if dbs[db].execute_command('EXISTS', 'obj') == 1]
+        assert len(survivors) < len(payloads), "a key in another db had to give way"
+        for db in survivors:
+            assert dbs[db].execute_command('BLOB.GET', 'obj') == payloads[db]
+
     def test_tenacity_zero_still_evicts(self):
         """A zero search budget must not degenerate into noeviction.
 
@@ -1454,6 +1479,62 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         for key in survivors:
             assert client.execute_command('BLOB.GET', key) == payloads[key]
         wait_for_true(lambda: len(self._dat_files()) == len(survivors) + 1, timeout=10)
+
+    def test_eviction_takes_victims_from_every_db(self):
+        """The budget is node-wide, so a SET evicts from any db, not just its own.
+
+        Every victim here is in dbs 1 to 4 and the SET comes from db 0, so a walk confined to
+        the client's db has nothing to take. A SET the victims cannot cover is refused and
+        leaves both dbs as they were, which means the rollback puts each key back into the db it
+        came from. The walk must also leave the client on its own db, so the newcomer is read
+        back from a fresh connection.
+
+        Tiered keys are written to db 0 whichever db the SET came from, so they are moved to
+        another db once written.
+        """
+        db0 = self.server.get_new_client()
+        dbs = {db: self.server.create_from_server(db=db) for db in (1, 2, 3, 4)}
+        allow_evictions(db0)
+        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP)}
+        home = {}
+
+        def park(key):
+            home[key] = 1 + len(home) % len(dbs)
+            assert db0.execute_command('BLOB.SET', key, payloads[key]) == b'OK'
+            assert db0.execute_command('MOVE', key, home[key]) == 1
+
+        def assert_intact(keys):
+            for key in keys:
+                assert dbs[home[key]].execute_command('BLOB.GET', key) == payloads[key], \
+                    f"{key} must be readable in db {home[key]}"
+
+        for key in list(payloads)[:6]:
+            park(key)
+
+        before = info_largeobj(db0)
+        self._assert_capacity_rejected(db0, 'too_big', b'X' * (7 * self.DISK_PER_OBJ - self.HEADER))
+        after = info_largeobj(db0)
+        assert_intact(home)
+        assert after['largeobj_disk_used_bytes'] == before['largeobj_disk_used_bytes']
+        assert after['largeobj_disk_evictions_total'] == before['largeobj_disk_evictions_total']
+        assert (after['largeobj_disk_eviction_failures_total']
+                > before['largeobj_disk_eviction_failures_total']), \
+            "the walk must have reached the other dbs, claimed their keys and given them back"
+
+        for key in list(payloads)[6:]:
+            park(key)
+        # Two objects' worth needs three victims, which the walk draws from more than one db.
+        newcomer = b'N' * (2 * self.OBJ)
+        before = info_largeobj(db0)['largeobj_disk_evictions_total']
+        assert db0.execute_command('BLOB.SET', 'newcomer', newcomer) == b'OK'
+        victims = info_largeobj(db0)['largeobj_disk_evictions_total'] - before
+        assert victims >= 2, "the cap was full of keys in other dbs, so the SET had to take some"
+        fresh = self.server.get_new_client()
+        assert fresh.execute_command('BLOB.GET', 'newcomer') == newcomer
+        assert all(c.execute_command('EXISTS', 'newcomer') == 0 for c in dbs.values())
+        survivors = [k for k in payloads if dbs[home[k]].execute_command('EXISTS', k) == 1]
+        assert len(survivors) == self.OBJECTS_PER_CAP - victims
+        assert_intact(survivors)
 
     def test_a_pinned_object_is_not_claimed_for_the_disk_budget(self):
         """An object a GET is reading is skipped, and the ledger still stays under the cap.

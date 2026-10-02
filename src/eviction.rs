@@ -47,9 +47,11 @@
 //!
 //! - **Candidates come from a resumable `RM_Scan` cursor, not a random draw**, because `RANDOMKEY`
 //!   via `ctx.call` costs a command dispatch per sample.
-//! - **The scan visits every key in the DB, not just `LO` keys**, so a keyspace that is mostly
-//!   non-module keys spends its budget on misses and `MAX_EMPTY_STEPS` gives up rather than
-//!   hunting.
+//! - **The scan visits every key, not just `LO` keys**, so a keyspace that is mostly non-module
+//!   keys spends its budget on misses and `MAX_EMPTY_STEPS` gives up rather than hunting.
+//!
+//! Like core, a walk draws from every DB that has keys, whichever DB the request came from: the
+//! budgets are node-wide. It scans one bucket of each in turn, and victims are ranked together.
 //!
 //! # Threading
 //!
@@ -157,30 +159,54 @@ const CREDIT_PERCENT: u64 = 90;
 //
 // One cursor per DB, because `RM_Scan` walks `ctx->client->db` only: a single shared position
 // applied to differently sized kvstores makes "every key offered once per pass" hold for neither.
-//
-// The arena, the NVMe ledger and `object_count()` are process-global while the scan is per-DB, so
-// a client on DB 0 cannot evict DB 5's objects even when they are the whole budget.
 thread_local! {
     static CURSORS: RefCell<HashMap<c_int, Rc<KeysCursor>>> = RefCell::new(HashMap::new());
 }
 
-/// Run `f` against the resumable cursor for the calling client's selected DB.
-///
-/// Raw FFI because the crate wraps neither `RM_GetSelectedDb` nor the `selected_db` it reads.
-/// The `Rc` is cloned out before `f` runs so the walk — which deletes keys, and may re-enter
-/// through anything a notification handler does — never runs inside the `RefCell` borrow.
-fn with_cursor<T>(ctx: &Context, f: impl FnOnce(&KeysCursor) -> T) -> T {
-    // SAFETY: `ctx.ctx` is a live module context; we are inside a command.
-    let db = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.ctx) };
-    let cursor = CURSORS.with(|cursors| {
+/// The resumable cursor for `db`. The `Rc` is cloned out of the map so the walk — which deletes
+/// keys, and may re-enter through anything a notification handler does — never runs inside the
+/// `RefCell` borrow.
+fn cursor_for(db: c_int) -> Rc<KeysCursor> {
+    CURSORS.with(|cursors| {
         Rc::clone(
             cursors
                 .borrow_mut()
                 .entry(db)
                 .or_insert_with(|| Rc::new(KeysCursor::new())),
         )
-    });
-    f(&cursor)
+    })
+}
+
+/// Point `ctx` at `db`, which is where `RM_Scan` and `RM_OpenKey` look. Raw FFI because the crate
+/// wraps neither `RM_SelectDb` nor `RM_GetSelectedDb`. On a command's context this moves the
+/// calling client itself, so an entry point puts it back with `restoring_db`.
+fn select_db(ctx: &Context, db: c_int) -> bool {
+    // SAFETY: `ctx.ctx` is a live module context.
+    unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.ctx, db) == raw::REDISMODULE_OK as c_int }
+}
+
+/// Run `f` and leave `ctx` on the DB it started on.
+fn restoring_db<T>(ctx: &Context, f: impl FnOnce() -> T) -> T {
+    // SAFETY: `ctx.ctx` is a live module context.
+    let home = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.ctx) };
+    let out = f();
+    select_db(ctx, home);
+    out
+}
+
+/// Every DB that has keys, with its cursor. `RM_SelectDb` refuses an id past the last DB, which
+/// is how the end of the list is found.
+fn populated_dbs(ctx: &Context) -> Vec<(c_int, Rc<KeysCursor>)> {
+    let mut dbs = Vec::new();
+    let mut db = 0;
+    while select_db(ctx, db) {
+        // SAFETY: `ctx.ctx` is a live module context.
+        if unsafe { raw::RedisModule_DbSize.unwrap()(ctx.ctx) } > 0 {
+            dbs.push((db, cursor_for(db)));
+        }
+        db += 1;
+    }
+    dbs
 }
 
 // ─── The search budget ───────────────────────────────────────────────────────
@@ -216,8 +242,15 @@ fn deadline_from_now(budget: Duration) -> Option<Instant> {
 
 // ─── Shared: candidate supply ────────────────────────────────────────────────
 
-/// The keyspace walk as an iterator: `LO` keys from wherever `cursor` stopped last time, in
-/// cursor order, wrapping as often as the budget allows.
+/// A sampled key and the DB it lives in.
+struct Candidate {
+    db: c_int,
+    name: ValkeyString,
+    object_id: ObjectId,
+}
+
+/// The keyspace walk as an iterator: `LO` keys from wherever each DB's cursor stopped last time,
+/// one bucket of each populated DB in turn, wrapping as often as the budget allows.
 ///
 /// Two stop conditions, each with one job. `MAX_EMPTY_STEPS` bounds the *search* for candidates
 /// and must hold even at tenacity 100, where no deadline ever arrives. `deadline` bounds the
@@ -225,9 +258,11 @@ fn deadline_from_now(budget: Duration) -> Option<Instant> {
 /// would yield nothing at all.
 struct Candidates<'a> {
     ctx: &'a Context,
-    cursor: &'a KeysCursor,
+    /// The DBs that had keys when the walk began.
+    dbs: Vec<(c_int, Rc<KeysCursor>)>,
+    next_db: usize,
     /// One bucket's worth of keys from the last `scan_step`.
-    batch: std::vec::IntoIter<(ValkeyString, ObjectId)>,
+    batch: std::vec::IntoIter<Candidate>,
     /// `None` when the budget is unbounded.
     deadline: Option<Instant>,
     yielded: usize,
@@ -238,15 +273,17 @@ struct Candidates<'a> {
 }
 
 impl<'a> Candidates<'a> {
-    fn new(ctx: &'a Context, cursor: &'a KeysCursor, deadline: Option<Instant>) -> Self {
+    fn new(ctx: &'a Context, deadline: Option<Instant>) -> Self {
+        let dbs = populated_dbs(ctx);
         Self {
             ctx,
-            cursor,
+            stop: dbs.is_empty(),
+            dbs,
+            next_db: 0,
             batch: Vec::new().into_iter(),
             deadline,
             yielded: 0,
             empty_steps: 0,
-            stop: false,
         }
     }
 
@@ -256,7 +293,7 @@ impl<'a> Candidates<'a> {
 }
 
 impl Iterator for Candidates<'_> {
-    type Item = (ValkeyString, ObjectId);
+    type Item = Candidate;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -268,9 +305,13 @@ impl Iterator for Candidates<'_> {
                 return None;
             }
 
-            let (found, at_end) = scan_step(self.ctx, self.cursor);
+            let (db, cursor) = &self.dbs[self.next_db];
+            let (db, cursor) = (*db, Rc::clone(cursor));
+            self.next_db = (self.next_db + 1) % self.dbs.len();
+            select_db(self.ctx, db);
+            let (found, at_end) = scan_step(self.ctx, &cursor);
             if at_end {
-                self.cursor.restart();
+                cursor.restart();
             }
             if found.is_empty() {
                 self.empty_steps += 1;
@@ -283,7 +324,15 @@ impl Iterator for Candidates<'_> {
             {
                 self.stop = true;
             }
-            self.batch = found.into_iter();
+            self.batch = found
+                .into_iter()
+                .map(|(name, object_id)| Candidate {
+                    db,
+                    name,
+                    object_id,
+                })
+                .collect::<Vec<_>>()
+                .into_iter();
         }
     }
 }
@@ -406,9 +455,9 @@ trait Budget {
     ///
     /// Deleting the key is the impl's business: `Arena` must destroy now, since `satisfy` cannot
     /// answer until the bytes are really free; `DiskLedger` empties the value and defers. Hence
-    /// `key_name` by value, so a deferring impl can keep it.
-    fn claim(&mut self, ctx: &Context, key_name: ValkeyString, object_id: &ObjectId)
-        -> Option<u64>;
+    /// the candidate by value, so a deferring impl can keep its name and DB. `ctx` is already on
+    /// the candidate's DB.
+    fn claim(&mut self, ctx: &Context, candidate: Candidate) -> Option<u64>;
 
     /// The authoritative check, asked only once the discounted credit says it is worth
     /// asking. `Some` ends the walk successfully; `None` means keep going, and for the arena
@@ -424,19 +473,14 @@ trait Budget {
 /// credit, so a walk can free well over `need` in total and still end below the threshold that
 /// triggers an attempt — and the victims freed since that refusal may have coalesced into the run
 /// the allocator wanted. Core does the same, re-checking `getMaxmemoryState` at `cant_free`.
-fn walk<B: Budget>(
-    ctx: &Context,
-    cursor: &KeysCursor,
-    need: u64,
-    budget: &mut B,
-) -> (Option<B::Output>, usize) {
+fn walk<B: Budget>(ctx: &Context, need: u64, budget: &mut B) -> (Option<B::Output>, usize) {
     // One read each, so a walk is internally consistent against a runtime-modifiable config.
     let tenacity = crate::eviction_tenacity();
     let deadline = deadline_from_now(search_budget(tenacity));
     let barren_limit = barren_rounds(tenacity);
     let samples = crate::maxmemory_samples();
     let volatile_only = crate::volatile_policy(ctx);
-    let mut candidates = Candidates::new(ctx, cursor, deadline);
+    let mut candidates = Candidates::new(ctx, deadline);
 
     let mut credit = 0u64;
     let mut victims = 0usize;
@@ -451,7 +495,7 @@ fn walk<B: Budget>(
             break;
         }
 
-        let round: Vec<(ValkeyString, ObjectId)> = candidates.by_ref().take(samples).collect();
+        let round: Vec<Candidate> = candidates.by_ref().take(samples).collect();
         if round.is_empty() {
             break; // the supply gave up first — out of time, or nothing left to find
         }
@@ -459,20 +503,24 @@ fn walk<B: Budget>(
         // Best victim first. Claiming in score order is what makes this a policy rather than an
         // ordering, and a key we could not claim costs us the next-best rather than the walk.
         let offered = round.len();
-        let mut ranked: Vec<(i64, ValkeyString, ObjectId)> = round
+        let mut ranked: Vec<(i64, Candidate)> = round
             .into_iter()
-            .filter_map(|(name, oid)| idleness(ctx, &name, volatile_only).map(|s| (s, name, oid)))
+            .filter_map(|candidate| {
+                select_db(ctx, candidate.db);
+                idleness(ctx, &candidate.name, volatile_only).map(|score| (score, candidate))
+            })
             .collect();
-        ranked.sort_unstable_by_key(|(score, _, _)| std::cmp::Reverse(*score));
+        ranked.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
         // A key the policy excluded cost a sample even though nothing claims it, so the clock's
         // `MIN_CANDIDATES` floor counts it — otherwise a keyspace of persistent keys under
         // `volatile-*` would walk to `barren_limit` with the deadline never armed.
         examined += offered - ranked.len();
 
         let mut claimed_any = false;
-        for (_score, key_name, object_id) in ranked {
+        for (_score, candidate) in ranked {
             examined += 1;
-            let Some(bytes) = budget.claim(ctx, key_name, &object_id) else {
+            select_db(ctx, candidate.db);
+            let Some(bytes) = budget.claim(ctx, candidate) else {
                 continue;
             };
             victims += 1;
@@ -530,7 +578,7 @@ pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer
     }
 
     let mut arena = Arena;
-    let (buffers, victims) = with_cursor(ctx, |cursor| walk(ctx, cursor, need as u64, &mut arena));
+    let (buffers, victims) = restoring_db(ctx, || walk(ctx, need as u64, &mut arena));
 
     // Count only runs that gave something up — they paid and got nothing.
     if buffers.is_none() && victims > 0 {
@@ -544,19 +592,14 @@ struct Arena;
 impl Budget for Arena {
     type Output = Vec<SegmentBuffer>;
 
-    fn claim(
-        &mut self,
-        ctx: &Context,
-        key_name: ValkeyString,
-        object_id: &ObjectId,
-    ) -> Option<u64> {
+    fn claim(&mut self, ctx: &Context, candidate: Candidate) -> Option<u64> {
         // An in-flight request holds this object, so taking the entry would leave it gone and the
         // bytes still unavailable — the freeing drop belongs to whoever holds the last reference.
-        if crate::storage::get_dram_pool().is_pinned(object_id) {
+        if crate::storage::get_dram_pool().is_pinned(&candidate.object_id) {
             PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        reclaim(ctx, &key_name, object_id)
+        reclaim(ctx, &candidate.name, &candidate.object_id)
     }
 
     fn satisfy(&mut self, need: u64) -> Option<Vec<SegmentBuffer>> {
@@ -627,47 +670,46 @@ pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<ObjectFile>> {
         return None;
     }
 
-    let mut ledger = DiskLedger::default();
-    let (claimed, victims) = with_cursor(ctx, |cursor| walk(ctx, cursor, need, &mut ledger));
+    restoring_db(ctx, || {
+        let mut ledger = DiskLedger::default();
+        let (claimed, victims) = walk(ctx, need, &mut ledger);
 
-    if let Some(claimed) = claimed {
-        return Some(delete_claimed(ctx, claimed));
-    }
+        if let Some(claimed) = claimed {
+            return Some(delete_claimed(ctx, claimed));
+        }
 
-    restore_claimed(ctx, ledger.claimed);
+        restore_claimed(ctx, ledger.claimed);
 
-    // A walk that claimed nothing is not thrashing. The keys are back, so this counts wasted
-    // search, not lost data: a rise against `disk_evictions_total` means the working set is too
-    // pinned or too large.
-    if victims > 0 {
-        DISK_EVICTION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-    }
-    None
+        // A walk that claimed nothing is not thrashing. The keys are back, so this counts wasted
+        // search, not lost data: a rise against `disk_evictions_total` means the working set is
+        // too pinned or too large.
+        if victims > 0 {
+            DISK_EVICTION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    })
 }
 
 /// Accumulates claimed handles until they cover `need`. Its running total is exact rather than an
 /// allocator's guess, so `satisfy` is a comparison and can never refuse.
 ///
-/// Each entry carries its key name because the delete is deferred until `satisfy` succeeds.
+/// Each entry carries its DB and key name because the delete is deferred until `satisfy` succeeds.
 #[derive(Default)]
 struct DiskLedger {
-    claimed: Vec<(ValkeyString, ObjectFile)>,
+    claimed: Vec<Claim>,
     freed: u64,
 }
 
-impl Budget for DiskLedger {
-    type Output = Vec<(ValkeyString, ObjectFile)>;
+type Claim = (c_int, ValkeyString, ObjectFile);
 
-    fn claim(
-        &mut self,
-        ctx: &Context,
-        key_name: ValkeyString,
-        _object_id: &ObjectId,
-    ) -> Option<u64> {
-        let file = take_file(ctx, &key_name)?;
+impl Budget for DiskLedger {
+    type Output = Vec<Claim>;
+
+    fn claim(&mut self, ctx: &Context, candidate: Candidate) -> Option<u64> {
+        let file = take_file(ctx, &candidate.name)?;
         let bytes = file.disk_len();
         self.freed += bytes;
-        self.claimed.push((key_name, file));
+        self.claimed.push((candidate.db, candidate.name, file));
         Some(bytes)
     }
 
@@ -708,10 +750,11 @@ fn take_file(ctx: &Context, key_name: &ValkeyString) -> Option<ObjectFile> {
 ///
 /// The values are already emptied, so the deletes free nothing — the bytes and the `unlink(2)` ride
 /// on the handles instead. `Key::delete` returns `Ok` unconditionally, hence the discard.
-fn delete_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) -> Vec<ObjectFile> {
+fn delete_claimed(ctx: &Context, claimed: Vec<Claim>) -> Vec<ObjectFile> {
     claimed
         .into_iter()
-        .map(|(key_name, file)| {
+        .map(|(db, key_name, file)| {
+            select_db(ctx, db);
             let _ = ctx.open_key_writable(&key_name).delete();
             DISK_RECLAIMED_BYTES_TOTAL.fetch_add(file.disk_len(), Ordering::Relaxed);
             DISK_EVICTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -726,8 +769,9 @@ fn delete_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) -> Ve
 ///
 /// A key that expired mid-walk has no value left to take its handle back. Letting the handle drop
 /// here is right: the key is gone, so the file and its bytes should go with it.
-fn restore_claimed(ctx: &Context, claimed: Vec<(ValkeyString, ObjectFile)>) {
-    for (key_name, file) in claimed {
+fn restore_claimed(ctx: &Context, claimed: Vec<Claim>) {
+    for (db, key_name, file) in claimed {
+        select_db(ctx, db);
         let key = ctx.open_key_writable(&key_name);
         if let Ok(Some(lo)) = key.get_value::<LoValue>(&LO_TYPE) {
             lo.file = Some(Arc::new(file));
