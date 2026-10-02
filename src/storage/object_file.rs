@@ -141,9 +141,7 @@ impl Drop for ObjectFile {
         // remaining ObjectFile refs. Means "object gone" — deregister the fd and
         // unlink the file.
         let object_id = self.object_id;
-
-        // Return credits back to the NVMe ledger.
-        super::nvme::decrease_nvme_disk_usage(self.disk_len);
+        let disk_len = self.disk_len;
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
@@ -155,6 +153,8 @@ impl Drop for ObjectFile {
             if let Err(e) = std::fs::remove_file(&path) {
                 super::warn_failed_unlink("teardown", &path, &e);
             }
+            // Release exactly what create added — no stat, so it can't drift.
+            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
         };
 
         // The main event-loop thread must be kept syscall-free. Hand the operation
