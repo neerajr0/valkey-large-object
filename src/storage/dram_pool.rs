@@ -159,9 +159,9 @@ impl DRAMPool {
             .remove(oid)
     }
 
-    /// True when someone outside the map holds this object — an in-flight transfer
-    /// whose buffer the NIC is still reading. Eviction skips these: the memory is
-    /// genuinely in use, so giving the entry up would free nothing.
+    /// True when someone outside the map holds this object — an in-flight GET, from dispatch
+    /// until its transfer completes, or a COPY reading its source. Eviction skips these: the
+    /// memory is genuinely in use, so giving the entry up would free nothing.
     ///
     /// Reads through the guard rather than via `get_object`, which clones — and a
     /// clone is itself a reference, so it could never report anything but pinned.

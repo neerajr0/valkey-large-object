@@ -20,14 +20,14 @@
 //! once enough bytes are free, when they are scattered instead of in one contiguous run. That
 //! forces everything else. Victims must be destroyed as they are claimed, because the memory has to
 //! be genuinely free before the allocator can answer — so a walk that comes up short has spent them
-//! and still fails the SET. A pin is the NIC reading the buffer. The bytes come back in our own
-//! drop, inside this call stack.
+//! and still fails the SET. Pinned objects are skipped (see Threading). The bytes come back in our
+//! own drop, inside this call stack.
 //!
 //! `[Tiered]` — `claim_disk_victims`, from `engine::reserve_nvme_or_make_room`, claims
 //! `nvme-maxmemory` budget through `DiskLedger`. Its `satisfy` compares a running total against the
 //! request and can never refuse, so the deletes can wait until the claims cover it: a walk that
-//! comes up short puts every key back and destroys nothing. A pin is a reader holding the unlinked
-//! file open. The bytes are settled later, by the write task.
+//! comes up short puts every key back and destroys nothing. A pinned file keeps its blocks past
+//! the unlink, so it is skipped too. The bytes are settled later, by the write task.
 //!
 //! # Search bound
 //!
@@ -60,11 +60,11 @@
 //! That holds for every mode and transport: a SET allocates before spawning its tokio task, and a
 //! GET decides promotion before spawning, so no eviction ever runs off the event loop.
 //!
-//! Serving a GET is another matter. `Dram` + TCP is the one path that stays on the event loop
-//! (`engine::execute_get`); the other three block the client and move the object's `Arc` onto a
-//! tokio thread — EFA because the NIC is reading the buffer, `Tiered` because an NVMe read holds
-//! the file handle open. That live `Arc` is a pin, and a pinned object is skipped: claiming it
-//! would report bytes that do not come back until the reader is done.
+//! A pin is any extra `Arc` on an object: an in-flight GET, from dispatch until its transfer
+//! completes, or a COPY reading its source. `Dram` + TCP is the one GET that completes on
+//! the event loop (`engine::execute_get`), so a walk never sees it mid-flight; the other three hand
+//! the `Arc` to a tokio thread. A pinned object is skipped: claiming it would report bytes that do
+//! not come back until its holder is done.
 //!
 //! Skipping is safe in both directions because we hold the event loop. A new pin cannot arrive
 //! between the check and the delete, since making one means dispatching a command. A pin that
@@ -550,9 +550,8 @@ impl Budget for Arena {
         key_name: ValkeyString,
         object_id: &ObjectId,
     ) -> Option<u64> {
-        // A transfer is reading this buffer, so taking the entry would leave it gone and the
-        // bytes still unavailable — the freeing drop belongs to whoever holds the last
-        // reference. Not worth waiting for either: an EFA read is a network round trip.
+        // An in-flight request holds this object, so taking the entry would leave it gone and the
+        // bytes still unavailable — the freeing drop belongs to whoever holds the last reference.
         if crate::storage::get_dram_pool().is_pinned(object_id) {
             PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return None;
