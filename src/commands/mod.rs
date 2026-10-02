@@ -59,7 +59,7 @@ fn parse_efa_addresses(
             .to_string_lossy()
             .parse()
             .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN))?;
-        // A zero-length address can never absorb bytes; ChunkIterator would skip past it.
+        // A zero-length address can never absorb bytes
         if 0 == len {
             return Err(ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN));
         }
