@@ -16,8 +16,8 @@ io-uring = "0.7"
 crossbeam-channel = "0.5"
 dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 lazy_static = "1"
 nvme-telem = "0.3.3"
 rand = "0.10"
@@ -28,6 +28,8 @@ allocator-api2 = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 rstest = "0.23.0"
+tokio = { version = "1", features = ["test-util"] }
+serial_test = "3"
 
 [lib]
 crate-type = ["cdylib"]

@@ -488,7 +488,24 @@ async fn cmd_get_tiered_run(
         obj_len,
         crc32c: crc32c_expected,
     } = get_info;
-    let hdr_buf = &buffers[0];
+    // Dedicated header buffer — can't share buffers[0] because the header read
+    // and chunk 0's data read would race on the same memory.
+    let hdr_buf = match source_pool.alloc_for_file_header() {
+        Some(buf) => buf,
+        None => {
+            let (metric, err) = match source_pool {
+                crate::stream::Pool::Nvme(_) => (
+                    &info::NVME_BUFFER_EXHAUSTED,
+                    errors::ERR_INSUFFICIENT_NVME_BUFFERS,
+                ),
+                crate::stream::Pool::Dram(_) => {
+                    (&info::DRAM_POOL_EXHAUSTED, errors::ERR_DRAM_POOL_EXHAUSTED)
+                }
+            };
+            reply_err(thread_ctx, metric, ValkeyError::Str(err));
+            return;
+        }
+    };
     let job = crate::stream::StreamJob::for_nvme_get(
         fd,
         obj_len,
@@ -866,6 +883,8 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
+    // Header write reuses a data buffer — safe because it runs after drive_window
+    // completes, unlike the GET path which needs a dedicated header buffer.
     let job = crate::stream::StreamJob::for_nvme_set(
         fd.as_raw_fd(),
         obj_len,

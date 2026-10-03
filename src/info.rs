@@ -16,6 +16,8 @@ pub static NVME_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static NVME_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static EFA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static EFA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static EFA_TIMEOUT_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static EFA_DRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +189,14 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "efa_write_errors",
             EFA_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "efa_timeout_errors",
+            EFA_TIMEOUT_ERRORS.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "efa_drain_count",
+            EFA_DRAIN_COUNT.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "dram_pool_exhausted",

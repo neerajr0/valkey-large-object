@@ -43,6 +43,7 @@ define_errors! {
 
     // Streaming Errors
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
+    ERR_EFA_TIMEOUT => "ERR EFA operation timed out",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
     ERR_SET_VALUE => "ERR failed to set key",
 
