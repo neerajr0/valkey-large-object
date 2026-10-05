@@ -127,6 +127,21 @@ async fn test_pause_before_finalize() {
     }
 }
 
+/// Test hook: pause the promotion leader after the Filling ObjectContext is in
+/// the map but before NVMe reads start. Widens the window so concurrent GETs
+/// deterministically register as coalesced waiters. Controlled by
+/// `test-pause-during-promotion-ms` config. 0 = disabled (production default).
+async fn test_pause_during_promotion() {
+    let pause_ms = crate::test_pause_during_promotion_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+}
+
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
 fn collect_dram_bytes(
     dram_pool: &storage::DRAMPool,
@@ -282,8 +297,8 @@ fn cmd_get_dram_efa(
             );
         }
         Some(_obj_ctx) => {
-            // TODO: Replace with waiter registration on the watch channel (coalescing).
-            todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
+            // DRAM-only: both SET paths insert as Ready; Filling state is unreachable.
+            unreachable!("DRAM-only GET: object in Filling state — SET always inserts as Ready");
         }
         None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
     }
@@ -304,24 +319,18 @@ fn cmd_get_tiered(
 ) {
     let dram_pool = storage::get_dram_pool();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
-    if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
-        if obj_ctx.is_ready() {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            cmd_get_from_dram(
-                dram_pool,
-                &obj_ctx,
-                obj_len,
-                crc32c,
-                transport,
-                thread_ctx,
-                Some(file),
-            );
-            return;
-        }
-        // Filling state: promotion in progress.
-        // TODO: coalesce — register as waiter on this ObjectContext.
-        // For now: fall through to NVMe read.
-    }
+    let (transport, blocked_client) = match try_serve_dram_hit(
+        dram_pool,
+        &object_id,
+        obj_len,
+        crc32c,
+        transport,
+        blocked_client,
+        &file,
+    ) {
+        None => return,     // served (Ready or coalesced waiter)
+        Some(args) => args, // not in DRAMPool — continue to promotion / fallback
+    };
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
@@ -357,6 +366,8 @@ fn cmd_get_tiered(
         crate::runtime_handle().spawn(async move {
             let _keep_alive = (file, fd);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
+            test_pause_during_promotion().await;
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
             let progress = crate::stream::PromotionProgress {
@@ -382,7 +393,21 @@ fn cmd_get_tiered(
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
     // Reaches here when try_promote_object returns None: pool full, object
     // exceeds max-promote-size, or another GET is already promoting this OID.
-    // Future: LRFU admission policy may also reject promotion here.
+    // Re-check the map: if another GET inserted a Filling entry between our
+    // initial get_object and try_promote_object, coalesce on it instead of
+    // doing a redundant NVMe read.
+    let (transport, blocked_client) = match try_serve_dram_hit(
+        dram_pool,
+        &object_id,
+        obj_len,
+        crc32c,
+        transport,
+        blocked_client,
+        &file,
+    ) {
+        None => return,
+        Some(args) => args,
+    };
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -1025,6 +1050,118 @@ fn cmd_get_from_dram(
                     Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
                 }
             });
+        }
+    }
+}
+
+// ─── Coalesced Waiter Registration ───────────────────────────────────────────
+
+/// Check DRAMPool for a cached object and serve it if found. Returns None if
+/// the request was served (Ready → DRAM serve, Filling → coalesced waiter).
+/// Returns Some((transport, blocked_client)) if the object is not in the map,
+/// giving ownership back to the caller for the next fallback path.
+fn try_serve_dram_hit(
+    dram_pool: &'static storage::DRAMPool,
+    object_id: &ObjectId,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    blocked_client: valkey_module::BlockedClient,
+    file: &Arc<ObjectFile>,
+) -> Option<(Transport, valkey_module::BlockedClient)> {
+    let obj_ctx = match dram_pool.get_object(object_id) {
+        Some(ctx) => ctx,
+        None => return Some((transport, blocked_client)), // cache miss — caller continues
+    };
+    if obj_ctx.is_ready() {
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        cmd_get_from_dram(
+            dram_pool,
+            &obj_ctx,
+            obj_len,
+            crc32c,
+            transport,
+            thread_ctx,
+            Some(file.clone()),
+        );
+        return None;
+    }
+    serve_filling_or_became_ready(
+        dram_pool,
+        obj_ctx,
+        obj_len,
+        crc32c,
+        transport,
+        blocked_client,
+        Some(file.clone()),
+    );
+    None
+}
+
+/// Handle a Filling ObjectContext: try to subscribe as a coalesced waiter.
+/// If subscribe succeeds, spawns a waiter task that waits for Ready then serves
+/// via cmd_get_from_dram. If subscribe returns None (transitioned to Ready between
+/// checks), serves directly.
+fn serve_filling_or_became_ready(
+    dram_pool: &'static storage::DRAMPool,
+    obj_ctx: Arc<ObjectContext>,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    blocked_client: valkey_module::BlockedClient,
+    file: Option<Arc<ObjectFile>>,
+) {
+    if let Some(rx) = obj_ctx.subscribe() {
+        info::COALESCED_READS.fetch_add(1, Ordering::Relaxed);
+        crate::runtime_handle().spawn(async move {
+            serve_coalesced_waiter(
+                obj_ctx,
+                rx,
+                obj_len,
+                crc32c,
+                transport,
+                blocked_client,
+                file,
+            )
+            .await;
+        });
+    } else {
+        // subscribe() returned None → transitioned to Ready between checks.
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        cmd_get_from_dram(
+            dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+        );
+    }
+}
+
+/// Coalesced waiter: wait for the promotion leader to finish, then serve via the
+/// standard DRAM path. Transport-agnostic — cmd_get_from_dram handles both TCP
+/// (collect_dram_bytes) and EFA (run_get with Source::DramResident + Target::EfaWrite).
+async fn serve_coalesced_waiter(
+    obj_ctx: Arc<ObjectContext>,
+    rx: tokio::sync::watch::Receiver<u32>,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    blocked_client: valkey_module::BlockedClient,
+    file: Option<Arc<ObjectFile>>,
+) {
+    match obj_ctx.await_promotion(rx).await {
+        Ok(()) => {
+            let dram_pool = storage::get_dram_pool();
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            cmd_get_from_dram(
+                dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+            );
+        }
+        Err(_reason) => {
+            // Promotion failed or leader crashed — reply NVMe read error.
+            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            reply_err(
+                &thread_ctx,
+                &info::NVME_READ_ERRORS,
+                ValkeyError::Str(errors::ERR_NVME_READ),
+            );
         }
     }
 }
