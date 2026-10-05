@@ -1,4 +1,4 @@
-//! ValkeyLargeObj: Large Object Module + Transport Crate
+//! valkey-large-object: Large Object Module + Transport Crate
 //!
 //! Architecture (from interface doc):
 //!   Data Type (commands, LoValue, keyspace)

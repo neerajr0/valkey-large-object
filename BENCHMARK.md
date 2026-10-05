@@ -132,7 +132,7 @@ Config values in bench.sh use **raw bytes** for module load args. The module als
 
 | Variable | Description |
 |----------|-------------|
-| `MODULE_SO` | Path to module .so (default: `./target/release/libvalkey_largeobj.so`) |
+| `MODULE_SO` | Path to module .so (default: `./target/release/libvalkey_large_object.so`) |
 | `VALKEY_SERVER` | Server binary (default: `valkey-server`) |
 | `VALKEY_CLI` | CLI binary (default: `valkey-cli`) |
 | `VALKEY_BENCH` | Benchmark binary (default: `valkey-benchmark`) |
