@@ -13,7 +13,7 @@ Tests cover:
   - Tiered mode: eviction frees nvme-maxmemory budget, credits each victim's
     whole disk_len, and unlinks the files it gave away
   - Tiered mode: a promotion into a full arena skips itself and serves from NVMe,
-    giving up nothing resident and leaving every key in place
+    evicting nothing resident and leaving every key in place
   - Both modes: an object a transfer is reading is skipped, not destroyed
   - Both modes: COPY at the cap evicts for room like a SET, but never its own source
 """
@@ -1587,7 +1587,7 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
     """Tiered mode against a DRAM arena too small for the working set.
 
     The promotion cache is the third pressure point, and the one where nothing is ever
-    given up: the object is already on NVMe, so an arena with no room simply skips the
+    evicted: the object is already on NVMe, so an arena with no room simply skips the
     promotion and the GET serves from disk. The arena is held at one segment —
     `dram-maxmemory == segment-size`, so expand can never fire — and more distinct objects
     are read than it can hold, which is the only way to make a promotion ask for room that
@@ -1663,3 +1663,402 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
                 f"{key} left the keyspace — a skipped promotion must not delete"
             assert client.execute_command('BLOB.GET', key) == payload, \
                 f"{key} survived but its data is wrong"
+
+
+def own_all_slots(client):
+    client.execute_command('CLUSTER', 'ADDSLOTSRANGE', 0, 16383)
+    wait_for_true(lambda: b'cluster_state:ok' in client.execute_command('CLUSTER', 'INFO'))
+
+
+def tombstones(client):
+    return info_largeobj(client)['largeobj_tombstones']
+
+
+class ClusterNode:
+    """Run the server as a cluster node, so the module sees cluster mode.
+
+    The core resolves a key lookup made while a command runs to the slot of that command's own
+    key. A walk inside `BLOB.SET foo` therefore cannot find a victim `bar` in another slot, and
+    `delete` reports success without removing it. Eviction tombstones the object instead: its bytes
+    are freed at once, every `LO.*` read treats it as a miss, and a sweep deletes the key later,
+    from a timer. So these tests write keys that hash to different slots, and the keys an eviction
+    takes stay in the keyspace, visible to core commands like `EXISTS`, until the sweep runs.
+    """
+
+    CLUSTER_DATABASES = 1
+    SWEEP_MS = 60_000  # out of the way; the sweep tests shorten it
+
+    def get_server_args(self):
+        config_file = os.path.abspath(os.path.join(self.testdir, 'nodes.conf'))
+        if os.path.exists(config_file):
+            os.remove(config_file)
+        return {
+            'cluster-enabled': 'yes',
+            'cluster-config-file': config_file,
+            'cluster-databases': str(self.CLUSTER_DATABASES),
+        }
+
+
+class DramSegment(ClusterNode):
+    """One 1MB segment that cannot grow, so a SET past it can only succeed by evicting."""
+
+    SEGMENT_SIZE = 1024 * 1024
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" segment-size {self.SEGMENT_SIZE}"
+            f" dram-maxmemory {self.SEGMENT_SIZE}"
+            f" scaling-poll-ms 60000"
+            f" tombstone-sweep-ms {self.SWEEP_MS}"
+            f" bench-mode no"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def evicted_key(self, client, key='{z}victim', size=600 * 1024):
+        """Evict `key` through a SET in another slot. The segment holds one object this size, so
+        the key is the only victim, and it stays in the keyspace as a tombstone."""
+        assert client.execute_command('BLOB.SET', key, b'V' * size) == b'OK'
+        assert client.execute_command('BLOB.SET', '{y}newcomer', b'N' * size) == b'OK'
+        assert client.execute_command('EXISTS', key) == 1, "another slot: the key outlives its data"
+        assert tombstones(client) == 1
+        return key
+
+
+class TestClusterDramTombstones(DramSegment, ValkeyLargeObjTestCaseBase):
+    """Reading, overwriting and deleting keys whose objects eviction has tombstoned."""
+
+    start_target = TestDramReactiveExpand.start_target
+
+    def new_node(self):
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        return client
+
+    def test_a_set_at_the_segment_evicts_keys_in_other_slots(self):
+        """SETs past the segment keep succeeding by evicting, the survivors are intact, and every
+        key answers rather than crashing the node — the ones eviction took read as misses."""
+        client = self.new_node()
+        obj_size = self.SEGMENT_SIZE // 4
+        payloads = {f'obj_{i}': bytes([i + 1]) * obj_size for i in range(12)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+
+        assert info_largeobj(client)['largeobj_evictions_total'] > 0
+        live, evicted = [], []
+        for key, payload in payloads.items():
+            got = client.execute_command('BLOB.GET', key)
+            if got is None:
+                evicted.append(key)
+            else:
+                assert got == payload
+                live.append(key)
+        assert live and evicted
+        assert tombstones(client) == len(evicted), "every key eviction could not delete is tombstoned"
+        for key in evicted:
+            assert client.execute_command('EXISTS', key) == 1
+        assert client.execute_command('EXISTS', live[-1]) == 1
+
+    def test_an_evicted_key_reads_as_a_miss_everywhere_in_the_module(self):
+        client = self.new_node()
+        key = self.evicted_key(client)
+
+        assert client.execute_command('BLOB.GET', key) is None
+        try:
+            client.execute_command('BLOB.INFO', key)
+            assert False, "BLOB.INFO must report the key as not found"
+        except ResponseError as e:
+            assert 'not found' in str(e).lower()
+        try:
+            assert not client.execute_command('COPY', key, '{z}copy')
+        except ResponseError:
+            pass
+        assert client.execute_command('EXISTS', '{z}copy') == 0
+        assert client.execute_command('MEMORY', 'USAGE', key) < 1024, \
+            "the payload is gone, so it must not be reported"
+        assert client.execute_command('DEBUG', 'DIGEST-VALUE', key)
+        assert client.execute_command('PING')
+
+    def test_deleting_an_evicted_key_clears_its_tombstone(self):
+        client = self.new_node()
+        key = self.evicted_key(client)
+
+        assert client.execute_command('DEL', key) == 1
+        # Freeing the value clears it, possibly on a lazyfree thread. The sweep would clear it too,
+        # a minute from now, which is not what is under test.
+        wait_for_true(lambda: tombstones(client) == 0, timeout=10)
+
+    def test_overwriting_an_evicted_key_is_not_a_miss(self):
+        """The tombstone is the old object's, not the name's."""
+        client = self.new_node()
+        key = self.evicted_key(client)
+
+        assert client.execute_command('BLOB.SET', key, b'fresh' * 1000) == b'OK'
+        assert client.execute_command('BLOB.GET', key) == b'fresh' * 1000
+        wait_for_true(lambda: tombstones(client) == 0, timeout=10)
+
+    def test_an_efa_set_at_the_segment_evicts_keys_in_other_slots(self):
+        """The arena is full once anything has been evicted, and an eviction can leave a few KB
+        of slack, so the EFA SETs together write well past it."""
+        client = self.new_node()
+        filled = 0
+        while info_largeobj(client)['largeobj_evictions_total'] == 0:
+            assert client.execute_command('BLOB.SET', f'fill_{filled}', b'F' * 4096) == b'OK'
+            filled += 1
+            assert filled < 1000, "the arena never filled"
+
+        before = info_largeobj(client)['largeobj_evictions_total']
+        for i in range(16):
+            process, address, rkey, remote_addr = self.start_target('--read')
+            try:
+                peer = self.server.get_new_client()  # one BLOB.HELLO per connection
+                peer.execute_command('BLOB.HELLO', address)
+                result = peer.execute_command(
+                    'BLOB.SET', f'efa_{i}', EFA_TARGET_LEN, rkey, remote_addr)
+                assert result == b'OK'
+            finally:
+                process.kill()
+        assert info_largeobj(client)['largeobj_evictions_total'] > before
+        assert client.execute_command('BLOB.GET', 'efa_15') == EFA_PATTERN * EFA_TARGET_LEN
+        for key in [f'fill_{i}' for i in range(filled)] + [f'efa_{i}' for i in range(16)]:
+            got = client.execute_command('BLOB.GET', key)
+            assert got is None or len(got) in (4096, EFA_TARGET_LEN)
+
+    def test_copy_at_the_segment_evicts_a_key_in_another_slot_and_never_its_source(self):
+        client = self.new_node()
+        obj = b'A' * (384 * 1024)
+        assert client.execute_command('BLOB.SET', '{t}src', obj) == b'OK'
+        assert client.execute_command('BLOB.SET', 'other', b'O' * len(obj)) == b'OK'
+        before = info_largeobj(client)['largeobj_evictions_total']
+
+        assert client.execute_command('COPY', '{t}src', '{t}dst') in (1, True)
+        assert info_largeobj(client)['largeobj_evictions_total'] == before + 1
+        assert client.execute_command('BLOB.GET', 'other') is None
+        assert client.execute_command('BLOB.GET', '{t}src') == obj
+        assert client.execute_command('BLOB.GET', '{t}dst') == obj
+
+
+class TestClusterDramSweep(DramSegment, ValkeyLargeObjTestCaseBase):
+    """The timer that finishes what eviction could not: deleting the keys it tombstoned."""
+
+    SWEEP_MS = 500  # long enough to act on a tombstone first, short enough to wait for
+
+    def new_node(self):
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        return client
+
+    def test_the_sweep_deletes_the_keys_eviction_took(self):
+        client = self.new_node()
+        obj_size = self.SEGMENT_SIZE // 4
+        payloads = {f'obj_{i}': bytes([i + 1]) * obj_size for i in range(12)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+        assert tombstones(client) > 0
+
+        wait_for_true(lambda: tombstones(client) == 0)
+        live = 0
+        for key, payload in payloads.items():
+            got = client.execute_command('BLOB.GET', key)
+            assert (client.execute_command('EXISTS', key) == 1) == (got is not None), \
+                f"{key}: a key the sweep left must be a live one"
+            if got is not None:
+                assert got == payload
+                live += 1
+        assert live > 0
+        assert client.execute_command('DBSIZE') == live
+
+    def test_a_renamed_key_is_still_swept(self):
+        """The tombstone remembers the name the key had. The sweep checks that rather than trusting
+        it, and finds the object by id when the key has moved."""
+        client = self.new_node()
+        key = self.evicted_key(client)
+
+        assert client.execute_command('RENAME', key, '{z}renamed') in (b'OK', True)
+        wait_for_true(lambda: tombstones(client) == 0)
+        assert client.execute_command('EXISTS', '{z}renamed') == 0
+        assert client.execute_command('EXISTS', key) == 0
+        assert len(client.execute_command('BLOB.GET', '{y}newcomer')) == 600 * 1024
+
+
+class TestClusterDramAcrossDbs(DramSegment, ValkeyLargeObjTestCaseBase):
+    """The same node with four DBs: a SET evicts keys that live in other DBs and other slots."""
+
+    CLUSTER_DATABASES = 4
+    SWEEP_MS = 500
+
+    def test_eviction_takes_victims_from_every_db(self):
+        db0 = self.server.get_new_client()
+        own_all_slots(db0)
+        dbs = {d: self.server.create_from_server(db=d) for d in (1, 2)}
+        allow_evictions(db0)
+        obj_size = 384 * 1024
+        payloads = {1: b'A' * obj_size, 2: b'B' * obj_size}
+        for db, payload in payloads.items():
+            assert dbs[db].execute_command('BLOB.SET', 'obj', payload) == b'OK'
+
+        before = info_largeobj(db0)['largeobj_evictions_total']
+        assert db0.execute_command('BLOB.SET', 'newcomer', b'N' * obj_size) == b'OK'
+        assert info_largeobj(db0)['largeobj_evictions_total'] > before
+        fresh = self.server.get_new_client()
+        assert fresh.execute_command('BLOB.GET', 'newcomer') == b'N' * obj_size
+        survivors = [db for db in payloads if dbs[db].execute_command('BLOB.GET', 'obj') is not None]
+        assert len(survivors) < len(payloads), "a key in another db had to give way"
+        for db in survivors:
+            assert dbs[db].execute_command('BLOB.GET', 'obj') == payloads[db]
+
+    def test_a_key_moved_to_another_db_is_still_swept(self):
+        """The tombstone remembers the DB the key was in. A MOVE before the sweep leaves that
+        wrong, and the sweep finds the object by id."""
+        db0 = self.server.get_new_client()
+        own_all_slots(db0)
+        db1 = self.server.create_from_server(db=1)
+        allow_evictions(db0)
+        size = 600 * 1024
+        assert db1.execute_command('BLOB.SET', '{z}victim', b'V' * size) == b'OK'
+        assert db0.execute_command('BLOB.SET', '{y}newcomer', b'N' * size) == b'OK'
+        assert tombstones(db0) == 1
+
+        assert db1.execute_command('MOVE', '{z}victim', 2) in (1, True)
+        wait_for_true(lambda: tombstones(db0) == 0)
+        db2 = self.server.create_from_server(db=2)
+        assert db2.execute_command('EXISTS', '{z}victim') == 0
+        assert db1.execute_command('EXISTS', '{z}victim') == 0
+
+
+class TestClusterTieredEviction(ClusterNode, ValkeyLargeObjTestCaseBase):
+    """Tiered mode against a small `nvme-maxmemory`, on a node with four DBs."""
+
+    CLUSTER_DATABASES = 4
+    OBJ = TestTieredEviction.OBJ
+    DISK_PER_OBJ = TestTieredEviction.DISK_PER_OBJ
+    OBJECTS_PER_CAP = TestTieredEviction.OBJECTS_PER_CAP
+    CAP = TestTieredEviction.CAP
+
+    def get_module_args(self, data_dir, direct_io):
+        return (TestTieredEviction.get_module_args(self, data_dir, direct_io)
+                + f" tombstone-sweep-ms {self.SWEEP_MS}")
+
+    def _dat_files(self):
+        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
+
+    def test_a_set_at_the_cap_evicts_keys_in_other_slots_and_dbs(self):
+        """The victims' files are unlinked and their bytes credited when the write settles, even
+        though their keys outlive them as tombstones.
+
+        Written from db 0 and then moved: a Tiered SET from another db lands in db 0 whichever
+        db the client selected.
+        """
+        db0 = self.server.get_new_client()
+        own_all_slots(db0)
+        db2 = self.server.create_from_server(db=2)
+        allow_evictions(db0)
+        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP + 4)}
+        clients = {key: db0 for key in payloads}
+        for i, (key, payload) in enumerate(payloads.items()):
+            assert db0.execute_command('BLOB.SET', key, payload) == b'OK'
+            if i < self.OBJECTS_PER_CAP and i % 2 == 1:
+                assert db0.execute_command('MOVE', key, 2) in (1, True)
+                clients[key] = db2
+
+        info = info_largeobj(db0)
+        assert info['largeobj_disk_evictions_total'] > 0
+        assert info['largeobj_disk_used_bytes'] <= info['largeobj_disk_maxmemory_bytes']
+        live = []
+        for key, payload in payloads.items():
+            got = clients[key].execute_command('BLOB.GET', key)
+            if got is not None:
+                assert got == payload
+                live.append(key)
+        assert 0 < len(live) < len(payloads)
+        assert any(clients[key] is db2 for key in payloads if key not in live), \
+            "the walk must reach the victims in db 2 as well as db 0"
+        assert len(self._dat_files()) == len(live), "an evicted object's file must be gone"
+        assert info['largeobj_disk_used_bytes'] == len(live) * self.DISK_PER_OBJ
+        assert tombstones(db0) == len(payloads) - len(live)
+
+    def test_copy_at_the_cap_evicts_a_key_in_another_slot_and_never_its_source(self):
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP - 1)}
+        payloads['{t}src'] = b'S' * self.OBJ
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+        before = info_largeobj(client)['largeobj_disk_evictions_total']
+
+        assert client.execute_command('COPY', '{t}src', '{t}dst') in (1, True)
+        info = info_largeobj(client)
+        assert info['largeobj_disk_evictions_total'] > before
+        assert info['largeobj_disk_used_bytes'] <= info['largeobj_disk_maxmemory_bytes']
+        assert client.execute_command('BLOB.GET', '{t}src') == payloads['{t}src']
+        assert client.execute_command('BLOB.GET', '{t}dst') == payloads['{t}src']
+
+    def test_a_late_commit_overwrites_a_newer_write_that_was_evicted(self):
+        """A SET slow to commit finds the key holding a newer object, which eviction has since given
+        up. That object is a miss, not a write to defer to, so the late commit has to land."""
+        slow = self.server.get_new_client()
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        key, late, newer = '{k}key', b'L' * self.OBJ, b'N' * self.OBJ
+        slow.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000')
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(reply=slow.execute_command('BLOB.SET', key, late)))
+        thread.start()
+        time.sleep(0.5)  # the write is done and the task is paused, holding the older object id
+        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0')
+        assert client.execute_command('BLOB.SET', key, newer) == b'OK'
+
+        filled = 0
+        while client.execute_command('BLOB.GET', key) is not None:
+            assert client.execute_command('BLOB.SET', f'fill_{filled}', b'F' * self.OBJ) == b'OK'
+            filled += 1
+            assert filled < 100, "the newer object was never evicted"
+        assert client.execute_command('EXISTS', key) == 1, "evicted from another slot: a tombstone"
+
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert outcome['reply'] == b'OK'
+        assert client.execute_command('BLOB.GET', key) == late
+
+    def test_a_tombstone_is_never_claimed_a_second_time(self):
+        """A tombstoned object is already evicted; offering it again would credit the walk with
+        bytes that are not coming back, and the budget would creep past its cap."""
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        for i in range(4 * self.OBJECTS_PER_CAP):
+            assert client.execute_command('BLOB.SET', f'fill_{i}', bytes([i % 251]) * self.OBJ) == b'OK'
+            info = info_largeobj(client)
+            assert info['largeobj_disk_used_bytes'] <= info['largeobj_disk_maxmemory_bytes'], \
+                f"over the cap after SET {i}"
+        assert info['largeobj_tombstones'] > 0
+        assert info['largeobj_pinned_skips_total'] == 0, "nothing here is being read"
+        live = sum(client.execute_command('BLOB.GET', f'fill_{i}') is not None
+                   for i in range(4 * self.OBJECTS_PER_CAP))
+        assert info['largeobj_disk_used_bytes'] == live * self.DISK_PER_OBJ
+        assert len(self._dat_files()) == live
+
+    def test_an_evicted_key_reads_as_a_miss(self):
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP + 2)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+
+        evicted = [k for k in payloads if client.execute_command('BLOB.GET', k) is None]
+        assert evicted
+        for key in evicted:
+            try:
+                client.execute_command('BLOB.INFO', key)
+                assert False, "BLOB.INFO must report the key as not found"
+            except ResponseError as e:
+                assert 'not found' in str(e).lower()
+            assert client.execute_command('MEMORY', 'USAGE', key) < 1024

@@ -82,6 +82,13 @@ pub struct LoValue {
 // ─── LoValue Helper Methods ──────────────────────────────────────────────────
 
 impl LoValue {
+    /// Whether eviction has given this object up while its key waits for the sweep (see
+    /// `crate::eviction::tombstone`). Such a value is a miss: its bytes are gone, so every read of a
+    /// `LoValue` must check this before it touches the object.
+    pub fn is_tombstoned(&self) -> bool {
+        crate::eviction::tombstone::contains(self.object_id)
+    }
+
     /// Reports DRAM memory usage in bytes for `MEMORY USAGE <key>`.
     /// Always includes the LoValue struct overhead. Includes the object payload
     /// only when it is actually resident in DRAM:
@@ -89,6 +96,9 @@ impl LoValue {
     /// - Tiered mode: only if the object has been promoted into DRAMPool.
     pub fn memory_usage(&self) -> usize {
         let base = std::mem::size_of::<LoValue>();
+        if self.is_tombstoned() {
+            return base;
+        }
         let dram_usage = base + self.len as usize;
         match crate::operating_mode() {
             crate::OperatingMode::Dram => dram_usage,
@@ -128,8 +138,12 @@ impl LoValue {
     /// Deep-copy for the COPY command callback, evicting other keys for room if the budget is
     /// full. The copy holds its source like any reader, so eviction skips it as pinned.
     /// Dram mode: copy the ObjectContext's buffers. Tiered mode: copy the NVMe file.
-    /// Returns None on capacity exhaustion (nothing evictable, or the copy fails).
+    /// Returns None on capacity exhaustion (nothing evictable, or the copy fails), or when the
+    /// source has been evicted: its bytes are gone, so there is nothing to copy.
     pub fn create_copy(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
+        if self.is_tombstoned() {
+            return None;
+        }
         match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(ctx),
             crate::OperatingMode::Tiered => self.create_copy_tiered(ctx),
@@ -183,6 +197,8 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     // Drop the DRAM cache entry.
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    // The key is gone, so a tombstone for it has nothing left to hide or sweep.
+    crate::eviction::tombstone::remove(lo.object_id);
     // `lo` (and its Option<Arc<ObjectFile>>) drops here; teardown fires on last ref.
 }
 

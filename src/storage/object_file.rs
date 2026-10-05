@@ -25,16 +25,19 @@
 //! last ref, except on the main event-loop thread, where blocking would stall the
 //! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
-//! The handle also owns `disk_len`, its charge against `nvme-maxmemory`, and `Drop` is
+//! The handle also owns `disk_len`, its charge against `nvme-maxmemory`, and teardown is
 //! the only thing that credits it back — so DEL, overwrite, expiry, flush and eviction
-//! each account for themselves exactly once. Eviction keeps that true by *moving* the
-//! last handle into a `DiskReservation` (instead of cloning the `Arc`).
+//! each account for themselves exactly once. Teardown is `release`, which runs once:
+//! `Drop` calls it when the last reference goes, and eviction calls it directly through a
+//! `DiskReservation`, because the keyspace's own reference may outlive the eviction (see
+//! `crate::eviction::tombstone`).
 //!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
 use std::os::unix::io::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::fd_pool::FdPool;
@@ -53,6 +56,8 @@ pub struct ObjectFile {
     object_id: ObjectId,
     /// True on-disk size, used for NVMe utilization accounting.
     disk_len: u64,
+    /// Set by the first `release`, so the file is unlinked and its bytes credited once.
+    released: AtomicBool,
 }
 
 impl ObjectFile {
@@ -64,11 +69,46 @@ impl ObjectFile {
         Self {
             object_id,
             disk_len,
+            released: AtomicBool::new(false),
         }
     }
 
     pub fn object_id(&self) -> ObjectId {
         self.object_id
+    }
+
+    /// Give the file back now: deregister the fd, unlink, and credit `disk_len`, in that order.
+    /// Runs once however often it is called, and `Drop` calls it, so a handle whose eviction
+    /// has released it is inert by the time the keyspace frees its reference.
+    ///
+    /// The main event-loop thread must be kept syscall-free, so a release from it is handed to
+    /// the tokio pool. The credit then lands after the unlink, as it does for a `Drop` there.
+    pub fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let object_id = self.object_id;
+        let disk_len = self.disk_len;
+
+        // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
+        // holds a clone, the fd's OwnedFd closes at this time.
+        let teardown = move || {
+            if let Some(pool) = super::FD_POOL.get() {
+                pool.remove(object_id);
+            }
+            let path = object_id.file_path(&crate::nvme_dir());
+            if let Err(e) = std::fs::remove_file(&path) {
+                super::warn_failed_unlink("teardown", &path, &e);
+            }
+            // Release exactly what create added — no stat, so it can't drift.
+            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+        };
+
+        if crate::is_main_thread() {
+            crate::runtime_handle().spawn(async move { teardown() });
+        } else {
+            teardown();
+        }
     }
 
     /// On-disk bytes this version is charged for — what releasing it is worth.
@@ -137,33 +177,9 @@ impl ObjectFile {
 
 impl Drop for ObjectFile {
     fn drop(&mut self) {
-        // Runs once, when the last ref drops: a completed deletion with no
-        // remaining ObjectFile refs. Means "object gone" — deregister the fd and
-        // unlink the file.
-        let object_id = self.object_id;
-        let disk_len = self.disk_len;
-
-        // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
-        // holds a clone, the fd's OwnedFd closes at this time.
-        let teardown = move || {
-            if let Some(pool) = super::FD_POOL.get() {
-                pool.remove(object_id);
-            }
-            let path = object_id.file_path(&crate::nvme_dir());
-            if let Err(e) = std::fs::remove_file(&path) {
-                super::warn_failed_unlink("teardown", &path, &e);
-            }
-            // Release exactly what create added — no stat, so it can't drift.
-            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
-        };
-
-        // The main event-loop thread must be kept syscall-free. Hand the operation
-        // off to the tokio pool if the drop() is invoked from the main thread.
-        if crate::is_main_thread() {
-            crate::runtime_handle().spawn(async move { teardown() });
-        } else {
-            teardown();
-        }
+        // Runs once, when the last ref drops: a completed deletion with no remaining
+        // ObjectFile refs. Means "object gone", unless eviction already said so.
+        self.release();
     }
 }
 
@@ -178,9 +194,9 @@ impl Drop for ObjectFile {
 /// pending claim's bytes are invisible to the next SET, which frees its own victims instead
 /// of waiting; at a full cache that is one victim per newcomer either way.
 ///
-/// Ordering: victims are owned outright — `eviction::take_file` takes the handle out of the
-/// keyspace. `commit` drops them, so the victims' files are gone from the directory before
-/// the new one is created, and a reservation dropped instead of committed undoes itself.
+/// Ordering: the victims are `release`d by `commit`, so their files are gone from the directory
+/// before the new one is created, and a reservation dropped instead of committed releases them
+/// too. The keyspace may still hold a reference to each, so dropping would not be enough.
 pub struct DiskReservation {
     /// The version these bytes are for.
     object_id: ObjectId,
@@ -194,9 +210,9 @@ enum Payment {
     /// Charged to the ledger, by a successful `try_reserve` or by `commit`. Dropping the
     /// reservation credits it back.
     Charged,
-    /// Not charged yet. Objects gone from the keyspace, their bytes still charged, pay for
-    /// `disk_len` on `commit`. Dropping them returns their own credit and calls `unlink(2)`.
-    PaidBy(Vec<ObjectFile>),
+    /// Not charged yet. Objects eviction has evicted, their bytes still charged, pay for
+    /// `disk_len` on `commit`. Releasing them returns their own credit and calls `unlink(2)`.
+    PaidBy(Vec<Arc<ObjectFile>>),
     /// The new `ObjectFile` owes the credit.
     HandedOff,
 }
@@ -211,9 +227,9 @@ impl DiskReservation {
         }
     }
 
-    /// The budget was full: `victims` are gone from the keyspace and their still-charged
+    /// The budget was full: `victims` have been evicted and their still-charged
     /// bytes, which the caller has verified cover `disk_len`, are what will pay for it.
-    pub fn paid_by(object_id: ObjectId, disk_len: u64, victims: Vec<ObjectFile>) -> Self {
+    pub fn paid_by(object_id: ObjectId, disk_len: u64, victims: Vec<Arc<ObjectFile>>) -> Self {
         Self {
             object_id,
             disk_len,
@@ -229,15 +245,17 @@ impl DiskReservation {
         self.disk_len
     }
 
-    /// Charge our own bytes, then drop the victims. `Drop` runs in-line and is responsible for
-    /// unlinking victim files and crediting their `disk_len` before creating the new file.
+    /// Charge our own bytes, then release the victims, which unlinks their files and credits
+    /// their `disk_len` before the new file is created.
     ///
     /// Charging first is what keeps a competing SET's `try_reserve` isolated: the ledger briefly
     /// over-counts by briefly including both the new file and victims whose files are being unlinked.
     pub fn commit(&mut self) {
         if let Payment::PaidBy(victims) = std::mem::replace(&mut self.payment, Payment::Charged) {
             super::nvme::increase_nvme_disk_usage(self.disk_len);
-            drop(victims);
+            for victim in victims {
+                victim.release();
+            }
         }
     }
 
@@ -253,11 +271,12 @@ impl DiskReservation {
 impl Drop for DiskReservation {
     fn drop(&mut self) {
         // The write never got as far as an `ObjectFile`, so give the budget back. Victims
-        // drop with `self.payment` and release their own — and they stay destroyed, because
-        // the keyspace lost them before this reservation existed and no reply promised
-        // otherwise.
-        if matches!(self.payment, Payment::Charged) {
-            super::nvme::decrease_nvme_disk_usage(self.disk_len);
+        // release their own — and they stay destroyed, because eviction gave them up before
+        // this reservation existed and no reply promised otherwise.
+        match &self.payment {
+            Payment::Charged => super::nvme::decrease_nvme_disk_usage(self.disk_len),
+            Payment::PaidBy(victims) => victims.iter().for_each(|victim| victim.release()),
+            Payment::HandedOff => {}
         }
     }
 }
@@ -298,8 +317,9 @@ mod tests {
     /// The whole point of the type: a victim's bytes pay for its replacement, the ledger ends up
     /// charged for exactly one object rather than two or zero, and the victim's file is gone from
     /// the directory before `commit` returns so the caller writes into space that is actually free.
-    /// That ordering is what owning the handles buys — a cloned `Arc` would leave the unlink to
-    /// whenever the keyspace's own reference died on a lazyfree BIO thread.
+    /// The keyspace still holds its own reference, as it does for a tombstoned key awaiting the
+    /// sweep, so the release must not wait for that reference to drop — and must not be repeated
+    /// when it finally does.
     #[test]
     fn commit_spends_victims_on_the_newcomer() {
         let _g = accounting_test_lock();
@@ -307,7 +327,7 @@ mod tests {
         let victim_oid = ObjectId(u64::MAX - 8);
         let newcomer_oid = ObjectId(u64::MAX - 9);
 
-        let victim = charged_file(victim_oid);
+        let keyspace_ref = Arc::new(charged_file(victim_oid));
         let victim_path = victim_oid.file_path(&crate::nvme_dir());
         assert_eq!(nvme_disk_usage(), base + DISK_LEN);
         assert!(
@@ -315,7 +335,8 @@ mod tests {
             "fixture must place the victim's file"
         );
 
-        let mut res = DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![victim]);
+        let mut res =
+            DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![Arc::clone(&keyspace_ref)]);
         assert_eq!(
             nvme_disk_usage(),
             base + DISK_LEN,
@@ -332,6 +353,12 @@ mod tests {
             nvme_disk_usage(),
             base + DISK_LEN,
             "one object out, one in — the charge lands, the victim's credit comes back"
+        );
+        drop(keyspace_ref);
+        assert_eq!(
+            nvme_disk_usage(),
+            base + DISK_LEN,
+            "the keyspace's reference dropping later must not credit the victim twice"
         );
 
         // After `into_object_file` the *handle* owes the bytes. If the reservation's `Drop` also
@@ -362,13 +389,30 @@ mod tests {
         let _g = accounting_test_lock();
         let base = nvme_disk_usage();
 
-        let victim = charged_file(ObjectId(u64::MAX - 4));
+        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 4)));
         drop(DiskReservation::paid_by(
             ObjectId(u64::MAX - 5),
             DISK_LEN,
             vec![victim],
         ));
         assert_eq!(nvme_disk_usage(), base, "victim bytes returned, none taken");
+
+        // The keyspace still holds its own reference to a tombstoned victim until `lo_free`, so the
+        // reservation cannot leave the credit to the last `Arc` dropping.
+        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 7)));
+        let keyspace = Arc::clone(&victim);
+        drop(DiskReservation::paid_by(
+            ObjectId(u64::MAX - 8),
+            DISK_LEN,
+            vec![victim],
+        ));
+        assert_eq!(
+            nvme_disk_usage(),
+            base,
+            "credited while the keyspace holds on"
+        );
+        drop(keyspace);
+        assert_eq!(nvme_disk_usage(), base, "and not again when it lets go");
 
         // `charged` means the caller's `try_reserve` already succeeded, so the bytes are charged up
         // front and the drop has to give them back itself.
@@ -378,7 +422,7 @@ mod tests {
 
         // Past `commit` and still abandoned: nothing wrote a file, so the reservation dies owing
         // the bytes it charged and has to credit them itself.
-        let victim = charged_file(ObjectId(u64::MAX - 2));
+        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 2)));
         let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 3), DISK_LEN, vec![victim]);
         res.commit();
         drop(res);

@@ -160,6 +160,12 @@ lazy_static::lazy_static! {
     /// `maxmemory-samples`, same range and default.
     static ref CFG_MAXMEMORY_SAMPLES: AtomicI64 = AtomicI64::new(5);
 
+    /// How long an evicted object's key may linger before the sweep deletes it, in milliseconds.
+    /// Only a key eviction could not delete inside the command waits at all (cluster mode, for a
+    /// victim in another slot), and until the sweep runs it reads as a miss to `LO.*` but not to
+    /// core commands such as `EXISTS`.
+    static ref CFG_TOMBSTONE_SWEEP_MS: AtomicI64 = AtomicI64::new(100);
+
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
     /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
@@ -278,6 +284,10 @@ pub fn eviction_tenacity() -> i64 {
 
 pub fn maxmemory_samples() -> usize {
     CFG_MAXMEMORY_SAMPLES.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn tombstone_sweep_ms() -> u64 {
+    CFG_TOMBSTONE_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn worker_threads() -> usize {
@@ -755,6 +765,8 @@ valkey_module! {
             ["eviction-tenacity", &*CFG_EVICTION_TENACITY, 10, 0, 100,
              ConfigurationFlags::DEFAULT, None, None],
             ["maxmemory-samples", &*CFG_MAXMEMORY_SAMPLES, 5, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["tombstone-sweep-ms", &*CFG_TOMBSTONE_SWEEP_MS, 100, 10, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
         ],
         string: [

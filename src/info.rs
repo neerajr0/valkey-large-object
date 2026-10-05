@@ -93,6 +93,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "pinned_skips_total",
             crate::eviction::PINNED_SKIPS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
+        .field("tombstones", crate::eviction::tombstone::len() as i64)?
         .build_section()?
         .build_info()
         .map(|_| ())

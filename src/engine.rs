@@ -178,7 +178,8 @@ fn commit_lo_value(
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
     let event = match key.get_value::<LoValue>(&LO_TYPE) {
-        Ok(Some(existing)) if existing.object_id > object_id => {
+        // An evicted value is a miss, not a newer write to defer to.
+        Ok(Some(existing)) if existing.object_id > object_id && !existing.is_tombstoned() => {
             return Ok(CommitOutcome::StaleDiscarded);
         }
         Ok(Some(_)) => EVENT_UPDATE,

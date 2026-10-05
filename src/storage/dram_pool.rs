@@ -13,7 +13,7 @@
 //!
 //! Shrink leaves the keyspace alone because the data is on NVMe. It is the only thing that
 //! drops promoted copies: an arena too full to serve a promotion skips it instead
-//! (`try_promote_object`), so nothing resident is ever given up for a cache fill.
+//! (`try_promote_object`), so nothing resident is ever evicted for a cache fill.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
