@@ -618,8 +618,6 @@ fn walk<B: Budget>(ctx: &Context, need: u64, budget: &mut B) -> (Option<B::Outpu
 // ─── DRAM arena: evict (Dram) ─────────────────────────────────────────────────
 
 /// Allocate `need` bytes, destroying resident objects to make room.
-///
-/// The caller checks the eviction policy (`engine::alloc_dram_or_make_room`).
 pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer>> {
     debug_assert_eq!(
         crate::operating_mode(),
@@ -636,6 +634,10 @@ pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer
     let (live_segments, _, _) = dram_pool.segment_counts();
     let achievable = (live_segments * crate::dram_segment_size()) as u64;
     if hopeless_request(need as u64, achievable, dram_pool.object_count() as u64) {
+        return None;
+    }
+
+    if !crate::eviction_allowed(ctx) {
         return None;
     }
 

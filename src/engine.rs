@@ -612,9 +612,6 @@ pub(crate) fn alloc_dram_or_make_room(
     if let Some(buffers) = dram_pool.alloc_exact_or_expand(ctx, len) {
         return Some(buffers);
     }
-    if !crate::eviction_allowed(ctx) {
-        return None;
-    }
     crate::eviction::alloc_by_evicting(ctx, len as usize)
 }
 
