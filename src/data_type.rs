@@ -83,8 +83,7 @@ pub struct LoValue {
 
 impl LoValue {
     /// Whether eviction has given this object up while its key waits for the sweep (see
-    /// `crate::eviction::tombstone`). Such a value is a miss: its bytes are gone, so every read of a
-    /// `LoValue` must check this before it touches the object.
+    /// `crate::eviction::tombstone`). Such a value is a miss: every read must check this first.
     pub fn is_tombstoned(&self) -> bool {
         crate::eviction::tombstone::contains(self.object_id)
     }
@@ -136,10 +135,9 @@ impl LoValue {
     }
 
     /// Deep-copy for the COPY command callback, evicting other keys for room if the budget is
-    /// full. The copy holds its source like any reader, so eviction skips it as pinned.
+    /// full (the copy holds its source like any reader, so it is never a victim).
     /// Dram mode: copy the ObjectContext's buffers. Tiered mode: copy the NVMe file.
-    /// Returns None on capacity exhaustion (nothing evictable, or the copy fails), or when the
-    /// source has been evicted: its bytes are gone, so there is nothing to copy.
+    /// Returns None on capacity exhaustion or when the source has been evicted.
     pub fn create_copy(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         if self.is_tombstoned() {
             return None;

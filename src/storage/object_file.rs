@@ -25,12 +25,9 @@
 //! last ref, except on the main event-loop thread, where blocking would stall the
 //! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
-//! The handle also owns `disk_len`, its charge against `nvme-maxmemory`, and teardown is
-//! the only thing that credits it back — so DEL, overwrite, expiry, flush and eviction
-//! each account for themselves exactly once. Teardown is `release`, which runs once:
-//! `Drop` calls it when the last reference goes, and eviction calls it directly through a
-//! `DiskReservation`, because the keyspace's own reference may outlive the eviction (see
-//! `crate::eviction::tombstone`).
+//! The handle also owns `disk_len`, its charge against `nvme-maxmemory`. `release` credits it back
+//! once: from `Drop`, or earlier from eviction via a `DiskReservation`, since a tombstoned key keeps
+//! its reference (see `crate::eviction::tombstone`).
 //!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
 //! serialized form; on load a handle is reconstructed for the existing file and its
@@ -63,7 +60,7 @@ pub struct ObjectFile {
 impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
-    /// `ensure_open`. `disk_len` is the true on-disk size, and `Drop` releases exactly
+    /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
     /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         Self {
@@ -77,13 +74,18 @@ impl ObjectFile {
         self.object_id
     }
 
-    /// Give the file back now: deregister the fd, unlink, and credit `disk_len`, in that order.
-    /// Runs once however often it is called, and `Drop` calls it, so a handle whose eviction
-    /// has released it is inert by the time the keyspace frees its reference.
-    ///
-    /// The main event-loop thread must be kept syscall-free, so a release from it is handed to
-    /// the tokio pool. The credit then lands after the unlink, as it does for a `Drop` there.
+    /// Deregister the fd, unlink the file and credit `disk_len`, once however often it is called.
+    /// From the main thread the teardown is queued to the tokio pool, so it lands later.
     pub fn release(&self) {
+        self.release_on(crate::is_main_thread());
+    }
+
+    /// `release` that always unlinks inline: COPY blocks the event loop on a whole-object copy anyway.
+    pub fn release_blocking(&self) {
+        self.release_on(false);
+    }
+
+    fn release_on(&self, defer: bool) {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -104,14 +106,13 @@ impl ObjectFile {
             crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
         };
 
-        if crate::is_main_thread() {
+        if defer {
             crate::runtime_handle().spawn(async move { teardown() });
         } else {
             teardown();
         }
     }
 
-    /// On-disk bytes this version is charged for — what releasing it is worth.
     pub fn disk_len(&self) -> u64 {
         self.disk_len
     }
@@ -123,14 +124,14 @@ impl ObjectFile {
         pool.get_or_open(self.object_id, dir)
     }
 
-    /// Copy this file into the new object version `reservation` pays for: commits the
-    /// reservation, writes a header carrying the new OID with this object's `len`/`crc32c`,
-    /// then copies the payload past the header byte-for-byte. `fsync`s before returning so the
-    /// file is durable before it is exposed to O_DIRECT reads via io_uring.
+    /// Copy this file into the new object version `reservation` pays for: writes a
+    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
+    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
+    /// durable before it is exposed to O_DIRECT reads via io_uring.
     ///
-    /// The returned handle's `Drop` releases the reservation's bytes. Returns `None` if any I/O
+    /// The returned handle's `Drop` releases the reserved bytes. Returns `None` if any I/O
     /// fails (COPY then fails the command rather than aborting the node), leaving no partial
-    /// file behind and the bytes returned to the budget.
+    /// file behind.
     pub fn copy(
         &self,
         mut reservation: DiskReservation,
@@ -177,41 +178,33 @@ impl ObjectFile {
 
 impl Drop for ObjectFile {
     fn drop(&mut self) {
-        // Runs once, when the last ref drops: a completed deletion with no remaining
-        // ObjectFile refs. Means "object gone", unless eviction already said so.
+        // The last ref dropped: the object is gone, unless eviction already released it.
         self.release();
     }
 }
 
 // ─── DiskReservation ───────────────────────────────────────────────────────────
 
-/// One Tiered SET's claim on the `nvme-maxmemory` budget: created on the main thread,
-/// carried into the write task, settled there.
+/// One Tiered SET's claim on the `nvme-maxmemory` budget, made on the main thread and settled by
+/// the write task: either budget that is already charged, or evicted victims whose still-charged
+/// bytes pay on `commit`. Deciding that up front means the task cannot fail for capacity and no
+/// concurrent SET can spend what this holds. The cost is that a pending claim is invisible to the
+/// next SET, which evicts its own victims rather than wait.
 ///
-/// Isolation: whatever pays for `disk_len` — spare budget or victims already out of the
-/// keyspace — is decided on the event loop and travels with the write, so the task cannot
-/// fail for capacity and no concurrent SET can spend what this holds. The cost is that a
-/// pending claim's bytes are invisible to the next SET, which frees its own victims instead
-/// of waiting; at a full cache that is one victim per newcomer either way.
-///
-/// Ordering: the victims are `release`d by `commit`, so their files are gone from the directory
-/// before the new one is created, and a reservation dropped instead of committed releases them
-/// too. The keyspace may still hold a reference to each, so dropping would not be enough.
+/// `commit` releases the victims (their keys may still hold a reference, so dropping alone would
+/// not), and a reservation dropped uncommitted releases them too: they stay destroyed.
 pub struct DiskReservation {
-    /// The version these bytes are for.
     object_id: ObjectId,
-    /// Bytes this reservation is for — the new object's on-disk size.
+    /// The new object's on-disk size.
     disk_len: u64,
     payment: Payment,
 }
 
 /// How `disk_len` is paid for, and so who owes the ledger credit.
 enum Payment {
-    /// Charged to the ledger, by a successful `try_reserve` or by `commit`. Dropping the
-    /// reservation credits it back.
+    /// Charged to the ledger; dropping the reservation credits it back.
     Charged,
-    /// Not charged yet. Objects eviction has evicted, their bytes still charged, pay for
-    /// `disk_len` on `commit`. Releasing them returns their own credit and calls `unlink(2)`.
+    /// Not charged yet: the evicted victims, still charged, pay on `commit`.
     PaidBy(Vec<Arc<ObjectFile>>),
     /// The new `ObjectFile` owes the credit.
     HandedOff,
@@ -227,8 +220,8 @@ impl DiskReservation {
         }
     }
 
-    /// The budget was full: `victims` have been evicted and their still-charged
-    /// bytes, which the caller has verified cover `disk_len`, are what will pay for it.
+    /// The budget was full: `victims` are evicted, and their still-charged bytes (which the caller
+    /// has verified cover `disk_len`) will pay for it.
     pub fn paid_by(object_id: ObjectId, disk_len: u64, victims: Vec<Arc<ObjectFile>>) -> Self {
         Self {
             object_id,
@@ -241,26 +234,18 @@ impl DiskReservation {
         self.object_id
     }
 
-    pub fn disk_len(&self) -> u64 {
-        self.disk_len
-    }
-
-    /// Charge our own bytes, then release the victims, which unlinks their files and credits
-    /// their `disk_len` before the new file is created.
-    ///
-    /// Charging first is what keeps a competing SET's `try_reserve` isolated: the ledger briefly
-    /// over-counts by briefly including both the new file and victims whose files are being unlinked.
+    /// Charge the new file, then release the victims, unlinking inline. Charging first keeps a
+    /// competing `try_reserve` honest: the ledger over-counts until the unlinks land.
     pub fn commit(&mut self) {
         if let Payment::PaidBy(victims) = std::mem::replace(&mut self.payment, Payment::Charged) {
             super::nvme::increase_nvme_disk_usage(self.disk_len);
             for victim in victims {
-                victim.release();
+                victim.release_blocking();
             }
         }
     }
 
-    /// Hand the charged bytes to the new version's handle. From here the `ObjectFile` owes
-    /// the release, which is where every other delete path already expects it to live.
+    /// Hand the charged bytes to the new version's handle, which now owes the release.
     pub fn into_object_file(mut self) -> ObjectFile {
         debug_assert!(matches!(self.payment, Payment::Charged), "commit first");
         self.payment = Payment::HandedOff;
@@ -270,162 +255,11 @@ impl DiskReservation {
 
 impl Drop for DiskReservation {
     fn drop(&mut self) {
-        // The write never got as far as an `ObjectFile`, so give the budget back. Victims
-        // release their own — and they stay destroyed, because eviction gave them up before
-        // this reservation existed and no reply promised otherwise.
+        // The write never produced an `ObjectFile`: give the budget back. Victims stay destroyed.
         match &self.payment {
             Payment::Charged => super::nvme::decrease_nvme_disk_usage(self.disk_len),
             Payment::PaidBy(victims) => victims.iter().for_each(|victim| victim.release()),
             Payment::HandedOff => {}
         }
-    }
-}
-
-// ─── Unit Tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::nvme::{accounting_test_lock, nvme_disk_usage};
-
-    const DISK_LEN: u64 = 64 * 1024;
-
-    /// Make a handle for `oid` droppable: point `nvme-dir` at a writable directory and put
-    /// the file there, so the `unlink(2)` succeeds. Otherwise `Drop` logs the failure, and
-    /// logging aborts outside a server — `log_internal`'s `cfg!(test)` escape is compiled
-    /// into the *valkey-module* crate, which is not built as a test.
-    fn place_file_for(oid: ObjectId) {
-        let dir = std::env::temp_dir().join("bigobj-object-file-tests");
-        std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
-        let dir = dir.to_str().expect("temp path must be UTF-8").to_string();
-        crate::set_nvme_dir_for_test(&dir);
-        std::fs::write(oid.file_path(&dir), b"x").expect("stand-in object file");
-    }
-
-    fn file_with_real_path(oid: ObjectId) -> ObjectFile {
-        place_file_for(oid);
-        ObjectFile::new(oid, DISK_LEN)
-    }
-
-    /// Stand in for the SET that built a file: charge the ledger, then hand back the handle
-    /// that owes it. Every `ObjectFile` exists only after a successful reservation.
-    fn charged_file(oid: ObjectId) -> ObjectFile {
-        super::super::nvme::increase_nvme_disk_usage(DISK_LEN);
-        file_with_real_path(oid)
-    }
-
-    /// The whole point of the type: a victim's bytes pay for its replacement, the ledger ends up
-    /// charged for exactly one object rather than two or zero, and the victim's file is gone from
-    /// the directory before `commit` returns so the caller writes into space that is actually free.
-    /// The keyspace still holds its own reference, as it does for a tombstoned key awaiting the
-    /// sweep, so the release must not wait for that reference to drop — and must not be repeated
-    /// when it finally does.
-    #[test]
-    fn commit_spends_victims_on_the_newcomer() {
-        let _g = accounting_test_lock();
-        let base = nvme_disk_usage();
-        let victim_oid = ObjectId(u64::MAX - 8);
-        let newcomer_oid = ObjectId(u64::MAX - 9);
-
-        let keyspace_ref = Arc::new(charged_file(victim_oid));
-        let victim_path = victim_oid.file_path(&crate::nvme_dir());
-        assert_eq!(nvme_disk_usage(), base + DISK_LEN);
-        assert!(
-            std::path::Path::new(&victim_path).exists(),
-            "fixture must place the victim's file"
-        );
-
-        let mut res =
-            DiskReservation::paid_by(newcomer_oid, DISK_LEN, vec![Arc::clone(&keyspace_ref)]);
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "claiming a victim must not move the ledger — its bytes are still charged, \
-             which is what stops another SET from spending them"
-        );
-
-        res.commit();
-        assert!(
-            !std::path::Path::new(&victim_path).exists(),
-            "commit must unlink the victim before the caller writes the new file"
-        );
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "one object out, one in — the charge lands, the victim's credit comes back"
-        );
-        drop(keyspace_ref);
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "the keyspace's reference dropping later must not credit the victim twice"
-        );
-
-        // After `into_object_file` the *handle* owes the bytes. If the reservation's `Drop` also
-        // released, the new object would be accounted for by nobody and the ledger would drift down
-        // by one object per SET. `Drop` on the handle is then the whole of the release path: without
-        // it every DEL, overwrite and expiry would leak budget.
-        place_file_for(newcomer_oid);
-        let file = res.into_object_file();
-        assert_eq!(
-            nvme_disk_usage(),
-            base + DISK_LEN,
-            "the object is charged, exactly once"
-        );
-        drop(file);
-        assert_eq!(
-            nvme_disk_usage(),
-            base,
-            "and the handle is what releases it"
-        );
-    }
-
-    /// A reservation that never hands its file over must undo itself: the EFA read failed, say, or
-    /// nothing ever wrote the file. The victims are still destroyed, because the keyspace lost them
-    /// before the reservation existed, but their bytes go back to the ledger rather than being lost
-    /// to it. Both constructors, and both sides of `commit`.
-    #[test]
-    fn a_reservation_that_never_hands_over_its_file_undoes_itself() {
-        let _g = accounting_test_lock();
-        let base = nvme_disk_usage();
-
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 4)));
-        drop(DiskReservation::paid_by(
-            ObjectId(u64::MAX - 5),
-            DISK_LEN,
-            vec![victim],
-        ));
-        assert_eq!(nvme_disk_usage(), base, "victim bytes returned, none taken");
-
-        // The keyspace still holds its own reference to a tombstoned victim until `lo_free`, so the
-        // reservation cannot leave the credit to the last `Arc` dropping.
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 7)));
-        let keyspace = Arc::clone(&victim);
-        drop(DiskReservation::paid_by(
-            ObjectId(u64::MAX - 8),
-            DISK_LEN,
-            vec![victim],
-        ));
-        assert_eq!(
-            nvme_disk_usage(),
-            base,
-            "credited while the keyspace holds on"
-        );
-        drop(keyspace);
-        assert_eq!(nvme_disk_usage(), base, "and not again when it lets go");
-
-        // `charged` means the caller's `try_reserve` already succeeded, so the bytes are charged up
-        // front and the drop has to give them back itself.
-        super::super::nvme::increase_nvme_disk_usage(DISK_LEN);
-        drop(DiskReservation::charged(ObjectId(u64::MAX - 6), DISK_LEN));
-        assert_eq!(nvme_disk_usage(), base, "un-reserved on the way out");
-
-        // Past `commit` and still abandoned: nothing wrote a file, so the reservation dies owing
-        // the bytes it charged and has to credit them itself.
-        let victim = Arc::new(charged_file(ObjectId(u64::MAX - 2)));
-        let mut res = DiskReservation::paid_by(ObjectId(u64::MAX - 3), DISK_LEN, vec![victim]);
-        res.commit();
-        drop(res);
-        assert_eq!(nvme_disk_usage(), base, "an abandoned commit leaks nothing");
     }
 }

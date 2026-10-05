@@ -20,7 +20,8 @@ use crate::data_type::ObjectId;
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 
-/// Increment NVMe disk usage after a file is created.
+/// Charge `bytes` without a cap check (`DiskReservation::commit`); `try_reserve_nvme_disk_usage`
+/// is the checked form.
 pub fn increase_nvme_disk_usage(bytes: u64) {
     NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
 }
@@ -368,22 +369,20 @@ pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
-/// Serializes every test that touches `NVME_DISK_USAGE`. The counter is a process-global
-/// static and cargo runs tests in one binary in parallel, so tests asserting on it have to
-/// take turns — including the ones in `object_file`, which is why this is not private to
-/// this module's test block. Poisoning is recovered from: the underflow test panics by
-/// design and must not wedge the others.
-#[cfg(test)]
-pub(crate) fn accounting_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    use accounting_test_lock as lock;
+    // NVME_DISK_USAGE is a process-global static shared by every test in this
+    // binary, and cargo runs tests in parallel. Serialize the accounting tests so
+    // their reads/writes don't interleave. Recover from a poisoned lock (the
+    // underflow test panics by design) so one panicking test can't wedge the rest.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // increase/decrease are exact inverses: an equal amount added and removed must
     // leave the counter where it started. Asserted as a delta against a fresh

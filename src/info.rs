@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use valkey_module::{InfoContext, ValkeyResult};
 
+use crate::eviction;
 use crate::smartlog::{snapshot_for_info, CRITICAL_WARNING_BITS};
 use crate::storage;
 use crate::{operating_mode, OperatingMode};
@@ -35,6 +36,10 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
+}
+
+fn count(counter: &AtomicU64) -> i64 {
+    counter.load(Ordering::Relaxed) as i64
 }
 
 fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
@@ -75,35 +80,25 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "dram_uring_registered_segments",
             dram.io_uring_registered_count() as i64,
         )?
-        .field(
-            "evictions_total",
-            crate::eviction::EVICTIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
+        .field("evictions_total", count(&eviction::EVICTIONS_TOTAL))?
         .field(
             "eviction_failures_total",
-            crate::eviction::EVICTION_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::EVICTION_FAILURES_TOTAL),
         )?
         .field(
             "eviction_reclaimed_bytes_total",
-            crate::eviction::RECLAIMED_BYTES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::RECLAIMED_BYTES_TOTAL),
         )?
-        .field(
-            "pinned_skips_total",
-            crate::eviction::PINNED_SKIPS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
+        .field("pinned_skips_total", count(&eviction::PINNED_SKIPS_TOTAL))?
         .field(
             "satisfy_refusals_total",
-            crate::eviction::SATISFY_REFUSALS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::SATISFY_REFUSALS_TOTAL),
         )?
         .field(
             "fragmentation_aborts_total",
-            crate::eviction::FRAGMENTATION_ABORTS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::FRAGMENTATION_ABORTS_TOTAL),
         )?
-        .field("tombstones", crate::eviction::tombstone::len() as i64)?
+        .field("tombstones", eviction::tombstone::len() as i64)?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -129,22 +124,18 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field("disk_maxmemory_bytes", crate::nvme_maxmemory() as i64)?
-        // `disk_` prefixes are load-bearing, not decoration: the builder prefixes every
-        // field with `largeobj_` and nothing else, so a bare `evictions_total` here is the
-        // *same* INFO field as the DRAM section's and one silently masks the other.
+        // The `disk_` prefix keeps these apart from the DRAM section's: fields share one namespace.
         .field(
             "disk_evictions_total",
-            crate::eviction::DISK_EVICTIONS_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            count(&eviction::DISK_EVICTIONS_TOTAL),
         )?
         .field(
             "disk_eviction_failures_total",
-            crate::eviction::DISK_EVICTION_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::DISK_EVICTION_FAILURES_TOTAL),
         )?
         .field(
             "disk_eviction_reclaimed_bytes_total",
-            crate::eviction::DISK_RECLAIMED_BYTES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
+            count(&eviction::DISK_RECLAIMED_BYTES_TOTAL),
         )?
         .build_section()?
         .build_info()

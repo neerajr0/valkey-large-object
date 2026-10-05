@@ -11,9 +11,8 @@
 //! it draining, and removes its cached objects from the HashMap so GET handlers
 //! fall back to NVMe. The segment releases on the next cron tick when refcount hits 0.
 //!
-//! Shrink leaves the keyspace alone because the data is on NVMe. It is the only thing that
-//! drops promoted copies: an arena too full to serve a promotion skips it instead
-//! (`try_promote_object`), so nothing resident is ever evicted for a cache fill.
+//! An arena too full to serve a promotion skips it (`try_promote_object`): nothing resident is
+//! evicted for a cache fill.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,8 +45,7 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Allocate from the capacity the pool already has. Never expands, so it is also the
-    /// question eviction asks: "is there room *now*".
+    /// Allocate from the capacity the pool already has, never expanding.
     pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         self.pool.alloc_exact(size)
     }
@@ -60,9 +58,9 @@ impl DRAMPool {
     /// If even a fresh segment can't (talc overhead on an object right at the
     /// boundary), no same-size segment can — so we return None rather than loop.
     ///
-    /// Callers on the main thread pass their command `&Context`; callers on
-    /// tokio workers pass `&Context::dummy()` (null ctx is accepted by
-    /// RM_GetServerInfo for the memory watermark check).
+    /// Callers on the main thread pass their command `&Context`; `try_promote_object`
+    /// passes `&Context::dummy()` (null ctx is accepted by RM_GetServerInfo for the
+    /// memory watermark check).
     pub fn alloc_exact_or_expand(
         &self,
         ctx: &valkey_module::Context,
@@ -159,12 +157,8 @@ impl DRAMPool {
             .remove(oid)
     }
 
-    /// True when someone outside the map holds this object — an in-flight GET, from dispatch
-    /// until its transfer completes, or a COPY reading its source. Eviction skips these: the
-    /// memory is genuinely in use, so giving the entry up would free nothing.
-    ///
-    /// Reads through the guard rather than via `get_object`, which clones — and a
-    /// clone is itself a reference, so it could never report anything but pinned.
+    /// True when someone outside the map holds this object (an in-flight GET, or a COPY reading
+    /// its source). Peeks at the map, since `get_object`'s clone would itself count.
     pub fn is_pinned(&self, oid: &ObjectId) -> bool {
         self.objects
             .read()

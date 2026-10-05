@@ -592,18 +592,8 @@ pub fn execute_set(
 
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
 
-/// Allocate `len` bytes in the DRAM arena. Returns `None` on failure. Runs on the
-/// main thread for both TCP and EFA paths.
-///
-/// Allocation and eviction procedure is as follows:
-///
-/// 1. Attempt to use the free capacity already in the pool.
-/// 2. Try to expand the dram pool if the server `maxmemory` watermark allows.
-///
-/// If the eviction policy is `noeviction` or `maxmemory` is equal to 0, we do not attempt
-/// to evict.
-///
-/// 3. Try to evict items from the keyspace.
+/// Allocate `len` bytes in the DRAM arena, on the main thread: free capacity first, then one
+/// segment of growth if the `maxmemory` watermark allows, then eviction if the server allows it.
 pub(crate) fn alloc_dram_or_make_room(
     ctx: &valkey_module::Context,
     dram_pool: &storage::DRAMPool,
@@ -777,11 +767,9 @@ fn cmd_set_dram_efa(
 
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
 
-/// Reserve `disk_len` of the `nvme-maxmemory` budget. Claiming resident objects for eviction
-/// if enabled and required. `None` means the budget cannot serve this object and the caller
-/// must fail the write.
-///
-/// Main thread only — eviction deletes keys.
+/// Reserve `disk_len` of the `nvme-maxmemory` budget, evicting resident objects if it is full and
+/// the server allows it. `None` means the budget cannot serve this object. Main thread only:
+/// eviction deletes keys.
 pub(crate) fn reserve_nvme_or_make_room(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
@@ -821,14 +809,14 @@ fn cmd_set_tiered(
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
-    // Disk budget and any eviction it needs are settled here, on the main thread, and travel
-    // with the write task as one pre-paid instruction so the task cannot fail for capacity.
-    let disk_len = {
-        let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
-        storage::object_disk_len(&mut chunk_iter)
-    };
+    // Settled here, on the main thread, so the write task cannot fail for capacity.
+    let disk_len = storage::object_disk_len(&mut ChunkIterator::new(
+        obj_len,
+        chunk_size,
+        batch_width,
+        None,
+    ));
     let Some(reservation) = reserve_nvme_or_make_room(ctx, object_id, disk_len) else {
-        // `stream_ctx` drops here, handing the staging window back to the pool.
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         reply_err(
             &thread_ctx,
@@ -893,7 +881,7 @@ enum SetSource {
     Efa(Arc<Session>),
 }
 
-/// Envelope shared by both Tiered NVMe-write SET paths (TCP + EFA). Reserve disk →
+/// Envelope shared by both Tiered NVMe-write SET paths (TCP + EFA). Commit reservation →
 /// open write fd → ObjectFile (owns cleanup) → run(source → NvmeTarget) → finalize.
 /// `variant` is the ONLY per-transport difference (source construction + CRC rule);
 /// it is matched once here. On any error the fd + ObjectFile drop on return,
@@ -914,24 +902,14 @@ async fn cmd_set_tiered_run(
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let mut chunk_iter = chunk_iter;
-    // Settle the budget before touching the filesystem: charge the new file, then drop the
-    // victims, which unlinks their files and credits their bytes back. Write tasks cannot borrow
-    // from each other's eviction reservations, so this one cannot fail for capacity.
+    // Charge the new file and release any victims before touching the filesystem.
     reservation.commit();
-    let disk_len = reservation.disk_len();
-    debug_assert_eq!(
-        disk_len,
-        storage::object_disk_len(&mut chunk_iter),
-        "reserved disk_len must match what this task will actually write"
-    );
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::nvme_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
-            // `reservation` drops on return, giving the budget back.
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,

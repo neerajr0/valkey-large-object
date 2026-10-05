@@ -94,7 +94,9 @@ lazy_static::lazy_static! {
     /// Default: 1 GiB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
-    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
+    /// Max disk usage in nvme-dir. Default: 0 (unlimited). At the cap a write evicts only if the
+    /// server's `maxmemory` is set with an evicting policy; otherwise it is refused. Lowering the
+    /// cap stops growth but sheds nothing: a write still evicts just enough for itself.
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
@@ -146,24 +148,17 @@ lazy_static::lazy_static! {
 
     // ─── Eviction Configs ────────────────────────────────────────────────
 
-    /// Eviction aggressiveness when selecting victims. Inspired by Valkey core's
-    /// `maxmemory-eviction-tenacity`. Bounded on a 0–100 scale to determine how much
-    /// eviction effort the main thread should dedicate. Default of 10 translates to
-    /// 500us. 100 is an unbounded wait until eviction reclaimation is sufficient or we
-    /// hit failsafe ``eviction::unclaimable_rounds_limit`.
-    ///
-    /// We cannot use the core tenacity calculation directly because we are using
-    /// different hardware with different latency performance (NVMe vs DRAM).
+    /// How hard a walk searches for victims, as in core's `maxmemory-eviction-tenacity`: 0..=10 is
+    /// 0..500µs, then 15% more per point, and 100 has no time limit (`eviction::search_time_limit`).
+    /// Unlike core's, a cut-off walk cannot resume in the background: the SET can fail.
     static ref CFG_EVICTION_TENACITY: AtomicI64 = AtomicI64::new(10);
 
-    /// Candidates drawn and scored per eviction sample round. Inspired by Valkey core's
-    /// `maxmemory-samples`, same range and default.
+    /// Candidates scored per sampling round, as in core's `maxmemory-samples`.
     static ref CFG_MAXMEMORY_SAMPLES: AtomicI64 = AtomicI64::new(5);
 
-    /// How long an evicted object's key may linger before the sweep deletes it, in milliseconds.
-    /// Only a key eviction could not delete inside the command waits at all (cluster mode, for a
-    /// victim in another slot), and until the sweep runs it reads as a miss to `LO.*` but not to
-    /// core commands such as `EXISTS`.
+    /// Milliseconds before the sweep deletes an evicted object's key. Only a key eviction could not
+    /// delete inside the command waits (cluster mode: a victim in another slot); until then it
+    /// reads as a miss to `LO.*` but not to core commands such as `EXISTS`.
     static ref CFG_TOMBSTONE_SWEEP_MS: AtomicI64 = AtomicI64::new(100);
 
     // ─── Fabric Configs ──────────────────────────────────────────────────
@@ -236,7 +231,7 @@ static CALLBACK_CTX: AtomicPtr<valkey_module::raw::RedisModuleCtx> =
     AtomicPtr::new(std::ptr::null_mut());
 
 /// Run `f` with the callback context. Main thread only, inside a callback: the event loop already
-/// holds the lock the context nominally needs, and taking it again deadlocks.
+/// holds the lock the context nominally needs.
 pub fn with_callback_ctx<T>(f: impl FnOnce(&Context) -> T) -> T {
     let ptr = CALLBACK_CTX.load(std::sync::atomic::Ordering::Relaxed);
     debug_assert!(is_main_thread() && !ptr.is_null());
@@ -250,15 +245,6 @@ pub fn nvme_dir() -> String {
         .lock()
         .expect("CFG_NVME_DIR lock unavailable")
         .clone()
-}
-
-/// Test-only: point `nvme-dir` at a writable directory. `nvme-dir` is an IMMUTABLE config
-/// set once at module load, which unit tests never reach, so it is the empty string there
-/// — and a unit test that drops an `ObjectFile` would then fail to unlink `/<oid>.dat` and
-/// try to log the failure, which aborts outside a server (`RedisModule_Log` is null).
-#[cfg(test)]
-pub(crate) fn set_nvme_dir_for_test(dir: &str) {
-    *CFG_NVME_DIR.lock().expect("CFG_NVME_DIR lock unavailable") = dir.to_string();
 }
 
 pub fn nvme_staging_size() -> usize {
@@ -332,8 +318,8 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
     (used, maxmemory)
 }
 
-/// Whether the server permits deleting keys to make room. Requires a
-/// `noeviction` policy, `maxmemory > 0`, and being a primary.
+/// Whether the server lets modules evict: `maxmemory > 0`, a policy other than `noeviction`, and
+/// not a replica that ignores `maxmemory` (core's `EVICTED` context flag).
 pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
 }
