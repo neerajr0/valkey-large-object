@@ -1,4 +1,4 @@
-# ValkeyLargeObj
+# valkey-large-object
 
 A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) with a tiered DRAM + NVMe architecture, io_uring zero-copy I/O, and optional EFA RDMA transport to GPU memory.
 
@@ -30,7 +30,7 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 ```bash
 cargo build --release
-# Output: target/release/libvalkey_largeobj.so
+# Output: target/release/libvalkey_large_object.so
 ```
 
 ## Run
@@ -38,7 +38,7 @@ cargo build --release
 ### Dram mode (default)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Dram \
         dram-maxmemory 1gb \
         segment-size 64mb
@@ -47,7 +47,7 @@ valkey-server --port 7380 \
 ### Tiered mode (DRAM cache + NVMe persistence)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
         nvme-dir /mnt/nvme-data \
         dram-maxmemory 1gb \

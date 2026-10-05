@@ -6,9 +6,9 @@
 
 ## Summary
 
-The ValkeyLargeObj module moves large objects (4KB–512MB) between GPU client memory and NVMe storage via EFA RDMA. This document specifies the DMA command syntax — how the GPU client and Valkey server establish an RDMA session and transfer data.
+The valkey-large-object module moves large objects (4KB–512MB) between GPU client memory and NVMe storage via EFA RDMA. This document specifies the DMA command syntax — how the GPU client and Valkey server establish an RDMA session and transfer data.
 
-Three designs were evaluated. **Option 2 (per-request rkey with session routing) is implemented now.** The choice between Option 2 and Option 3 (fully stateless) remains open — both are viable for production. We implement Option 2 first. If we later decide Option 3 is better, the migration is subtractive (remove the HELLO command and session map) rather than additive in the ValkeyLargeObj Module and is minimal churn.
+Three designs were evaluated. **Option 2 (per-request rkey with session routing) is implemented now.** The choice between Option 2 and Option 3 (fully stateless) remains open — both are viable for production. We implement Option 2 first. If we later decide Option 3 is better, the migration is subtractive (remove the HELLO command and session map) rather than additive in the valkey-large-object Module and is minimal churn.
 
 **Why start with Option 2:**
 - There is a simple 1:N (client EFA device to server EFA device) mapping per client's HELLO session.
