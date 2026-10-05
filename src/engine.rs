@@ -598,7 +598,7 @@ pub fn execute_set(
 /// Allocation and eviction procedure is as follows:
 ///
 /// 1. Attempt to use the free capacity already in the pool.
-/// 2. Try to expand the dram pool if we are under `dram-maxmemory` and the watermark.
+/// 2. Try to expand the dram pool if the server `maxmemory` watermark allows.
 ///
 /// If the eviction policy is `noeviction` or `maxmemory` is equal to 0, we do not attempt
 /// to evict.

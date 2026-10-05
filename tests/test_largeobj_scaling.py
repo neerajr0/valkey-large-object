@@ -51,16 +51,32 @@ def wait_uring_registered_matches_live(client, timeout=10):
     wait_for_true(_match, timeout=timeout)
 
 
+def cap_dram_growth(client):
+    """Freeze the DRAM pool at its current size. Only the server `maxmemory` stops it growing:
+    `try_expand` refuses once used + one segment reaches the shrink watermark of maxmemory.
+
+    At the watermark's 50% floor that leaves about two segments of headroom under maxmemory for
+    the client's own buffers; any tighter and the core evicts or refuses on its own.
+    """
+    segment = info_largeobj(client)['largeobj_dram_segment_size_bytes']
+    used = int(client.info('memory')['used_memory'])
+    client.execute_command('CONFIG', 'SET', 'largeobj.scaling-shrink-watermark', 50)
+    client.execute_command('CONFIG', 'SET', 'maxmemory', str(2 * (used + segment) - 512 * 1024))
+
+
 def _set_memory_policy(client, policy):
     """Make the module's EVICT-flag gate resolve as intended: maxmemory > 0 and a policy that
     permits eviction (Valkey defaults to neither).
 
-    maxmemory lands far above current usage, so core eviction never runs and any eviction a
-    test observes is the module's own.
+    Tiered leaves maxmemory far above current usage, so core eviction never runs and any eviction
+    a test observes is the module's own. Dram freezes the pool, so a full segment can only be
+    served by evicting.
     """
-    mem = client.execute_command('INFO', 'memory')
-    used = int(mem.get(b'used_memory') or mem.get('used_memory'))
-    client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024 * 1024))
+    if 'largeobj_nvme_live_segments' in info_largeobj(client):
+        used = int(client.info('memory')['used_memory'])
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024 * 1024))
+    else:
+        cap_dram_growth(client)
     client.execute_command('CONFIG', 'SET', 'maxmemory-policy', policy)
 
 
@@ -88,8 +104,8 @@ def hold_pin_via_dead_peer(client, key):
     def loop():
         while not stop.is_set():
             try:
-                # EFA arity: BLOB.GET key rkey remote_addr.
-                client.execute_command('BLOB.GET', key, 0, 0)
+                # EFA arity: BLOB.GET key rkey addr len.
+                client.execute_command('BLOB.GET', key, 0, 0, 1 << 30)
             except ResponseError:
                 pass  # expected: the transfer has no peer
 
@@ -379,17 +395,17 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
-    """Dram mode at dram-maxmemory: a further SET either evicts (the policy allows it) or errors.
-    The cap is a hard ceiling in both directions, so a request eviction cannot serve is refused."""
+    """Dram mode with the pool frozen at two segments: a further SET either evicts (the policy
+    allows it) or errors."""
 
     def get_module_args(self, data_dir, direct_io):
-        # 2MB total, 1MB segment. After reactive expand, pool is 2MB (2 segments)
-        # and cannot grow again, so a third 900KB object can only be admitted by
-        # evicting one of the first two.
+        # 1MB segments: the pool grows to two for the first pair of 900KB objects, and is then
+        # frozen there, so a third can only be admitted by evicting one of them.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
-            f" dram-maxmemory 2097152"
+            f" max-object-size 983040"
+            f" scaling-poll-ms 60000"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -397,35 +413,24 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
     OBJ_SIZE = 900 * 1024
     CAP_BYTES = 2097152
-    # Past what emptying the arena could produce, so the walk declines the request
-    # instead of spending the keyspace on it. Fits in three segments, not two.
-    OVER_CAP_SIZE = 2304 * 1024
 
     def _fill_to_cap(self, client):
-        """Two 900KB objects: one per segment, pool now at dram-maxmemory."""
+        """Two 900KB objects: one per segment. The pool grows to hold them, then is frozen."""
         client.execute_command('BLOB.SET', 'key_a', b'A' * self.OBJ_SIZE)
         client.execute_command('BLOB.SET', 'key_b', b'B' * self.OBJ_SIZE)
+        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2
 
-    def _assert_pool_exhausted(self, client, key, payload):
-        try:
-            client.execute_command('BLOB.SET', key, payload)
-            assert False, f"Expected '{key}' to be refused at dram-maxmemory"
-        except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+    def test_the_two_outcomes_at_the_cap(self):
+        """Against a pool that cannot grow, in this order so the second also witnesses that the
+        first left the keyspace alone.
 
-    def test_the_three_outcomes_at_the_cap(self):
-        """The three outcomes against one pool sitting at dram-maxmemory, in this order so each
-        later one also witnesses that the earlier ones left the keyspace alone.
-
-        1. Evictions permitted, request servable: admitted by evicting a resident object.
-        2. Evictions permitted, request larger than the whole cap: refused before destroying
-           anything, which separates "eviction could not serve it" from "eviction forbidden".
-        3. `noeviction`: refused at the first SET that would need a victim. It takes a loop
+        1. Evictions permitted: admitted by evicting a resident object.
+        2. `noeviction`: refused at the first SET that would need a victim. It takes a loop
            because (1)'s eviction overshoots and leaves a spare object's room behind.
         """
         client = self.server.get_new_client()
-        allow_evictions(client)
         self._fill_to_cap(client)
+        allow_evictions(client)
 
         before = info_largeobj(client)['largeobj_evictions_total']
         payload = b'C' * self.OBJ_SIZE
@@ -435,10 +440,6 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         assert evicted > before, \
             "at the cap the pool cannot grow, so key_c could only have fit by evicting"
         assert client.execute_command('BLOB.GET', 'key_c') == payload
-
-        self._assert_pool_exhausted(client, 'over_cap', b'O' * self.OVER_CAP_SIZE)
-        assert info_largeobj(client)['largeobj_evictions_total'] == evicted, \
-            "the walk had nothing to give that would have helped, so it took nothing"
 
         deny_evictions(client)
         originals = {k for k in ('key_a', 'key_b', 'key_c')
@@ -464,8 +465,7 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
         info = info_largeobj(client)
         assert info['largeobj_capacity_bytes'] <= self.CAP_BYTES, \
-            f"dram-maxmemory exceeded: {info['largeobj_capacity_bytes']}"
-        assert client.execute_command('EXISTS', 'over_cap') == 0
+            f"pool grew past its two segments: {info['largeobj_capacity_bytes']}"
         assert client.execute_command('EXISTS', refused) == 0, \
             "a refused SET must not leave the key behind"
 
@@ -478,12 +478,13 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
     SEGMENT_SIZE = 1024 * 1024
 
     def get_module_args(self, data_dir, direct_io):
-        # dram-maxmemory == segment-size → exactly one segment, try_expand always
-        # fails. scaling-poll-ms high so the cron cannot interfere.
+        # One segment, frozen there by `allow_evictions`. scaling-poll-ms high so the cron
+        # cannot interfere.
         return (
             f"operating-mode Dram"
             f" segment-size {self.SEGMENT_SIZE}"
-            f" dram-maxmemory {self.SEGMENT_SIZE}"
+            f" max-object-size {self.SEGMENT_SIZE - 64 * 1024}"
+            f" chunk-size 65536"
             f" scaling-poll-ms 60000"
             f" bench-mode no"
             f" direct-io no"
@@ -515,8 +516,8 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             f"wrote {count * obj_size} bytes into a {self.SEGMENT_SIZE}-byte segment that "
             "cannot grow, so these SETs could only have fit by evicting"
         )
-        assert info['largeobj_live_segments'] == 1, \
-            "dram-maxmemory == segment-size must keep the pool at one segment"
+        assert info['largeobj_dram_live_segments'] == 1, \
+            "a frozen pool must stay at one segment"
         assert info['largeobj_allocated_bytes'] <= info['largeobj_capacity_bytes'], \
             f"allocated {info['largeobj_allocated_bytes']} exceeds capacity " \
             f"{info['largeobj_capacity_bytes']}"
@@ -532,20 +533,15 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         keeper = f'obj_{count - 1}'
         assert client.execute_command('EXISTS', keeper) == 1
 
-        # An object larger than one segment can never fit: the O(1) guard rejects it before any
-        # victim is taken, so the failure counter (destroyed and still short) must not move.
-        before = info_largeobj(client)
+        # An object over max-object-size is refused at admission, before any victim is taken.
+        before = info_largeobj(client)['largeobj_evictions_total']
         try:
-            client.execute_command('BLOB.SET', 'toobig', b'D' * (2 * self.SEGMENT_SIZE))
-            assert False, "Expected pool exhausted error"
+            client.execute_command('BLOB.SET', 'toobig', b'D' * self.SEGMENT_SIZE)
+            assert False, "Expected max object size error"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
-        after = info_largeobj(client)
-        assert after['largeobj_evictions_total'] == before['largeobj_evictions_total'], \
-            "an unsatisfiable SET must not destroy objects"
-        assert after['largeobj_eviction_failures_total'] \
-            == before['largeobj_eviction_failures_total'], \
-            "the guard rejected before evicting, so this is not an eviction failure"
+            assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
+        assert info_largeobj(client)['largeobj_evictions_total'] == before, \
+            "an inadmissible SET must not destroy objects"
         assert client.execute_command('BLOB.GET', keeper) == payloads[keeper]
 
     def test_copy_at_the_segment_evicts_another_key_and_never_its_source(self):
@@ -648,9 +644,9 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             "and the EFA SET below can allocate without evicting"
         )
 
-        # EFA arity: BLOB.SET key len rkey remote_addr.
+        # EFA arity: BLOB.SET key total_len rkey addr len.
         try:
-            client.execute_command('BLOB.SET', 'efa_newcomer', obj_size, 0, 0)
+            client.execute_command('BLOB.SET', 'efa_newcomer', obj_size, 0, 0, obj_size)
         except ResponseError:
             pass  # expected: the transfer has no peer
 
@@ -1167,6 +1163,8 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
             f" nvme-maxmemory {self.CAP}"
             f" nvme-staging-size {2 * self.CAP}"
             f" segment-size {2 * self.CAP}"
+            f" max-object-size {self.CAP}"
+            f" max-promote-size {self.CAP}"
             f" scaling-poll-ms 60000"
             f" bench-mode no"
             f" direct-io no"
@@ -1284,14 +1282,14 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
     def test_a_set_the_cap_cannot_serve_is_refused_without_evicting(self):
         """The two ways a full ledger refuses a write, neither destroying anything: a request
         larger than the cap (evictions permitted) and `noeviction`. Both run against one filled
-        cap, so the second half also shows the first spent nothing. The staging pool is twice
-        the cap so the oversized SET reaches the disk check."""
+        cap, so the second half also shows the first spent nothing. The oversized SET is as big
+        as max-object-size allows: its payload alone is the cap, so with the header it cannot fit."""
         client = self.server.get_new_client()
         allow_evictions(client)
         self._fill_cap(client)
         before = info_largeobj(client)['largeobj_disk_evictions_total']
 
-        self._assert_capacity_rejected(client, 'huge', b'H' * (self.CAP + self.OBJ))
+        self._assert_capacity_rejected(client, 'huge', b'H' * self.CAP)
         assert info_largeobj(client)['largeobj_disk_evictions_total'] == before, \
             "nothing is worth destroying for a write that can never fit"
 
@@ -1458,7 +1456,7 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
             f" nvme-maxmemory {self.DISK_CAP}"
             f" nvme-staging-size 4194304"
             f" segment-size {self.SEGMENT}"
-            f" dram-maxmemory {self.SEGMENT}"
+            f" max-object-size 1048576"
             f" max-promote-size 1048576"
             f" chunk-size 65536"
             f" scaling-poll-ms 60000"
@@ -1469,6 +1467,7 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
     def _write_and_read_all(self, client, prefix):
         """Write OBJECTS distinct objects, then read each once. Tiered SETs never touch the arena,
         so every read is a promotion attempt. Returns the payloads."""
+        cap_dram_growth(client)
         payloads = {f'{prefix}_{i}': bytes([i % 256]) * self.OBJ for i in range(self.OBJECTS)}
         for key, payload in payloads.items():
             r = client.execute_command('BLOB.SET', key, payload)
@@ -1490,7 +1489,7 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_evictions_total'] == 0, \
             "the disk cap was never pressed, so nothing should have been claimed for it"
         assert info['largeobj_capacity_bytes'] == self.SEGMENT, \
-            "dram-maxmemory == segment-size must keep the pool at one segment"
+            "a frozen pool must stay at one segment"
         assert info['largeobj_allocated_bytes'] <= info['largeobj_capacity_bytes'], \
             "promotion must never over-commit the arena"
         assert info['largeobj_cached_objects'] * self.OBJ <= self.SEGMENT, \
@@ -1545,7 +1544,8 @@ class DramSegment(ClusterNode):
         return (
             f"operating-mode Dram"
             f" segment-size {self.SEGMENT_SIZE}"
-            f" dram-maxmemory {self.SEGMENT_SIZE}"
+            f" max-object-size {self.SEGMENT_SIZE - 64 * 1024}"
+            f" chunk-size 65536"
             f" scaling-poll-ms 60000"
             f" tombstone-sweep-ms {self.SWEEP_MS}"
             f" bench-mode no"
@@ -1649,17 +1649,17 @@ class TestClusterDramTombstones(DramSegment, ValkeyLargeObjTestCaseBase):
 
         before = info_largeobj(client)['largeobj_evictions_total']
         for i in range(16):
-            process, address, rkey, remote_addr = self.start_target('--read')
+            process, address, rkey, remote_addr, length = self.start_target('--read')
             try:
                 peer = self.server.get_new_client()  # one BLOB.HELLO per connection
                 peer.execute_command('BLOB.HELLO', address)
                 result = peer.execute_command(
-                    'BLOB.SET', f'efa_{i}', EFA_TARGET_LEN, rkey, remote_addr)
+                    'BLOB.SET', f'efa_{i}', EFA_TARGET_LEN, rkey, remote_addr, length)
                 assert result == b'OK'
             finally:
                 process.kill()
         assert info_largeobj(client)['largeobj_evictions_total'] > before
-        assert client.execute_command('BLOB.GET', 'efa_15') == EFA_PATTERN * EFA_TARGET_LEN
+        assert client.execute_command('BLOB.GET', 'efa_15') == EFA_PATTERN
         for key in [f'fill_{i}' for i in range(filled)] + [f'efa_{i}' for i in range(16)]:
             got = client.execute_command('BLOB.GET', key)
             assert got is None or len(got) in (4096, EFA_TARGET_LEN)

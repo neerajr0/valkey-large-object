@@ -95,7 +95,7 @@ pub static EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// SETs that still failed after eviction ran — objects destroyed for nothing. Rising against
-/// `EVICTIONS_TOTAL` means thrashing: raise `dram-maxmemory` or look at fragmentation.
+/// `EVICTIONS_TOTAL` means thrashing: raise `maxmemory` or look at fragmentation.
 pub static EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Objects a walk passed over because someone still held them. Rising alongside a failure
