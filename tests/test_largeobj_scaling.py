@@ -52,17 +52,11 @@ def wait_uring_registered_matches_live(client, timeout=10):
 
 
 def _set_memory_policy(client, policy):
-    """Configure the server so bigobj's EVICT-flag gate resolves as intended.
+    """Make the module's EVICT-flag gate resolve as intended: maxmemory > 0 and a policy that
+    permits eviction (Valkey defaults to neither).
 
-    The module reads `VALKEYMODULE_CTX_FLAGS_EVICT`, which the server sets only
-    when maxmemory > 0 AND the policy is not noeviction. Both have to be set
-    deliberately: Valkey defaults maxmemory to 0 and the policy to noeviction, so
-    eviction is off out of the box.
-
-    maxmemory lands far above current usage on purpose. These tests press against
-    the module's own dram-maxmemory, so the server-wide limit must stay slack
-    enough that core eviction never runs and the expand OOM guard never trips —
-    any eviction they observe is then unambiguously the module's own.
+    maxmemory lands far above current usage, so core eviction never runs and any eviction a
+    test observes is the module's own.
     """
     mem = client.execute_command('INFO', 'memory')
     used = int(mem.get(b'used_memory') or mem.get('used_memory'))
@@ -76,26 +70,17 @@ def allow_evictions(client):
 
 
 def deny_evictions(client):
-    """Forbid module eviction via the policy specifically.
-
-    maxmemory is still set, so `noeviction` is the only reason the gate closes —
-    otherwise the test would also pass with maxmemory at its 0 default and prove
-    nothing about the policy.
-    """
+    """Forbid module eviction via the policy alone: maxmemory stays set, so `noeviction` is the
+    only reason the gate closes."""
     _set_memory_policy(client, 'noeviction')
 
 
 def hold_pin_via_dead_peer(client, key):
-    """Keep `key` pinned against eviction, using nothing but a GET that cannot finish.
+    """Keep `key` pinned by looping GETs that cannot finish: each clones the object's reference
+    and holds it until a fabric timeout against PEER_ADDRESS (about a second).
 
-    An async GET clones the object's reference before it transfers — `Arc<ObjectContext>`
-    in Dram mode, `Arc<ObjectFile>` in Tiered — and holds it until the transfer resolves.
-    Against PEER_ADDRESS that resolution is a fabric timeout, about a second, so each
-    doomed GET is a real pin held by the real code path. Looping them keeps the object
-    pinned for as long as the caller needs.
-
-    `client` is consumed: it is put into BLOB.HELLO and then blocks in GET after GET until
-    the returned event is set, so it must not be shared with the writer.
+    `client` is consumed: it is put into BLOB.HELLO, then blocks in GET after GET until the
+    returned event is set.
     """
     client.execute_command('BLOB.HELLO', PEER_ADDRESS)
     stop = threading.Event()
@@ -116,12 +101,8 @@ def hold_pin_via_dead_peer(client, key):
 def write_until_pinned_skip(client, prefix, payload, batch, timeout=10):
     """SET `payload` under `prefix` until a walk reports declining a pinned victim.
 
-    Batched against a deadline rather than a fixed count, because the pin above is held
-    in bursts: a fixed number of writes could in principle land entirely between two of
-    them. Individual SETs are not asserted — whether a given write fits is not what
-    these tests measure, only that the walks ran and met the pinned key.
-
-    Returns (skips_before, skips_after).
+    Batched against a deadline because the pin is held in bursts. Individual SETs are not
+    asserted. Returns (skips_before, skips_after).
     """
     before = info_largeobj(client)['largeobj_pinned_skips_total']
     deadline = time.time() + timeout
@@ -141,10 +122,8 @@ def write_until_pinned_skip(client, prefix, payload, batch, timeout=10):
 def write_until_key_is_claimed(client, prefix, payload, batch, key, timeout=10):
     """SET `payload` under `prefix` until a walk destroys `key`. False if it never does.
 
-    The other half of `write_until_pinned_skip`: a skip has to be the pin and not a
-    permanent refusal. The reference a transfer holds is gone once that transfer resolves,
-    so the walks that were declining `key` must start claiming it — otherwise it is
-    un-evictable for the node's lifetime and its bytes are lost to the budget.
+    Shows a pinned skip was the pin and not a permanent refusal: once the transfer resolves,
+    the key must be a candidate again.
     """
     deadline = time.time() + timeout
     i = 0
@@ -400,14 +379,8 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
-    """Dram mode: what happens at dram-maxmemory, on each rung of the ladder.
-
-    Once the pool is at the cap it cannot grow, so a further SET either evicts
-    (maxmemory-policy allows it) or errors. dram-maxmemory is a hard ceiling in
-    both directions: nothing grows the pool past it, so a request eviction cannot
-    serve is refused rather than admitted. All three outcomes are tested here so
-    none can regress into another.
-    """
+    """Dram mode at dram-maxmemory: a further SET either evicts (the policy allows it) or errors.
+    The cap is a hard ceiling in both directions, so a request eviction cannot serve is refused."""
 
     def get_module_args(self, data_dir, direct_io):
         # 2MB total, 1MB segment. After reactive expand, pool is 2MB (2 segments)
@@ -441,24 +414,14 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_the_three_outcomes_at_the_cap(self):
-        """All three rungs, against the same pool sitting at dram-maxmemory.
+        """The three outcomes against one pool sitting at dram-maxmemory, in this order so each
+        later one also witnesses that the earlier ones left the keyspace alone.
 
-        1. Evictions permitted, a request the arena could serve: admitted. The cap bounds
-           memory, not admission — once expand is impossible the SET destroys a resident
-           object rather than failing.
-        2. Evictions still permitted, a request larger than the whole cap: refused.
-           Emptying the arena would not produce this run, so the walk declines before
-           destroying anything, and nothing below it grows the pool. The permitting policy
-           is the point — it separates "eviction could not serve this" from "eviction was
-           forbidden".
-        3. `noeviction`: writes keep being admitted only while free bytes last, and the
-           first one that would need a victim is refused. That isolates the policy gate
-           from the making-room path below it. It takes a loop rather than a single SET
-           because (1)'s eviction overshoots — freed bytes are credited below face value,
-           so a walk can take a second victim and leave a spare object's room behind.
-
-        Running them in this order means each later outcome also witnesses that the earlier
-        ones left the keyspace where they claimed to.
+        1. Evictions permitted, request servable: admitted by evicting a resident object.
+        2. Evictions permitted, request larger than the whole cap: refused before destroying
+           anything, which separates "eviction could not serve it" from "eviction forbidden".
+        3. `noeviction`: refused at the first SET that would need a victim. It takes a loop
+           because (1)'s eviction overshoots and leaves a spare object's room behind.
         """
         client = self.server.get_new_client()
         allow_evictions(client)
@@ -508,17 +471,9 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramEviction(ValkeyLargeObjTestCaseBase):
-    """Dram mode, one 1MB segment, no room to grow.
-
-    In Dram mode an object lives only in the DRAMPool, so making room for a new
-    SET means destroying resident objects. Eviction is the last resort in
-    `alloc_dram_or_make_room`: alloc -> try_expand -> evict. Both transports reach
-    that helper, so both are tested here — the fabric is up in every Dram server
-    (`Fabric::start` is unconditional), which is why EFA needs no separate fixture.
-
-    Pinning dram-maxmemory to segment-size means expand can never fire, which
-    leaves eviction as the only way a SET can succeed once the segment is full.
-    """
+    """Dram mode, one 1MB segment that cannot grow, so eviction is the only way a SET can succeed
+    once it is full. Both transports reach `alloc_dram_or_make_room`, and the fabric is up in
+    every Dram server, so EFA needs no separate fixture."""
 
     SEGMENT_SIZE = 1024 * 1024
 
@@ -534,21 +489,16 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             f" direct-io no"
         )
 
-    # Objects are sized so at most this many are resident in one segment (fewer in
-    # practice, since talc's per-chunk overhead comes out of the same space). Derived
-    # from SEGMENT_SIZE rather than hardcoded so the test follows a config change.
+    # Objects are sized so this many would fill the segment exactly; fewer fit, because talc's
+    # metadata lives inside it.
     OBJECTS_PER_SEGMENT = 4
 
     def test_writing_past_the_segment_evicts_and_stays_bounded(self):
-        """SETs past the segment's capacity keep succeeding by evicting, the survivors are
-        intact rather than corrupt, and the pool never grows past its one segment.
+        """SETs past the segment keep succeeding by evicting, the survivors are intact, and the
+        pool never grows.
 
-        Three segments' worth. That total is what makes this independent of eviction's
-        internals: whatever a single call frees, this much data cannot be resident at once
-        and the pool cannot grow, so objects had to be destroyed. A per-SET assertion would
-        not survive a change to how much eviction frees per call — today it overshoots
-        (freed bytes are credited below face value), leaving slack that lets the next SET or
-        two fit without evicting.
+        Three segments' worth: that much cannot be resident whatever one call frees, so no
+        per-SET assertion (which eviction's overshoot would break) is needed.
         """
         client = self.server.get_new_client()
         allow_evictions(client)
@@ -582,10 +532,8 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         keeper = f'obj_{count - 1}'
         assert client.execute_command('EXISTS', keeper) == 1
 
-        # An object larger than one segment can never fit, so the O(1) guard — the request
-        # is larger than everything the live segments hold — rejects it before any victim is
-        # taken. The failure counter only rises when eviction destroyed something and still
-        # came up short, so it must not move either.
+        # An object larger than one segment can never fit: the O(1) guard rejects it before any
+        # victim is taken, so the failure counter (destroyed and still short) must not move.
         before = info_largeobj(client)
         try:
             client.execute_command('BLOB.SET', 'toobig', b'D' * (2 * self.SEGMENT_SIZE))
@@ -601,12 +549,8 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', keeper) == payloads[keeper]
 
     def test_copy_at_the_segment_evicts_another_key_and_never_its_source(self):
-        """COPY makes room like a SET does, but never out of the key it is copying.
-
-        Two 384KB objects leave the segment too full for a third, so COPY has to evict:
-        the only other key is the victim, and the source stays. With the source alone in
-        the segment, nothing may be taken and COPY fails with the source untouched.
-        """
+        """COPY makes room like a SET does, but never out of its source: alone in the segment it
+        fails cleanly, and with another key resident that key is the victim."""
         client = self.server.get_new_client()
         allow_evictions(client)
         obj = b'A' * (384 * 1024)
@@ -634,12 +578,9 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', 'dst') == obj
 
     def test_eviction_takes_victims_from_every_db(self):
-        """The arena is node-wide, so a SET evicts from any db, not just its own.
-
-        Two 384KB objects, one in db 1 and one in db 2, leave no room for a third, and the SET
-        comes from db 0, so a walk confined to the client's db has nothing to take. The walk must
-        also leave the client on its own db, so the newcomer is read back from a fresh connection.
-        """
+        """A SET from db 0 evicts keys in dbs 1 and 2: the arena is node-wide. The newcomer needs
+        both victims (one is not enough room), so the walk has to rotate across dbs. The client
+        must be left on its own db, so the newcomer is read back from a fresh connection."""
         db0 = self.server.get_new_client()
         dbs = {1: self.server.create_from_server(db=1), 2: self.server.create_from_server(db=2)}
         allow_evictions(db0)
@@ -648,24 +589,18 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             assert dbs[db].execute_command('BLOB.SET', 'obj', payload) == b'OK'
 
         before = info_largeobj(db0)['largeobj_evictions_total']
-        assert db0.execute_command('BLOB.SET', 'newcomer', b'N' * (384 * 1024)) == b'OK'
-        assert info_largeobj(db0)['largeobj_evictions_total'] > before
+        newcomer = b'N' * (700 * 1024)
+        assert db0.execute_command('BLOB.SET', 'newcomer', newcomer) == b'OK'
+        assert info_largeobj(db0)['largeobj_evictions_total'] == before + 2
         fresh = self.server.get_new_client()
-        assert fresh.execute_command('BLOB.GET', 'newcomer') == b'N' * (384 * 1024)
+        assert fresh.execute_command('BLOB.GET', 'newcomer') == newcomer
         assert all(c.execute_command('EXISTS', 'newcomer') == 0 for c in dbs.values())
-        survivors = [db for db in payloads if dbs[db].execute_command('EXISTS', 'obj') == 1]
-        assert len(survivors) < len(payloads), "a key in another db had to give way"
-        for db in survivors:
-            assert dbs[db].execute_command('BLOB.GET', 'obj') == payloads[db]
+        assert all(c.execute_command('EXISTS', 'obj') == 0 for c in dbs.values()), \
+            "freeing 700KB took the key in each db"
 
     def test_tenacity_zero_still_evicts(self):
-        """A zero search budget must not degenerate into noeviction.
-
-        `eviction-tenacity 0` is 0µs, and a walk that checked the clock before doing
-        any work would free nothing and fail every SET at capacity — silently turning
-        the tightest latency setting into "reject all writes". The floor of candidates
-        a walk always examines is what prevents that, so it gets a test.
-        """
+        """A zero search time limit must not degenerate into noeviction: the floor of candidates
+        a walk always examines is what keeps tenacity 0 evicting."""
         client = self.server.get_new_client()
         allow_evictions(client)
         client.execute_command('CONFIG', 'SET', 'largeobj.eviction-tenacity', '0')
@@ -677,9 +612,8 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
 
         before = info_largeobj(client)['largeobj_evictions_total']
 
-        # Twice a segment's worth, for the same reason as test_set_succeeds_by_evicting:
-        # a single SET can be served by the slack an earlier eviction left behind, so only
-        # a total that cannot be resident at once proves the walk ran.
+        # Twice a segment's worth: one SET can be served by slack an earlier eviction left, so
+        # only a total that cannot be resident at once proves the walk ran.
         count = 2 * self.OBJECTS_PER_SEGMENT
         payload = b'Z' * obj_size
         for i in range(count):
@@ -694,27 +628,15 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', f'newcomer_{count - 1}') == payload
 
     def test_efa_set_evicts_at_alloc_time(self):
-        """An EFA SET into a full, ungrowable arena evicts before it transfers.
-
-        The transfer cannot succeed here — PEER_ADDRESS is a dead address, so the SET
-        always ends in an error. That is the point rather than a limitation: the alloc
-        happens before the transfer is dispatched, so the metric moves even though the
-        command fails. Asserting on the reply would be testing libfabric.
-        """
+        """An EFA SET into a full, ungrowable arena evicts at alloc time, before the transfer.
+        PEER_ADDRESS is dead so the SET errors; the metric moving is the assertion."""
         client = self.server.get_new_client()
         allow_evictions(client)
         obj_size = self.SEGMENT_SIZE // self.OBJECTS_PER_SEGMENT
 
-        # Fill over TCP: same mode, same arena, and synchronous, so the arena is
-        # known-full before the EFA SET rather than racing it.
-        #
-        # One short of OBJECTS_PER_SEGMENT, because that many is what actually fits:
-        # the full count sums to exactly SEGMENT_SIZE, which cannot, since talc's
-        # metadata lives inside the claimed span. Filling all of them would make the
-        # last *fill* evict, and an eviction can overshoot — talc may refuse the first
-        # attempt and cost a second victim — which would leave the arena with a spare
-        # object's room and let the EFA SET below allocate without evicting, defeating
-        # the test. Stopping here leaves it genuinely tight.
+        # Fill over TCP, which is synchronous, so the arena is known-full. One short of
+        # OBJECTS_PER_SEGMENT: the full count sums to exactly SEGMENT_SIZE, which cannot fit, so
+        # the last fill would evict, overshoot and leave slack for the EFA SET to use.
         for i in range(self.OBJECTS_PER_SEGMENT - 1):
             r = client.execute_command('BLOB.SET', f'fill_{i}', bytes([i % 256]) * obj_size)
             assert r == b'OK', f"fill_{i} failed: {r}"
@@ -726,8 +648,7 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
             "and the EFA SET below can allocate without evicting"
         )
 
-        # EFA arity: BLOB.SET key len rkey remote_addr. The arena is full and pinned at
-        # one segment, so the alloc in execute_set_dram_efa has to evict to proceed.
+        # EFA arity: BLOB.SET key len rkey remote_addr.
         try:
             client.execute_command('BLOB.SET', 'efa_newcomer', obj_size, 0, 0)
         except ResponseError:
@@ -744,26 +665,17 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
     PINNED_OBJECTS = 8
 
     def test_a_pinned_object_is_not_claimed_for_the_arena(self):
-        """An object a transfer is reading is skipped by the walk, not handed out twice.
-
-        The arena's pin is `Arc<ObjectContext>`: `serve_from_dram` clones the map's
-        reference into the transfer task, so while that task runs the buffer is being read
-        and its bytes are not the walk's to give. Claiming it anyway would unlink the key
-        and credit bytes that only come back when the reader drops its reference — budget
-        reported and never received.
-        """
+        """An object a transfer is reading is skipped by the walk: claiming it would credit bytes
+        that only come back when the reader drops its `Arc<ObjectContext>`."""
         client = self.server.get_new_client()
         allow_evictions(client)
-        # One round samples at least the whole keyspace, so the pinned key is offered to
-        # the very first walk rather than eventually, by cursor order.
+        # One round samples the whole keyspace, so the pinned key is offered to the first walk.
         client.execute_command('CONFIG', 'SET', 'maxmemory-samples', '16')
         obj_size = self.SEGMENT_SIZE // self.PINNED_OBJECTS
         payload = b'F' * obj_size
 
-        # One short of what the arithmetic allows, for the reason spelled out in
-        # test_efa_set_evicts_at_alloc_time: the full count sums to exactly SEGMENT_SIZE,
-        # which cannot fit, so the last fill would evict — and fill_0, the key this test
-        # is about to pin, is a candidate for that.
+        # One short of what fits, as in test_efa_set_evicts_at_alloc_time, so the last fill does
+        # not evict fill_0 before it is pinned.
         for i in range(self.PINNED_OBJECTS - 1):
             assert client.execute_command('BLOB.SET', f'fill_{i}', payload) == b'OK'
         assert info_largeobj(client)['largeobj_evictions_total'] == 0, \
@@ -795,52 +707,30 @@ class TestDramEviction(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
-    """*Which* object eviction destroys, not merely that it destroys one.
+    """*Which* object eviction destroys. These are the only tests that tell ranked victim
+    selection from taking whatever the cursor offers: each makes half the keyspace demonstrably
+    warmer by the metric its policy reads, forces one SET's worth of eviction, and asserts the
+    cold half paid.
 
-    Same premise as TestDramEviction — one segment, no room to grow — but these tests
-    are the only ones that can tell ranked victim selection from taking whatever the
-    cursor happened to offer. Each makes half the keyspace demonstrably warmer by the
-    metric its policy reads, forces one SET's worth of eviction, and asserts the cold
-    half paid for it.
-
-    One test per policy because `idleness` genuinely has two branches: the module never
-    reads maxmemory-policy, it calls both the LRU and the LFU getter and uses whichever
-    did not return its `-1` sentinel. A bug in either branch is invisible to the other's
-    test.
-
-    Sizes are chosen so the whole keyspace fits in one sample round, which is what makes
-    the assertions exact rather than statistical: four resident objects against a default
-    `maxmemory-samples` of 5, so every key is scored and the ordering is total.
+    One test per ranking, since `victim_score` has branches the others' tests cannot see. Four
+    residents against the default `maxmemory-samples` of 5 means every key is scored, so the
+    ordering is exact.
     """
 
     SEGMENT_SIZE = 1024 * 1024
-    # Five to a segment, so four residents plus a fifth newcomer overshoots it and the
-    # SET must evict. At a 90% credit one victim is not enough and two are, so eviction
-    # takes exactly the two coldest — which is exactly the hot/cold split below.
+    # Five to a segment, so four residents plus a fifth newcomer overshoots it and the SET
+    # must evict. At a 90% credit one victim is not enough and two are, so eviction takes
+    # exactly the two coldest — which is exactly the hot/cold split below.
     OBJ_SIZE = SEGMENT_SIZE // 5
     COLD = ('cold_0', 'cold_1')
     HOT = ('hot_0', 'hot_1')
 
-    def get_module_args(self, data_dir, direct_io):
-        return (
-            f"operating-mode Dram"
-            f" segment-size {self.SEGMENT_SIZE}"
-            f" dram-maxmemory {self.SEGMENT_SIZE}"
-            f" scaling-poll-ms 60000"
-            f" bench-mode no"
-            f" direct-io no"
-        )
+    get_module_args = TestDramEviction.get_module_args
 
     def _fill(self, client):
-        """Four residents, written hot-first so cursor order is adversarial.
-
-        The cold pair is written *last*, which in a small single-bucket keyspace puts it
-        behind the hot pair in cursor order — so a walk that took whatever the cursor
-        offered would destroy the hot pair and fail these tests. Only a ranking that
-        reads the access metric picks the cold pair out of that order. (Written the other
-        way round, cursor order and the correct answer coincide, and both tests pass with
-        the ranking deleted — which is how they were, and it was verified.)
-        """
+        """Four residents, the cold pair written last. In a small keyspace that puts it behind the
+        hot pair in cursor order, so only a ranking that reads the metric picks it out (written
+        the other way round, cursor order and the right answer coincide)."""
         for key in self.HOT + self.COLD:
             payload = key.encode()[:1] * self.OBJ_SIZE
             assert client.execute_command('BLOB.SET', key, payload) == b'OK', \
@@ -855,19 +745,12 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
                 f"{key} was idle and should have been chosen before any hot key"
 
     def test_lru_evicts_the_idle_keys_without_resetting_what_it_samples(self):
-        """Under an LRU policy the least recently touched objects are the victims, and being
-        sampled does not make a key look freshly used.
+        """Under LRU the least recently touched objects are the victims, and sampling does not
+        refresh a key's idle time.
 
-        The scoring open is NOTOUCH; without it every candidate's idle time is stamped to ~0
-        as it is read, which both flattens our own ranking and tells *core's* eviction that
-        keys we merely looked at are hot. `keeper` is the externally visible half of that: it
-        is written a sleep later than the rest, so it is the *least* idle candidate and
-        survives the walk, and it is never read, so core must still report its real idle time
-        afterwards. A touching open during the walk would have reset that to 0.
-
-        Both halves need the same two waits, so they are one test. The LRU clock has
-        one-second resolution — keys touched within the same second are genuinely
-        indistinguishable, so idle time has to be *made*, not implied by access order.
+        `keeper` is written a sleep after the rest and never read: it survives as the least idle
+        candidate, and its real idle time must still show afterwards. The LRU clock has
+        one-second resolution, so the waits are needed.
         """
         client = self.server.get_new_client()
         _set_memory_policy(client, 'allkeys-lru')
@@ -880,9 +763,8 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.SET', 'keeper', b'K' * (64 * 1024)) == b'OK'
         time.sleep(2.1)
 
-        # The cold pair is now strictly the most idle: untouched since the fill, where the
-        # hot pair and `keeper` date from one sleep later. A 90% credit means one victim is
-        # not enough and two are, so the walk takes exactly them.
+        # The cold pair is now strictly the most idle, and the 90% credit makes the walk take
+        # exactly it.
         payload = b'N' * self.OBJ_SIZE
         assert client.execute_command('BLOB.SET', 'newcomer', payload) == b'OK'
         self._assert_cold_paid(client)
@@ -890,22 +772,17 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('EXISTS', 'keeper') == 1, \
             "keeper is the least idle candidate; it should not be a victim"
         assert client.execute_command('OBJECT', 'IDLETIME', 'keeper') >= 2, \
-            "sampling reset keeper's idle time — the scoring open is not NOTOUCH"
+            "sampling reset keeper's idle time — scoring touched the key"
 
     def test_lfu_evicts_the_rarely_used_keys(self):
-        """Under an LFU policy the least frequently used objects are the victims.
-
-        No sleep here, and that is the difference worth having both tests for: the LFU
-        counter separates keys by access *count* immediately, where LRU cannot separate
-        them at all inside one second.
-        """
+        """Under LFU the rarely used objects are the victims. No sleep: the counter separates
+        keys by access count immediately."""
         client = self.server.get_new_client()
         _set_memory_policy(client, 'allkeys-lfu')
         self._fill(client)
 
-        # A fresh object starts at LFU_INIT_VAL and the first increments are near-certain
-        # at the default lfu-log-factor, so a handful of reads is enough to lift the hot
-        # pair clear of the cold pair's starting counter.
+        # A fresh object starts at LFU_INIT_VAL and early increments are near-certain, so a
+        # few reads lift the hot pair clear of the cold pair.
         for _ in range(10):
             for key in self.HOT:
                 client.execute_command('BLOB.GET', key)
@@ -918,16 +795,10 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
     def test_volatile_policy_evicts_only_keys_with_a_ttl(self):
         """Under `volatile-*` a key with no TTL is not a victim, and a TTL makes it one.
 
-        Core samples `db->expires` under those policies, so an operator who set
-        `volatile-lru` was promised their persistent keys survive. We sample the whole
-        keyspace, so that promise is ours to keep: a walk that finds only persistent keys
-        must come back empty and fail the SET, not delete them.
-
-        Both halves are needed, and taking them against one keyspace is what makes the
-        argument tight: the first SET fails with four persistent residents, then the *only*
-        thing that changes is a TTL on the cold pair and the same SET succeeds by taking
-        exactly them. Without the second half the first would also pass if `volatile-*`
-        simply disabled eviction; without the first, an eligible-set bug would hide.
+        Core samples `db->expires`; we sample the whole keyspace and must exclude persistent
+        keys ourselves. Both halves run against one keyspace: the first SET fails with four
+        persistent residents, then only a TTL on the cold pair changes and the same SET takes
+        exactly them.
         """
         client = self.server.get_new_client()
         _set_memory_policy(client, 'volatile-lru')
@@ -946,14 +817,45 @@ class TestDramEvictionPolicy(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('EXISTS', key) == 1, \
                 f"{key} has no TTL and volatile-lru does not evict it"
 
-        # The cold pair is now the whole eligible set, so it is both what ranking should
-        # pick and all it could pick — which is what the assertion needs, since one round
-        # cannot distinguish two keys when only those two are candidates.
+        # The cold pair is now the whole eligible set.
         for key in self.COLD:
             assert client.execute_command('EXPIRE', key, 600) == 1
         assert client.execute_command('BLOB.SET', 'newcomer', payload) == b'OK'
         self._assert_cold_paid(client)
         assert client.execute_command('BLOB.GET', 'newcomer') == payload
+
+    def test_volatile_ttl_evicts_the_soonest_to_expire_first(self):
+        """Under `volatile-ttl` the soonest-to-expire keys are the victims, whatever their idle
+        time. That pair is written and read last, so idleness and cursor order would both take
+        the other pair."""
+        client = self.server.get_new_client()
+        _set_memory_policy(client, 'volatile-ttl')
+        self._fill(client)
+        for key, ttl in zip(self.HOT + self.COLD, (5000, 6000, 100, 200)):
+            assert client.execute_command('EXPIRE', key, ttl) == 1
+        for key in self.COLD:
+            assert client.execute_command('BLOB.GET', key) is not None
+
+        payload = b'N' * self.OBJ_SIZE
+        assert client.execute_command('BLOB.SET', 'newcomer', payload) == b'OK'
+        self._assert_cold_paid(client)
+        assert client.execute_command('BLOB.GET', 'newcomer') == payload
+
+    def test_allkeys_random_still_finds_victims(self):
+        """A random policy ranks nothing: which keys go is not asserted, that the walk takes
+        exactly enough and leaves the rest readable is."""
+        client = self.server.get_new_client()
+        _set_memory_policy(client, 'allkeys-random')
+        self._fill(client)
+        before = info_largeobj(client)['largeobj_evictions_total']
+        payload = b'N' * self.OBJ_SIZE
+        assert client.execute_command('BLOB.SET', 'newcomer', payload) == b'OK'
+        assert info_largeobj(client)['largeobj_evictions_total'] == before + 2
+        assert client.execute_command('BLOB.GET', 'newcomer') == payload
+        survivors = [k for k in self.HOT + self.COLD if client.execute_command('EXISTS', k)]
+        assert len(survivors) == 2
+        for key in survivors:
+            assert client.execute_command('BLOB.GET', key) == key.encode()[:1] * self.OBJ_SIZE
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────
@@ -1244,22 +1146,11 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
 
 class TestTieredEviction(ValkeyLargeObjTestCaseBase):
-    """Tiered mode against a small `nvme-maxmemory` — the only budget eviction can free.
-
-    Tiered mode carries three budgets and just one of them is worth evicting for. The
-    DRAM segment pool and the NVMe staging pool are both transient: a staging buffer is
-    owned by a SET still in flight and comes back when that write completes, so running
-    out of either means "busy", and destroying a key would not produce one. The disk
-    ledger is the opposite — those bytes belong to objects that exist, and the only way
-    to get them back is to destroy an object. So these tests press on the ledger, and
-    both pools are sized above the largest object written here so that a rejected SET
-    can only be the ledger talking.
-
-    The policy is the same one Dram mode follows — never destroy a key you cannot turn
-    into budget — but the arithmetic is easier: disk bytes are fungible, so there is no
-    fragmentation and the counter *is* the authority, which is what lets the reclaimed
-    bytes be asserted exactly below.
-    """
+    """Tiered mode against a small `nvme-maxmemory`, the only budget eviction can free: the DRAM
+    and staging pools are transient (running out means "busy"), while ledger bytes belong to
+    objects that exist. Both pools are sized above the largest object, so a rejected SET can
+    only be the ledger. Disk bytes are fungible, so the counter is the authority and reclaimed
+    bytes can be asserted exactly."""
 
     OBJ = 512 * 1024                  # a 4096-multiple, so the payload needs no tail padding
     HEADER = 4096                     # FILE_HEADER_SIZE: one page per version, ahead of the payload
@@ -1268,9 +1159,8 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
     CAP = OBJECTS_PER_CAP * DISK_PER_OBJ  # a whole number of objects, so filling it evicts nothing
 
     def get_module_args(self, data_dir, direct_io):
-        # scaling-poll-ms high so the DRAM scaling cron cannot shrink underneath us.
-        # segment-size holds every object these tests write at once, so promotion never
-        # pressures the DRAM pool and the only eviction observed is the disk's.
+        # segment-size holds every object at once, so promotion never pressures the DRAM pool
+        # and the only eviction observed is the disk's.
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
@@ -1281,9 +1171,6 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
         )
-
-    def _dat_files(self):
-        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
 
     def _assert_capacity_rejected(self, client, key, payload):
         try:
@@ -1299,25 +1186,24 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
             r = client.execute_command('BLOB.SET', f'fill_{i}', b'F' * self.OBJ)
             assert r == b'OK', f"fill_{i} failed: {r}"
 
+    def test_the_ledger_credit_is_exact_so_one_victim_pays_for_one_object(self):
+        """A same-sized SET at the cap takes exactly one victim: the ledger has no placement
+        to misjudge, so no discount is applied to its credit (the arena's is 90%, which makes
+        the same request take two)."""
+        client = self.server.get_new_client()
+        allow_evictions(client)
+        self._fill_cap(client)
+
+        assert client.execute_command('BLOB.SET', 'n0', b'N' * self.OBJ) == b'OK'
+        assert info_largeobj(client)['largeobj_disk_evictions_total'] == 1
+
     def test_writing_past_the_cap_evicts_exactly_and_stays_bounded(self):
-        """SETs past nvme-maxmemory keep succeeding by evicting, and the ledger, the
-        counters, the survivors and the directory all agree about what was destroyed.
+        """SETs past nvme-maxmemory keep succeeding by evicting, and the ledger, counters,
+        survivors and directory agree on what was destroyed.
 
-        Three caps' worth of identically sized objects. The total is what makes this
-        independent of how much a single call frees: this much data cannot be on disk at
-        once and the cap cannot grow, so objects had to be destroyed.
-
-        `reclaimed == victims * DISK_PER_OBJ` is the assertion Dram mode cannot make.
-        Both modes credit freed bytes at face value, but in the arena that total is only a
-        guess — the bytes may not form a contiguous run, so `alloc_exact` gets the last
-        word. On disk the bytes are fungible, so the ledger *is* the authority and the
-        product is exact: a discount, a double-credit, or a size taken from the wrong
-        version of the object all break it.
-
-        The file count settles rather than matching instantly. Eviction releases the ledger
-        on the main thread and leaves `unlink(2)` to whoever drops the last
-        `Arc<ObjectFile>`, off-thread. Bounded overshoot is by design; files that never go
-        are a leak.
+        Three caps' worth, so objects had to be destroyed whatever one call frees.
+        `reclaimed == victims * DISK_PER_OBJ` is exact here, where Dram mode cannot assert it.
+        Files are unlinked off-thread, so their count settles rather than matching instantly.
         """
         client = self.server.get_new_client()
         allow_evictions(client)
@@ -1357,20 +1243,12 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: len(self._dat_files()) == survivors, timeout=10)
 
     def test_a_refused_set_destroys_nothing(self):
-        """A walk that cannot cover the request rolls back, so the SET fails and the
-        keyspace is untouched.
+        """A walk that cannot cover the request evicts nothing: the SET fails and the keyspace is
+        untouched.
 
-        The walk claims as it samples — it empties each victim's value to take sole
-        ownership of the file handle — but it does not delete the keys until it knows the
-        claims cover the newcomer. Without the rollback this SET would fail *and* take
-        every object with it: the caller gets an error and the cache is empty.
-
-        Engineered so the failure needs no clock and no pins. Three objects resident
-        against a request worth seven: `hopeless_request` lets it through (seven is under
-        the cap and something is resident), the scan then offers every key in the DB and
-        the walk claims all three, and `freed >= need` is still false when the candidates
-        run out. Deterministic, and the failure counter is what proves the walk really did
-        claim and give back rather than never having tried.
+        Three objects resident against a request worth seven: `cannot_be_satisfied` lets it
+        through, the walk claims all three, and the claims still fall short. The failure counter
+        proves the walk ran rather than never trying.
         """
         client = self.server.get_new_client()
         allow_evictions(client)
@@ -1404,15 +1282,10 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
             "the walk must have claimed victims and rolled them back, not declined to start"
 
     def test_a_set_the_cap_cannot_serve_is_refused_without_evicting(self):
-        """The two ways a full ledger refuses a write, neither of which destroys anything.
-
-        Both run against the same filled cap, so the second half also shows the first did
-        not quietly spend the keyspace. The oversized object is larger than the cap could
-        ever hold, with evictions *permitted*, which separates "eviction could not serve
-        this" from "eviction was forbidden" — the staging pool is twice the cap precisely
-        so it fits in memory, or the SET would be rejected earlier for a buffer it could
-        not get and prove nothing about the disk pre-check.
-        """
+        """The two ways a full ledger refuses a write, neither destroying anything: a request
+        larger than the cap (evictions permitted) and `noeviction`. Both run against one filled
+        cap, so the second half also shows the first spent nothing. The staging pool is twice
+        the cap so the oversized SET reaches the disk check."""
         client = self.server.get_new_client()
         allow_evictions(client)
         self._fill_cap(client)
@@ -1434,14 +1307,9 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('EXISTS', 'overflow') == 0
 
     def test_copy_at_the_cap_evicts_another_key_and_never_its_source(self):
-        """COPY makes room like a SET does, but never out of the key it is copying.
-
-        Core holds the source value for the whole `copyCommand`, so a walk that took it
-        would free a value core is still reading. COPY pins its source like any reader, which
-        is what makes the walk skip it. With the source the only resident key, the walk has
-        nothing it may take: COPY fails cleanly and the source is untouched. With other keys
-        resident, COPY succeeds by evicting one of them.
-        """
+        """COPY makes room like a SET, but never out of its source: COPY pins it, so the walk
+        skips it. Alone, COPY fails cleanly with the source untouched; with other keys resident,
+        one of them is the victim."""
         client = self.server.get_new_client()
         allow_evictions(client)
 
@@ -1481,16 +1349,11 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: len(self._dat_files()) == len(survivors) + 1, timeout=10)
 
     def test_eviction_takes_victims_from_every_db(self):
-        """The budget is node-wide, so a SET evicts from any db, not just its own.
+        """A SET from db 0 evicts keys in dbs 1 to 4: the budget is node-wide. A refused SET
+        leaves each key in the db it came from, and the client ends on its own db (the newcomer
+        is read back from a fresh connection).
 
-        Every victim here is in dbs 1 to 4 and the SET comes from db 0, so a walk confined to
-        the client's db has nothing to take. A SET the victims cannot cover is refused and
-        leaves both dbs as they were, which means the rollback puts each key back into the db it
-        came from. The walk must also leave the client on its own db, so the newcomer is read
-        back from a fresh connection.
-
-        Tiered keys are written to db 0 whichever db the SET came from, so they are moved to
-        another db once written.
+        Tiered keys land in db 0 whichever db the SET selected, so they are moved after writing.
         """
         db0 = self.server.get_new_client()
         dbs = {db: self.server.create_from_server(db=db) for db in (1, 2, 3, 4)}
@@ -1523,12 +1386,12 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
 
         for key in list(payloads)[6:]:
             park(key)
-        # Two objects' worth needs three victims, which the walk draws from more than one db.
-        newcomer = b'N' * (2 * self.OBJ)
+        # Three objects' worth needs three victims, and no db holds more than two.
+        newcomer = b'N' * (3 * self.OBJ)
         before = info_largeobj(db0)['largeobj_disk_evictions_total']
         assert db0.execute_command('BLOB.SET', 'newcomer', newcomer) == b'OK'
         victims = info_largeobj(db0)['largeobj_disk_evictions_total'] - before
-        assert victims >= 2, "the cap was full of keys in other dbs, so the SET had to take some"
+        assert victims == 3, "the cap was full of keys in other dbs, so the SET had to take three"
         fresh = self.server.get_new_client()
         assert fresh.execute_command('BLOB.GET', 'newcomer') == newcomer
         assert all(c.execute_command('EXISTS', 'newcomer') == 0 for c in dbs.values())
@@ -1537,16 +1400,9 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
         assert_intact(survivors)
 
     def test_a_pinned_object_is_not_claimed_for_the_disk_budget(self):
-        """An object a GET is reading is skipped, and the ledger still stays under the cap.
-
-        The disk budget's pin is `Arc<ObjectFile>`: a reader's reference keeps the file's
-        blocks allocated past the `unlink(2)`, so those bytes stay charged to
-        `nvme-maxmemory`. Claiming such a victim would credit budget that never arrives,
-        and `DiskReservation::commit`'s "the victims cover `disk_len`" would stop being
-        true — usage parked at the cap while every SET destroys another key. So the walk
-        declines it, and both halves are checked here: the skip happens, and the writes
-        that follow still respect the ledger by taking someone else.
-        """
+        """An object a GET is reading is skipped, and the ledger stays under the cap: a reader's
+        `Arc<ObjectFile>` keeps the file's blocks allocated past the `unlink(2)`, so claiming it
+        would credit budget that never arrives."""
         client = self.server.get_new_client()
         allow_evictions(client)
         client.execute_command('CONFIG', 'SET', 'maxmemory-samples', '16')
@@ -1584,18 +1440,10 @@ class TestTieredEviction(ValkeyLargeObjTestCaseBase):
 
 
 class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
-    """Tiered mode against a DRAM arena too small for the working set.
-
-    The promotion cache is the third pressure point, and the one where nothing is ever
-    evicted: the object is already on NVMe, so an arena with no room simply skips the
-    promotion and the GET serves from disk. The arena is held at one segment —
-    `dram-maxmemory == segment-size`, so expand can never fire — and more distinct objects
-    are read than it can hold, which is the only way to make a promotion ask for room that
-    is not there.
-
-    The disk cap is far above what is written here, so any eviction counter that moves is a
-    bug rather than the test's own doing.
-    """
+    """Tiered mode against a DRAM arena too small for the working set: a promotion into a full
+    arena skips itself and the GET serves from NVMe, evicting nothing. Reading more distinct
+    objects than fit is what makes a promotion ask for room that is not there. The disk cap is
+    far above what is written, so any eviction counter that moves is a bug."""
 
     OBJ = 512 * 1024                  # a chunk-size multiple, so a promoted copy takes exactly this
     SEGMENT = 2 * 1024 * 1024         # holds two or three OBJ at once, not twelve
@@ -1603,8 +1451,7 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
     DISK_CAP = 64 * 1024 * 1024       # far above OBJECTS * OBJ: the ledger never presses
 
     def get_module_args(self, data_dir, direct_io):
-        # scaling-poll-ms high so the cron cannot shrink or grow underneath us; the only
-        # thing moving DRAM here is the promotion path itself.
+        # scaling-poll-ms high so the cron cannot resize the pool underneath us.
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
@@ -1619,16 +1466,9 @@ class TestTieredPromotionSkip(ValkeyLargeObjTestCaseBase):
             f" direct-io no"
         )
 
-    def _dat_files(self):
-        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
-
     def _write_and_read_all(self, client, prefix):
-        """Write OBJECTS distinct objects, then read each once.
-
-        Each SET goes straight to NVMe — Tiered SETs never touch the arena — so every
-        read is a promotion attempt, and the arena runs out partway through. Returns the
-        payloads so callers can check the data survived.
-        """
+        """Write OBJECTS distinct objects, then read each once. Tiered SETs never touch the arena,
+        so every read is a promotion attempt. Returns the payloads."""
         payloads = {f'{prefix}_{i}': bytes([i % 256]) * self.OBJ for i in range(self.OBJECTS)}
         for key, payload in payloads.items():
             r = client.execute_command('BLOB.SET', key, payload)
@@ -1675,14 +1515,11 @@ def tombstones(client):
 
 
 class ClusterNode:
-    """Run the server as a cluster node, so the module sees cluster mode.
-
-    The core resolves a key lookup made while a command runs to the slot of that command's own
-    key. A walk inside `BLOB.SET foo` therefore cannot find a victim `bar` in another slot, and
-    `delete` reports success without removing it. Eviction tombstones the object instead: its bytes
-    are freed at once, every `LO.*` read treats it as a miss, and a sweep deletes the key later,
-    from a timer. So these tests write keys that hash to different slots, and the keys an eviction
-    takes stay in the keyspace, visible to core commands like `EXISTS`, until the sweep runs.
+    """Run the server as a cluster node. Core resolves a lookup made during a command to that
+    command's own slot, so a walk inside `BLOB.SET foo` cannot find a victim `bar` in another
+    slot: eviction tombstones it instead (bytes freed, reads miss) and a sweep deletes the key
+    later. These tests write keys in different slots, and the keys an eviction takes stay
+    visible to core commands like `EXISTS` until the sweep runs.
     """
 
     CLUSTER_DATABASES = 1
@@ -1717,6 +1554,12 @@ class DramSegment(ClusterNode):
             f" fabric-interfaces lo"
         )
 
+    def new_node(self):
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        return client
+
     def evicted_key(self, client, key='{z}victim', size=600 * 1024):
         """Evict `key` through a SET in another slot. The segment holds one object this size, so
         the key is the only victim, and it stays in the keyspace as a tombstone."""
@@ -1731,12 +1574,6 @@ class TestClusterDramTombstones(DramSegment, ValkeyLargeObjTestCaseBase):
     """Reading, overwriting and deleting keys whose objects eviction has tombstoned."""
 
     start_target = TestDramReactiveExpand.start_target
-
-    def new_node(self):
-        client = self.server.get_new_client()
-        own_all_slots(client)
-        allow_evictions(client)
-        return client
 
     def test_a_set_at_the_segment_evicts_keys_in_other_slots(self):
         """SETs past the segment keep succeeding by evicting, the survivors are intact, and every
@@ -1846,12 +1683,6 @@ class TestClusterDramSweep(DramSegment, ValkeyLargeObjTestCaseBase):
 
     SWEEP_MS = 500  # long enough to act on a tombstone first, short enough to wait for
 
-    def new_node(self):
-        client = self.server.get_new_client()
-        own_all_slots(client)
-        allow_evictions(client)
-        return client
-
     def test_the_sweep_deletes_the_keys_eviction_took(self):
         client = self.new_node()
         obj_size = self.SEGMENT_SIZE // 4
@@ -1942,9 +1773,6 @@ class TestClusterTieredEviction(ClusterNode, ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (TestTieredEviction.get_module_args(self, data_dir, direct_io)
                 + f" tombstone-sweep-ms {self.SWEEP_MS}")
-
-    def _dat_files(self):
-        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
 
     def test_a_set_at_the_cap_evicts_keys_in_other_slots_and_dbs(self):
         """The victims' files are unlinked and their bytes credited when the write settles, even
@@ -2044,6 +1872,22 @@ class TestClusterTieredEviction(ClusterNode, ValkeyLargeObjTestCaseBase):
                    for i in range(4 * self.OBJECTS_PER_CAP))
         assert info['largeobj_disk_used_bytes'] == live * self.DISK_PER_OBJ
         assert len(self._dat_files()) == live
+
+    def test_an_evicted_object_releases_its_promoted_copy_at_once(self):
+        """The victim's key waits for the sweep, but its DRAM copy must not: `lo_free` would drop
+        it, and that is a minute away."""
+        client = self.server.get_new_client()
+        own_all_slots(client)
+        allow_evictions(client)
+        for i in range(self.OBJECTS_PER_CAP):
+            assert client.execute_command('BLOB.SET', f'fill_{i}', b'F' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.GET', f'fill_{i}') == b'F' * self.OBJ
+        assert info_largeobj(client)['largeobj_cached_objects'] == self.OBJECTS_PER_CAP
+
+        assert client.execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        info = info_largeobj(client)
+        assert info['largeobj_disk_evictions_total'] == 1 and info['largeobj_tombstones'] == 1
+        assert info['largeobj_cached_objects'] == self.OBJECTS_PER_CAP - 1
 
     def test_an_evicted_key_reads_as_a_miss(self):
         client = self.server.get_new_client()

@@ -150,7 +150,7 @@ lazy_static::lazy_static! {
     /// `maxmemory-eviction-tenacity`. Bounded on a 0–100 scale to determine how much
     /// eviction effort the main thread should dedicate. Default of 10 translates to
     /// 500us. 100 is an unbounded wait until eviction reclaimation is sufficient or we
-    /// hit failsafe ``eviction::barren_rounds`.
+    /// hit failsafe ``eviction::unclaimable_rounds_limit`.
     ///
     /// We cannot use the core tenacity calculation directly because we are using
     /// different hardware with different latency performance (NVMe vs DRAM).
@@ -336,13 +336,6 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
 /// `noeviction` policy, `maxmemory > 0`, and being a primary.
 pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
-}
-
-/// Whether the `maxmemory-policy` is one of the `volatile-*` family.
-pub fn volatile_policy(ctx: &Context) -> bool {
-    let info = ctx.server_info("memory");
-    info.field_c("maxmemory_policy")
-        .is_some_and(|policy| policy.starts_with("volatile-"))
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the

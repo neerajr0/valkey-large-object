@@ -1,89 +1,77 @@
-//! Eviction — evicting resident objects to free a budget.
+//! Eviction — freeing a budget by evicting resident objects.
 //!
-//! # One driver
+//! # Driver
 //!
-//! `walk` is the entire policy: how long to search, which candidates to sample, how to rank them,
-//! what to skip, when to give up. Both modes go through it, so victim selection cannot drift apart
-//! between them, and both stay aligned with core's policy.
+//! `walk` is the whole policy: how long to search, which candidates to sample, how to rank them,
+//! what to skip, when to stop. Both modes go through it, so victim selection cannot drift apart.
+//! What differs is what a freed byte *is*, which each mode supplies as a `Budget`: `claim` takes
+//! one victim and reports the bytes it yielded, `satisfy` says whether that is enough yet.
 //!
-//! What `walk` does not decide is what a freed byte *is*. That is where the two modes fork: each
-//! passes in a `Budget` impl with two methods. `claim` takes one victim and reports the bytes it
-//! yielded; `satisfy` says whether that is enough yet and hands back the result.
+//! A node runs in one mode for its lifetime. Promotion and demotion between the tiers do not go
+//! through here.
 //!
-//! # Two budgets
-//!
-//! A node runs in one mode for its lifetime, so it only ever takes one of these. Promotion and
-//! demotion between the tiers do not go through here.
-//!
-//! `[Dram]` — `alloc_by_evicting`, from `engine::alloc_dram_or_make_room`, frees DRAM arena bytes
-//! through `Arena`. Its `satisfy` is `alloc_exact`: asking *is* allocating, so it can refuse even
-//! once enough bytes are free, when they are scattered instead of in one contiguous run. That
-//! forces everything else. Victims must be destroyed as they are claimed, because the memory has to
-//! be genuinely free before the allocator can answer — so a walk that comes up short has spent them
-//! and still fails the SET. Pinned objects are skipped (see Threading). The bytes come back in our
-//! own drop, inside this call stack.
-//!
-//! `[Tiered]` — `claim_disk_victims`, from `engine::reserve_nvme_or_make_room`, claims
-//! `nvme-maxmemory` budget through `DiskLedger`. Its `satisfy` compares a running total against the
-//! request and can never refuse, so the deletes can wait until the claims cover it: a walk that
-//! comes up short evicts nothing. A pinned file keeps its blocks past the unlink, so it is skipped
-//! too. The bytes are settled later, by the write task.
+//! - `[Dram]` — `alloc_by_evicting` frees arena bytes through `Arena`. `satisfy` is `alloc_exact`,
+//!   so it can refuse even once enough bytes are free, when they are scattered rather than one
+//!   contiguous run. That forces victims to be destroyed as they are claimed, so a walk that comes
+//!   up short has spent them and still fails the SET.
+//! - `[Tiered]` — `claim_disk_victims` claims `nvme-maxmemory` budget through `DiskLedger`.
+//!   `satisfy` compares a running total and never refuses, so victims are evicted only once the
+//!   claims cover the request: a walk that comes up short evicts nothing. The bytes are settled
+//!   later, by the write task.
 //!
 //! # Search bound
 //!
-//! Time based search bound. Module's `eviction-tenacity` maps to a microsecond budget and is
-//! inspired by core Valkey's `maxmemory-eviction-tenacity`. If tenacity reaches 100 there is
-//! no time based timeout, so `barren_rounds` checks for consecutive sample rounds that claimed
-//! nothing in order to exit. `barren_rounds` is not native to core Valkey and is necessary due
-//! to the sampling limitations of the module API. It can cause error replies in cases where
-//! eviction fails to sample items belonging to the module.
+//! `eviction-tenacity` maps to a time limit, after core's `maxmemory-eviction-tenacity`. Tenacity
+//! 100 removes the clock, so a walk also stops after `MAX_STEPS_WITHOUT_LO_KEY` scan steps that
+//! find no `LO` key (foreign keys), `unclaimable_rounds_limit` rounds that claim nothing (`LO` keys
+//! that are pinned or otherwise unclaimable), or `MAX_SATISFY_REFUSALS` refusals. The round limit
+//! is not in core; the module API's sampling makes it necessary, and it can fail a SET when
+//! sampling never finds the module's keys.
+//!
+//! The clock is only consulted once `MIN_CANDIDATES` have been offered, so where `LO` keys are
+//! sparse among other types a walk can run past it, by up to `MAX_STEPS_WITHOUT_LO_KEY` scan steps
+//! per candidate still needed. That is accepted for mixed keyspaces.
 //!
 //! # Victim ranking
 //!
-//! Valkey Core evictions are recreated within the module. Draw `maxmemory-samples` candidates,
-//! score each with `objectGetIdleness` (based on eviction policy), claim best victims.
+//! As in core: draw `maxmemory-samples` candidates, score each under the active policy (idleness
+//! for LRU and LFU, soonest expiry for `volatile-ttl`, none for the random policies), claim the
+//! best first. The module API forces two differences:
 //!
-//! Two limitations due to module API restrictions:
+//! - Candidates come from a resumable `RM_Scan` cursor, not a random draw, because `RANDOMKEY` via
+//!   `ctx.call` costs a command dispatch per sample.
+//! - The scan visits every key, not just `LO` keys, so a mostly non-module keyspace spends its
+//!   budget on misses and `MAX_STEPS_WITHOUT_LO_KEY` ends the walk rather than hunting.
 //!
-//! - **Candidates come from a resumable `RM_Scan` cursor, not a random draw**, because `RANDOMKEY`
-//!   via `ctx.call` costs a command dispatch per sample.
-//! - **The scan visits every key, not just `LO` keys**, so a keyspace that is mostly non-module
-//!   keys spends its budget on misses and `MAX_EMPTY_STEPS` gives up rather than hunting.
-//!
-//! Like core, a walk draws from every DB that has keys, whichever DB the request came from: the
-//! budgets are node-wide. It scans one bucket of each in turn, and victims are ranked together.
+//! The budgets are node-wide, so a walk draws from every DB that has keys: one bucket of each in
+//! turn, ranked together.
 //!
 //! # Evicting a victim
 //!
-//! Core resolves every key lookup made while a command executes to that command's own slot, so in
-//! cluster mode a victim in another slot cannot be opened or deleted from here: `delete` reports
-//! success and the key survives with its data freed. A victim is therefore tombstoned by object
-//! id first, and every read of the value treats a tombstoned object as a miss. Then its key
-//! is deleted inline if that works, which it always does when standalone or in the request's slot.
-//! Otherwise `arm_sweep` schedules a timer, where no command is executing, and `sweep` deletes the
-//! key there, scanning every DB for the object id if the key was renamed or moved since.
+//! In cluster mode core resolves every key lookup made during a command to that command's own
+//! slot, so a victim in another slot cannot be opened or deleted from here: `delete` reports
+//! success and the key survives with its data freed. So a victim is first tombstoned (see
+//! `tombstone`), then its key is deleted inline if the lookup can see it, which it always can
+//! standalone or in the request's slot. Otherwise `arm_sweep` schedules a timer, where no command
+//! is executing, and `sweep` deletes the key there.
 //!
-//! Until the sweep runs, a tombstoned key is still visible to core commands that do not read the
-//! value (`EXISTS`, `DBSIZE`, `KEYS`, `SCAN`).
+//! Until then a tombstoned key still shows in commands that do not read the value (`EXISTS`,
+//! `DBSIZE`, `KEYS`, `SCAN`).
 //!
 //! # Threading
 //!
-//! Eviction selection runs only on the Valkey event-loop thread, and never awaits, so every drop
-//! here returns its memory inside this call stack rather than on a later thread. `alloc_by_evicting`
-//! depends on that: it frees victims and immediately retries the allocation.
+//! Selection runs only on the event-loop thread and never awaits, so every drop returns its memory
+//! inside the call stack; `alloc_by_evicting` relies on that to retry its allocation at once. A SET
+//! allocates before spawning its tokio task and a GET decides promotion before spawning, so this
+//! holds for every mode and transport.
 //!
-//! That holds for every mode and transport: a SET allocates before spawning its tokio task, and a
-//! GET decides promotion before spawning, so no eviction ever runs off the event loop.
-//!
-//! A pin is any extra `Arc` on an object: an in-flight GET, from dispatch until its transfer
-//! completes, or a COPY reading its source. `Dram` + TCP is the one GET that completes on
-//! the event loop (`engine::execute_get`), so a walk never sees it mid-flight; the other three hand
-//! the `Arc` to a tokio thread. A pinned object is skipped: claiming it would report bytes that do
-//! not come back until its holder is done.
-//!
-//! Skipping is safe in both directions because we hold the event loop. A new pin cannot arrive
-//! between the check and the delete, since making one means dispatching a command. A pin that
-//! *disappears* mid-walk only costs us a candidate the next round re-offers.
+//! A pin is any extra `Arc` on an object: an in-flight GET from dispatch until its transfer
+//! completes, or a COPY reading its source. Only `Dram` + TCP completes a GET on the event loop
+//! (`engine::execute_get`), so a walk never sees that one mid-flight. A pinned object is skipped,
+//! because claiming it would report bytes that do not come back until its holder is done. That is
+//! safe in both directions: a new pin cannot appear between the check and the delete (making one
+//! means dispatching a command), and a pin that disappears mid-walk only costs a candidate the
+//! next round re-offers.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -100,11 +88,10 @@ use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::storage::context::SegmentBuffer;
 use crate::storage::ObjectFile;
 
-/// Objects destroyed since module load. All of these are exposed via `INFO largeobj`.
+/// Objects evicted since module load. The counters below are all exposed via `INFO largeobj`.
 pub static EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Arena bytes the victims held. Exact as a byte count; says nothing about placement, so
-/// these bytes are in the arena but not necessarily in a run anyone can use.
+/// Arena bytes the victims held: exact as a count, says nothing about placement.
 pub static RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// SETs that still failed after eviction ran — objects destroyed for nothing. Rising against
@@ -112,7 +99,7 @@ pub static RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Objects a walk passed over because someone still held them. Rising alongside a failure
-/// counter says the working set is busy rather than full — those bytes come back on their own.
+/// counter says the working set is busy rather than full.
 pub static PINNED_SKIPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Disk counterparts, separate statics because `INFO` reports them under the NVMe section.
@@ -126,58 +113,45 @@ pub static DISK_RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Tiered SETs that still could not reserve after destroying something.
 pub static DISK_EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Times `Budget::satisfy` refused a request the walk had fully freed for. Each one is bytes that
+/// are free but not usable together, so a rate here is fragmentation rather than scarcity.
+pub static SATISFY_REFUSALS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Walks abandoned at `MAX_SATISFY_REFUSALS`: eviction cannot make the allocation work, and
+/// retrying upstream will not either.
+pub static FRAGMENTATION_ABORTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Candidates a walk always draws before the clock may stop it, so tenacity 0 means a 0µs
 /// budget rather than zero work. Core has the same floor for the same reason (`evict.c:578`).
 const MIN_CANDIDATES: usize = 16;
 
 /// Consecutive claim-nothing rounds tolerated at tenacity 0..=19, doubling every
-/// `BARREN_TENACITY_STEP` points above that. 8 at the default tenacity of 10.
-const BARREN_ROUNDS_BASE: usize = 8;
+/// `UNCLAIMABLE_TENACITY_STEP` points above that. 8 at the default tenacity of 10.
+const UNCLAIMABLE_ROUNDS_BASE: usize = 8;
 
-/// Tenacity points per doubling of `barren_rounds`. 20 gives six settings across 0..=100,
-/// ending at 256 rounds.
-const BARREN_TENACITY_STEP: i64 = 20;
+/// Tenacity points per doubling of `unclaimable_rounds_limit`. 20 gives six settings across
+/// 0..=100, ending at 256 rounds.
+const UNCLAIMABLE_TENACITY_STEP: i64 = 20;
 
-/// Consecutive `scan_step`s that yield no `LO` key before the walk gives up looking. The scan is
-/// keyspace-wide, so this is what bounds a walk over a keyspace that is mostly other people's
-/// keys — including at tenacity 100, where there is no clock to fall back on.
-const MAX_EMPTY_STEPS: usize = 256;
+/// Consecutive `scan_step`s that yield no `LO` key before the walk stops looking. Bounds a walk
+/// over a mostly non-module keyspace, including at tenacity 100.
+const MAX_STEPS_WITHOUT_LO_KEY: usize = 256;
 
-/// Times `Budget::satisfy` may refuse a fully-funded request before the walk gives up. Only
-/// `Arena` can refuse (the bytes are free but not contiguous), and a refusal resets the credit,
-/// so without this the walk has no stop at all in the case that matters: every round claims
-/// something, so `barren` never rises, and at tenacity 100 there is no clock either.
+/// Times `Budget::satisfy` may refuse a fully-funded request before the walk stops. Only `Arena`
+/// refuses (bytes free but not contiguous). A refusal resets the credit, so every round still
+/// claims something and neither `unclaimable_rounds` nor a clock would end the walk.
 const MAX_SATISFY_REFUSALS: usize = 3;
 
-/// Freed bytes are credited at this percentage of face value, in both walks.
-///
-/// One constant for both budgets, and not 100. The discount only decides *when to first ask* —
-/// `Budget::satisfy` is still the authority — and what it buys is fewer doomed attempts, which are
-/// not free: a multi-chunk `alloc_exact` allocates the first N−1 chunks before it fails and frees
-/// them again (`segment_pool.rs:143-151`).
-///
-/// It is a blunt instrument, because neither credit is imprecise in a way a percentage models. The
-/// DRAM one is exact as a byte count and imprecise only in placement, and the NVMe ledger has no
-/// placement dimension at all, so 90% there just deletes ~11% more keys than the cap requires.
-const CREDIT_PERCENT: u64 = 90;
-
-// Keyspace cursors, resumed across calls so a request continues the previous walk rather than
-// restarting it. A thread-local rather than a lock because every entry point here is main-thread
-// only; a second thread would get its own cursors and walk independently, which is a fairness
-// regression rather than a data race.
-//
-// `RM_Scan` cursors survive writes — the reverse-binary bucket order that gives `SCAN` its
-// guarantees survives rehashing — so deleting victims mid-walk cannot make the cursor skip a key
-// that was present throughout.
-//
-// One cursor per DB, because `RM_Scan` walks `ctx->client->db` only: a single shared position
-// applied to differently sized kvstores makes "every key offered once per pass" hold for neither.
+// Per-DB `RM_Scan` cursors, resumed across walks. Thread-local because every entry point is
+// main-thread only; another thread would walk independently, which is unfair but not a race. One
+// per DB because `RM_Scan` walks `ctx->client->db` only. Cursors survive writes, so deleting
+// victims mid-walk cannot make one skip a key that was present throughout.
 thread_local! {
     static CURSORS: RefCell<HashMap<c_int, Rc<ScanCursor>>> = RefCell::new(HashMap::new());
 }
 
 /// A resumable `RM_Scan` cursor. Owned here rather than the crate's `KeysCursor` because the scan
-/// callback needs the raw key handle it is given, which the crate does not pass on (see `collect`).
+/// callback needs the raw key handle (see `collect`).
 struct ScanCursor(*mut raw::RedisModuleScanCursor);
 
 impl ScanCursor {
@@ -199,9 +173,8 @@ impl Drop for ScanCursor {
     }
 }
 
-/// The resumable cursor for `db`. The `Rc` is cloned out of the map so the walk — which deletes
-/// keys, and may re-enter through anything a notification handler does — never runs inside the
-/// `RefCell` borrow.
+/// The resumable cursor for `db`. The `Rc` is cloned out so the walk, which deletes keys and may
+/// re-enter, never runs inside the `RefCell` borrow.
 fn cursor_for(db: c_int) -> Rc<ScanCursor> {
     CURSORS.with(|cursors| {
         Rc::clone(
@@ -213,9 +186,9 @@ fn cursor_for(db: c_int) -> Rc<ScanCursor> {
     })
 }
 
-/// Point `ctx` at `db`, which is where `RM_Scan` and `RM_OpenKey` look. Raw FFI because the crate
-/// wraps neither `RM_SelectDb` nor `RM_GetSelectedDb`. On a command's context this moves the
-/// calling client itself, so an entry point puts it back with `restoring_db`.
+/// Point `ctx` at `db`, where `RM_Scan` and `RM_OpenKey` look. Raw FFI because the crate wraps
+/// neither `RM_SelectDb` nor `RM_GetSelectedDb`. On a command's context this moves the client
+/// itself, so entry points put it back with `restoring_db`.
 pub(crate) fn select_db(ctx: &Context, db: c_int) -> bool {
     // SAFETY: `ctx.ctx` is a live module context.
     unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.ctx, db) == raw::REDISMODULE_OK as c_int }
@@ -245,11 +218,11 @@ fn populated_dbs(ctx: &Context) -> Vec<(c_int, Rc<ScanCursor>)> {
     dbs
 }
 
-// ─── The search budget ───────────────────────────────────────────────────────
+// ─── The search time limit ───────────────────────────────────────────────────
 
-/// `eviction-tenacity` as a wall-clock budget, ported from `evictionTimeLimitUs`
+/// `eviction-tenacity` as a wall-clock limit, ported from `evictionTimeLimitUs`
 /// (`evict.c:363-378`): 0..=10 linear to 500µs, then 15% per point, 100 unbounded.
-fn search_budget(tenacity: i64) -> Duration {
+fn search_time_limit(tenacity: i64) -> Duration {
     match tenacity {
         t if t <= 10 => Duration::from_micros(50 * t.max(0) as u64),
         t if t < 100 => Duration::from_micros((500.0 * 1.15f64.powi(t as i32 - 10)) as u64),
@@ -259,31 +232,26 @@ fn search_budget(tenacity: i64) -> Duration {
 
 /// Consecutive claim-nothing rounds a walk tolerates before calling the keyspace unhelpful.
 ///
-/// The termination guard rather than the clock, and the only stop in the case that matters: a
-/// keyspace of `LO` keys that are all pinned resets `MAX_EMPTY_STEPS` on every scan step and, at
-/// tenacity 100, has no deadline either. It scales with tenacity because a rejection is a
-/// property of the key, not of the supply — the cap is really a confidence threshold, since with
-/// a fraction `p` of keys unclaimable a walk gives up spuriously with probability
-/// `p^(samples * rounds)`. At 95% pinned and 5 samples that is ~10% per walk at 8 rounds and
-/// ~2e-29 at 256.
-fn barren_rounds(tenacity: i64) -> usize {
-    BARREN_ROUNDS_BASE << (tenacity.clamp(0, 100) / BARREN_TENACITY_STEP)
+/// The only stop when every `LO` key is pinned at tenacity 100: scans keep finding keys, so
+/// `MAX_STEPS_WITHOUT_LO_KEY` resets, and there is no clock. It scales with tenacity because it is
+/// a confidence threshold: with a fraction `p` of keys unclaimable, a walk quits spuriously with
+/// probability `p^(samples * rounds)` — ~10% at 95% pinned and 5 samples with 8 rounds, ~2e-29
+/// with 256.
+fn unclaimable_rounds_limit(tenacity: i64) -> usize {
+    UNCLAIMABLE_ROUNDS_BASE << (tenacity.clamp(0, 100) / UNCLAIMABLE_TENACITY_STEP)
 }
 
-/// `Duration::MAX` cannot be added to an `Instant`, which is the honest shape of "tenacity 100
-/// has no clock": a deadline that never arrives, leaving the other stop conditions to terminate.
-fn deadline_from_now(budget: Duration) -> Option<Instant> {
-    Instant::now().checked_add(budget)
+/// `Duration::MAX` cannot be added to an `Instant`, so `None` is the deadline that never arrives.
+fn deadline_from_now(limit: Duration) -> Option<Instant> {
+    Instant::now().checked_add(limit)
 }
 
 // ─── Shared: candidate supply ────────────────────────────────────────────────
 
-/// A sampled key, the DB it lives in, and what ranking needs to know about it.
+/// A sampled key and what ranking needs to know about it.
 ///
-/// Everything here is read off the scan's own key handle, never by reopening the key by name.
-/// In cluster mode a lookup made inside a command resolves to the slot of the command's own key,
-/// so reopening a victim in any other slot would miss — scoring it as idle 0, the worst victim
-/// there is, and leaving the walk nothing to claim it through.
+/// Everything is read off the scan's own key handle: reopening by name would miss for a key
+/// outside the running command's slot (see the module docs) and score it as the hottest.
 struct Candidate {
     db: c_int,
     name: Vec<u8>,
@@ -294,18 +262,17 @@ struct Candidate {
     freq: i64,
     /// `RM_GetExpire`: milliseconds to live, or `REDISMODULE_NO_EXPIRE`.
     ttl: i64,
-    /// Tiered mode: the object's file. Holding it is what lets a claim test for a reader and
-    /// reach the file without opening the key (see `DiskLedger::claim`).
+    /// Tiered mode: the object's file. Holding it lets a claim test for a reader and reach the
+    /// file without opening the key.
     file: Option<Arc<ObjectFile>>,
 }
 
-/// The keyspace walk as an iterator: `LO` keys from wherever each DB's cursor stopped last time,
-/// one bucket of each populated DB in turn, wrapping as often as the budget allows.
+/// The keyspace walk as an iterator: `LO` keys from where each DB's cursor last stopped, one
+/// bucket of each populated DB in turn, wrapping while the budget allows.
 ///
-/// Two stop conditions, each with one job. `MAX_EMPTY_STEPS` bounds the *search* for candidates
-/// and must hold even at tenacity 100, where no deadline ever arrives. `deadline` bounds the
-/// *walk*, and only once `MIN_CANDIDATES` have been offered — without that gate a zero budget
-/// would yield nothing at all.
+/// `MAX_STEPS_WITHOUT_LO_KEY` bounds the search for candidates, even at tenacity 100. `deadline`
+/// bounds the walk, but only once `MIN_CANDIDATES` have been offered: a zero limit would yield
+/// nothing.
 struct Candidates<'a> {
     ctx: &'a Context,
     /// The DBs that had keys when the walk began.
@@ -316,9 +283,8 @@ struct Candidates<'a> {
     /// `None` when the budget is unbounded.
     deadline: Option<Instant>,
     yielded: usize,
-    empty_steps: usize,
-    /// Set once a stop condition fires. The batch in hand is still drained first — those
-    /// keys were offered by the same scan that ended the walk.
+    steps_without_lo_key: usize,
+    /// Set once a stop condition fires. The batch in hand is still drained.
     stop: bool,
 }
 
@@ -333,7 +299,7 @@ impl<'a> Candidates<'a> {
             batch: Vec::new().into_iter(),
             deadline,
             yielded: 0,
-            empty_steps: 0,
+            steps_without_lo_key: 0,
         }
     }
 
@@ -366,12 +332,12 @@ impl Iterator for Candidates<'_> {
             // An evicted object whose key is awaiting the sweep has nothing left to give.
             found.retain(|candidate| !tombstone::contains(candidate.object_id));
             if found.is_empty() {
-                self.empty_steps += 1;
+                self.steps_without_lo_key += 1;
             } else {
-                self.empty_steps = 0;
+                self.steps_without_lo_key = 0;
             }
 
-            if self.empty_steps >= MAX_EMPTY_STEPS
+            if self.steps_without_lo_key >= MAX_STEPS_WITHOUT_LO_KEY
                 || (self.yielded >= MIN_CANDIDATES && self.out_of_time())
             {
                 self.stop = true;
@@ -389,10 +355,9 @@ struct ScanSink {
 
 /// `RM_Scan` callback: record the key if it is one of ours.
 ///
-/// Why raw FFI: the handle the scan passes is built straight from the dictionary entry, so it
-/// works for a key in any slot, where a lookup by name made inside a command does not. The
-/// crate's trampoline wraps that handle in a `ValkeyKey` whose raw pointer is `pub(crate)`, so
-/// the LRU, LFU and TTL getters are unreachable through it.
+/// Raw FFI because the crate wraps the handle in a `ValkeyKey` whose raw pointer is `pub(crate)`,
+/// which hides the LRU, LFU and TTL getters. The handle is built from the dictionary entry, so
+/// it works for a key in any slot.
 ///
 /// # Safety
 /// Only passed to `RM_Scan` by `scan_step`, with `privdata` the `&mut ScanSink` it owns; the
@@ -407,9 +372,8 @@ unsafe extern "C" fn collect(
     if key.is_null() {
         return; // no handle offered; skip rather than reopen mid-scan
     }
-    // Scans are keyspace-wide and we may not be the only module loaded, so confirm the key
-    // is ours. The type comparison is a real guarantee: `RM_CreateDataType` refuses duplicate
-    // names and mints a fresh `moduleType` per call.
+    // The scan is keyspace-wide, so other modules' keys pass through. The type comparison is a
+    // real guarantee: `RM_CreateDataType` refuses duplicate names.
     if verify_type(key, &LO_TYPE).is_err() {
         return;
     }
@@ -436,13 +400,11 @@ unsafe extern "C" fn collect(
     });
 }
 
-/// Advance `cursor` one step — one bucket, so zero to several keys — and return the `LO` keys it
-/// visited plus whether it reached the end of the table.
+/// Advance `cursor` one bucket and return the `LO` keys it visited plus whether the table ended.
 ///
-/// Victims are collected rather than acted on in the callback because `RM_Scan` permits deleting
-/// the key currently being visited but not others, and we may delete a whole bucket's worth.
-/// Outliving the callback is sound because the candidates own their data: the name is copied and
-/// the file is a counted reference.
+/// Victims are collected rather than acted on in the callback: `RM_Scan` permits deleting only
+/// the key being visited, and we may delete a whole bucket. The candidates own their data (a
+/// copied name, a counted file), so they outlive the callback.
 fn scan_step(ctx: &Context, db: c_int, cursor: &ScanCursor) -> (Vec<Candidate>, bool) {
     let mut sink = ScanSink {
         db,
@@ -463,151 +425,184 @@ fn scan_step(ctx: &Context, db: c_int, cursor: &ScanCursor) -> (Vec<Candidate>, 
 
 // ─── Shared: victim ranking ──────────────────────────────────────────────────
 
-/// Core's `objectGetIdleness` (`lrulfu.c:162-171`) over what the scan read, plus the one
-/// eligibility rule the getters cannot express. Higher is a better victim: idle milliseconds
-/// under an LRU policy, `UINT8_MAX - freq` under an LFU one.
+/// What the `maxmemory-policy` ranks victims by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ranking {
+    /// Idle time under LRU, access frequency under LFU.
+    Idleness,
+    /// Soonest expiry first (`volatile-ttl`).
+    Ttl,
+    /// No ranking: any candidate is as good as another.
+    Random,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Policy {
+    ranking: Ranking,
+    /// `volatile-*`: only keys with a TTL may be evicted.
+    volatile_only: bool,
+}
+
+impl Policy {
+    fn parse(name: &str) -> Self {
+        let ranking = if name.ends_with("-random") {
+            Ranking::Random
+        } else if name == "volatile-ttl" {
+            Ranking::Ttl
+        } else {
+            Ranking::Idleness
+        };
+        Self {
+            ranking,
+            volatile_only: name.starts_with("volatile-"),
+        }
+    }
+
+    fn current(ctx: &Context) -> Self {
+        let info = ctx.server_info("memory");
+        Self::parse(info.field_c("maxmemory_policy").unwrap_or_default())
+    }
+}
+
+/// Core's victim score (`evictionPoolPopulate`, `evict.c:122-137`) over what the scan read. Higher
+/// is a better victim.
 ///
-/// **`None` means "not a candidate", which under `volatile-*` is a key with no TTL.** Core samples
-/// `db->expires` there, so a persistent key is never a victim; we sample the whole keyspace and
-/// have to exclude it ourselves. The policy itself is read once per walk, by the caller.
+/// `None` means not a candidate: under `volatile-*`, a key with no TTL. Core samples
+/// `db->expires` there; we sample the whole keyspace and must exclude it ourselves.
 ///
-/// **No `maxmemory-policy` read is needed** — the getters are self-identifying. `VM_GetLRU`
-/// returns OK but writes `-1` under an LFU policy (`module.c:14731-14737`), `VM_GetLFU` likewise
-/// unless `lrulfu_isUsingLFU()` (`:14753-14758`), and `-1` is unreachable for a live value. So
-/// "call both, take the non-negative" *is* `objectGetIdleness`. Never trust the return code, only
-/// the sentinel. Units differ from core's seconds — a monotone transform of a score only ever
-/// compared against itself.
+/// For LRU and LFU, no second policy read is needed. `VM_GetLRU` writes -1 under an LFU policy
+/// and `VM_GetLFU` under an LRU one (`module.c:14731-14758`), and -1 is unreachable for a live
+/// value, so taking the non-negative one *is* `objectGetIdleness` (`lrulfu.c:162-171`): idle
+/// milliseconds, or `UINT8_MAX - freq`. Trust the sentinel, not the return code.
 ///
-/// **Nothing is stamped by sampling.** The scan hands over a handle without a lookup, so `val->lru`
-/// stays what the last real access left it. That matters beyond our own ranking: it is what core's
-/// `performEvictions` reads, so a sampling pass that touched LO keys would make them look hot and
-/// push core's eviction toward everyone else's keys.
-///
-/// Reading the LFU frequency does still mutate: `objectGetLFUFrequency` writes the decayed
-/// counter back (`object.c:1677-1680`). That is decay, not a touch, and core does the same while
-/// sampling. There is no read-only sample.
-fn idleness(candidate: &Candidate, volatile_only: bool) -> Option<i64> {
-    if volatile_only && candidate.ttl == raw::REDISMODULE_NO_EXPIRE as i64 {
+/// Sampling stamps nothing: the scan involves no lookup, so `val->lru` stays as the last real
+/// access left it. A touch would make LO keys look hot to core's `performEvictions` and push it
+/// toward other keys. Reading the LFU frequency does write back the decayed counter
+/// (`object.c:1677-1680`), but that is decay, as in core; there is no read-only sample.
+fn victim_score(candidate: &Candidate, policy: Policy) -> Option<i64> {
+    if policy.volatile_only && candidate.ttl == raw::REDISMODULE_NO_EXPIRE as i64 {
         return None;
     }
-    Some(if candidate.freq >= 0 {
-        i64::from(u8::MAX) - candidate.freq
-    } else {
-        candidate.idle_ms.max(0)
+    Some(match policy.ranking {
+        Ranking::Idleness if candidate.freq >= 0 => i64::from(u8::MAX) - candidate.freq,
+        Ranking::Idleness => candidate.idle_ms.max(0),
+        Ranking::Ttl => i64::MAX - candidate.ttl,
+        Ranking::Random => 0,
     })
 }
 
-/// The O(1) refusals every budget makes before walking. `need` above the whole budget can never
-/// be served by emptying the node, and a budget with nothing resident has nothing to give — a
-/// fact the walk could only learn by touching every key. Core answers the same question off
-/// `kvstoreSize` (`evict.c:482`). A zero `ceiling` means unlimited.
-fn hopeless_request(need: u64, ceiling: u64, resident: u64) -> bool {
+/// The O(1) refusals every budget makes before walking: `need` above the whole budget can never
+/// be served, and nothing resident leaves nothing to evict, which a walk could only learn by
+/// touching every key (core asks `kvstoreSize`, `evict.c:482`). A zero `ceiling` means unlimited.
+fn cannot_be_satisfied(need: u64, ceiling: u64, resident: u64) -> bool {
     (ceiling != 0 && need > ceiling) || resident == 0
 }
 
 // ─── Shared: the driver ──────────────────────────────────────────────────────
 
-/// What a walk does with a victim, and what it is trying to produce. One impl per budget;
-/// everything else about the search is in `walk`.
+/// What a walk does with a victim, and what it is trying to produce. `walk` owns the rest of the
+/// search.
 trait Budget {
     type Output;
 
-    /// Take the object's bytes, at face value. `None` leaves it alone — pinned, already gone, or
-    /// not convertible into this budget. Impls own their own notion of a pin, and bump
-    /// `PINNED_SKIPS_TOTAL` when that is why they declined.
+    /// Freed bytes count at this percentage of face value. It only decides when to first ask
+    /// `satisfy`, which stays the authority, so it is a discount for a budget whose credit
+    /// overstates what the asker can use and 100 where it is exact.
+    const CREDIT_PERCENT: u64;
+
+    /// Take the object's bytes, at face value. `None` leaves it alone: pinned (the impl bumps
+    /// `PINNED_SKIPS_TOTAL`), already gone, or not convertible into this budget.
     ///
-    /// Giving the object up is the impl's business: `Arena` must do it now, since `satisfy` cannot
-    /// answer until the bytes are really free; `DiskLedger` only records the claim and defers.
-    /// Hence the candidate by value, so a deferring impl can keep its name and DB. `ctx` is already
-    /// on the candidate's DB.
+    /// Evicting is the impl's business: `Arena` must now, since `satisfy` cannot answer until the
+    /// bytes are free; `DiskLedger` only records. Hence the candidate by value, so a deferring impl
+    /// keeps its name and DB.
     fn claim(&mut self, ctx: &Context, candidate: Candidate) -> Option<u64>;
 
-    /// The authoritative check, asked only once the discounted credit says it is worth
-    /// asking. `Some` ends the walk successfully; `None` means keep going, and for the arena
-    /// it means the bytes are free but unusably placed.
+    /// The authoritative check, asked once the discounted credit says it is worth asking. `Some`
+    /// ends the walk; `None` keeps going, and for the arena means the bytes are free but unusably
+    /// placed.
     fn satisfy(&mut self, need: u64) -> Option<Self::Output>;
 }
 
-/// Sample, score, claim, repeat until `budget` is satisfied or a stop condition fires. Returns
-/// the output and how many objects were evicted, which callers need to tell a failed run from
-/// a no-op one.
+/// Sample, score, claim, repeat until `budget` is satisfied or a stop fires. Returns the output and
+/// how many objects were evicted, so callers can tell a failed run from a no-op one.
 ///
-/// The final `satisfy` is reachable with the request already paid for. A refusal resets the
-/// credit, so a walk can free well over `need` in total and still end below the threshold that
-/// triggers an attempt — and the victims freed since that refusal may have coalesced into the run
-/// the allocator wanted. Core does the same, re-checking `getMaxmemoryState` at `cant_free`.
+/// The final `satisfy` can succeed with the request already paid for: a refusal resets the credit,
+/// so a walk can free well over `need` and still end below the threshold, and the victims freed
+/// since may have coalesced into the run the allocator wanted. Core does the same at `cant_free`.
 fn walk<B: Budget>(ctx: &Context, need: u64, budget: &mut B) -> (Option<B::Output>, usize) {
     // One read each, so a walk is internally consistent against a runtime-modifiable config.
     let tenacity = crate::eviction_tenacity();
-    let deadline = deadline_from_now(search_budget(tenacity));
-    let barren_limit = barren_rounds(tenacity);
+    let deadline = deadline_from_now(search_time_limit(tenacity));
+    let unclaimable_limit = unclaimable_rounds_limit(tenacity);
     let samples = crate::maxmemory_samples();
-    let volatile_only = crate::volatile_policy(ctx);
+    let policy = Policy::current(ctx);
     let mut candidates = Candidates::new(ctx, deadline);
 
     let mut credit = 0u64;
     let mut victims = 0usize;
     let mut examined = 0usize;
-    let mut barren = 0usize;
+    let mut unclaimable_rounds = 0usize;
     let mut refusals = 0usize;
 
     loop {
-        // Once per round rather than per candidate: a round is bounded work and this is where
-        // the next one would begin.
+        // Checked per round, not per candidate: a round is bounded work.
         if examined >= MIN_CANDIDATES && candidates.out_of_time() {
             break;
         }
 
         let round: Vec<Candidate> = candidates.by_ref().take(samples).collect();
         if round.is_empty() {
-            break; // the supply gave up first — out of time, or nothing left to find
+            break; // out of time, or nothing left to find
         }
 
-        // Best victim first. Claiming in score order is what makes this a policy rather than an
-        // ordering, and a key we could not claim costs us the next-best rather than the walk.
+        // Best victim first; a key we cannot claim costs the next-best, not the walk.
         let offered = round.len();
         let mut ranked: Vec<(i64, Candidate)> = round
             .into_iter()
             .filter_map(|candidate| {
-                idleness(&candidate, volatile_only).map(|score| (score, candidate))
+                victim_score(&candidate, policy).map(|score| (score, candidate))
             })
             .collect();
-        ranked.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
-        // A key the policy excluded cost a sample even though nothing claims it, so the clock's
-        // `MIN_CANDIDATES` floor counts it — otherwise a keyspace of persistent keys under
-        // `volatile-*` would walk to `barren_limit` with the deadline never armed.
+        ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        // Policy-excluded keys cost a sample too, so they count toward the `MIN_CANDIDATES` floor;
+        // otherwise persistent keys under `volatile-*` would run to `unclaimable_limit` with no
+        // deadline.
         examined += offered - ranked.len();
 
         let mut claimed_any = false;
         for (_score, candidate) in ranked {
             examined += 1;
-            select_db(ctx, candidate.db);
             let Some(bytes) = budget.claim(ctx, candidate) else {
                 continue;
             };
             victims += 1;
-            // A claim that yielded nothing is not progress, whatever it destroyed: crediting it
-            // would reset `barren` and let the walk run until the keyspace is empty.
-            claimed_any |= bytes > 0;
-            credit += bytes * CREDIT_PERCENT / 100;
+            claimed_any = true;
+            credit += bytes * B::CREDIT_PERCENT / 100;
             if credit < need {
                 continue;
             }
             if let Some(output) = budget.satisfy(need) {
                 return (Some(output), victims);
             }
-            // The bytes are free but unusably placed. Starting the credit over lets the next
-            // victims coalesce into a run — but being refused this often with the whole request
-            // freed each time is fragmentation, not scarcity, and more victims will not fix it.
+            // Free but unusably placed. Restarting the credit lets the next victims coalesce, but
+            // repeated refusals with the whole request freed each time are fragmentation, which
+            // more victims will not fix.
+            SATISFY_REFUSALS_TOTAL.fetch_add(1, Ordering::Relaxed);
             refusals += 1;
             if refusals >= MAX_SATISFY_REFUSALS {
+                FRAGMENTATION_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 return (None, victims);
             }
             credit = 0;
         }
 
-        barren = if claimed_any { 0 } else { barren + 1 };
-        if barren >= barren_limit {
+        unclaimable_rounds = if claimed_any {
+            0
+        } else {
+            unclaimable_rounds + 1
+        };
+        if unclaimable_rounds >= unclaimable_limit {
             break;
         }
     }
@@ -626,14 +621,12 @@ pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer
     );
     let dram_pool = crate::storage::get_dram_pool();
 
-    // The bound is what emptying the arena could produce, not what the config permits: eviction
-    // frees inside the segments that exist and cannot add one, and `try_expand` is separately
-    // gated on the server watermark, so a pool may sit far below `dram-maxmemory` for good. Not
-    // one segment either — `alloc_exact` may split a request across segments. The residency arm
-    // also covers an arena full of in-flight SET buffers no key points at yet.
+    // Bound by what emptying the arena could produce, not the config: eviction cannot add
+    // segments, and `alloc_exact` may split a request across them. The residency arm also covers
+    // an arena full of in-flight SET buffers no key points at yet.
     let (live_segments, _, _) = dram_pool.segment_counts();
     let achievable = (live_segments * crate::dram_segment_size()) as u64;
-    if hopeless_request(need as u64, achievable, dram_pool.object_count() as u64) {
+    if cannot_be_satisfied(need as u64, achievable, dram_pool.object_count() as u64) {
         return None;
     }
 
@@ -644,7 +637,7 @@ pub fn alloc_by_evicting(ctx: &Context, need: usize) -> Option<Vec<SegmentBuffer
     let mut arena = Arena;
     let (buffers, victims) = restoring_db(ctx, || walk(ctx, need as u64, &mut arena));
 
-    // Count only runs that gave something up — they paid and got nothing.
+    // Only runs that evicted something: they paid and got nothing.
     if buffers.is_none() && victims > 0 {
         EVICTION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
@@ -656,9 +649,13 @@ struct Arena;
 impl Budget for Arena {
     type Output = Vec<SegmentBuffer>;
 
+    // Exact as a byte count but not as a placement, and a doomed multi-chunk `alloc_exact`
+    // allocates N−1 chunks before failing (`segment_pool.rs:143-151`). The discount spares those.
+    const CREDIT_PERCENT: u64 = 90;
+
     fn claim(&mut self, ctx: &Context, candidate: Candidate) -> Option<u64> {
-        // An in-flight request holds this object, so taking the entry would leave it gone and the
-        // bytes still unavailable — the freeing drop belongs to whoever holds the last reference.
+        // An in-flight request holds this object; the bytes free only when its holder drops the
+        // last reference.
         if crate::storage::get_dram_pool().is_pinned(&candidate.object_id) {
             PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -671,23 +668,22 @@ impl Budget for Arena {
     }
 }
 
-/// Give up the `LO` object behind `candidate` and report the arena bytes it freed. `None` if the
-/// object is already gone, which is the walk's signal that nothing happened.
+/// Evict the `LO` object behind `candidate` and report the arena bytes it freed. `None` if it is
+/// already gone.
 fn reclaim(ctx: &Context, candidate: &Candidate) -> Option<u64> {
     let dram_pool = crate::storage::get_dram_pool();
 
-    // Take the reference, and so the size, *before* giving the object up: once the key is deleted
-    // `lo_free` removes the entry, possibly from the lazyfree thread, so it may be gone by the time
-    // we look. Crediting 0 there counts as progress while making none, which resets the walk's
-    // termination guards.
+    // Take the reference, and so the size, before evicting: `lo_free` removes the pool entry once
+    // the key is deleted, possibly from the lazyfree thread. A scanned key is still in the
+    // keyspace, so this is present and only this thread can pin it.
     let obj_ctx = dram_pool.get_object(&candidate.object_id)?;
     let bytes = arena_bytes(&obj_ctx);
 
     evict(ctx, candidate.db, &candidate.name, candidate.object_id);
 
-    // The bytes have to be free *now*: the retry that motivated this eviction runs before the
-    // lazyfree thread could get to them. Dropping the map's reference here, and ours at the end of
-    // this scope, runs `ObjectContext::Drop` -> `dram_pool.free` — a talc coalesce, no syscall.
+    // The bytes must be free now: the retry runs before the lazyfree thread could get to them.
+    // Dropping the map's reference, and ours at scope end, runs `ObjectContext::Drop` ->
+    // `dram_pool.free`, a talc coalesce with no syscall.
     dram_pool.remove_object(&candidate.object_id);
 
     RECLAIMED_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
@@ -704,26 +700,18 @@ fn arena_bytes(obj_ctx: &crate::storage::context::ObjectContext) -> u64 {
 // ─── Tombstones ──────────────────────────────────────────────────────────────
 
 pub mod tombstone {
-    //! Tombstones — objects eviction has evicted whose keys are still in the keyspace.
+    //! Tombstones — evicted objects whose keys are still in the keyspace, waiting for `sweep`.
     //!
-    //! Eviction frees an object's bytes inline, because the SET that needed them is waiting, but it
-    //! cannot always delete the object's key there. In cluster mode the core resolves every key
-    //! lookup made while a command executes to the slot of that command's own key, so a victim in
-    //! another slot is not found, and `delete` reports success without removing it. The key then
-    //! outlives its data.
-    //!
-    //! A tombstone keeps that key safe to leave behind. The object id goes in this table, every
-    //! read of a `LoValue` treats a tombstoned object as absent (`LoValue::is_tombstoned`), and
-    //! `eviction::sweep` deletes the key later from a timer, where no command is executing and
-    //! lookups resolve their own slots.
+    //! Eviction frees an object's bytes inline but cannot always delete its key (see the module
+    //! docs), so the object id is tombstoned instead: every read of a `LoValue` treats a
+    //! tombstoned object as absent (`LoValue::is_tombstoned`) until the sweep deletes the key.
     //!
     //! Keyed by object id, not key name: the key can be renamed or moved before the sweep, and a
-    //! SET that overwrites it mints a new id, which must not inherit the tombstone. The entry
-    //! remembers where the key was when it was tombstoned, as a hint the sweep verifies rather
-    //! than trusts.
+    //! SET that overwrites it mints a new id, which must not inherit the tombstone. The recorded
+    //! location is a hint the sweep verifies.
     //!
-    //! An entry leaves the table when the sweep deletes the key, or when the value is freed by any
-    //! other route (`DEL`, overwrite, expiry, flush — `lo_free` calls `remove`).
+    //! An entry leaves when the sweep deletes the key or the value is freed by any other route
+    //! (`DEL`, overwrite, expiry, flush — `lo_free` calls `remove`).
 
     use std::collections::HashMap;
     use std::os::raw::c_int;
@@ -732,7 +720,7 @@ pub mod tombstone {
 
     use crate::data_type::ObjectId;
 
-    /// Where a tombstoned object's key was when it was tombstoned.
+    /// Where the object's key was when it was tombstoned.
     #[derive(Clone, Debug)]
     pub struct Location {
         pub db: c_int,
@@ -822,13 +810,8 @@ pub mod tombstone {
 
 // ─── Evicting a key ──────────────────────────────────────────────────────────
 
-/// Evict the object `object_id`, which the key `name` in `db` holds: tombstone it, then try to
-/// delete the key.
-///
-/// The tombstone comes first and is what makes eviction safe. The delete is best effort, because
-/// in cluster mode a lookup from inside a command cannot find a key in another slot. Where it does
-/// find the key the delete removes the tombstone with it, and nothing lingers (every standalone
-/// delete, and same-slot ones in a cluster). Where it does not, the sweep finishes the job.
+/// Evict the object `object_id`, which the key `name` in `db` holds: tombstone it first, then
+/// delete the key if the lookup can see it (which also removes the tombstone), else arm the sweep.
 fn evict(ctx: &Context, db: c_int, name: &[u8], object_id: ObjectId) {
     tombstone::add(object_id, db, name);
     if !delete_if_present(ctx, db, name, object_id) {
@@ -836,13 +819,12 @@ fn evict(ctx: &Context, db: c_int, name: &[u8], object_id: ObjectId) {
     }
 }
 
-/// Delete the key `name` in `db` if it still holds `object_id`, and drop that object's tombstone.
-/// `false` if it does not — not there, or not under this name any more, or (in a command, in
-/// cluster mode) in a slot this lookup cannot see.
+/// Delete the key `name` in `db` if it still holds `object_id`, and drop that tombstone. `false`
+/// if it does not: absent, overwritten under that name, or (in a cluster command) in a slot this
+/// lookup cannot see.
 ///
-/// Checks the id because a key found is not necessarily the object: the name may have been
-/// overwritten since it was tombstoned. `Key::delete` returns `Ok` unconditionally, so this is
-/// also the only way to know whether anything was deleted.
+/// The id is checked because the name may have been overwritten since. `Key::delete` returns `Ok`
+/// unconditionally, so this is also the only way to know whether anything was deleted.
 fn delete_if_present(ctx: &Context, db: c_int, name: &[u8], object_id: ObjectId) -> bool {
     select_db(ctx, db);
     let key_name = ctx.create_string(name.to_vec());
@@ -877,16 +859,15 @@ fn arm_sweep(ctx: &Context) {
     );
 }
 
-/// Delete the key of every tombstoned object.
+/// Delete the key of every tombstoned object. Runs from a timer, where no command is executing,
+/// so lookups resolve their own slots.
 ///
-/// Runs from a timer, where no command is executing, so lookups resolve their own slots. Each
-/// entry says where its key was when it was tombstoned; that is a hint and is checked, because
-/// the key may have been renamed or moved since. An entry whose key is not where it was is looked
-/// up by object id instead, through a scan of every DB — the reverse lookup. It is slow, and it
-/// is the rare path: a key has to be renamed or moved during the few milliseconds it lingers.
+/// Each entry's location is checked, not trusted. One whose key is not there (renamed or moved)
+/// is found by object id through a scan of every DB — the reverse lookup. It is slow but rare: it
+/// takes a RENAME or MOVE in the few milliseconds a key lingers.
 ///
 /// An object no scan finds has no key, so its entry is dropped. That is how an entry whose value
-/// is still being freed by the lazyfree thread, which has not reached `lo_free` yet, goes away.
+/// is still being freed by the lazyfree thread goes away.
 fn sweep(ctx: &Context) {
     let entries = tombstone::snapshot();
     restoring_db(ctx, || {
@@ -906,7 +887,7 @@ fn sweep(ctx: &Context) {
 }
 
 /// Find the keys holding `strays` by scanning every DB, delete them, and remove each object found
-/// from `strays`. A fresh cursor per DB, so the walk's own cursors are undisturbed.
+/// from `strays`. A fresh cursor per DB leaves the walk's own undisturbed.
 fn delete_strays(ctx: &Context, strays: &mut HashSet<ObjectId>) {
     let mut db = 0;
     while !strays.is_empty() && select_db(ctx, db) {
@@ -937,30 +918,26 @@ fn delete_strays(ctx: &Context, strays: &mut HashSet<ObjectId>) {
 // ─── Tiered: the nvme-maxmemory budget ───────────────────────────────────────
 
 /// Claim enough resident objects to pay for `need` disk bytes. `None` means the search came up
-/// short and the SET must be refused — having destroyed nothing, because objects are evicted only
-/// once the claims cover the request.
+/// short and the SET must be refused, with nothing evicted: victims are evicted only once the
+/// claims cover the request.
 ///
-/// The claim is exclusive: the objects are tombstoned and their bytes still charged, so no other
-/// request can select them or spend those bytes. That is what lets the write task settle up
-/// without a second capacity check (see `DiskReservation`).
-///
-/// The returned handles are the keyspace's own, shared, not taken out of it: the key may be in
-/// another slot than the running command's, where it cannot be reached. The reservation
-/// `release`s them when the write settles.
+/// The claim is exclusive: victims are tombstoned with their bytes still charged, so no other
+/// request can select them or spend those bytes, which lets the write task settle without a
+/// second capacity check (see `DiskReservation`). The returned handles are the keyspace's own,
+/// shared rather than taken, because the key may be in a slot the running command cannot reach;
+/// the reservation `release`s them when the write settles.
 ///
 /// Main thread only, before the SET's tokio task is spawned.
 pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<Arc<ObjectFile>>> {
     let budget = crate::nvme_maxmemory();
 
-    // Unreachable in practice — an unlimited budget cannot refuse a reservation, so the caller
-    // never asks — but destroying data to satisfy a cap that does not exist would be the worst
-    // way to find that out. `hopeless_request` reads a zero ceiling as "nothing to compare
-    // against", which is right for the arena and wrong here.
+    // An unlimited budget cannot refuse a reservation, so nothing asks for victims. Fail loudly:
+    // evicting to satisfy a cap that does not exist would be the worst way to find out.
     if budget == 0 {
-        return None;
+        unreachable!("nvme-maxmemory is unlimited, yet a reservation was refused");
     }
 
-    if hopeless_request(need, budget, crate::storage::nvme::nvme_disk_usage()) {
+    if cannot_be_satisfied(need, budget, crate::storage::nvme::nvme_disk_usage()) {
         return None;
     }
 
@@ -976,8 +953,7 @@ pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<Arc<ObjectFile
             return Some(evict_claimed(ctx, claimed));
         }
 
-        // A claim only records, so there is nothing to put back. A walk that claimed nothing is not
-        // thrashing: this counts wasted search, not lost data, and a rise against
+        // Claims only record, so nothing was lost: this counts wasted search. A rise against
         // `disk_evictions_total` means the working set is too pinned or too large.
         if victims > 0 {
             DISK_EVICTION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -986,11 +962,9 @@ pub fn claim_disk_victims(ctx: &Context, need: u64) -> Option<Vec<Arc<ObjectFile
     })
 }
 
-/// Accumulates claimed handles until they cover `need`. Its running total is exact rather than an
-/// allocator's guess, so `satisfy` is a comparison and can never refuse.
-///
-/// Each entry carries its DB and key name because the key is dealt with only once `satisfy`
-/// succeeds.
+/// Accumulates claimed handles until they cover `need`. The running total is exact, so `satisfy`
+/// is a comparison and never refuses. Each claim carries its DB and name because the key is dealt
+/// with only once `satisfy` succeeds.
 #[derive(Default)]
 struct DiskLedger {
     claimed: Vec<Claim>,
@@ -1006,6 +980,9 @@ struct Claim {
 impl Budget for DiskLedger {
     type Output = Vec<Claim>;
 
+    // The ledger's total is exact and has no placement, so anything less over-evicts.
+    const CREDIT_PERCENT: u64 = 100;
+
     fn claim(&mut self, _ctx: &Context, candidate: Candidate) -> Option<u64> {
         let file = candidate.file?;
         // A key the scan cursor offers twice is claimed once; left to the pin check below, its own
@@ -1017,10 +994,10 @@ impl Budget for DiskLedger {
         {
             return None;
         }
-        // A second `Arc` beyond the keyspace's and this candidate's *is* the pin check — a
-        // reader's reference holds the file's blocks past the unlink, so claiming it would report
-        // budget we never receive. Nothing is written to the value, so a pinned one is never
-        // disturbed: COPY holds its own source through a `&LoValue` while the walk runs.
+        // An `Arc` beyond the keyspace's and this candidate's is a reader, whose reference holds
+        // the file's blocks past the unlink: claiming it would report budget we never receive.
+        // Nothing is written to the value, so a pinned one is undisturbed (COPY holds its source
+        // through a `&LoValue` while the walk runs).
         if Arc::strong_count(&file) > 2 {
             PINNED_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -1040,11 +1017,10 @@ impl Budget for DiskLedger {
     }
 }
 
-/// Spend the claims: evict the objects and hand the handles on. Called only once the walk covered
-/// the request, so this is where eviction becomes irreversible.
-///
-/// The handles are not released here. They ride on the reservation, so the `unlink(2)` and the
-/// credit stay off the event loop and land just before the new file is created.
+/// Evict the claimed objects and hand their handles on. Called only once the walk covered the
+/// request, so this is where eviction becomes irreversible. The handles ride on the reservation,
+/// so the `unlink(2)` and the credit stay off the event loop and land just before the new file is
+/// created.
 fn evict_claimed(ctx: &Context, claimed: Vec<Claim>) -> Vec<Arc<ObjectFile>> {
     let dram_pool = crate::storage::get_dram_pool();
     claimed
@@ -1067,76 +1043,174 @@ fn evict_claimed(ctx: &Context, claimed: Vec<Claim>) -> Vec<Arc<ObjectFile>> {
 mod tests {
     use super::*;
 
+    fn candidate(idle_ms: i64, freq: i64, ttl: i64) -> Candidate {
+        Candidate {
+            db: 0,
+            name: b"k".to_vec(),
+            object_id: ObjectId(u64::MAX - 201),
+            idle_ms,
+            freq,
+            ttl,
+            file: None,
+        }
+    }
+
+    const NO_TTL: i64 = raw::REDISMODULE_NO_EXPIRE as i64;
+
+    #[test]
+    fn policy_names_pick_a_ranking_and_a_scope() {
+        let cases = [
+            ("allkeys-lru", Ranking::Idleness, false),
+            ("allkeys-lfu", Ranking::Idleness, false),
+            ("volatile-lru", Ranking::Idleness, true),
+            ("volatile-lfu", Ranking::Idleness, true),
+            ("volatile-ttl", Ranking::Ttl, true),
+            ("allkeys-random", Ranking::Random, false),
+            ("volatile-random", Ranking::Random, true),
+            ("noeviction", Ranking::Idleness, false),
+            ("", Ranking::Idleness, false),
+        ];
+        for (name, ranking, volatile_only) in cases {
+            assert_eq!(
+                Policy::parse(name),
+                Policy {
+                    ranking,
+                    volatile_only
+                },
+                "{name}"
+            );
+        }
+    }
+
+    /// Each policy has to order the same three keys its own way, and `volatile-*` has to refuse
+    /// the one with no TTL instead of scoring it.
+    #[test]
+    fn each_policy_scores_what_it_ranks_by() {
+        let (idle, busy) = (candidate(9_000, -1, NO_TTL), candidate(10, -1, NO_TTL));
+        let lru = Policy::parse("allkeys-lru");
+        assert!(
+            victim_score(&idle, lru) > victim_score(&busy, lru),
+            "idler first"
+        );
+
+        let (rare, common) = (candidate(-1, 2, NO_TTL), candidate(-1, 200, NO_TTL));
+        let lfu = Policy::parse("allkeys-lfu");
+        assert!(
+            victim_score(&rare, lfu) > victim_score(&common, lfu),
+            "rarer first"
+        );
+
+        let (soon, later) = (candidate(10, -1, 1_000), candidate(9_000, -1, 60_000));
+        let ttl = Policy::parse("volatile-ttl");
+        assert!(
+            victim_score(&soon, ttl) > victim_score(&later, ttl),
+            "soonest expiry first, whatever the idle time"
+        );
+        assert_eq!(
+            victim_score(&candidate(10, -1, NO_TTL), ttl),
+            None,
+            "no TTL, no candidate"
+        );
+        assert_eq!(
+            victim_score(&candidate(10, -1, 0), ttl),
+            Some(i64::MAX),
+            "already expired"
+        );
+
+        let random = Policy::parse("allkeys-random");
+        assert_eq!(
+            victim_score(&idle, random),
+            victim_score(&busy, random),
+            "no order"
+        );
+        assert_eq!(
+            victim_score(&candidate(10, -1, NO_TTL), Policy::parse("volatile-lru")),
+            None
+        );
+        assert_eq!(
+            victim_score(&candidate(10, -1, NO_TTL), Policy::parse("volatile-random")),
+            None
+        );
+    }
+
     /// Each arm is a refusal that saves the keyspace from a request no amount of work could serve.
     #[test]
     fn hopeless_request_refuses_only_what_a_walk_could_not_serve() {
         assert!(
-            hopeless_request(2048, 1024, 10),
+            cannot_be_satisfied(2048, 1024, 10),
             "larger than the whole budget"
         );
-        assert!(hopeless_request(64, 1024, 0), "nothing resident to evict");
         assert!(
-            !hopeless_request(2048, 0, 10),
+            cannot_be_satisfied(64, 1024, 0),
+            "nothing resident to evict"
+        );
+        assert!(
+            !cannot_be_satisfied(2048, 0, 10),
             "a zero ceiling is unlimited, not a bound of zero"
         );
         assert!(
-            !hopeless_request(64, 1024, 10),
+            !cannot_be_satisfied(64, 1024, 10),
             "fits, and something is here"
         );
     }
 
-    /// Both halves of the search bound, over core's curve. `eviction-tenacity` is the one number an
-    /// operator tunes and the clock and the round count have to move together, so they are asserted
-    /// together. The endpoints matter most: 0 must not mean "unbounded" and 100 must.
+    /// Both halves of the search bound, over core's curve. The endpoints matter most: 0 must not
+    /// mean "unbounded" and 100 must.
     #[test]
     fn tenacity_bounds_the_search() {
         assert_eq!(
-            search_budget(0),
+            search_time_limit(0),
             Duration::ZERO,
             "no time, but see MIN_CANDIDATES"
         );
         assert_eq!(
-            search_budget(10),
+            search_time_limit(10),
             Duration::from_micros(500),
-            "the default, 20x tighter than the 10ms this replaced"
+            "the default"
         );
         assert_eq!(
-            search_budget(11),
+            search_time_limit(11),
             Duration::from_micros(575),
             "15% per point past the ramp"
         );
         assert_eq!(
-            search_budget(100),
+            search_time_limit(100),
             Duration::MAX,
             "tenacity 100 has no clock"
         );
         assert!(
-            search_budget(50) > search_budget(20) && search_budget(20) > search_budget(10),
+            search_time_limit(50) > search_time_limit(20)
+                && search_time_limit(20) > search_time_limit(10),
             "monotone, so raising the knob can only buy more search"
         );
-        assert_eq!(barren_rounds(10), 8, "the default is what this started as");
+        assert_eq!(unclaimable_rounds_limit(10), 8, "the default");
         assert_eq!(
-            barren_rounds(0),
+            unclaimable_rounds_limit(0),
             8,
             "tenacity 0 is bounded by the clock, not this"
         );
-        assert_eq!(barren_rounds(20), 16, "one doubling per 20 points");
         assert_eq!(
-            barren_rounds(100),
+            unclaimable_rounds_limit(20),
+            16,
+            "one doubling per 20 points"
+        );
+        assert_eq!(
+            unclaimable_rounds_limit(100),
             256,
             "no clock at 100, so this is the only stop"
         );
         assert!(
-            barren_rounds(-5) == barren_rounds(0) && barren_rounds(500) == barren_rounds(100),
+            unclaimable_rounds_limit(-5) == unclaimable_rounds_limit(0)
+                && unclaimable_rounds_limit(500) == unclaimable_rounds_limit(100),
             "clamped, so an out-of-range config cannot shift the whole curve"
         );
         // `Duration::MAX` cannot be added to an `Instant`; handling that is what keeps tenacity 100
         // the loosest setting rather than a deadline in the past.
         assert!(
-            deadline_from_now(search_budget(100)).is_none(),
+            deadline_from_now(search_time_limit(100)).is_none(),
             "no deadline at all, not a saturated one"
         );
-        let at = deadline_from_now(search_budget(10)).expect("a finite budget has a deadline");
+        let at = deadline_from_now(search_time_limit(10)).expect("a finite budget has a deadline");
         assert!(at > Instant::now(), "and it is in the future");
     }
 }
