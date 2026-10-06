@@ -90,8 +90,9 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Cached objects removed by `make_room_for` to free space.
-    pub reclaims: AtomicU64,
+    /// Cached copies demoted (dropped from DRAM, NVMe copy kept) by
+    /// `make_room_for` to free space. Tiered only.
+    pub demotions: AtomicU64,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.
     pub cache: Option<TieredCache>,
@@ -104,7 +105,7 @@ impl DRAMPool {
             objects: RwLock::new(ObjectMaps::default()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            reclaims: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
             cache,
         }
     }
@@ -346,7 +347,7 @@ impl DRAMPool {
             }
             return None;
         }
-        self.reclaims
+        self.demotions
             .fetch_add(victims.len() as u64, Ordering::Relaxed);
         Some(victims)
     }
@@ -530,7 +531,7 @@ mod tests {
             p.contains_object(&ObjectId(10)),
             "other segment is untouched"
         );
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 1);
+        assert_eq!(p.demotions.load(Ordering::Relaxed), 1);
         drop(victims);
         assert_index_consistent(&p);
 
@@ -550,7 +551,7 @@ mod tests {
         let victims = p.reclaim_in(0, 2 * BUF as usize, 16).unwrap();
         assert_eq!(victims.len(), 2, "no over-reclaim past the first fit");
         assert_eq!(p.object_count(), 2);
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 2);
+        assert_eq!(p.demotions.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -565,7 +566,7 @@ mod tests {
         // The victim cap stops short of 3 BUF.
         assert!(p.reclaim_in(0, 3 * BUF as usize, 2).is_none());
         assert_eq!(p.object_count(), 8);
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 0);
+        assert_eq!(p.demotions.load(Ordering::Relaxed), 0);
         assert_index_consistent(&p);
 
         // Exactly what segment 0 holds goes through, and only segment 0 pays.

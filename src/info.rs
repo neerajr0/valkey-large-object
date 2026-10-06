@@ -75,7 +75,7 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_reclaims_total",
+            "fd_reclaims",
             fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
@@ -104,11 +104,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("dram_fragment_count", dram.fragment_count() as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
-        .field("cached_objects", dram.object_count() as i64)?
-        .field(
-            "reclaims_total",
-            dram.reclaims.load(Ordering::Relaxed) as i64,
-        )?;
+        .field("cached_objects", dram.object_count() as i64)?;
     // Cache counters exist only in Tiered mode.
     if let Some(cache) = &dram.cache {
         section = section
@@ -127,7 +123,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             .field(
                 "admission_rejects_total",
                 cache.admission.rejects.load(Ordering::Relaxed) as i64,
-            )?;
+            )?
+            .field("demotions", dram.demotions.load(Ordering::Relaxed) as i64)?;
     }
     section
         .field(
