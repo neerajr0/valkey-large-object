@@ -113,7 +113,7 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
     fabric
         .add_peer(client_id, &peer_address)
-        .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
+        .map_err(|_| ValkeyError::Str(errors::ERR_SESSION_CREATE))?;
     session::insert(client_id, Session::new(client_id, peer_address));
 
     let reply: Vec<ValkeyValue> = fabric
