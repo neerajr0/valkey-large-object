@@ -219,8 +219,8 @@ In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so nei
 - NVMePool: fi_write to client during serve-and-discard GET
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
 
-If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
-command paths (`BLOB.SET`/`BLOB.GET` with `[rkey remote_addr]`) are rejected with an
+If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. RDMA
+command paths (`BLOB.RDMA_GET`/`BLOB.RDMA_SET`) are rejected with an
 error until EFA becomes available. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**

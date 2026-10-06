@@ -15,7 +15,7 @@ PEER_ADDRESS = binascii.hexlify(
 
 
 class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
-    """BLOB.HELLO against real fabric services over the tcp provider on loopback."""
+    """BLOB.RDMA_HELLO against real fabric services over the tcp provider on loopback."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -30,7 +30,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
     def test_hello_returns_one_address_per_server(self):
         """One server was pinned to lo, so HELLO returns exactly one address, and it decodes."""
         client = self.server.get_new_client()
-        reply = client.execute_command('BLOB.HELLO', PEER_ADDRESS)
+        reply = client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
         assert isinstance(reply, list) and len(reply) == 1
         address = binascii.unhexlify(reply[0])
         assert 0 < len(address)
@@ -38,47 +38,47 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
     def test_hello_is_once_per_connection(self):
         """A second HELLO on the same connection is refused; a new connection may HELLO again."""
         client = self.server.get_new_client()
-        first = client.execute_command('BLOB.HELLO', PEER_ADDRESS)
+        first = client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
         self.verify_error_response(
-            client, f'BLOB.HELLO {PEER_ADDRESS}',
-            'DMA session already established (one BLOB.HELLO per connection)')
-        assert self.server.get_new_client().execute_command('BLOB.HELLO', PEER_ADDRESS) == first
+            client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}',
+            'DMA session already established (one BLOB.RDMA_HELLO per connection)')
+        assert self.server.get_new_client().execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS) == first
 
     def test_hello_rejects_bad_hex(self):
         client = self.server.get_new_client()
-        self.verify_error_response(client, 'BLOB.HELLO zz', 'invalid peer address hex')
+        self.verify_error_response(client, 'BLOB.RDMA_HELLO zz', 'invalid peer address hex')
         try:
-            client.execute_command('BLOB.HELLO', '')
+            client.execute_command('BLOB.RDMA_HELLO', '')
             assert False, "Expected an error for an empty address"
         except ResponseError as e:
             assert str(e) == 'peer address must not be empty'
 
     def test_efa_get_needs_hello(self):
-        """The EFA arity of BLOB.GET is refused until this client has a session."""
+        """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.SET', 'key', b'A' * 4096)
+        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
         self.verify_error_response(
-            client, 'BLOB.GET key 999 0 4096', 'no DMA session (call BLOB.HELLO first)')
+            client, 'BLOB.RDMA_GET key 999 0 4096', 'no DMA session (call BLOB.RDMA_HELLO first)')
 
-    def test_arity_gaps_are_refused(self):
-        """Arg counts that are neither TCP nor EFA with complete triples are rejected.
+    def test_rdma_arity_and_malformed_triples_are_refused(self):
+        """RDMA commands reject too-few args and incomplete triples."""
 
-        GET: 2=TCP, >=5=EFA (triplets). So 3 or 4 args is invalid.
-        SET: 3=TCP, >=6=EFA (total_len + triplets). So 4 or 5 args is invalid.
-        Trailing args that break a triplet boundary are also refused."""
+        RDMA_GET: >=5 args (key + at least one triplet). Incomplete triples are refused.
+        RDMA_SET: >=6 args (key + total_len + at least one triplet). Incomplete triples are refused.
+        """
         client = self.server.get_new_client()
-        client.execute_command('BLOB.SET', 'key', b'A' * 4096)
-        for command in ('BLOB.GET key 999',
-                        'BLOB.GET key 999 0',
-                        'BLOB.SET key 4096 999',
-                        'BLOB.SET key 4096 999 0'):
+        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        for command in ('BLOB.RDMA_GET key 999',
+                        'BLOB.RDMA_GET key 999 0',
+                        'BLOB.RDMA_SET key 4096 999',
+                        'BLOB.RDMA_SET key 4096 999 0'):
             name = command.split()[0]
             self.verify_error_response(
                 client, command, f"wrong number of arguments for '{name}' command")
-        # Trailing arg past a well-formed single-address list: 6 args enters the EFA
-        # parser (>=5), but 4 tail fields is not divisible by 3.
+        # 6 args passes the minimum-arity check, but 4 tail fields is not
+        # divisible by 3 — caught by parse_efa_addresses.
         self.verify_error_response(
-            client, 'BLOB.GET key 999 0 4096 7',
+            client, 'BLOB.RDMA_GET key 999 0 4096 7',
             'address args must be rkey, addr, len triples')
 
 
@@ -97,8 +97,8 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
 
     def test_hello_reports_unavailable(self):
         client = self.server.get_new_client()
-        self.verify_error_response(client, f'BLOB.HELLO {PEER_ADDRESS}', 'EFA unavailable on this instance')
-        assert client.execute_command('BLOB.SET', 'key', b'A' * 4096) == b'OK'
+        self.verify_error_response(client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}', 'RDMA provider unavailable on this instance')
+        assert client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096) == b'OK'
 
 # Position-dependent payload for fabric transfers: cycling 0x00..0xFF so that byte-ordering
 # across multi-region splits is verified, not just fill. Must match fabric_target's
@@ -107,7 +107,7 @@ TARGET_LEN = 4096
 PATTERN = bytes(i % 256 for i in range(TARGET_LEN))
 
 # One advertised client memory address: the fabric address to HELLO with, plus the
-# (rkey, addr, len) triple that BLOB.GET / BLOB.SET carries per address.
+# (rkey, addr, len) triple that BLOB.RDMA_GET / BLOB.RDMA_SET carries per address.
 Region = collections.namedtuple('Region', 'address rkey addr len')
 
 
@@ -124,7 +124,7 @@ def address_args(regions):
 
 class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     """Bytes actually move: tests/harness/fabric_target, a passive libfabric peer on tcp loopback, is
-    the client's buffer. Its advertisement is what a real client would carry into BLOB.HELLO and the
+    the client's buffer. Its advertisement is what a real client would carry into BLOB.RDMA_HELLO and the
     per-request rkey / remote address."""
 
     def get_module_args(self, data_dir, direct_io):
@@ -162,9 +162,9 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target()
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.SET', 'key', PATTERN)
-            client.execute_command('BLOB.HELLO', regions[0].address)
-            reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            reply = client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             assert reply == [TARGET_LEN, crc32c.crc32c(PATTERN)]
             # The target exits once every byte of the pattern has landed.
             output = process.communicate(timeout=30)[0]
@@ -176,10 +176,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             assert client.execute_command(
-                'BLOB.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
-            assert client.execute_command('BLOB.GET', 'key') == PATTERN
+                'BLOB.RDMA_SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
         finally:
             process.kill()
 
@@ -190,13 +190,13 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.SET', 'key', payload)
-            client.execute_command('BLOB.HELLO', regions[0].address)
-            reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            client.execute_command('BLOB.TCP_SET', 'key', payload)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            reply = client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
             assert client.execute_command(
-                'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
-            assert client.execute_command('BLOB.GET', 'copy') == payload
+                'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'copy') == payload
         finally:
             process.kill()
 
@@ -215,9 +215,9 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 # Separate registrations, so distinct keys — the multi-rkey path.
                 assert regions[0].rkey != regions[1].rkey
                 client = self.server.get_new_client()
-                client.execute_command('BLOB.SET', 'key', payload)
-                client.execute_command('BLOB.HELLO', regions[0].address)
-                reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
+                client.execute_command('BLOB.TCP_SET', 'key', payload)
+                client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+                reply = client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
                 assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
                 output = process.communicate(timeout=30)[0]
                 assert 'payload verified' in output, output
@@ -227,10 +227,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target('--read', split=[1024, 3072])
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             assert client.execute_command(
-                'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
-            assert client.execute_command('BLOB.GET', 'copy') == payload
+                'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'copy') == payload
         finally:
             process.kill()
 
@@ -244,19 +244,19 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target(split=[1024, 3072])
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             # 4096 bytes of advertised space for a 2048-byte object.
-            client.execute_command('BLOB.SET', 'short', PATTERN[:short_len])
-            assert client.execute_command('BLOB.GET', 'short', *address_args(regions)) == [
+            client.execute_command('BLOB.TCP_SET', 'short', PATTERN[:short_len])
+            assert client.execute_command('BLOB.RDMA_GET', 'short', *address_args(regions)) == [
                 short_len, crc32c.crc32c(PATTERN[:short_len])]
             # The 1024-byte address alone cannot hold a 4096-byte object.
-            client.execute_command('BLOB.SET', 'key', PATTERN)
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
             first = f'{regions[0].rkey} {regions[0].addr} {regions[0].len}'
             self.verify_error_response(
-                client, f'BLOB.GET key {first}',
+                client, f'BLOB.RDMA_GET key {first}',
                 'client address space smaller than object length')
             self.verify_error_response(
-                client, f'BLOB.SET key {TARGET_LEN} {first}',
+                client, f'BLOB.RDMA_SET key {TARGET_LEN} {first}',
                 'client address space smaller than object length')
         finally:
             process.kill()
@@ -282,9 +282,9 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
         process, regions = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             assert client.execute_command(
-                'BLOB.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
+                'BLOB.RDMA_SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
             assert len(self._object_files()) == 1
         finally:
             process.kill()
@@ -311,18 +311,18 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
         process, regions = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             assert client.execute_command(
-                'BLOB.SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
+                'BLOB.RDMA_SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
             # Cold load into dram
             assert client.execute_command(
-                'BLOB.GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
+                'BLOB.RDMA_GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
             # Hot load from dram
             assert client.execute_command(
-                'BLOB.GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
+                'BLOB.RDMA_GET', 'key', *address_args(regions)) == [TARGET_LEN, crc32c.crc32c(payload)]
             # Read back from client and verify literal bytes
             assert client.execute_command(
-                'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
-            assert client.execute_command('BLOB.GET', 'copy') == payload
+                'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'copy') == payload
         finally:
             process.kill()

@@ -18,11 +18,11 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 | Command | Description |
 |---------|-------------|
-| `BLOB.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `BLOB.SET key total_len rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
-| `BLOB.GET key` | Retrieve object over TCP. Returns a bulk string. |
-| `BLOB.GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
-| `BLOB.HELLO client_efa_addr_hex` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `BLOB.TCP_SET key <data>` | Store object (TCP). Data length is implicit. |
+| `BLOB.RDMA_SET key total_len rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
+| `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
+| `BLOB.RDMA_GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
+| `BLOB.RDMA_HELLO client_efa_addr_hex` | Establish RDMA session for GPU-direct DMA transfers. |
 | `BLOB.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
@@ -72,7 +72,7 @@ valkey-server --port 7380 \
 | `reclaim-sample-size` | 5 | Yes | Tiered: cached entries sampled per reclaim; the lowest LFU score goes. Range 1-64. |
 | `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
-| `bench-mode` | no | Yes | BLOB.GET returns integer size instead of bulk data (isolates NVMe throughput). |
+| `bench-mode` | no | Yes | BLOB.TCP_GET returns integer size instead of bulk data (isolates NVMe throughput). |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
 | `fabric-provider` | `Emulated` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
