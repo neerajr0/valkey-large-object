@@ -96,7 +96,7 @@ import torch
 
 ### glide-rdma
 
-New leaf crate to glide-core that contains the components needed for establishing the client host as a RDMA target, registering a block of memory the server will RDMA against, minting a key for the server to access that memory, and building the RESP commands glide-core sends to a valkey server node with the [ValkeyLargeObj module](https://github.com/KarthikSubbarao/ValkeyLargeObj) installed: `BLOB.HELLO`, `BLOB.GET`, and `BLOB.SET`. This crate depends on libfabric to open the fabric endpoint and register memory, but the server performs all of the actual data transfer.
+New leaf crate to glide-core that contains the components needed for establishing the client host as a RDMA target, registering a block of memory the server will RDMA against, minting a key for the server to access that memory, and building the RESP commands glide-core sends to a valkey server node with the [valkey-large-object module](https://github.com/KarthikSubbarao/valkey-large-object) installed: `BLOB.HELLO`, `BLOB.GET`, and `BLOB.SET`. This crate depends on libfabric to open the fabric endpoint and register memory, but the server performs all of the actual data transfer.
 
 - diagram of main glide-rdma components
     
@@ -151,9 +151,9 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 Allows for building `glide-core` with large object RDMA capability using `--features rdma`.
 
-The [server module lists `BLOB.HELLO` as a write command](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
+The [server module lists `BLOB.HELLO` as a write command](https://github.com/KarthikSubbarao/valkey-large-object/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
-RDMA handshakes occur on the first transfer (`BLOB.GET` or `BLOB.SET` command). There should be only one `BLOB.HELLO` per RESP connection. The server module [tracks RDMA sessions by each connection's `client_id`](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/transport/session.rs#L88), so the client should also pair an RDMA session with its own RESP connection. This way, RDMA sessions are kept in sync whenever a RESP connection must be replaced or a new one must be created or removed due to cluster topology changes.
+RDMA handshakes occur on the first transfer (`BLOB.GET` or `BLOB.SET` command). There should be only one `BLOB.HELLO` per RESP connection. The server module [tracks RDMA sessions by each connection's `client_id`](https://github.com/KarthikSubbarao/valkey-large-object/blob/main/src/transport/session.rs#L88), so the client should also pair an RDMA session with its own RESP connection. This way, RDMA sessions are kept in sync whenever a RESP connection must be replaced or a new one must be created or removed due to cluster topology changes.
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 

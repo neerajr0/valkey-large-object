@@ -1,4 +1,4 @@
-# ValkeyLargeObj
+# valkey-large-object
 
 A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) with a tiered DRAM + NVMe architecture, io_uring zero-copy I/O, and optional EFA RDMA transport to GPU memory.
 
@@ -7,7 +7,7 @@ A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) 
 Two operating modes:
 
 - **Dram** (default) — All objects live in a DRAMPool backed by pre-allocated segments with a talc arena allocator. Fastest reads. No NVMe.
-- **Tiered** — Objects persist on NVMe files. DRAMPool acts as a read cache with automatic promotion. io_uring ReadFixed/WriteFixed with O_DIRECT for zero-copy NVMe I/O.
+- **Tiered** — Objects persist on NVMe files. DRAMPool acts as a read cache: objects are promoted on repeat access (`promote-min-hits`) and cold copies are reclaimed by an LFU score when the pool is full. io_uring ReadFixed/WriteFixed with O_DIRECT for zero-copy NVMe I/O.
 
 Storage is organized as segments (contiguous memory regions) managed by pool allocators:
 - **DRAMPool** — Long-lived object cache. Segment memory registered with both io_uring and EFA.
@@ -30,7 +30,7 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 ```bash
 cargo build --release
-# Output: target/release/libvalkey_largeobj.so
+# Output: target/release/libvalkey_large_object.so
 ```
 
 ## Run
@@ -38,7 +38,7 @@ cargo build --release
 ### Dram mode (default)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Dram \
         dram-maxmemory 1gb \
         segment-size 64mb
@@ -47,7 +47,7 @@ valkey-server --port 7380 \
 ### Tiered mode (DRAM cache + NVMe persistence)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
         nvme-dir /mnt/nvme-data \
         dram-maxmemory 1gb \
@@ -67,6 +67,10 @@ valkey-server --port 7380 \
 | `nvme-maxmemory` | 10gb | Yes | Max NVMe disk usage. Min 1mb. |
 | `nvme-staging-size` | 64mb | Immutable | Size of NVMe staging buffer (1 segment). Min 1mb. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
+| `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Range 1-255. |
+| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd reclaim. 0 = no decay. |
+| `reclaim-sample-size` | 5 | Yes | Tiered: cached entries sampled per reclaim; the lowest LFU score goes. Range 1-64. |
+| `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
 | `bench-mode` | no | Yes | BLOB.GET returns integer size instead of bulk data (isolates NVMe throughput). |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |

@@ -992,7 +992,7 @@ reduces the memory available to core. Three startup allocation options exist:
 
 **Option B is the current implementation.** It guarantees the first LO command
 is fast (no registration stall) and simplifies startup logic. Option A is the
-better production choice for deployments where ValkeyLargeObj usage is optional, but it
+better production choice for deployments where valkey-large-object usage is optional, but it
 requires implementing a "0-segment" init path and deferring EFA registration to
 the first command. This is a pre-ship decision point for the feature.
 

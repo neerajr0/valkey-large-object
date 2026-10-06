@@ -26,7 +26,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     Subclasses can override get_module_args() to customize config.
 
     Env vars:
-        MODULE_PATH: path to libvalkey_largeobj.so
+        MODULE_PATH: path to libvalkey_large_object.so
         SERVER_VERSION: valkey-server version directory name
     """
 

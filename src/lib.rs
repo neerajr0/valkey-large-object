@@ -1,4 +1,4 @@
-//! ValkeyLargeObj: Large Object Module + Transport Crate
+//! valkey-large-object: Large Object Module + Transport Crate
 //!
 //! Architecture (from interface doc):
 //!   Data Type (commands, LoValue, keyspace)
@@ -111,6 +111,20 @@ lazy_static::lazy_static! {
     /// entirely: no background reads, and the INFO section never appears.
     /// Immutable after load — the poller either starts at init or not at all.
     static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
+
+    /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
+    static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
+
+    /// How many misses an object must accumulate in the admission filter before a GET
+    /// promotes it into DRAMPool. Default: 2.
+    static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
+
+    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
+    static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
+
+    /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
+    /// the lowest LFU score among samples. 0 means unlimited.
+    static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(1024);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
@@ -250,6 +264,22 @@ pub fn scaling_poll_ms() -> u64 {
 
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn tiered_decay_time() -> u64 {
+    CFG_TIERED_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn promote_min_hits() -> u8 {
+    CFG_PROMOTE_MIN_HITS.load(std::sync::atomic::Ordering::Relaxed) as u8
+}
+
+pub fn reclaim_sample_size() -> usize {
+    CFG_RECLAIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_cached_fds() -> usize {
+    CFG_MAX_CACHED_FDS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn scaling_expand_watermark() -> f64 {
@@ -681,6 +711,14 @@ valkey_module! {
             ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, 1, 0, 65_535,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, 2, 1, 255,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, 5, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, 1024, 0, 1_048_576,
              ConfigurationFlags::DEFAULT, None, None],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
              ConfigurationFlags::IMMUTABLE, None, None],

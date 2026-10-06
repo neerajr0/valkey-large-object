@@ -1,5 +1,5 @@
 #!/bin/bash
-# ValkeyLargeObj Benchmark Script
+# valkey-large-object Benchmark Script
 #
 # Cycles through operating modes and object sizes, measuring BLOB.GET throughput.
 #
@@ -119,7 +119,7 @@ for m in $MODES_STR; do
     fi
 done
 
-MODULE_SO="${MODULE_SO:-$(dirname "$0")/target/release/libvalkey_largeobj.so}"
+MODULE_SO="${MODULE_SO:-$(dirname "$0")/target/release/libvalkey_large_object.so}"
 
 # Verify nvme-dir is NOT on the root disk (common mistake: /data falls through to /)
 if [ -n "$NVME_DIR" ]; then
@@ -224,7 +224,7 @@ run_bench_pass() {
 # ─── Header ───────────────────────────────────────────────────────────────────
 
 echo "=============================================="
-echo "ValkeyLargeObj Benchmark"
+echo "valkey-large-object Benchmark"
 echo "=============================================="
 echo "Port:           $PORT"
 echo "Modes:          $MODES_STR"
