@@ -1,6 +1,6 @@
 import os
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
@@ -191,6 +191,34 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         """Dram mode never starts the SMART log poller"""
         client = self.server.get_new_client()
         assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
+
+    # ─── INFO largeobj tests ───────────────────────────────────────────────
+
+    def test_info_every_get_is_a_dram_hit(self):
+        """Dram mode serves every GET from DRAMPool; a missing key is neither a hit nor a miss."""
+        client = self.server.get_new_client()
+        payload = b'H' * 4096
+        client.execute_command('BLOB.SET', 'hitkey', payload)
+        for _ in range(3):
+            assert client.execute_command('BLOB.GET', 'hitkey') == payload
+        assert client.execute_command('BLOB.GET', 'nokey') is None
+        info = info_largeobj(client)
+        assert info['largeobj_dram_hits_total'] == 3
+        assert info['largeobj_dram_misses_total'] == 0
+        assert info['largeobj_cached_objects'] == 1
+
+    def test_info_sections_by_mode(self):
+        """The NVMe sections are Tiered-only. The EFA section is always present, zeroed
+        while nothing has moved over EFA."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.SET', 'key', b'A' * 4096)
+        assert client.execute_command('BLOB.GET', 'key') == b'A' * 4096
+        assert client.info('largeobj_nvme') == {}
+        assert client.info('largeobj_nvme_staging') == {}
+        efa = client.info('largeobj_efa')
+        for field in ('sessions', 'read_bytes_total', 'write_bytes_total',
+                      'reads_total', 'read_usec_total', 'writes_total', 'write_usec_total'):
+            assert efa[f'largeobj_efa_{field}'] == 0, field
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 

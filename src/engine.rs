@@ -167,6 +167,8 @@ enum CommitOutcome {
 /// (with `file: Some`/`None`), does any accounting BEFORE calling, and handles its
 /// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
 /// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
+/// The one exception is INFO `live_objects`, counted here while the lock is held so
+/// that a DEL can't free the value before it's counted.
 fn commit_lo_value(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     key_name: &[u8],
@@ -187,6 +189,7 @@ fn commit_lo_value(
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    crate::data_type::record_attached();
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
 }
@@ -241,6 +244,7 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            info::DRAM_HITS.fetch_add(1, Ordering::Relaxed);
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
@@ -277,6 +281,7 @@ fn cmd_get_dram_efa(
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Serve from DRAMPool.
+            info::DRAM_HITS.fetch_add(1, Ordering::Relaxed);
             cmd_get_from_dram(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
             );
@@ -306,6 +311,7 @@ fn cmd_get_tiered(
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
+            info::DRAM_HITS.fetch_add(1, Ordering::Relaxed);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             cmd_get_from_dram(
                 dram_pool,
@@ -322,6 +328,8 @@ fn cmd_get_tiered(
         // TODO: coalesce — register as waiter on this ObjectContext.
         // For now: fall through to NVMe read.
     }
+    // From here the GET goes to NVMe, by promotion or a streamed read.
+    info::DRAM_MISSES.fetch_add(1, Ordering::Relaxed);
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // If pool has space and object is eligible, read directly into DRAMPool.
     if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
@@ -645,6 +653,7 @@ fn cmd_set_dram_tcp(
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    crate::data_type::record_attached();
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     VALKEY_OK
 }
