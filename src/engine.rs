@@ -322,6 +322,7 @@ fn cmd_get_tiered(
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     let (transport, blocked_client) = match try_serve_dram_hit(
         dram_pool,
+        cache,
         &object_id,
         obj_len,
         crc32c,
@@ -337,7 +338,7 @@ fn cmd_get_tiered(
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
     // Skip both if another GET is already promoting this OID (Filling).
-    let promoted = if !filling && cache.admission.admit(object_id, obj_len) {
+    let promoted = if cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
@@ -409,6 +410,7 @@ fn cmd_get_tiered(
     // doing a redundant NVMe read.
     let (transport, blocked_client) = match try_serve_dram_hit(
         dram_pool,
+        cache,
         &object_id,
         obj_len,
         crc32c,
@@ -1072,8 +1074,10 @@ fn cmd_get_from_dram(
 /// the request was served (Ready → DRAM serve, Filling → coalesced waiter).
 /// Returns Some((transport, blocked_client)) if the object is not in the map,
 /// giving ownership back to the caller for the next fallback path.
+#[allow(clippy::too_many_arguments)]
 fn try_serve_dram_hit(
     dram_pool: &'static storage::DRAMPool,
+    cache: &storage::cache_policy::TieredCache,
     object_id: &ObjectId,
     obj_len: u64,
     crc32c: Crc,
@@ -1086,6 +1090,7 @@ fn try_serve_dram_hit(
         None => return Some((transport, blocked_client)), // cache miss — caller continues
     };
     if obj_ctx.is_ready() {
+        cache.stats.record_hit(&obj_ctx.stats);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         cmd_get_from_dram(
             dram_pool,
