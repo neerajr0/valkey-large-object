@@ -848,28 +848,28 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', 'basic_key') == payload
         assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'nvme'
         after1 = dram()
-        assert after1['largeobj_cache_misses_total'] == 1
-        assert after1['largeobj_admission_rejects_total'] == 1
-        assert after1['largeobj_promotions_total'] == 0
+        assert after1['largeobj_cache_misses'] == 1
+        assert after1['largeobj_admission_rejects'] == 1
+        assert after1['largeobj_promotions'] == 0
         assert after1['largeobj_cached_objects'] == 0
 
         # GET 2: second touch, promoted. mark_ready runs before the reply.
         assert client.execute_command('BLOB.GET', 'basic_key') == payload
         assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'dram'
         after2 = dram()
-        assert after2['largeobj_cache_misses_total'] == 2
-        assert after2['largeobj_admission_rejects_total'] == 1
-        assert after2['largeobj_promotions_total'] == 1
+        assert after2['largeobj_cache_misses'] == 2
+        assert after2['largeobj_admission_rejects'] == 1
+        assert after2['largeobj_promotions'] == 1
         assert after2['largeobj_cached_objects'] == 1
-        assert after2['largeobj_cache_hits_total'] == 0
+        assert after2['largeobj_cache_hits'] == 0
 
         # GET 3: plain hit, nothing on the miss side moves.
         assert client.execute_command('BLOB.GET', 'basic_key') == payload
         after3 = dram()
-        assert after3['largeobj_cache_hits_total'] == 1
-        assert after3['largeobj_cache_misses_total'] == 2
-        assert after3['largeobj_admission_rejects_total'] == 1
-        assert after3['largeobj_promotions_total'] == 1
+        assert after3['largeobj_cache_hits'] == 1
+        assert after3['largeobj_cache_misses'] == 2
+        assert after3['largeobj_admission_rejects'] == 1
+        assert after3['largeobj_promotions'] == 1
 
         # Oversize: three misses, no rejects, no promotion.
         client.execute_command('CONFIG', 'SET', 'largeobj.max-promote-size', '4096')
@@ -878,9 +878,9 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         for _ in range(3):
             assert client.execute_command('BLOB.GET', 'big_key') == big
         after4 = dram()
-        assert after4['largeobj_cache_misses_total'] == 5
-        assert after4['largeobj_admission_rejects_total'] == 1
-        assert after4['largeobj_promotions_total'] == 1
+        assert after4['largeobj_cache_misses'] == 5
+        assert after4['largeobj_admission_rejects'] == 1
+        assert after4['largeobj_promotions'] == 1
 
     def test_promote_min_hits_runtime(self):
         """promote-min-hits is runtime mutable: 1 restores first-GET promotion,
@@ -890,10 +890,10 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '1')
         client.execute_command('BLOB.SET', 'one_key', payload)
-        rejects = client.info('largeobj_dram')['largeobj_admission_rejects_total']
+        rejects = client.info('largeobj_dram')['largeobj_admission_rejects']
         assert client.execute_command('BLOB.GET', 'one_key') == payload
         assert client.execute_command('BLOB.INFO', 'one_key', 'TIER') == b'dram'
-        assert client.info('largeobj_dram')['largeobj_admission_rejects_total'] == rejects
+        assert client.info('largeobj_dram')['largeobj_admission_rejects'] == rejects
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '3')
         client.execute_command('BLOB.SET', 'three_key', payload)
@@ -971,7 +971,7 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_demotions'] == 1
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_dram_live_segments'] == 1
-        assert info['largeobj_scaling_expand_total'] == 0
+        assert info['largeobj_scaling_expands'] == 0
         assert client.execute_command('BLOB.INFO', hot, 'TIER') == b'dram'
         assert client.execute_command('BLOB.INFO', 'ev_new', 'TIER') == b'dram'
         tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
@@ -1023,7 +1023,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
             self._promote(client, k, k.encode() * self.OBJ)
         info = client.info('largeobj_dram')
         assert info['largeobj_dram_live_segments'] == 2
-        assert info['largeobj_scaling_expand_total'] == 1
+        assert info['largeobj_scaling_expands'] == 1
         assert info['largeobj_demotions'] == 0
 
         # No more growth. Segment 1 (D, 256 KiB) is the less loaded one, so E,
@@ -1048,7 +1048,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_demotions'] == 1, "no over-reclaim"
         assert info['largeobj_cached_objects'] == 7
         assert info['largeobj_dram_live_segments'] == 2
-        assert info['largeobj_scaling_expand_total'] == 1
+        assert info['largeobj_scaling_expands'] == 1
         assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'nvme'
         for k in ('A', 'B', 'D', 'E', 'H', 'F'):
             assert client.execute_command('BLOB.INFO', k, 'TIER') == b'dram', k

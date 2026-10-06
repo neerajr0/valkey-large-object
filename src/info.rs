@@ -56,10 +56,13 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "num_objects",
             LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
         )?
-        .field("pending_reclaim", storage::reclaim::lock().len() as i64)?
         .field(
-            "reclaim_count",
-            storage::reclaim::RECLAIM_COUNT.load(Ordering::Relaxed) as i64,
+            "pending_reclaims",
+            storage::reclaim::RECLAIM_LIST.len() as i64,
+        )?
+        .field(
+            "reclaims",
+            storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -109,30 +112,33 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     if let Some(cache) = &dram.cache {
         section = section
             .field(
-                "cache_hits_total",
+                "cache_hits",
                 cache.stats.hits.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "cache_misses_total",
+                "cache_misses",
                 cache.stats.misses.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "promotions_total",
+                "promotions",
                 cache.stats.promotions.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "admission_rejects_total",
+                "admission_rejects",
                 cache.admission.rejects.load(Ordering::Relaxed) as i64,
             )?
-            .field("demotions", dram.demotions.load(Ordering::Relaxed) as i64)?;
+            .field(
+                "demotions",
+                cache.stats.demotions.load(Ordering::Relaxed) as i64,
+            )?;
     }
     section
         .field(
-            "scaling_expand_total",
+            "scaling_expands",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
-            "scaling_shrink_total",
+            "scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?

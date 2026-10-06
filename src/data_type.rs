@@ -116,8 +116,8 @@ impl LoValue {
 
     /// On the reclaim list: memory already freed, the key reads as missing
     /// until the scaling cron deletes it. Check before touching the DRAMPool.
-    pub fn is_reclaimed(&self) -> bool {
-        crate::storage::reclaim::contains(&self.object_id)
+    pub fn reclaim_in_progress(&self) -> bool {
+        crate::storage::reclaim::RECLAIM_LIST.contains(&self.object_id)
     }
 
     /// Where a GET issued right now would be served from:
@@ -147,7 +147,7 @@ impl LoValue {
     /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
     /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
     pub fn create_copy(&self) -> Option<LoValue> {
-        if self.is_reclaimed() {
+        if self.reclaim_in_progress() {
             return None;
         }
         match crate::operating_mode() {

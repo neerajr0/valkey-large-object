@@ -90,9 +90,9 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Cached copies demoted (dropped from DRAM, NVMe copy kept) by
-    /// `make_room_for` to free space. Tiered only.
-    pub demotions: AtomicU64,
+    /// Completed reclaims: objects whose memory a background job freed and
+    /// whose key is now gone (Dram shrink today; other reclaims later).
+    pub reclaims: AtomicU64,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.
     pub cache: Option<TieredCache>,
@@ -105,7 +105,7 @@ impl DRAMPool {
             objects: RwLock::new(ObjectMaps::default()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            demotions: AtomicU64::new(0),
+            reclaims: AtomicU64::new(0),
             cache,
         }
     }
@@ -225,7 +225,7 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable")
             .remove(oid);
-        super::reclaim::remove(oid);
+        super::reclaim::RECLAIM_LIST.remove(oid);
         removed
     }
 
@@ -347,7 +347,9 @@ impl DRAMPool {
             }
             return None;
         }
-        self.demotions
+        self.tiered_cache()
+            .stats
+            .demotions
             .fetch_add(victims.len() as u64, Ordering::Relaxed);
         Some(victims)
     }
@@ -447,7 +449,7 @@ impl DRAMPool {
         // either removed the object first (not seen, not listed) or blocks
         // until we are done and then clears the oid we listed.
         let dram = crate::operating_mode() == crate::OperatingMode::Dram;
-        let mut reclaim = super::reclaim::lock();
+        let mut reclaim = super::reclaim::RECLAIM_LIST.lock();
         let removed = self
             .objects
             .write()
@@ -531,7 +533,7 @@ mod tests {
             p.contains_object(&ObjectId(10)),
             "other segment is untouched"
         );
-        assert_eq!(p.demotions.load(Ordering::Relaxed), 1);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 1);
         drop(victims);
         assert_index_consistent(&p);
 
@@ -551,7 +553,7 @@ mod tests {
         let victims = p.reclaim_in(0, 2 * BUF as usize, 16).unwrap();
         assert_eq!(victims.len(), 2, "no over-reclaim past the first fit");
         assert_eq!(p.object_count(), 2);
-        assert_eq!(p.demotions.load(Ordering::Relaxed), 2);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -566,7 +568,7 @@ mod tests {
         // The victim cap stops short of 3 BUF.
         assert!(p.reclaim_in(0, 3 * BUF as usize, 2).is_none());
         assert_eq!(p.object_count(), 8);
-        assert_eq!(p.demotions.load(Ordering::Relaxed), 0);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 0);
         assert_index_consistent(&p);
 
         // Exactly what segment 0 holds goes through, and only segment 0 pays.
