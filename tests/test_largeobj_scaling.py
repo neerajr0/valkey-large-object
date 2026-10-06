@@ -4,6 +4,7 @@ Integration tests for DRAMPool expand/shrink scaling behavior.
 Tests cover:
   - Dram mode: reactive expand when segment fills
   - Dram mode: expansion gated by server maxmemory watermark
+  - Dram mode: shrink deletes the victim segment's keys and frees memory
   - Tiered mode: reactive expand on DRAMPool fill
   - Tiered mode: shrink evicts cached segment but NVMe copy survives
 """
@@ -12,6 +13,8 @@ import binascii
 import os
 import subprocess
 import time
+
+import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
@@ -275,6 +278,120 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             pass
         # Restore uncapped for teardown safety.
         client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+
+
+class TestDramShrink(ValkeyLargeObjTestCaseBase):
+    """Dram mode: under server memory pressure the scaling cron drains a segment,
+    deletes the keys whose objects live on it, and releases it — so used_memory
+    drops and core data types can be written again.
+    """
+
+    SHRINK_TIMEOUT_S = 20
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" segment-size 1048576"
+            f" max-object-size 983040"
+            f" scaling-poll-ms 1000"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_shrink_deletes_victim_keys_and_frees_memory(self):
+        client = self.server.get_new_client()
+        mem_info = client.execute_command('INFO', 'memory')
+        assert int(mem_info.get(b'maxmemory') or mem_info.get('maxmemory', 0)) == 0
+
+        # 900KB objects in 1MB segments: one object per segment.
+        payloads = {f'dshrink_{i}': bytes([i]) * (900 * 1024) for i in range(4)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+        # A non-LargeObject key: Dram shrink only runs when one exists.
+        assert client.set('core_seed', 'v') is True
+        live_before = info_largeobj(client)['largeobj_dram_live_segments']
+        shrink_before = info_largeobj(client).get('largeobj_scaling_shrink_total', 0)
+        reclaim_before = info_largeobj(client)['largeobj_reclaim_count']
+
+        # Pressure: noeviction so core deletes nothing; only the module shrink can
+        # free memory. maxmemory = used * 0.85 puts the ratio (~1.18) above the watermark.
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        mem_info = client.execute_command('INFO', 'memory')
+        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+        with pytest.raises(ResponseError):
+            client.execute_command('SET', 'core_key', 'v')
+
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_scaling_shrink_total', 0) > shrink_before,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+        # Core writes succeed once the module has released enough segments.
+        def _core_set_ok():
+            try:
+                return client.set('core_key', 'v') is True
+            except ResponseError:
+                return False
+        wait_for_true(_core_set_ok, timeout=self.SHRINK_TIMEOUT_S)
+        wait_for_true(
+            lambda: info_largeobj(client).get('largeobj_draining_segments', 1) == 0,
+            timeout=self.SHRINK_TIMEOUT_S,
+        )
+
+        info = info_largeobj(client)
+        shrinks = info['largeobj_scaling_shrink_total'] - shrink_before
+        assert info['largeobj_dram_live_segments'] == live_before - shrinks
+        # One object per segment: each shrink evicts exactly one key. Memory frees
+        # at shrink time; the cron deletes the key afterwards.
+        def _surviving():
+            return [k for k in payloads if client.execute_command('EXISTS', k) == 1]
+        wait_for_true(lambda: len(_surviving()) == len(payloads) - shrinks,
+                      timeout=self.SHRINK_TIMEOUT_S)
+        surviving = _surviving()
+        info = info_largeobj(client)
+        assert info['largeobj_pending_reclaim'] == 0
+        assert info['largeobj_reclaim_count'] - reclaim_before == shrinks
+        for key in surviving:
+            assert client.execute_command('BLOB.GET', key) == payloads[key], f"{key} corrupted"
+        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+
+    def test_no_shrink_when_only_large_objects(self):
+        """With no non-LargeObject keys, shrink would only delete LargeObjects
+        with nothing to make room for, so it must not fire."""
+        client = self.server.get_new_client()
+        payloads = {f'pure_{i}': bytes([i]) * (900 * 1024) for i in range(4)}
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+        assert info_largeobj(client)['largeobj_num_objects'] == client.dbsize()
+        shrink_before = info_largeobj(client).get('largeobj_scaling_shrink_total', 0)
+
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        mem_info = client.execute_command('INFO', 'memory')
+        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+        time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
+
+        assert info_largeobj(client).get('largeobj_scaling_shrink_total', 0) == shrink_before
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.GET', key) == payload
+        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+
+    def test_num_objects_tracks_keyspace(self):
+        """num_objects follows SET, overwrite, COPY and DEL."""
+        client = self.server.get_new_client()
+        count = lambda: info_largeobj(client)['largeobj_num_objects']
+        start = count()
+        client.execute_command('BLOB.SET', 'cnt_a', b'A' * 1024)
+        assert count() == start + 1
+        client.execute_command('BLOB.SET', 'cnt_a', b'B' * 1024)  # overwrite
+        wait_for_true(lambda: count() == start + 1)
+        client.execute_command('COPY', 'cnt_a', 'cnt_b')
+        assert count() == start + 2
+        client.set('cnt_core', 'v')
+        assert count() == start + 2
+        client.delete('cnt_a', 'cnt_b')
+        wait_for_true(lambda: count() == start)  # lo_free runs async
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────

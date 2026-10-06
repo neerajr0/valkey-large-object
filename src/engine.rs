@@ -174,6 +174,14 @@ fn commit_lo_value(
     lo_value: LoValue,
 ) -> Result<CommitOutcome, ValkeyError> {
     let ctx = thread_ctx.lock();
+    // Dram mode: a shrink between insert and this commit removed the object
+    // (or it landed on a draining segment). Never attach a key to an object
+    // that isn't served: Dram GET relies on LoValue => ObjectContext.
+    if crate::operating_mode() == OperatingMode::Dram
+        && storage::get_dram_pool().get_object(&object_id).is_none()
+    {
+        return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+    }
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
@@ -629,12 +637,7 @@ fn cmd_set_dram_tcp(
     let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
     dram_pool.insert_object(object_id, obj_ctx);
     let key = ctx.open_key_writable(key_name);
-    let lo_value = LoValue {
-        object_id,
-        len: obj_len,
-        crc32c: crc,
-        file: None,
-    };
+    let lo_value = LoValue::new(object_id, obj_len, crc, None);
     let event = if key.is_empty() {
         EVENT_CREATE
     } else {
@@ -725,12 +728,7 @@ fn cmd_set_dram_efa(
                 // ObjectContext::Drop returns buffers to DRAMPool automatically.
                 let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
                 dram_pool.insert_object(object_id, obj_ctx);
-                let lo_value = LoValue {
-                    object_id,
-                    len: obj_len,
-                    crc32c: crc,
-                    file: None,
-                };
+                let lo_value = LoValue::new(object_id, obj_len, crc, None);
                 match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
                     Ok(CommitOutcome::ValueSet) => {
                         thread_ctx.reply(VALKEY_OK);
@@ -945,12 +943,7 @@ async fn cmd_set_tiered_run(
          reserved {} B — write path and accounting have diverged",
         object_id, disk_len
     );
-    let lo_value = LoValue {
-        object_id,
-        len: obj_len,
-        crc32c: crc,
-        file: Some(object_file),
-    };
+    let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
     match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
         Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);

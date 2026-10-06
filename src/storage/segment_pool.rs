@@ -739,15 +739,12 @@ impl SegmentPool {
         }
     }
 
-    /// Returns true if any buffer in `bufs` lives in a currently-draining segment.
-    pub fn is_any_buffer_draining(&self, bufs: &[SegmentBuffer]) -> bool {
+    /// Returns true if segment `seg_idx` is draining.
+    pub fn is_segment_draining(&self, seg_idx: u16) -> bool {
         let st = self.state.lock().expect("state lock unavailable");
-        bufs.iter().any(|b| {
-            st.slots[b.segment_idx as usize]
-                .as_ref()
-                .map(|seg| seg.draining.load(std::sync::atomic::Ordering::Acquire))
-                .unwrap_or(false)
-        })
+        st.slots[seg_idx as usize]
+            .as_ref()
+            .is_some_and(|seg| seg.draining.load(std::sync::atomic::Ordering::Acquire))
     }
 }
 

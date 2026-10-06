@@ -22,6 +22,14 @@ pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+// ─── Core Metrics ────────────────────────────────────────────────────────────
+
+/// Live `LoValue` instances: +1 in `LoValue::new`, −1 in its `Drop`. Equals the
+/// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
+/// Compared against the total key count to tell whether the keyspace holds any
+/// non-LargeObject keys.
+pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -30,10 +38,30 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 }
 
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
+    core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
+    Ok(())
+}
+
+/// Module-wide stats, independent of operating mode (same shape as valkey-bloom's
+/// `bloom_core_metrics`).
+fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("core_metrics")
+        .field(
+            "num_objects",
+            LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
+        )?
+        .field("pending_reclaim", storage::reclaim::lock().len() as i64)?
+        .field(
+            "reclaim_count",
+            storage::reclaim::RECLAIM_COUNT.load(Ordering::Relaxed) as i64,
+        )?
+        .build_section()?
+        .build_info()?;
     Ok(())
 }
 

@@ -6,10 +6,11 @@
 //! by the scaling cron when utilization exceeds the expand watermark.
 //! Adds one `segment-size` segment via `try_expand()`.
 //!
-//! Shrink (Tiered-mode only): triggered proactively by the scaling cron when
-//! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks
-//! it draining, and removes its cached objects from the HashMap so GET handlers
-//! fall back to NVMe. The segment releases on the next cron tick when refcount hits 0.
+//! Shrink: triggered proactively by the scaling cron when `used_memory`
+//! approaches `maxmemory`. Picks the least-used segment, marks it draining, and
+//! removes its objects so the segment releases once in-flight readers drop.
+//! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
+//! list; their keys read as missing until the cron deletes them.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,7 +116,7 @@ impl DRAMPool {
     /// Lookup a cached object.
     ///
     /// Returns None if the object is not cached, or if its segment is draining
-    /// (caller should fall back to NVMe to prevent new Arc refs on a draining segment).
+    /// (no new Arc refs on a draining segment, so the drain can finish).
     pub fn get_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let arc = self
             .objects
@@ -124,10 +125,7 @@ impl DRAMPool {
             .get(oid)
             .cloned()?;
 
-        // If any buffer of this object lives in a draining segment, refuse the
-        // Arc — forces the caller to NVMe and lets the refcount drain to zero.
-        let is_draining = self.pool.is_any_buffer_draining(&arc.buffers);
-        if is_draining {
+        if self.pool.is_segment_draining(arc.buffers[0].segment_idx) {
             return None;
         }
         Some(arc)
@@ -141,12 +139,17 @@ impl DRAMPool {
             .insert(oid, ctx);
     }
 
-    /// Remove an ObjectContext (free callback / eviction).
+    /// Remove an ObjectContext (free callback / eviction). Also clears `oid`
+    /// from the reclaim list: its key is gone. Map first, then list: a shrink
+    /// that runs in between no longer sees the object, so cannot list it.
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        self.objects
+        let removed = self
+            .objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .remove(oid)
+            .remove(oid);
+        super::reclaim::remove(oid);
+        removed
     }
 
     /// Check if object exists (coalesce check — is promotion in progress?).
@@ -282,38 +285,36 @@ impl DRAMPool {
     ///
     /// Victim selection: the non-draining segment with the fewest allocated bytes.
     /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
-    /// This minimises NVMe fallback work after eviction — clients re-read the least data.
     ///
-    /// **Tiered mode:** always safe — data persists on NVMe; GETs fall back.
-    /// **Dram mode:** only allowed when the victim segment has zero allocated bytes.
-    ///   If it has live data, shrink is skipped — there is no NVMe fallback.
+    /// Removing the objects drops the map's Arcs, so the segment releases as soon
+    /// as in-flight readers drop theirs.
+    /// - **Tiered:** data persists on NVMe; GETs fall back.
+    /// - **Dram:** the oids go on the reclaim list. Their keys read as missing
+    ///   until the scaling cron deletes them.
     ///
     /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
-        let (victim_idx, victim_bytes) = match self.pool.find_shrink_victim() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        if crate::operating_mode() == crate::OperatingMode::Dram && victim_bytes > 0 {
-            // Can't evict — data would be lost with no NVMe fallback.
-            // No unmark needed: segment was never marked draining.
+        let Some((victim_idx, _)) = self.pool.find_shrink_victim() else {
             return false;
-        }
-
-        // Commit: mark draining only now that we know eviction is safe.
+        };
         self.pool.mark_segment_draining(victim_idx);
 
-        // Remove cached objects on the victim segment from the HashMap.
-        // Tiered: data persists on NVMe. Dram: verified empty above.
+        // Hold the reclaim list across the map scan. A concurrent `remove_object`
+        // either removed the object first (not seen, not listed) or blocks
+        // until we are done and then clears the oid we listed.
+        let dram = crate::operating_mode() == crate::OperatingMode::Dram;
+        let mut reclaim = super::reclaim::lock();
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .retain(|_oid, ctx| {
-                ctx.buffers
-                    .iter()
-                    .all(|b| b.segment_idx as usize != victim_idx)
+            .retain(|oid, ctx| {
+                let keep = ctx.buffers[0].segment_idx as usize != victim_idx;
+                if !keep && dram {
+                    reclaim.insert(*oid);
+                }
+                keep
             });
+        drop(reclaim);
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
