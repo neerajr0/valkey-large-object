@@ -251,7 +251,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.INFO', 'badkey', 'NOTREAL')
             assert False, "Expected wrong information field error"
         except ResponseError as e:
-            assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'invalid information field' in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
