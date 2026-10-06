@@ -263,7 +263,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.TCP_SET', 'nvme_cap_3', payload)
             assert False, "Expected capacity exceeded error from nvme-maxmemory"
         except ResponseError as e:
-            assert 'nvme disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
 
     # ─── DEL semantics ────────────────────────────────────────────────────
 
@@ -387,7 +387,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             err = str(e).lower()
             assert 'max object size' in err, f"Unexpected error: {e}"
-            assert 'nvme' not in err, f"Should not hit NVMe error: {e}"
+            assert 'disk capacity' not in err, f"Should not hit disk capacity error: {e}"
         # Rejected SET must not leave a .dat file or phantom key.
         assert self._dat_count() == 0
         assert client.execute_command('DBSIZE') == 0

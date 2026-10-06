@@ -33,15 +33,15 @@ define_errors! {
     ERR_INVALID_INFO_FIELD => "ERR invalid information value",
 
     // Storage/Engine Errors
-    ERR_NVME_READ => "ERR NVMe read",
-    ERR_NVME_WRITE => "ERR NVMe write",
+    ERR_DISK_READ => "ERR disk read failed",
+    ERR_DISK_WRITE => "ERR disk write failed",
     ERR_RDMA_WRITE => "ERR RDMA write",
     ERR_RDMA_READ => "ERR RDMA read",
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
-    ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
-    ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
+    ERR_INSUFFICIENT_DISK_BUFFERS => "ERR disk staging buffer pool exhausted",
+    ERR_DISK_CAPACITY_EXCEEDED => "ERR disk capacity exceeded",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors

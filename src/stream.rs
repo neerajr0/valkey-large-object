@@ -362,10 +362,10 @@ pub(crate) fn reply_stream_err(
 ) {
     use StreamError::*;
     let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
-        NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_NVME_READ),
+        NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_DISK_READ),
         NvmeWrite => (
             &crate::info::NVME_WRITE_ERRORS,
-            crate::errors::ERR_NVME_WRITE,
+            crate::errors::ERR_DISK_WRITE,
         ),
         EfaRead => (&crate::info::RDMA_READ_ERRORS, crate::errors::ERR_RDMA_READ),
         EfaWrite => (&crate::info::RDMA_WRITE_ERRORS, crate::errors::ERR_RDMA_WRITE),

@@ -349,7 +349,7 @@ fn cmd_get_tiered(
                 reply_err(
                     &thread_ctx,
                     &info::NVME_READ_ERRORS,
-                    ValkeyError::Str(errors::ERR_NVME_READ),
+                    ValkeyError::Str(errors::ERR_DISK_READ),
                 );
                 return;
             }
@@ -406,7 +406,7 @@ fn cmd_get_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                ValkeyError::Str(errors::ERR_INSUFFICIENT_DISK_BUFFERS),
             );
             return;
         }
@@ -420,7 +420,7 @@ fn cmd_get_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_READ),
+                ValkeyError::Str(errors::ERR_DISK_READ),
             );
             return;
         }
@@ -785,7 +785,7 @@ fn cmd_set_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                ValkeyError::Str(errors::ERR_INSUFFICIENT_DISK_BUFFERS),
             );
             return;
         }
@@ -873,7 +873,7 @@ async fn cmd_set_tiered_run(
         reply_err(
             &thread_ctx,
             &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
+            ValkeyError::Str(errors::ERR_DISK_CAPACITY_EXCEEDED),
         );
         return;
     }
@@ -887,7 +887,7 @@ async fn cmd_set_tiered_run(
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_WRITE),
+                ValkeyError::Str(errors::ERR_DISK_WRITE),
             );
             return;
         }
