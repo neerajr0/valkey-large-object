@@ -419,11 +419,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         All should return correct data."""
         client = self.server.get_new_client()
         payload = os.urandom(16384)
-        client.execute_command('LO.SET', 'pipe_key', payload)
+        client.execute_command('BLOB.SET', 'pipe_key', payload)
         pipe = client.pipeline(transaction=False)
         num_gets = 10
         for _ in range(num_gets):
-            pipe.execute_command('LO.GET', 'pipe_key')
+            pipe.execute_command('BLOB.GET', 'pipe_key')
         results = pipe.execute()
         for i, r in enumerate(results):
             assert r == payload, f"Pipeline GET {i} data mismatch"
@@ -440,7 +440,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         """
         client = self.server.get_new_client()
         payload = os.urandom(32768)
-        client.execute_command('LO.SET', 'det_coal_key', payload)
+        client.execute_command('BLOB.SET', 'det_coal_key', payload)
         # Enable test hook: pause promotion for 2s before NVMe reads.
         client.execute_command(
             'CONFIG', 'SET', 'largeobj.test-pause-during-promotion-ms', '2000'
@@ -454,7 +454,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         def reader(idx):
             try:
                 c = self.server.get_new_client()
-                results[idx] = c.execute_command('LO.GET', 'det_coal_key')
+                results[idx] = c.execute_command('BLOB.GET', 'det_coal_key')
             except Exception as e:
                 errors[idx] = e
         # Fire all readers — the first becomes the leader, the rest arrive
@@ -494,9 +494,9 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         depending on timing. Subsequent GET returns nil."""
         client = self.server.get_new_client()
         payload = os.urandom(32768)
-        client.execute_command('LO.SET', 'delprom_key', payload)
+        client.execute_command('BLOB.SET', 'delprom_key', payload)
         pipe = client.pipeline(transaction=False)
-        pipe.execute_command('LO.GET', 'delprom_key')
+        pipe.execute_command('BLOB.GET', 'delprom_key')
         pipe.execute_command('DEL', 'delprom_key')
         results = pipe.execute()
         # GET result: either the payload (promotion completed before DEL) or an
@@ -507,7 +507,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # DEL result: 1 (key existed) or 0 (already gone).
         wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         # After both complete, key should be gone.
-        assert client.execute_command('LO.GET', 'delprom_key') is None
+        assert client.execute_command('BLOB.GET', 'delprom_key') is None
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
