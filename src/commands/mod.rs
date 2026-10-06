@@ -264,7 +264,7 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let key = ctx.open_key(&args[1]);
     let value = match key.get_value::<LoValue>(&LO_TYPE)? {
         Some(v) => v,
-        None => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+        None => return Ok(ValkeyValue::Null),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);

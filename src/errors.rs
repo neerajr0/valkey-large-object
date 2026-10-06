@@ -30,7 +30,6 @@ define_errors! {
     ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.RDMA_HELLO first)",
     ERR_DMA_SESSION_EXISTS => "ERR DMA session already established",
     ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
-    ERR_NOT_FOUND => "ERR not found",
     ERR_INVALID_INFO_FIELD => "ERR invalid information value",
 
     // Storage/Engine Errors
