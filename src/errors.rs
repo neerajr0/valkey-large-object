@@ -25,7 +25,6 @@ define_errors! {
     ERR_INVALID_RKEY => "ERR invalid rkey",
     ERR_INVALID_REMOTE_ADDR => "ERR invalid memory address",
     ERR_INVALID_ADDR_LEN => "ERR invalid memory address len",
-    ERR_INSUFFICIENT_ADDR_SPACE => "ERR client address space smaller than object length",
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.RDMA_HELLO first)",

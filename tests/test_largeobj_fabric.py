@@ -254,10 +254,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             first = f'{regions[0].rkey} {regions[0].addr} {regions[0].len}'
             self.verify_error_response(
                 client, f'BLOB.RDMA_GET key {first}',
-                'client address space smaller than object length')
+                f'client memory address length {regions[0].len} smaller than object length {TARGET_LEN}')
             self.verify_error_response(
                 client, f'BLOB.RDMA_SET key {TARGET_LEN} {first}',
-                'client address space smaller than object length')
+                f'client memory address length {regions[0].len} smaller than object length {TARGET_LEN}')
         finally:
             process.kill()
 

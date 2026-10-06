@@ -67,7 +67,10 @@ fn parse_efa_addresses(
         total_addr_len = total_addr_len.saturating_add(len);
     }
     if total_addr_len < required_len {
-        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_ADDR_SPACE));
+        return Err(ValkeyError::String(format!(
+            "ERR client memory address length {} smaller than object length {}",
+            total_addr_len, required_len
+        )));
     }
     Ok(addrs)
 }
@@ -304,6 +307,7 @@ mod tests {
         match parse_efa_addresses(&vs, 0, required_len) {
             Ok(addrs) => panic!("expected rejection, parsed {addrs:?}"),
             Err(ValkeyError::Str(message)) => message.to_string(),
+            Err(ValkeyError::String(message)) => message,
             Err(ValkeyError::WrongArity) => "WrongArity".to_string(),
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -356,12 +360,12 @@ mod tests {
         // Shortfall is rejected.
         assert_eq!(
             reject(&["7", "64", "4095"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
         // Summed across addresses, still one byte short.
         assert_eq!(
             reject(&["7", "64", "2048", "8", "9000", "2047"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
     }
 
