@@ -41,7 +41,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         first = client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
         self.verify_error_response(
             client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}',
-            'DMA session already established (one BLOB.RDMA_HELLO per connection)')
+            'DMA session already established')
         assert self.server.get_new_client().execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS) == first
 
     def test_hello_rejects_bad_hex(self):
