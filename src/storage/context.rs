@@ -21,6 +21,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use tokio::sync::watch;
 
+use super::cache_policy::{now_minutes, AccessStats};
+
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
 /// A buffer that is a sub-allocation within a registered segment.
@@ -107,6 +109,8 @@ pub struct ObjectContext {
     /// Set by leader on promotion failure before dropping progress_tx.
     /// Waiters check this on RecvError to distinguish failure mode.
     promotion_failure: AtomicU8,
+    /// LFU access score for the cache policy.
+    pub stats: AccessStats,
 }
 
 impl ObjectContext {
@@ -118,6 +122,7 @@ impl ObjectContext {
             chunks_ready: AtomicU32::new(0),
             progress_tx: std::sync::Mutex::new(None),
             promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
+            stats: AccessStats::new(now_minutes()),
         }
     }
 
@@ -131,6 +136,7 @@ impl ObjectContext {
             chunks_ready: AtomicU32::new(0),
             progress_tx: std::sync::Mutex::new(Some(tx)),
             promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
+            stats: AccessStats::new(now_minutes()),
         }
     }
 

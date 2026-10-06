@@ -318,6 +318,7 @@ fn cmd_get_tiered(
     blocked_client: valkey_module::BlockedClient,
 ) {
     let dram_pool = storage::get_dram_pool();
+    let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     let (transport, blocked_client) = match try_serve_dram_hit(
         dram_pool,
@@ -331,9 +332,17 @@ fn cmd_get_tiered(
         None => return,     // served (Ready or coalesced waiter)
         Some(args) => args, // not in DRAMPool — continue to promotion / fallback
     };
+    // Everything below reads from NVMe, whether or not it also promotes.
+    cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
-    // If pool has space and object is eligible, read directly into DRAMPool.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+    // Admit via the admission filter, then allocate (reclaiming cold copies if full).
+    // Skip both if another GET is already promoting this OID (Filling).
+    let promoted = if !filling && cache.admission.admit(object_id, obj_len) {
+        dram_pool.try_promote_object(object_id, obj_len)
+    } else {
+        None
+    };
+    if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
         let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
@@ -364,8 +373,10 @@ fn cmd_get_tiered(
         };
         let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
-            let _keep_alive = (file, fd);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            // Declared after thread_ctx so it drops first: the fd clone is gone
+            // before the client unblocks, so its next GET sees the fd unpinned.
+            let _keep_alive = (file, fd);
             // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
             test_pause_during_promotion().await;
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
@@ -450,8 +461,9 @@ fn cmd_get_tiered(
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
-        let _keep_alive = (file, fd);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        // Declared after thread_ctx so it drops first (see the promotion path).
+        let _keep_alive = (file, fd);
         cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,
