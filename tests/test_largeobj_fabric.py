@@ -79,7 +79,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         # divisible by 3 — caught by parse_efa_addresses.
         self.verify_error_response(
             client, 'BLOB.RDMA_GET key 999 0 4096 7',
-            'address args must be rkey, addr, len triples')
+            'memory address args must be rkey, addr, len triples')
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
