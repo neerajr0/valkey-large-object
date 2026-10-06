@@ -16,7 +16,7 @@ macro_rules! define_errors {
 
 define_errors! {
     // Command Errors
-    ERR_EFA_UNAVAILABLE => "ERR EFA unavailable on this instance",
+    ERR_RDMA_UNAVAILABLE => "ERR RDMA provider unavailable on this instance",
     ERR_INVALID_PEER_ADDR_HEX => "ERR invalid peer address hex",
     ERR_PEER_ADDR_LEN => "ERR peer address must be 32 bytes",
     ERR_PEER_ADDR_EMPTY => "ERR peer address must not be empty",
@@ -37,8 +37,8 @@ define_errors! {
     // Storage/Engine Errors
     ERR_NVME_READ => "ERR NVMe read",
     ERR_NVME_WRITE => "ERR NVMe write",
-    ERR_EFA_WRITE => "ERR EFA write",
-    ERR_EFA_READ => "ERR EFA read",
+    ERR_RDMA_WRITE => "ERR RDMA write",
+    ERR_RDMA_READ => "ERR RDMA read",
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors

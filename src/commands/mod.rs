@@ -85,7 +85,7 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let Some(fabric) = transport::fabric() else {
-        return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_UNAVAILABLE));
     };
 
     let peer_address = decode_hex(args[1].as_slice())

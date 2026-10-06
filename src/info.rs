@@ -14,8 +14,8 @@ use crate::{operating_mode, OperatingMode};
 
 pub static NVME_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static NVME_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static EFA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static EFA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
@@ -112,7 +112,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(
-            "efa_registered_segments",
+            "rdma_registered_segments",
             crate::efa_registered_segment_count() as i64,
         )?
         .field(
@@ -225,12 +225,12 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             NVME_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_read_errors",
-            EFA_READ_ERRORS.load(Ordering::Relaxed) as i64,
+            "rdma_read_errors",
+            RDMA_READ_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_write_errors",
-            EFA_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
+            "rdma_write_errors",
+            RDMA_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "dram_pool_exhausted",
