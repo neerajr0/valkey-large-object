@@ -406,7 +406,7 @@ fn cmd_get_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_DISK_BUFFERS),
+                ValkeyError::Str(errors::ERR_OOM),
             );
             return;
         }
@@ -618,7 +618,7 @@ fn cmd_set_dram_tcp(
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+            return Err(ValkeyError::Str(errors::ERR_OOM));
         }
     };
     // DRAM-only SET allocates one buffer per chunk (no sliding window), so the
@@ -698,7 +698,7 @@ fn cmd_set_dram_efa(
             reply_err(
                 &thread_ctx,
                 &info::DRAM_POOL_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
+                ValkeyError::Str(errors::ERR_OOM),
             );
             return;
         }
@@ -785,7 +785,7 @@ fn cmd_set_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_DISK_BUFFERS),
+                ValkeyError::Str(errors::ERR_OOM),
             );
             return;
         }
@@ -873,7 +873,7 @@ async fn cmd_set_tiered_run(
         reply_err(
             &thread_ctx,
             &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_DISK_CAPACITY_EXCEEDED),
+            ValkeyError::Str(errors::ERR_OOM),
         );
         return;
     }

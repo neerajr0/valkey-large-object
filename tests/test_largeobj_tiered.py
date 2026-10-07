@@ -263,7 +263,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.TCP_SET', 'nvme_cap_3', payload)
             assert False, "Expected capacity exceeded error from nvme-maxmemory"
         except ResponseError as e:
-            assert 'disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'command not allowed' in str(e).lower(), f"Unexpected error: {e}"
 
     # ─── DEL semantics ────────────────────────────────────────────────────
 
@@ -387,7 +387,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             err = str(e).lower()
             assert 'max object size' in err, f"Unexpected error: {e}"
-            assert 'disk capacity' not in err, f"Should not hit disk capacity error: {e}"
+            assert 'command not allowed' not in err, f"Should not hit OOM error: {e}"
         # Rejected SET must not leave a .dat file or phantom key.
         assert self._dat_count() == 0
         assert client.execute_command('DBSIZE') == 0
@@ -546,12 +546,12 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
                 assert client.execute_command("BLOB.TCP_SET", key, payload) == b"OK"
                 return
             except ResponseError as e:
-                if "pool exhausted" not in str(e).lower():
+                if "command not allowed" not in str(e).lower():
                     raise
                 last = e
                 time.sleep(delay)
         assert False, (
-            f"SET '{key}' still pool-exhausted after {tries} tries "
+            f"SET '{key}' still OOM after {tries} tries "
             f"({tries * delay:.1f}s) -- capacity not reclaimed on overwrite (leak): {last}"
         )
 
@@ -561,7 +561,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
             assert False, f"Expected '{key}' SET to be rejected (capacity exceeded)"
         except ResponseError as e:
             err = str(e).lower()
-            assert "pool exhausted" in err or "capacity exceeded" in err, \
+            assert "command not allowed" in err, \
                 f"Unexpected error: {e}"
 
 

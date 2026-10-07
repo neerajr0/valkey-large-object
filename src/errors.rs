@@ -29,8 +29,13 @@ define_errors! {
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.RDMA_HELLO first)",
     ERR_DMA_SESSION_EXISTS => "ERR DMA session already established",
-    ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
     ERR_INVALID_INFO_FIELD => "ERR invalid information field",
+
+    // OOM — matches the standard Valkey OOM error prefix so clients can
+    // distinguish memory exhaustion from other errors programmatically.
+    // The INFO metric counters (dram_pool_exhausted, nvme_buffer_exhausted,
+    // nvme_capacity_exceeded) tell the operator which resource was exhausted.
+    ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
 
     // Storage/Engine Errors
     ERR_DISK_READ => "ERR disk read failed",
@@ -40,8 +45,6 @@ define_errors! {
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
-    ERR_INSUFFICIENT_DISK_BUFFERS => "ERR disk staging buffer pool exhausted",
-    ERR_DISK_CAPACITY_EXCEEDED => "ERR disk capacity exceeded",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors
@@ -61,11 +64,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_errors_have_err_prefix() {
+    fn test_all_errors_have_err_or_oom_prefix() {
         for err in ALL_ERRORS {
             assert!(
-                err.starts_with("ERR "),
-                "Error string missing 'ERR ' prefix: {:?}",
+                err.starts_with("ERR ") || err.starts_with("OOM "),
+                "Error string missing 'ERR ' or 'OOM ' prefix: {:?}",
                 err
             );
         }
