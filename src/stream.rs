@@ -368,7 +368,10 @@ pub(crate) fn reply_stream_err(
             crate::errors::ERR_DISK_WRITE,
         ),
         EfaRead => (&crate::info::RDMA_READ_ERRORS, crate::errors::ERR_RDMA_READ),
-        EfaWrite => (&crate::info::RDMA_WRITE_ERRORS, crate::errors::ERR_RDMA_WRITE),
+        EfaWrite => (
+            &crate::info::RDMA_WRITE_ERRORS,
+            crate::errors::ERR_RDMA_WRITE,
+        ),
     };
     crate::engine::reply_err(thread_ctx, metric, ValkeyError::Str(err));
 }
