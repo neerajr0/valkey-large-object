@@ -34,8 +34,9 @@ define_errors! {
     // OOM — matches the standard Valkey OOM error prefix so clients can
     // distinguish memory exhaustion from other errors programmatically.
     // The INFO metric counters (dram_pool_exhausted, nvme_buffer_exhausted,
-    // nvme_capacity_exceeded) tell the operator which resource was exhausted.
+    // disk_capacity_exceeded) tell the operator which resource was exhausted.
     ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
+    ERR_OOM_DISK => "OOM command not allowed when used disk space > 'disk-maxmemory'.",
 
     // Storage/Engine Errors
     ERR_DISK_READ => "ERR disk read failed",
@@ -45,6 +46,7 @@ define_errors! {
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
+    ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors

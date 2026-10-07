@@ -406,7 +406,7 @@ fn cmd_get_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_OOM),
+                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
         }
@@ -785,7 +785,7 @@ fn cmd_set_tiered(
             reply_err(
                 &thread_ctx,
                 &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_OOM),
+                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
         }
@@ -873,7 +873,7 @@ async fn cmd_set_tiered_run(
         reply_err(
             &thread_ctx,
             &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_OOM),
+            ValkeyError::Str(errors::ERR_OOM_DISK),
         );
         return;
     }
