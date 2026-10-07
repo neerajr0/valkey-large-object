@@ -269,7 +269,7 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
+            f" disk-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
             f" chunk-size 4096"
@@ -297,7 +297,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
+            f" disk-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
             f" max-promote-size 520192"

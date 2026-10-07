@@ -217,11 +217,11 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")
         .field(
-            "nvme_read_errors",
+            "disk_read_errors",
             NVME_READ_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_write_errors",
+            "disk_write_errors",
             NVME_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
@@ -241,7 +241,7 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             NVME_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_capacity_exceeded",
+            "disk_capacity_exceeded",
             NVME_CAPACITY_EXCEEDED.load(Ordering::Relaxed) as i64,
         )?
         .field(

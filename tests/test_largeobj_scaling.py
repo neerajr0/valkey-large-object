@@ -285,7 +285,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
+            f" disk-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 983040"
@@ -347,7 +347,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
+            f" disk-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 983040"
@@ -472,7 +472,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         # the test forces expansion and shrink quickly.
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
+            f" disk-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 983040"
