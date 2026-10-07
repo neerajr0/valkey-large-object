@@ -40,8 +40,8 @@ define_errors! {
     // Storage/Engine Errors
     ERR_DISK_READ => "ERR disk read failed",
     ERR_DISK_WRITE => "ERR disk write failed",
-    ERR_RDMA_WRITE => "ERR RDMA write",
-    ERR_RDMA_READ => "ERR RDMA read",
+    ERR_RDMA_WRITE => "ERR RDMA write failed",
+    ERR_RDMA_READ => "ERR RDMA read failed",
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
