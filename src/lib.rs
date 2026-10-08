@@ -677,10 +677,10 @@ valkey_module! {
     deinit: deinitialize,
     info: lo_info,
     commands: [
-        ["BLOB.RDMA_HELLO", commands::lo_rdma_hello, "write", 0, 0, 0],
         ["BLOB.TCP_GET", commands::lo_tcp_get, "readonly", 1, 1, 1],
-        ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly", 1, 1, 1],
         ["BLOB.TCP_SET", commands::lo_tcp_set, "write deny-oom", 1, 1, 1],
+        ["BLOB.RDMA_HELLO", commands::lo_rdma_hello, "write", 0, 0, 0],
+        ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly", 1, 1, 1],
         ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom", 1, 1, 1],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
     ],
