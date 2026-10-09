@@ -363,9 +363,9 @@ pub(crate) fn reply_stream_err(
 ) {
     use StreamError::*;
     let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
-        NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_DISK_READ),
+        NvmeRead => (&crate::info::DISK_READ_ERRORS, crate::errors::ERR_DISK_READ),
         NvmeWrite => (
-            &crate::info::NVME_WRITE_ERRORS,
+            &crate::info::DISK_WRITE_ERRORS,
             crate::errors::ERR_DISK_WRITE,
         ),
         EfaRead => (&crate::info::RDMA_READ_ERRORS, crate::errors::ERR_RDMA_READ),
@@ -795,7 +795,7 @@ pub(crate) async fn efa_transfer_addrs(
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
         // Already failing — remaining futures are in-flight RMAs being drained.
         if failed {
-            crate::info::EFA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
+            crate::info::RDMA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let done = match outcome {

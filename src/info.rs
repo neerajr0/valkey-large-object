@@ -12,16 +12,16 @@ use crate::{operating_mode, OperatingMode};
 
 // ─── Error Metrics ───────────────────────────────────────────────────────────
 
-pub static NVME_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static NVME_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+pub static DISK_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
-pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 
 // ─── Core Metrics ────────────────────────────────────────────────────────────
 
@@ -251,11 +251,11 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("error_metrics")
         .field(
             "disk_read_errors",
-            NVME_READ_ERRORS.load(Ordering::Relaxed) as i64,
+            DISK_READ_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "disk_write_errors",
-            NVME_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
+            DISK_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "rdma_read_errors",
@@ -275,7 +275,7 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field(
             "disk_capacity_exceeded",
-            NVME_CAPACITY_EXCEEDED.load(Ordering::Relaxed) as i64,
+            DISK_CAPACITY_EXCEEDED.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "set_finalize_stale",
@@ -287,7 +287,7 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field(
             "rdma_discarded_transfers",
-            EFA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
+            RDMA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()

@@ -347,7 +347,7 @@ fn cmd_get_tiered(
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 reply_err(
                     &thread_ctx,
-                    &info::NVME_READ_ERRORS,
+                    &info::DISK_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_DISK_READ),
                 );
                 return;
@@ -418,7 +418,7 @@ fn cmd_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_READ_ERRORS,
+                &info::DISK_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_DISK_READ),
             );
             return;
@@ -869,7 +869,7 @@ async fn cmd_set_tiered_run(
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
-            &info::NVME_CAPACITY_EXCEEDED,
+            &info::DISK_CAPACITY_EXCEEDED,
             ValkeyError::Str(errors::ERR_OOM_DISK),
         );
         return;
@@ -883,7 +883,7 @@ async fn cmd_set_tiered_run(
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
-                &info::NVME_WRITE_ERRORS,
+                &info::DISK_WRITE_ERRORS,
                 ValkeyError::Str(errors::ERR_DISK_WRITE),
             );
             return;
