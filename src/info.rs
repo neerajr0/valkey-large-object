@@ -21,6 +21,13 @@ pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
+
+// ─── Core Metrics ────────────────────────────────────────────────────────────
+
+/// Live `LoValue` instances: +1 in `LoValue::new`, −1 in its `Drop`. Equals the
+/// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
+pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
@@ -30,11 +37,34 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 }
 
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
+    core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     disk_staging_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
+    Ok(())
+}
+
+/// Module-wide stats, independent of operating mode (same shape as valkey-bloom's
+/// `bloom_core_metrics`).
+fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("core_metrics")
+        .field(
+            "num_objects",
+            LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "pending_reclaims",
+            storage::reclaim::RECLAIM_LIST.len() as i64,
+        )?
+        .field(
+            "reclaims",
+            storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
+        )?
+        .build_section()?
+        .build_info()?;
     Ok(())
 }
 
@@ -47,7 +77,7 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_reclaims_total",
+            "fd_reclaims",
             fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
@@ -60,54 +90,54 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .get()
         .expect("DRAM_POOL not initialized — lo_info called before module init");
 
-    let (live, draining, unused) = dram.segment_counts();
+    let (total, draining, unused) = dram.segment_counts();
     let seg_size = crate::dram_segment_size();
-    let capacity = live * seg_size;
+    let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
     let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
     let mut section = ctx
         .builder()
         .add_section("dram")
-        .field("dram_live_segments", live as i64)?
-        .field("draining_segments", draining as i64)?
+        .field("dram_segments", total as i64)?
+        .field("dram_draining_segments", draining as i64)?
         .field("dram_unused_segments", unused as i64)?
-        .field("allocated_bytes", allocated as i64)?
+        .field("dram_allocated_bytes", allocated as i64)?
         .field("dram_fragment_count", dram.fragment_count() as i64)?
-        .field("capacity_bytes", capacity as i64)?
-        .field("utilization_pct", util_pct)?
-        .field("cached_objects", dram.object_count() as i64)?
-        .field(
-            "reclaims_total",
-            dram.reclaims.load(Ordering::Relaxed) as i64,
-        )?;
+        .field("dram_capacity_bytes", capacity as i64)?
+        .field("dram_utilization_pct", util_pct)?
+        .field("dram_objects", dram.object_count() as i64)?;
     // Cache counters exist only in Tiered mode.
     if let Some(cache) = &dram.cache {
         section = section
             .field(
-                "cache_hits_total",
+                "cache_hits",
                 cache.stats.hits.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "cache_misses_total",
+                "cache_misses",
                 cache.stats.misses.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "promotions_total",
+                "cache_promotions",
                 cache.stats.promotions.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "admission_rejects_total",
+                "cache_admission_rejects",
                 cache.admission.rejects.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "cache_demotions",
+                cache.stats.demotions.load(Ordering::Relaxed) as i64,
             )?;
     }
     section
         .field(
-            "scaling_expand_total",
+            "dram_scaling_expands",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
-            "scaling_shrink_total",
+            "dram_scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
@@ -129,11 +159,11 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         return Ok(());
     };
 
-    let (live, _draining, unused) = nvme.segment_counts();
+    let (total, _draining, unused) = nvme.segment_counts();
 
     ctx.builder()
         .add_section("disk_staging")
-        .field("disk_staging_live_segments", live as i64)?
+        .field("disk_staging_segments", total as i64)?
         .field("disk_staging_unused_segments", unused as i64)?
         .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
         .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
@@ -251,6 +281,10 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "set_value_failures",
             SET_VALUE_FAILURES.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "efa_discarded_transfers",
+            EFA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()

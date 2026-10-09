@@ -133,9 +133,12 @@ pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
     // Lookup LoValue in keyspace.
     let key = ctx.open_key(&args[1]);
-    let lo_value: &LoValue = match key.get_value::<LoValue>(&LO_TYPE)? {
-        Some(v) => v,
-        None => return Ok(ValkeyValue::Null),
+    let lo_value: &LoValue = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Ok(ValkeyValue::Null),
     };
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
@@ -162,9 +165,12 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
     // Lookup LoValue in keyspace.
     let key = ctx.open_key(&args[1]);
-    let lo_value: &LoValue = match key.get_value::<LoValue>(&LO_TYPE)? {
-        Some(v) => v,
-        None => return Ok(ValkeyValue::Null),
+    let lo_value: &LoValue = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Ok(ValkeyValue::Null),
     };
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
@@ -190,6 +196,14 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
+    }
+    // Reject a key of another type before any transfer, matching valkey-bloom.
+    if ctx
+        .open_key(&args[1])
+        .get_value::<LoValue>(&LO_TYPE)
+        .is_err()
+    {
+        return Err(ValkeyError::WrongType);
     }
     // TCP path: data.len() IS the authoritative length. No user-provided len needed.
     let data = args[2].as_slice().to_vec();
@@ -222,6 +236,14 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Incomplete triples are caught by parse_efa_addresses with a clearer error.
     if args.len() < 6 {
         return Err(ValkeyError::WrongArity);
+    }
+    // Reject a key of another type before any transfer, matching valkey-bloom.
+    if ctx
+        .open_key(&args[1])
+        .get_value::<LoValue>(&LO_TYPE)
+        .is_err()
+    {
+        return Err(ValkeyError::WrongType);
     }
     // total_len is required — server needs to know how many bytes to fi_read
     // from the client.
@@ -262,9 +284,12 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let key = ctx.open_key(&args[1]);
-    let value = match key.get_value::<LoValue>(&LO_TYPE)? {
-        Some(v) => v,
-        None => return Ok(ValkeyValue::Null),
+    let value = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);

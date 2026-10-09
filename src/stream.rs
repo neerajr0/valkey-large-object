@@ -64,6 +64,7 @@
 #![allow(async_fn_in_trait)]
 
 use std::os::unix::io::RawFd;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use futures::stream::FuturesUnordered;
@@ -757,22 +758,56 @@ pub(crate) async fn efa_transfer_addrs(
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
-    let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
+    let mut failed = false;
+    let fail_partial = crate::test_efa_fail_partial();
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
+        // Hidden test hook: after the first successful post, inject a failure
+        // so the await loop exercises the inline drain path. Only takes effect
+        // when addrs has more than one entry, meaning a chunk spans more
+        // than one client address.
+        if fail_partial && i > 0 {
+            failed = true;
+            break;
+        }
         let transfer = match direction {
             EfaDirection::Write => {
                 session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr)
             }
             EfaDirection::Read => session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr),
+        };
+        match transfer {
+            Ok(t) => {
+                indexed_futures.push(async move { (i, t.await) });
+                buf_offset += len;
+            }
+            // Posted RMAs can't be aborted, so break and let the await loop
+            // drain already-submitted transfers before returning the error.
+            Err(e) => {
+                valkey_module::logging::log_debug(format!(
+                    "EFA submit failed on sub-transfer {i}: {e}"
+                ));
+                failed = true;
+                break;
+            }
         }
-        .map_err(|_| ValkeyError::Str(err_str))?;
-        sub_lens.push(len);
-        indexed_futures.push(async move { (i, transfer.await) });
-        buf_offset += len;
     }
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
-        let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
+        // Already failing — remaining futures are in-flight RMAs being drained.
+        if failed {
+            crate::info::EFA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let done = match outcome {
+            Ok(d) => d,
+            Err(e) => {
+                valkey_module::logging::log_debug(format!(
+                    "EFA transfer {idx} completed with error: {e}"
+                ));
+                failed = true;
+                continue;
+            }
+        };
         results[idx] = match direction {
             // SET path: transport must provide a checksum for CRC combination.
             EfaDirection::Read => Some(
@@ -782,6 +817,11 @@ pub(crate) async fn efa_transfer_addrs(
             // GET path: checksum not needed (already stored in FileHeader).
             EfaDirection::Write => Some(0),
         };
+    }
+    // All in-flight RMAs have completed. If any failed, return the error now
+    // that no DMA is outstanding and buffers are safe to release.
+    if failed {
+        return Err(ValkeyError::Str(err_str));
     }
     // GET (Write) path: callers ignore the returned CRC — skip combination.
     if matches!(direction, EfaDirection::Write) {
@@ -795,7 +835,7 @@ pub(crate) async fn efa_transfer_addrs(
             crc_fast::CrcAlgorithm::Crc32Iscsi,
             combined,
             results[i].expect("EFA transfer result missing") as u64,
-            sub_lens[i] as u64,
+            addrs[i].1 as u64,
         );
     }
     Ok(combined as u32)

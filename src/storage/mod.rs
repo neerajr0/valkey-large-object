@@ -17,6 +17,7 @@ pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
+pub mod reclaim;
 pub mod scaling;
 pub mod segment;
 pub mod segment_pool;
@@ -89,13 +90,6 @@ pub(crate) fn chunk_user_data_len(
     } else {
         chunk_size
     }
-}
-
-// ─── TryClone Trait ──────────────────────────────────────────────────────────
-
-/// Fallible deep-copy. Like Clone but returns None on failure modes when not possible.
-pub trait TryClone: Sized {
-    fn try_clone(&self) -> Option<Self>;
 }
 
 // ─── Error Types ─────────────────────────────────────────────────────────────

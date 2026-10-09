@@ -37,7 +37,9 @@ use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
+use valkey_module::{
+    valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
+};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -80,7 +82,7 @@ lazy_static::lazy_static! {
     /// Data directory for disk object files. Required. Immutable after load.
     static ref CFG_DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
@@ -106,6 +108,11 @@ lazy_static::lazy_static! {
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// Main-thread time, in microseconds, one scaling-cron tick may spend
+    /// scanning for and deleting reclaim-list keys. Default: 1000us.
+    static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(1000);
+    static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(100);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
@@ -176,6 +183,11 @@ lazy_static::lazy_static! {
     /// Allows integration tests to inject a DEL in the mid-stream window
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// When true, the first multi-address EFA transfer injects a synthetic
+    /// submit failure after the first successful post, exercising the inline
+    /// drain path. Default: false. Hidden test hook.
+    static ref CFG_TEST_EFA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -262,6 +274,14 @@ pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
+pub fn reclaim_scan_budget_us() -> u64 {
+    CFG_RECLAIM_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn reclaim_poll_ms() -> u64 {
+    CFG_RECLAIM_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
@@ -302,6 +322,14 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
     let used = info.field_unsigned("used_memory").unwrap_or(0);
     let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
     (used, maxmemory)
+}
+
+/// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
+/// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
+/// which leaves eviction to its primary. Dram shrink deletes keys, so it runs only
+/// when this holds.
+pub fn eviction_allowed(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::EVICTED)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
@@ -373,6 +401,10 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_efa_fail_partial() -> bool {
+    CFG_TEST_EFA_FAIL_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -676,13 +708,16 @@ valkey_module! {
     init: initialize,
     deinit: deinitialize,
     info: lo_info,
+    acl_categories: [
+        "largeobj",
+    ]
     commands: [
-        ["BLOB.TCP_GET", commands::lo_tcp_get, "readonly", 1, 1, 1],
-        ["BLOB.TCP_SET", commands::lo_tcp_set, "write deny-oom", 1, 1, 1],
-        ["BLOB.RDMA_HELLO", commands::lo_rdma_hello, "write", 0, 0, 0],
-        ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly", 1, 1, 1],
-        ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom", 1, 1, 1],
-        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
+        ["BLOB.TCP_GET", commands::lo_tcp_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.TCP_SET", commands::lo_tcp_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
+        ["BLOB.RDMA_HELLO", commands::lo_rdma_hello, "fast", 0, 0, 0, "connection largeobj fast"],
+        ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
+        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
     configurations: [
         i64: [
@@ -705,6 +740,10 @@ valkey_module! {
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, 1_000, 100, 100_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, 100, 10, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
              ConfigurationFlags::IMMUTABLE, None, None],
@@ -733,6 +772,7 @@ valkey_module! {
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
+            ["test-efa-fail-partial", &*CFG_TEST_EFA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [
