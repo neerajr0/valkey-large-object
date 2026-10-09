@@ -286,7 +286,7 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             SET_VALUE_FAILURES.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_discarded_transfers",
+            "rdma_discarded_transfers",
             EFA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
