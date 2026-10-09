@@ -188,7 +188,7 @@ print_scaling() {
     local label="$1"
     local info
     info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
-    local live nvme_live util expands shrinks dram_uring nvme_uring efa
+    local live nvme_live util expands shrinks dram_uring nvme_uring rdma
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
     nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
     util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
@@ -196,14 +196,14 @@ print_scaling() {
     shrinks=$(echo    "$info" | grep -E "scaling_shrink_total"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
     nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    efa=$(echo        "$info" | grep -E "efa_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
+    rdma=$(echo       "$info" | grep -E "rdma_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
     # io_uring registration coverage, per pool: each should equal that pool's live
     # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
-    # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
+    # io_uring engine). RDMA is fabric-global (one MR per segment, not per-pool), so
     # it is reported once against total_live.
-    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
+    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  rdma=${rdma:-?}/${total_live}"
 }
 
 # Run one BLOB.TCP_GET benchmark pass and print throughput + latency. Arg: label.
@@ -364,18 +364,18 @@ for BENCH_MODE in $MODES_STR; do
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
-                MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
+                MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size $MAX_OBJECT_SIZE"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
-                MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
+                MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
