@@ -75,4 +75,16 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_all_errors_fit_in_128_bytes() {
+        for err in ALL_ERRORS {
+            assert!(
+                err.len() <= 128,
+                "Error string exceeds 128 bytes ({} bytes): {:?}",
+                err.len(),
+                err
+            );
+        }
+    }
 }
