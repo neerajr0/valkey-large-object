@@ -47,12 +47,12 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
 
     def test_hello_rejects_bad_hex(self):
         client = self.server.get_new_client()
-        self.verify_error_response(client, 'BLOB.RDMA_HELLO zz', 'invalid peer address hex')
+        self.verify_error_response(client, 'BLOB.RDMA_HELLO zz', 'invalid rdma address hex')
         try:
             client.execute_command('BLOB.RDMA_HELLO', '')
             assert False, "Expected an error for an empty address"
         except ResponseError as e:
-            assert str(e) == 'peer address must not be empty'
+            assert str(e) == 'rdma address must not be empty'
 
     def test_efa_get_needs_hello(self):
         """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
@@ -243,20 +243,20 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         process, regions = self.start_target(split=[2048, 2048])
         try:
             client = self.server.get_new_client()
-            client.execute_command('BLOB.SET', 'key', payload)
-            client.execute_command('BLOB.HELLO', regions[0].address)
+            client.execute_command('BLOB.TCP_SET', 'key', payload)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
             client.execute_command(
                 'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
-            with pytest.raises(ResponseError, match="EFA write"):
-                client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            with pytest.raises(ResponseError, match="RDMA write"):
+                client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             after = info_largeobj(client)
             assert after['largeobj_efa_discarded_transfers'] - before == 1, \
                 f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
             # Recovery: disable the hook and confirm the next transfer succeeds.
             client.execute_command(
                 'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
-            reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            reply = client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
             output = process.communicate(timeout=30)[0]
             assert 'payload verified' in output, output
@@ -300,7 +300,7 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
         return (
             f"operating-mode Tiered"
             f" disk-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" chunk-size 4096"
             f" max-promote-size 0"
@@ -328,7 +328,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
         return (
             f"operating-mode Tiered"
             f" disk-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" max-promote-size 520192"
             f" chunk-size 4096"

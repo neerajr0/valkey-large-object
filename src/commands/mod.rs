@@ -289,7 +289,7 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::WrongType)?
     {
         Some(v) if !v.reclaim_in_progress() => v,
-        _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+        _ => return Ok(ValkeyValue::Null),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);

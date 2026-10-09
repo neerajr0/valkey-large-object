@@ -167,7 +167,10 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("disk_staging_unused_segments", unused as i64)?
         .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
         .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field("disk_staging_segment_size_bytes", crate::dram_segment_size() as i64)?
+        .field(
+            "disk_staging_segment_size_bytes",
+            crate::dram_segment_size() as i64,
+        )?
         .field(
             "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,

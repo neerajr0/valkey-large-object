@@ -32,7 +32,7 @@ def wait_uring_registered_matches_segments(client, timeout=10):
     def _match():
         i = info_largeobj(client)
         return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_segments']
-                and i['largeobj_nvme_uring_registered_segments'] == i['largeobj_nvme_segments'])
+                and i['largeobj_disk_staging_uring_registered_segments'] == i['largeobj_disk_staging_segments'])
     wait_for_true(_match, timeout=timeout)
 
 
@@ -59,7 +59,7 @@ def shrink_completed(client):
 def promote(client, keys):
     """Tiered (promote-min-hits 1): one GET per key caches it in DRAM."""
     for key in keys:
-        client.execute_command('BLOB.GET', key)
+        client.execute_command('BLOB.TCP_GET', key)
     wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == len(keys))
 
 
@@ -125,13 +125,13 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         """
         client = self.server.get_new_client()
         src = b'S' * (600 * 1024)
-        assert client.execute_command('BLOB.SET', 'src', src) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'src', src) == b'OK'
         assert client.execute_command('COPY', 'src', 'dst') == 1
-        assert client.execute_command('BLOB.GET', 'dst') == src
+        assert client.execute_command('BLOB.TCP_GET', 'dst') == src
         assert info_largeobj(client)['largeobj_dram_segments'] == 2
         client.execute_command('DEL', 'src')
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 1)
-        assert client.execute_command('BLOB.SET', 'big', b'B' * (900 * 1024)) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'big', b'B' * (900 * 1024)) == b'OK'
         assert info_largeobj(client)['largeobj_dram_segments'] == 2, \
             "copy was split across segments, so a 900KB SET needed a third"
 
@@ -220,7 +220,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
 
-        assert client.execute_command('BLOB.SET', 'probe', b'P' * (600 * 1024)) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'probe', b'P' * (600 * 1024)) == b'OK'
         assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expand_before
 
         wait_for_true(
@@ -234,9 +234,9 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         client.config_set('largeobj.scaling-expand-watermark', 95)
         expanded = info_largeobj(client)['largeobj_dram_scaling_expands']
         second = b'S' * (600 * 1024)
-        assert client.execute_command('BLOB.SET', 'second', second) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'second', second) == b'OK'
         assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expanded
-        assert client.execute_command('BLOB.GET', 'second') == second
+        assert client.execute_command('BLOB.TCP_GET', 'second') == second
 
 
 class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
@@ -262,7 +262,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         not grow. The object is small enough that core's own OOM check passes."""
         client = self.server.get_new_client()
         client.config_set('maxmemory-policy', 'noeviction')
-        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
 
         used = int(client.info('memory')['used_memory'])
         # 600KB under maxmemory: core's OOM check lets a 200KB SET through, but
@@ -272,7 +272,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
         # 200KB does not fit the ~124KB left in the segment, so it needs a new
         # segment, and the module rejects it.
-        with pytest.raises(ResponseError, match='pool exhausted'):
+        with pytest.raises(OutOfMemoryError):
             client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024))
         after = info_largeobj(client)
         assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
@@ -377,8 +377,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert len(victims) == 1
         victim = victims[0]
         assert client.exists(victim) == 1
-        with pytest.raises(ResponseError, match='not found'):
-            client.execute_command('BLOB.INFO', victim)
+        assert client.execute_command('BLOB.INFO', victim) is None
         with pytest.raises(ResponseError, match='module key failed to copy'):
             client.execute_command('COPY', victim, 'copy_dst')
 
@@ -467,8 +466,8 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
     def test_tiered_expand_on_promotion(self):
         """Promoting an object that fits no segment expands the pool."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
-        client.execute_command('BLOB.SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
         before = info_largeobj(client)
 
         promote(client, ['key_a', 'key_b'])
@@ -587,8 +586,8 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
         # Promoting the second ~full-segment object forces a reactive expand, and with the
         # fabric up try_expand EFA-registers that new segment (the path under test).
-        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
-        client.execute_command('BLOB.SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
         promote(client, ['key_a', 'key_b'])
 
         expanded = info_largeobj(client)
@@ -597,7 +596,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         registered = expanded['largeobj_rdma_registered_segments']
         assert dram_segments > 1
         # EFA registration spans BOTH pools: every live segment (DRAM + NVMe staging) is registered.
-        assert registered == dram_segments + expanded['largeobj_nvme_segments']
+        assert registered == dram_segments + expanded['largeobj_disk_staging_segments']
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         # In Tiered mode shrink releases a live-data segment (data persists on NVMe), and with
@@ -612,7 +611,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         after = info_largeobj(client)
         assert after['largeobj_rdma_registered_segments'] < registered
         assert after['largeobj_rdma_registered_segments'] == (
-            after['largeobj_dram_segments'] + after['largeobj_nvme_segments'])
+            after['largeobj_dram_segments'] + after['largeobj_disk_staging_segments'])
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
         assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE

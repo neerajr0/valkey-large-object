@@ -199,8 +199,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         strings. Frees run async, so decrements are awaited."""
         client = self.server.get_new_client()
         num_objects = lambda: info_largeobj(client)['largeobj_num_objects']
-        client.execute_command('BLOB.SET', 'blob', b'A' * 1024)
-        client.execute_command('BLOB.SET', 'blob', b'B' * 1024)
+        client.execute_command('BLOB.TCP_SET', 'blob', b'A' * 1024)
+        client.execute_command('BLOB.TCP_SET', 'blob', b'B' * 1024)
         client.execute_command('COPY', 'blob', 'blob_copy')
         client.set('string_key', 'v')
         wait_for_true(lambda: num_objects() == 2)
