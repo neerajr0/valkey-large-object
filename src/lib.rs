@@ -699,11 +699,14 @@ valkey_module! {
     init: initialize,
     deinit: deinitialize,
     info: lo_info,
+    acl_categories: [
+        "largeobj",
+    ]
     commands: [
-        ["BLOB.HELLO", commands::lo_hello, "write", 0, 0, 0],
-        ["BLOB.GET", commands::lo_get, "readonly", 1, 1, 1],
-        ["BLOB.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
-        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
+        ["BLOB.HELLO", commands::lo_hello, "fast", 0, 0, 0, "connection largeobj fast"],
+        ["BLOB.GET", commands::lo_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.SET", commands::lo_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
+        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
     configurations: [
         i64: [
