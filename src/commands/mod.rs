@@ -24,7 +24,7 @@ const MAX_EFA_ADDRESSES: usize = 256;
 
 /// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
-    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
+    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_RDMA_SESSION))
 }
 
 /// Parse the client's memory addresses from `args[start_idx..]`, which must be
@@ -109,7 +109,7 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // inserting the new one; when the client's old endpoint has died and the new one reuses its
     // QPN, efa-direct cannot represent both (vdma/.claude/open_issue.md). Reconnect instead.
     if session::lookup(client_id).is_some() {
-        return Err(ValkeyError::Str(errors::ERR_DMA_SESSION_EXISTS));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_SESSION_EXISTS));
     }
     fabric
         .add_peer(client_id, &peer_address)

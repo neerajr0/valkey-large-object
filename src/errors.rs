@@ -27,8 +27,8 @@ define_errors! {
     ERR_INVALID_ADDR_LEN => "ERR invalid memory address len",
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
-    ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.RDMA_HELLO first)",
-    ERR_DMA_SESSION_EXISTS => "ERR DMA session already established",
+    ERR_NO_RDMA_SESSION => "ERR no RDMA session (call BLOB.RDMA_HELLO first)",
+    ERR_RDMA_SESSION_EXISTS => "ERR RDMA session already established",
     ERR_INVALID_INFO_FIELD => "ERR invalid information field",
 
     // OOM — matches the standard Valkey OOM error prefix so clients can
