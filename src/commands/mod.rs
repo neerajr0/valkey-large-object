@@ -37,11 +37,11 @@ fn parse_efa_addresses(
 ) -> Result<Vec<ClientEFAAddress>, ValkeyError> {
     let tail = &args[start_idx..];
     if tail.is_empty() || !tail.len().is_multiple_of(3) {
-        return Err(ValkeyError::Str(errors::ERR_MALFORMED_ADDR_ARGS));
+        return Err(ValkeyError::Str(errors::ERR_MALFORMED_MEMORY_ADDR_ARGS));
     }
     let n_addrs = tail.len() / 3;
     if n_addrs > MAX_EFA_ADDRESSES {
-        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_ADDRESSES));
+        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_MEMORY_ADDRESSES));
     }
     let mut addrs = Vec::with_capacity(n_addrs);
     let mut total_addr_len: u64 = 0;
@@ -54,14 +54,14 @@ fn parse_efa_addresses(
         let addr: u64 = tail[base + 1]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR))?;
         let len: u64 = tail[base + 2]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN))?;
         // A zero-length address can never absorb bytes
         if 0 == len {
-            return Err(ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN));
+            return Err(ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN));
         }
         addrs.push((addr, len as usize, rkey));
         total_addr_len = total_addr_len.saturating_add(len);
@@ -373,14 +373,14 @@ mod tests {
     fn incomplete_triples_are_rejected() {
         assert_eq!(
             reject(&[] as &[&str], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
-        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
-        assert_eq!(reject(&["7", "64"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
+        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
+        assert_eq!(reject(&["7", "64"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
         // One complete triple + one leftover.
         assert_eq!(
             reject(&["7", "64", "4096", "extra"], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
     }
 
@@ -390,7 +390,7 @@ mod tests {
             .flat_map(|i| ["7".to_string(), (i * 4096).to_string(), "4096".to_string()])
             .collect();
         let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_ADDRESSES);
+        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_MEMORY_ADDRESSES);
     }
 
     #[test]
@@ -401,15 +401,15 @@ mod tests {
         );
         assert_eq!(
             reject(&["7", "notanaddr", "4096"], 4096),
-            errors::ERR_INVALID_REMOTE_ADDR
+            errors::ERR_INVALID_MEMORY_ADDR
         );
         assert_eq!(
             reject(&["7", "64", "notalen"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
         );
         assert_eq!(
             reject(&["7", "64", "0"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
         );
     }
 }
