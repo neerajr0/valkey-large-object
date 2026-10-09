@@ -95,7 +95,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'promo_key', payload)
 
         # Freshly SET: on NVMe only, nothing cached yet.
-        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'disk'
 
         # First GET: DRAMPool miss -> NVMe read -> promote to DRAMPool.
         result1 = client.execute_command('BLOB.TCP_GET', 'promo_key')
@@ -154,7 +154,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_GET', 'srckey2')  # promote source
         assert client.execute_command('BLOB.INFO', 'srckey2', 'TIER') == b'dram'
         client.execute_command('COPY', 'srckey2', 'dstkey3')
-        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'disk'
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -447,7 +447,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         for _ in range(5):
             result = client.execute_command('BLOB.TCP_GET', 'repeat_key')
             assert result == payload
-            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'nvme'
+            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'disk'
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
@@ -846,7 +846,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         # GET 1: rejected by admission, served transiently.
         assert client.execute_command('BLOB.TCP_GET', 'basic_key') == payload
-        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'disk'
         after1 = dram()
         assert after1['largeobj_cache_misses_total'] == 1
         assert after1['largeobj_admission_rejects_total'] == 1
@@ -899,7 +899,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'three_key', payload)
         for _ in range(2):
             assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
-            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'nvme'
+            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'disk'
         assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
         assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
 
@@ -975,10 +975,10 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.INFO', hot, 'TIER') == b'dram'
         assert client.execute_command('BLOB.INFO', 'ev_new', 'TIER') == b'dram'
         tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
-        assert tiers.count(b'nvme') == 1, tiers
+        assert tiers.count(b'disk') == 1, tiers
 
         # The reclaimed copy is still on NVMe and reads back intact.
-        reclaimed = self.KEYS[1:][tiers.index(b'nvme')]
+        reclaimed = self.KEYS[1:][tiers.index(b'disk')]
         idx = self.KEYS.index(reclaimed)
         assert client.execute_command('BLOB.TCP_GET', reclaimed) == bytes([65 + idx]) * self.OBJ
 
@@ -1049,7 +1049,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_cached_objects'] == 7
         assert info['largeobj_dram_live_segments'] == 2
         assert info['largeobj_scaling_expand_total'] == 1
-        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'disk'
         for k in ('A', 'B', 'D', 'E', 'H', 'F'):
             assert client.execute_command('BLOB.INFO', k, 'TIER') == b'dram', k
         # The reclaimed copy still reads back from NVMe.
