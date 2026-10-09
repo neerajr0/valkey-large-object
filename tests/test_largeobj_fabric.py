@@ -41,7 +41,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         first = client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
         self.verify_error_response(
             client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}',
-            'DMA session already established')
+            'RDMA session already established')
         assert self.server.get_new_client().execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS) == first
 
     def test_hello_rejects_bad_hex(self):
@@ -58,7 +58,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
         self.verify_error_response(
-            client, 'BLOB.RDMA_GET key 999 0 4096', 'no DMA session (call BLOB.RDMA_HELLO first)')
+            client, 'BLOB.RDMA_GET key 999 0 4096', 'no RDMA session (call BLOB.RDMA_HELLO first)')
 
     def test_rdma_arity_and_malformed_triples_are_refused(self):
         """RDMA commands reject too-few args and incomplete triples.

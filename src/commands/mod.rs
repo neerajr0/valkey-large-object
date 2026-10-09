@@ -376,7 +376,10 @@ mod tests {
             errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
         assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
-        assert_eq!(reject(&["7", "64"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
+        assert_eq!(
+            reject(&["7", "64"], 4096),
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
+        );
         // One complete triple + one leftover.
         assert_eq!(
             reject(&["7", "64", "4096", "extra"], 4096),
