@@ -610,7 +610,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
             ctx.log_notice(&format!(
-                "largeobj: fabric service {index} address {}",
+                "largeobj: fabric service {index} rdma address {}",
                 encode_hex(address)
             ));
         }

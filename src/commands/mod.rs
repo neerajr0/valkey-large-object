@@ -91,15 +91,15 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_RDMA_UNAVAILABLE));
     };
 
-    let peer_address = decode_hex(args[1].as_slice())
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
+    let rdma_address = decode_hex(args[1].as_slice())
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
     // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
     match crate::fabric_provider() {
-        FabricProvider::EfaDirect if peer_address.len() != 32 => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
+        FabricProvider::EfaDirect if rdma_address.len() != 32 => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
         }
-        FabricProvider::Emulated if peer_address.is_empty() => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_EMPTY));
+        FabricProvider::Emulated if rdma_address.is_empty() => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
         }
         FabricProvider::EfaDirect | FabricProvider::Emulated => {}
     }
@@ -112,9 +112,9 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_RDMA_SESSION_EXISTS));
     }
     fabric
-        .add_peer(client_id, &peer_address)
+        .add_peer(client_id, &rdma_address)
         .map_err(|_| ValkeyError::Str(errors::ERR_SESSION_CREATE))?;
-    session::insert(client_id, Session::new(client_id, peer_address));
+    session::insert(client_id, Session::new(client_id, rdma_address));
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
