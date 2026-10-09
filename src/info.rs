@@ -17,7 +17,7 @@ pub static NVME_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-pub static NVME_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +31,7 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     dram_pool_section(ctx)?;
-    nvme_staging_section(ctx)?;
+    disk_staging_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
@@ -124,7 +124,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
-fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
+fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(nvme) = storage::NVME_POOL.get() else {
         return Ok(());
     };
@@ -132,14 +132,14 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let (live, _draining, unused) = nvme.segment_counts();
 
     ctx.builder()
-        .add_section("nvme_staging")
-        .field("nvme_live_segments", live as i64)?
-        .field("nvme_unused_segments", unused as i64)?
-        .field("nvme_fragment_count", nvme.fragment_count() as i64)?
-        .field("staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
+        .add_section("disk_staging")
+        .field("disk_staging_live_segments", live as i64)?
+        .field("disk_staging_unused_segments", unused as i64)?
+        .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
+        .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
+        .field("disk_staging_segment_size_bytes", crate::dram_segment_size() as i64)?
         .field(
-            "nvme_uring_registered_segments",
+            "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
         .build_section()?
@@ -237,8 +237,8 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             DRAM_POOL_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_buffer_exhausted",
-            NVME_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
+            "disk_staging_buffer_exhausted",
+            DISK_STAGING_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "disk_capacity_exceeded",

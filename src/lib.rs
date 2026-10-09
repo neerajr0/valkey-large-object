@@ -688,7 +688,7 @@ valkey_module! {
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
+            ["disk-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["disk-maxmemory", &*CFG_DISK_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
@@ -878,7 +878,7 @@ mod tests {
                 "staging_lt_segment_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_NVME_STAGING_SIZE, segment - 1)],
-                Some("nvme-staging-size must be >= segment-size"),
+                Some("disk-staging-size must be >= segment-size"),
             ),
             (
                 "buffers_max_lt_min_rejected",

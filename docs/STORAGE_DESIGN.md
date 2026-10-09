@@ -1482,7 +1482,7 @@ this section owns the semantics.
 | `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
 | `dram-maxmemory` | `0` (grow-on-demand) | `0` | i64::MAX¹ | Live | Total DRAMPool budget. `0` = grow until the server ceiling (§11.2) |
 | `segment-size` | `64MB` | `1MB` | `1GiB` | Immutable | Uniform segment size for DRAMPool. Growth unit; DRAM segment count = `dram-maxmemory / segment-size` |
-| `nvme-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size. Single segment of this size; sized for max concurrent I/O, not object capacity |
+| `disk-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size. Single segment of this size; sized for max concurrent I/O, not object capacity |
 | `nvme-maxmemory` | `10GB` | `1MB` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
@@ -1497,7 +1497,7 @@ this section owns the semantics.
 server's `maxmemory` / physical RAM (§11.2).
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
-`nvme-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
+`disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
 NVMe staging is always io_uring-registered, and DRAMPool is io_uring-registered in
 Tiered mode (for promotion ReadFixed). Larger capacity comes from *more* segments,
 never bigger ones. (EFA `fi_mr_reg` itself has no such cap — a Dram-mode segment is
@@ -1545,7 +1545,7 @@ actor model in §8.1, and the reclaim *mechanics* live in §8.5:
   However, empty segments (all objects deleted by the client) are reclaimed by the
   scaling cron when memory pressure crosses the shrink watermark.
 
-**NVMe staging is not a scalable budget.** `nvme-staging-size` sizes transient I/O
+**NVMe staging is not a scalable budget.** `disk-staging-size` sizes transient I/O
 buffers for concurrency, not a cache; it is fixed at startup and never shrinks under
 memory pressure.
 

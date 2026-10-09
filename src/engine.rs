@@ -405,7 +405,7 @@ fn cmd_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
+                &info::DISK_STAGING_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
@@ -784,7 +784,7 @@ fn cmd_set_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
+                &info::DISK_STAGING_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
