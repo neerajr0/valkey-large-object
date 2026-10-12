@@ -78,6 +78,37 @@ pub const MODULE_VERSION: i32 = 1;
 
 // ─── Module Configurations (ValkeyModule Config API) ─────────────────────────
 
+// Config defaults, expressed as named constants so the values are defined once
+// and shared between the lazy_static initializers, the valkey_module! registration,
+// and the test reset helpers.
+pub const DEFAULT_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+pub const MIN_SEGMENT_SIZE: i64 = 1024 * 1024; // 1 MiB
+pub const MAX_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+pub const DEFAULT_NVME_STAGING_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+pub const MIN_NVME_STAGING_SIZE: i64 = 1024 * 1024; // 1 MiB
+pub const DEFAULT_NVME_MAXMEMORY: i64 = 0; // unlimited
+pub const DEFAULT_WORKER_THREADS: i64 = 2;
+pub const DEFAULT_MAX_PROMOTE_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
+pub const MAX_MAX_PROMOTE_SIZE: i64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
+pub const DEFAULT_RECLAIM_SCAN_BUDGET_US: i64 = 1000;
+pub const DEFAULT_RECLAIM_POLL_MS: i64 = 100;
+pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
+pub const DEFAULT_TIERED_DECAY_TIME: i64 = 1;
+pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
+pub const DEFAULT_RECLAIM_SAMPLE_SIZE: i64 = 5;
+pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
+pub const DEFAULT_SCALING_EXPAND_WATERMARK: i64 = 80; // stored as percent
+pub const DEFAULT_SCALING_SHRINK_WATERMARK: i64 = 90; // stored as percent
+pub const DEFAULT_CHUNK_SIZE: i64 = 8 * 1024 * 1024; // 8 MiB
+pub const MIN_CHUNK_SIZE: i64 = 4096;
+pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
+pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 8;
+pub const DEFAULT_MIN_BUFFERS_PER_OP: i64 = 2;
+pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
+pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
@@ -86,60 +117,60 @@ lazy_static::lazy_static! {
     /// Used in Tiered mode for read/write staging. Split into uniform
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
-    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
+    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_NVME_STAGING_SIZE);
 
     /// Uniform segment size for all pools (DRAMPool and NVMePool).
     /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
     /// Default: 1 GiB. Immutable after load.
-    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
+    static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_SEGMENT_SIZE);
 
     /// Max disk usage in nvme-dir. Default: 0 (unlimited).
-    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
+    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(DEFAULT_NVME_MAXMEMORY);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
-    static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_WORKER_THREADS);
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
     /// Must fit in one segment (object_fits_segment check). Default: 256 MiB.
     /// Supports memory notation (e.g., "256mb"). Refer to object_fits_segment().
-    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
+    static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_MAX_PROMOTE_SIZE);
 
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 2500ms.
-    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(2500);
+    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_POLL_MS);
 
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
     /// scanning for and deleting reclaim-list keys. Default: 1000us.
-    static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(1000);
-    static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(100);
+    static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SCAN_BUDGET_US);
+    static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_POLL_MS);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
     /// Immutable after load — the poller either starts at init or not at all.
-    static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
+    static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(DEFAULT_SMARTLOG_POLL_SECS);
 
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
+    static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_TIERED_DECAY_TIME);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
-    static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(DEFAULT_PROMOTE_MIN_HITS);
 
     /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
-    static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
+    static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SAMPLE_SIZE);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
     /// the lowest LFU score among samples. 0 means unlimited.
-    static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(1024);
+    static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
-    static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
+    static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_EXPAND_WATERMARK);
 
     /// Shrink watermark (0.0–1.0). When used_memory/maxmemory exceeds this ratio,
     /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
-    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
+    static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_SHRINK_WATERMARK);
 
     /// Bench mode: BLOB.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
@@ -171,10 +202,10 @@ lazy_static::lazy_static! {
     static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
     /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
-    static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+    static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_MAX_IN_FLIGHT);
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
-    static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
+    static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_CRC_POOL_THREADS);
 
     // ─── Test Hooks ──────────────────────────────────────────────────────
 
@@ -193,18 +224,18 @@ lazy_static::lazy_static! {
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
     /// Determines allocation unit for all I/O operations.
-    static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
+    static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_CHUNK_SIZE);
 
     /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
-    static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
+    static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(DEFAULT_MAX_BUFFERS_PER_OP);
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
-    static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(DEFAULT_MIN_BUFFERS_PER_OP);
 
     /// Maximum allowed object size for BLOB.SET. Rejects writes exceeding this limit.
     /// Default: 512 MiB. Must fit in one segment in Dram mode (object_fits_segment
     /// check). Supports memory notation (e.g., "512mb").
-    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
+    static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_MAX_OBJECT_SIZE);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -719,49 +750,49 @@ valkey_module! {
     ],
     configurations: [
         i64: [
-            ["segment-size", &*CFG_SEGMENT_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
+            ["segment-size", &*CFG_SEGMENT_SIZE, DEFAULT_SEGMENT_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, i64::MAX,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, DEFAULT_NVME_STAGING_SIZE, MIN_NVME_STAGING_SIZE, i64::MAX,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
+            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, DEFAULT_NVME_MAXMEMORY, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
-            ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
+            ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, DEFAULT_MAX_PROMOTE_SIZE, 0, MAX_MAX_PROMOTE_SIZE,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
-            ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
+            ["chunk-size", &*CFG_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
+            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, DEFAULT_MAX_BUFFERS_PER_OP, 2, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
-            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
+            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, DEFAULT_MIN_BUFFERS_PER_OP, 1, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
-            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 2_500, 1_000, 60_000,
+            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, 1_000, 100, 100_000,
+            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, DEFAULT_RECLAIM_SCAN_BUDGET_US, 100, 100_000,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, 100, 10, 60_000,
+            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, DEFAULT_RECLAIM_POLL_MS, 10, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
-            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
+            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, DEFAULT_SMARTLOG_POLL_SECS, 0, 86_400,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
+            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, DEFAULT_SCALING_EXPAND_WATERMARK, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
+            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, DEFAULT_MAX_OBJECT_SIZE, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
-            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
+            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, 1, 0, 65_535,
+            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, DEFAULT_TIERED_DECAY_TIME, 0, 65_535,
              ConfigurationFlags::DEFAULT, None, None],
-            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, 2, 1, 255,
+            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, 1, 255,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, 5, 1, 64,
+            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, DEFAULT_RECLAIM_SAMPLE_SIZE, 1, 64,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, 1024, 0, 1_048_576,
+            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, 0, 1_048_576,
              ConfigurationFlags::DEFAULT, None, None],
-            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
+            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, 0, 65_536,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, 1, 1, 1024,
+            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, 1, 1024,
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
@@ -795,14 +826,14 @@ mod tests {
     /// Reset all constrained configs to their compile-time defaults. Other tests
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_constrained_defaults() {
-        CFG_NVME_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
-        CFG_NVME_STAGING_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
-        CFG_SEGMENT_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
-        CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed); // 8 MiB
-        CFG_MAX_OBJECT_SIZE.store(512 * 1024 * 1024, Relaxed); // 512 MiB
-        CFG_MAX_PROMOTE_SIZE.store(256 * 1024 * 1024, Relaxed); // 256 MiB
-        CFG_MAX_BUFFERS_PER_OP.store(8, Relaxed);
-        CFG_MIN_BUFFERS_PER_OP.store(2, Relaxed);
+        CFG_NVME_MAXMEMORY.store(DEFAULT_NVME_MAXMEMORY, Relaxed);
+        CFG_NVME_STAGING_SIZE.store(DEFAULT_NVME_STAGING_SIZE, Relaxed);
+        CFG_SEGMENT_SIZE.store(DEFAULT_SEGMENT_SIZE, Relaxed);
+        CFG_CHUNK_SIZE.store(DEFAULT_CHUNK_SIZE, Relaxed);
+        CFG_MAX_OBJECT_SIZE.store(DEFAULT_MAX_OBJECT_SIZE, Relaxed);
+        CFG_MAX_PROMOTE_SIZE.store(DEFAULT_MAX_PROMOTE_SIZE, Relaxed);
+        CFG_MAX_BUFFERS_PER_OP.store(DEFAULT_MAX_BUFFERS_PER_OP, Relaxed);
+        CFG_MIN_BUFFERS_PER_OP.store(DEFAULT_MIN_BUFFERS_PER_OP, Relaxed);
     }
 
     fn set_cfgs(cfgs: &[(&AtomicI64, i64)]) {
