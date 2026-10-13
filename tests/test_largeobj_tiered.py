@@ -401,15 +401,15 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         del_client = self.server.get_new_client()
         payload = b'D' * 32768
-        client.execute_command('BLOB.SET', 'delset_key', payload)
-        assert client.execute_command('BLOB.GET', 'delset_key') == payload
+        client.execute_command('BLOB.TCP_SET', 'delset_key', payload)
+        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload
         payload2 = b'E' * 32768
         set_result = [None]
         set_error = [None]
         def background_set():
             try:
                 set_result[0] = client.execute_command(
-                    'BLOB.SET', 'delset_key', payload2
+                    'BLOB.TCP_SET', 'delset_key', payload2
                 )
             except Exception as e:
                 set_error[0] = e
@@ -429,7 +429,7 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         wait_for_equal(
             lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
         )
-        assert client.execute_command('BLOB.GET', 'delset_key') == payload2
+        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):

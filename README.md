@@ -65,7 +65,7 @@ valkey-server --port 7380 \
 | `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
 | `nvme-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. 0 = unlimited. |
 | `nvme-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
-| `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.SET. Min 1 byte. |
+| `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
 | `chunk-size` | 8mb | Immutable | Chunk size for multi-buffer streaming I/O. Min 4kb, max 256mb. |
 | `max-buffers-per-op` | 8 | Yes | Max buffers per streaming operation. Min 2, max 64. |
