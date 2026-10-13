@@ -103,7 +103,7 @@ All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 ./build.sh integ-test
 
 # Specific test
-TEST_PATTERN=test_lo_set_get_roundtrip ./build.sh test
+TEST_PATTERN=test_set_get_roundtrip ./build.sh test
 ```
 
 ## Benchmark

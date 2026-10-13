@@ -103,7 +103,7 @@ impl SegmentPool {
     /// Single-segment is the invariant that enables shrink: an object touches one
     /// segment's refcount, so relocating it is one contiguous move. Corollary: no
     /// object can exceed `segment_size` — oversized ones are rejected at SET
-    /// admission (`lo_set`) and never reach here. Used for DRAM ObjectContext.
+    /// admission (`lo_tcp_set`/`lo_rdma_set`) and never reach here. Used for DRAM ObjectContext.
     pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), None)
     }
