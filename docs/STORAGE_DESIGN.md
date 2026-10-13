@@ -8,7 +8,7 @@
 
 The module stores large objects (15KB to multi-GB (TBD)) and must serve them via two transports:
 - **TCP:** standard RESP reply
-- **EFA:** RDMA fi_write directly to client GPU memory (requires EFA NIC; detected at startup — if fabric init fails, `BLOB.HELLO` returns an EFA-unavailable error, no EFA session can be established, and the module operates TCP-only for its lifetime)
+- **EFA:** RDMA fi_write directly to client GPU memory (requires EFA NIC; detected at startup — if fabric init fails, `BLOB.RDMA_HELLO` returns an EFA-unavailable error, no EFA session can be established, and the module operates TCP-only for its lifetime)
 
 Two operating modes:
 - **DRAM-only:** All objects live in DRAM. No NVMe. Fastest reads. Limited by DRAM capacity.
@@ -219,9 +219,9 @@ In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so nei
 - NVMePool: fi_write to client during serve-and-discard GET
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
 
-If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
-command paths are unusable for the module's lifetime: `BLOB.HELLO` fails, and
-`BLOB.SET`/`BLOB.GET` with addresses require a HELLO session. The fabric is opened once
+If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. RDMA
+command paths are unusable for the module's lifetime: `BLOB.RDMA_HELLO` fails, and
+`BLOB.RDMA_GET`/`BLOB.RDMA_SET` require a HELLO session. The fabric is opened once
 at load; there is no runtime re-detection. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
