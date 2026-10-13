@@ -81,33 +81,96 @@ pub const MODULE_VERSION: i32 = 1;
 // Config defaults, expressed as named constants so the values are defined once
 // and shared between the lazy_static initializers, the valkey_module! registration,
 // and the test reset helpers.
+//
+// segment-size
 pub const DEFAULT_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 pub const MIN_SEGMENT_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MAX_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+                                                      // nvme-staging-size
 pub const DEFAULT_NVME_STAGING_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 pub const MIN_NVME_STAGING_SIZE: i64 = 1024 * 1024; // 1 MiB
+pub const MAX_NVME_STAGING_SIZE: i64 = i64::MAX;
+// nvme-maxmemory
 pub const DEFAULT_NVME_MAXMEMORY: i64 = 0; // unlimited
+pub const MIN_NVME_MAXMEMORY: i64 = 0;
+pub const MAX_NVME_MAXMEMORY: i64 = i64::MAX;
+// worker-threads
 pub const DEFAULT_WORKER_THREADS: i64 = 2;
+pub const MIN_WORKER_THREADS: i64 = 1;
+pub const MAX_WORKER_THREADS: i64 = 32;
+// max-promote-size
 pub const DEFAULT_MAX_PROMOTE_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
-pub const MAX_MAX_PROMOTE_SIZE: i64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+pub const MIN_MAX_PROMOTE_SIZE: i64 = 0;
+pub const MAX_MAX_PROMOTE_SIZE: i64 = i64::MAX;
+// scaling-poll-ms
 pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
+pub const MIN_SCALING_POLL_MS: i64 = 1_000;
+pub const MAX_SCALING_POLL_MS: i64 = 60_000;
+// reclaim-scan-budget-us
 pub const DEFAULT_RECLAIM_SCAN_BUDGET_US: i64 = 1000;
+pub const MIN_RECLAIM_SCAN_BUDGET_US: i64 = 100;
+pub const MAX_RECLAIM_SCAN_BUDGET_US: i64 = 100_000;
+// reclaim-poll-ms
 pub const DEFAULT_RECLAIM_POLL_MS: i64 = 100;
+pub const MIN_RECLAIM_POLL_MS: i64 = 10;
+pub const MAX_RECLAIM_POLL_MS: i64 = 60_000;
+// smartlog-poll-secs
 pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
+pub const MIN_SMARTLOG_POLL_SECS: i64 = 0;
+pub const MAX_SMARTLOG_POLL_SECS: i64 = 86_400;
+// tiered-decay-time
 pub const DEFAULT_TIERED_DECAY_TIME: i64 = 1;
+pub const MIN_TIERED_DECAY_TIME: i64 = 0;
+pub const MAX_TIERED_DECAY_TIME: i64 = 65_535;
+// promote-min-hits
 pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
+pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
+pub const MAX_PROMOTE_MIN_HITS: i64 = 255;
+// reclaim-sample-size
 pub const DEFAULT_RECLAIM_SAMPLE_SIZE: i64 = 5;
+pub const MIN_RECLAIM_SAMPLE_SIZE: i64 = 1;
+pub const MAX_RECLAIM_SAMPLE_SIZE: i64 = 64;
+// max-cached-fds
 pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
+pub const MIN_MAX_CACHED_FDS: i64 = 0;
+pub const MAX_MAX_CACHED_FDS: i64 = 1_048_576;
+// scaling-expand-watermark
 pub const DEFAULT_SCALING_EXPAND_WATERMARK: i64 = 80; // stored as percent
+pub const MIN_SCALING_EXPAND_WATERMARK: i64 = 50;
+pub const MAX_SCALING_EXPAND_WATERMARK: i64 = 95;
+// scaling-shrink-watermark
 pub const DEFAULT_SCALING_SHRINK_WATERMARK: i64 = 90; // stored as percent
+pub const MIN_SCALING_SHRINK_WATERMARK: i64 = 50;
+pub const MAX_SCALING_SHRINK_WATERMARK: i64 = 95;
+// chunk-size
 pub const DEFAULT_CHUNK_SIZE: i64 = 8 * 1024 * 1024; // 8 MiB
 pub const MIN_CHUNK_SIZE: i64 = 4096;
 pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
+                                                   // max-buffers-per-op
 pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 8;
+pub const MIN_MAX_BUFFERS_PER_OP: i64 = 2;
+pub const MAX_MAX_BUFFERS_PER_OP: i64 = 64;
+// min-buffers-per-op
 pub const DEFAULT_MIN_BUFFERS_PER_OP: i64 = 2;
+pub const MIN_MIN_BUFFERS_PER_OP: i64 = 1;
+pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
+// max-object-size
 pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
+pub const MIN_MAX_OBJECT_SIZE: i64 = 1;
+pub const MAX_MAX_OBJECT_SIZE: i64 = i64::MAX;
+// fabric-max-in-flight
 pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
+pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
+pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
+// fabric-crc-pool-threads
 pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
+// ─── Test Hooks ──────────────────────────────────────────────────────────────
+// test-pause-before-finalize-set-ms
+pub const DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 0;
+pub const MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 0;
+pub const MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 60_000;
 
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
@@ -752,47 +815,47 @@ valkey_module! {
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, DEFAULT_SEGMENT_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, DEFAULT_NVME_STAGING_SIZE, MIN_NVME_STAGING_SIZE, i64::MAX,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, DEFAULT_NVME_STAGING_SIZE, MIN_NVME_STAGING_SIZE, MAX_NVME_STAGING_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, DEFAULT_NVME_MAXMEMORY, 0, i64::MAX,
+            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, DEFAULT_NVME_MAXMEMORY, MIN_NVME_MAXMEMORY, MAX_NVME_MAXMEMORY,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
-            ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, 1, 32,
+            ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, MIN_WORKER_THREADS, MAX_WORKER_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, DEFAULT_MAX_PROMOTE_SIZE, 0, MAX_MAX_PROMOTE_SIZE,
+            ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, DEFAULT_MAX_PROMOTE_SIZE, MIN_MAX_PROMOTE_SIZE, MAX_MAX_PROMOTE_SIZE,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["chunk-size", &*CFG_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, DEFAULT_MAX_BUFFERS_PER_OP, 2, 64,
+            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, DEFAULT_MAX_BUFFERS_PER_OP, MIN_MAX_BUFFERS_PER_OP, MAX_MAX_BUFFERS_PER_OP,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
-            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, DEFAULT_MIN_BUFFERS_PER_OP, 1, 64,
+            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, DEFAULT_MIN_BUFFERS_PER_OP, MIN_MIN_BUFFERS_PER_OP, MAX_MIN_BUFFERS_PER_OP,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
-            ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+            ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
-            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, 1_000, 60_000,
+            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, MIN_SCALING_POLL_MS, MAX_SCALING_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, DEFAULT_RECLAIM_SCAN_BUDGET_US, 100, 100_000,
+            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, DEFAULT_RECLAIM_SCAN_BUDGET_US, MIN_RECLAIM_SCAN_BUDGET_US, MAX_RECLAIM_SCAN_BUDGET_US,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, DEFAULT_RECLAIM_POLL_MS, 10, 60_000,
+            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, DEFAULT_RECLAIM_POLL_MS, MIN_RECLAIM_POLL_MS, MAX_RECLAIM_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, DEFAULT_SMARTLOG_POLL_SECS, 0, 86_400,
+            ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, DEFAULT_SMARTLOG_POLL_SECS, MIN_SMARTLOG_POLL_SECS, MAX_SMARTLOG_POLL_SECS,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, DEFAULT_SCALING_EXPAND_WATERMARK, 50, 95,
+            ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, DEFAULT_SCALING_EXPAND_WATERMARK, MIN_SCALING_EXPAND_WATERMARK, MAX_SCALING_EXPAND_WATERMARK,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, DEFAULT_MAX_OBJECT_SIZE, 1, i64::MAX,
+            ["max-object-size", &*CFG_MAX_OBJECT_SIZE, DEFAULT_MAX_OBJECT_SIZE, MIN_MAX_OBJECT_SIZE, MAX_MAX_OBJECT_SIZE,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
-            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, 50, 95,
+            ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, MIN_SCALING_SHRINK_WATERMARK, MAX_SCALING_SHRINK_WATERMARK,
              ConfigurationFlags::DEFAULT, None, None],
-            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, DEFAULT_TIERED_DECAY_TIME, 0, 65_535,
+            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, DEFAULT_TIERED_DECAY_TIME, MIN_TIERED_DECAY_TIME, MAX_TIERED_DECAY_TIME,
              ConfigurationFlags::DEFAULT, None, None],
-            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, 1, 255,
+            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, MIN_PROMOTE_MIN_HITS, MAX_PROMOTE_MIN_HITS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, DEFAULT_RECLAIM_SAMPLE_SIZE, 1, 64,
+            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, DEFAULT_RECLAIM_SAMPLE_SIZE, MIN_RECLAIM_SAMPLE_SIZE, MAX_RECLAIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
-            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, 0, 1_048_576,
+            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, 0, 65_536,
+            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
-            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, 1, 1024,
+            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
