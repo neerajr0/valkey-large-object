@@ -18,11 +18,11 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 | Command | Description |
 |---------|-------------|
-| `BLOB.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `BLOB.SET key total_len rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
-| `BLOB.GET key` | Retrieve object over TCP. Returns a bulk string. |
-| `BLOB.GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
-| `BLOB.HELLO client_efa_addr_hex` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `BLOB.TCP_SET key <data>` | Store object (TCP). Data length is implicit. |
+| `BLOB.RDMA_SET key total_len rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
+| `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
+| `BLOB.RDMA_GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
+| `BLOB.RDMA_HELLO client_efa_addr_hex` | Establish RDMA session for GPU-direct DMA transfers. |
 | `BLOB.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
@@ -76,13 +76,13 @@ valkey-server --port 7380 \
 | `reclaim-poll-ms` | 100 | Yes | Reclaim cron poll interval in milliseconds. Min 10, max 60000. |
 | `reclaim-scan-budget-us` | 1000 | Yes | Microseconds per tick for reclaim-list key deletion. Min 100, max 100000. |
 | `reclaim-sample-size` | 5 | Yes | Tiered: cached entries sampled per reclaim; the lowest LFU score goes. Min 1, max 64. |
-| `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. Min 1, max 255. |
-| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score. 0 = no decay. Max 65535. |
+| `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
+| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd reclaim. 0 = no decay. Max 65535. |
 | `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. Max 1048576. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
-| `bench-mode` | no | Immutable | BLOB.GET returns integer size instead of bulk data (isolates NVMe throughput). Hidden. |
+| `bench-mode` | no | Immutable | BLOB.TCP_GET returns integer size instead of bulk data (isolates NVMe throughput). Hidden. |
 | `fabric-provider` | `EfaDirect` | Immutable | libfabric provider: `Emulated` (TCP) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = all discovered. |
 | `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
