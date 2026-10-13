@@ -448,8 +448,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
 
 TIERED_ARGS = (
     "operating-mode Tiered"
-    " nvme-dir {data_dir}"
-    " nvme-staging-size 4194304"
+    " disk-dir {data_dir}"
+    " disk-staging-size 4194304"
     " segment-size 1048576"
     " max-promote-size 983040"
     " promote-min-hits 1"

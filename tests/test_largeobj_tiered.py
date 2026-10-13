@@ -17,8 +17,8 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # With seg=4M and chunk=4K the max is 2093056 (~2044 KiB).
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" promote-min-hits 1"
             f" max-promote-size 2093056"
@@ -184,7 +184,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert nil_digest == [b'0' * 40]
 
     # ─── Streaming tests ─────────────────────────────────────────────────
-    # CRC integrity, delete-during-SET, nvme-maxmemory.
+    # CRC integrity, delete-during-SET, disk-maxmemory.
     # These use the same config as the promotion tests above.
 
     def test_zero_length_object_rejected(self):
@@ -197,10 +197,10 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             assert 'object length must be > 0' in str(e).lower(), f"Unexpected: {e}"
 
     def test_nvme_maxmemory_exhaustion(self):
-        """SET that would exceed nvme-maxmemory is rejected."""
+        """SET that would exceed disk-maxmemory is rejected."""
         client = self.server.get_new_client()
-        # nvme-maxmemory minimum is 1MB. Set to 1MB.
-        client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', '1048576')
+        # disk-maxmemory minimum is 1MB. Set to 1MB.
+        client.execute_command('CONFIG', 'SET', 'largeobj.disk-maxmemory', '1048576')
         # Each 256KB object has disk_len = 4096 (header) + 256KB = 266240 bytes.
         # Three fit (798720 < 1MB), fourth exceeds (1064960 > 1MB).
         payload = b'A' * (256 * 1024)
@@ -210,7 +210,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # Fourth SET should fail (would exceed 1MB).
         try:
             client.execute_command('BLOB.TCP_SET', 'nvme_cap_3', payload)
-            assert False, "Expected capacity exceeded error from nvme-maxmemory"
+            assert False, "Expected capacity exceeded error from disk-maxmemory"
         except ResponseError as e:
             assert 'nvme disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
 
@@ -351,18 +351,18 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'okkey') == b'Y' * limit
 
     def test_max_object_size_tiered_rejection(self):
-        """CONFIG SET max-object-size > nvme-maxmemory is rejected."""
+        """CONFIG SET max-object-size > disk-maxmemory is rejected."""
         client = self.server.get_new_client()
-        # Set nvme-maxmemory to a small value so we can exceed it.
+        # Set disk-maxmemory to a small value so we can exceed it.
         nvme_limit = 1048576  # 1 MiB
-        client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', str(nvme_limit))
+        client.execute_command('CONFIG', 'SET', 'largeobj.disk-maxmemory', str(nvme_limit))
         obj_limit = 2 * 1048576  # 2 MiB
         try:
             client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(obj_limit))
             assert False, "Expected CONFIG SET to be rejected"
         except ResponseError as e:
             assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
-            assert 'nvme-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'disk-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_num_objects(self):
         """INFO num_objects counts LargeObject keys through SET, overwrite, COPY
@@ -438,8 +438,8 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 0"
             f" bench-mode no"
@@ -511,7 +511,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
 
 
 # ─── NVMe disk-usage accounting ──────────────────────────────────────────
-# These Tiered-mode classes use small nvme-maxmemory caps to exercise the
+# These Tiered-mode classes use small disk-maxmemory caps to exercise the
 # capacity gate; each defines its own get_module_args.
 
 
@@ -521,7 +521,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     The usage counter is not observable directly (no INFO section / command), so
     these tests exercise it through its only externally-visible effect: the
     reserve-if-capacity gate (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
-    A SET that would push tracked usage past `nvme-maxmemory` is rejected with
+    A SET that would push tracked usage past `disk-maxmemory` is rejected with
     "pool exhausted"; a SET that fits succeeds. By filling to the cap, freeing,
     and re-filling we prove the counter is incremented on create and -- critically --
     decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
@@ -595,10 +595,10 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         # seg=1M, chunk=OBJ=256K → max 1028096.
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-maxmemory {self.CAP}"
+            f" disk-dir {data_dir}"
+            f" disk-maxmemory {self.CAP}"
             f" max-object-size {self.CAP}"
-            f" nvme-staging-size {self.CAP}"
+            f" disk-staging-size {self.CAP}"
             f" segment-size 1048576"
             f" max-promote-size 1028096"
             f" chunk-size {self.OBJ}"
@@ -671,14 +671,14 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
     def get_module_args(self, data_dir, direct_io):
         # segment-size must exceed the largest staged object (object < segment):
         # this test stages 1 MiB and ~1 MiB+2KiB objects, so use 2 MiB segments.
-        # nvme-staging-size 4 MiB -> ceil(4MiB / 2MiB) = 2 NVMe staging segments.
+        # disk-staging-size 4 MiB -> ceil(4MiB / 2MiB) = 2 NVMe staging segments.
         # max-promote-size must fit in segment after talc overhead (max 2084864).
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-maxmemory {self.CAP}"
+            f" disk-dir {data_dir}"
+            f" disk-maxmemory {self.CAP}"
             f" max-object-size {self.CAP}"
-            f" nvme-staging-size 4194304"
+            f" disk-staging-size 4194304"
             f" segment-size 2097152"
             f" max-promote-size 2084864"
             f" chunk-size 1048576"
@@ -698,7 +698,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         client = self.server.get_new_client()
         aligned_payload = b"Q" * (1024 * 1024)       # 1048576 — already 4096-aligned
         unaligned_payload = b"P" * (1024 * 1024 + 1)  # 1048577 — needs padding
-        # Verify the relationship between payload sizes and nvme-maxmemory cap.
+        # Verify the relationship between payload sizes and disk-maxmemory cap.
         assert self.FILE_HEADER_SIZE + len(aligned_payload) == self.CAP
         assert self.FILE_HEADER_SIZE + self._align_up(len(unaligned_payload)) > self.CAP
         # Aligned case succeeds: disk_len = 4096 + 1048576 = 1052672 == cap.
@@ -725,8 +725,8 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 0"
             f" chunk-size 4096"
@@ -760,8 +760,8 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 0"
             f" chunk-size 4096"
@@ -817,8 +817,8 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" max-promote-size 520192"
             f" chunk-size 4096"
@@ -845,8 +845,8 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 1048576"
             f" bench-mode no"
@@ -946,8 +946,8 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
@@ -1023,8 +1023,8 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
@@ -1093,8 +1093,8 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 4194304"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
             f" segment-size 1048576"
             f" max-promote-size 983040"
             f" promote-min-hits 255"

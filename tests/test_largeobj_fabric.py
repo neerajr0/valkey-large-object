@@ -272,8 +272,8 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" chunk-size 4096"
             f" max-promote-size 0"
@@ -300,8 +300,8 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" max-promote-size 520192"
             f" chunk-size 4096"
@@ -333,13 +333,13 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
 
 
 class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
-    """EFA partial failure + inline drain: test-efa-fail-partial is set at module load
+    """EFA partial failure + inline drain: test-rdma-fail-partial is set at module load
     (immutable), so the first multi-address EFA transfer always injects a synthetic
     submit failure after the first successful post. Runs in its own server instance."""
 
     def get_module_args(self, data_dir, direct_io):
         base = TestLargeObjFabricTransfer.get_module_args(self, data_dir, direct_io)
-        return base + " test-efa-fail-partial yes"
+        return base + " test-rdma-fail-partial yes"
 
     def start_target(self, *flags, split=None):
         """Launch the passive peer and return it with the regions it advertised."""

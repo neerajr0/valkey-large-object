@@ -87,14 +87,14 @@ pub const DEFAULT_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 pub const MIN_SEGMENT_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MAX_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 
-// nvme-staging-size
-pub const DEFAULT_NVME_STAGING_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
-pub const MIN_NVME_STAGING_SIZE: i64 = 1024 * 1024; // 1 MiB
-pub const MAX_NVME_STAGING_SIZE: i64 = i64::MAX;
-// nvme-maxmemory
-pub const DEFAULT_NVME_MAXMEMORY: i64 = 0; // unlimited
-pub const MIN_NVME_MAXMEMORY: i64 = 0;
-pub const MAX_NVME_MAXMEMORY: i64 = i64::MAX;
+// disk-staging-size
+pub const DEFAULT_DISK_STAGING_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+pub const MIN_DISK_STAGING_SIZE: i64 = 1024 * 1024; // 1 MiB
+pub const MAX_DISK_STAGING_SIZE: i64 = i64::MAX;
+// disk-maxmemory
+pub const DEFAULT_DISK_MAXMEMORY: i64 = 0; // unlimited
+pub const MIN_DISK_MAXMEMORY: i64 = 0;
+pub const MAX_DISK_MAXMEMORY: i64 = i64::MAX;
 // worker-threads
 pub const DEFAULT_WORKER_THREADS: i64 = 2;
 pub const MIN_WORKER_THREADS: i64 = 1;
@@ -176,21 +176,21 @@ pub const MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 60_000;
 
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
-    static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
+    static ref CFG_DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
-    /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
+    /// `segment-size` segments: count = ceil(disk-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
-    static ref CFG_NVME_STAGING_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_NVME_STAGING_SIZE);
+    static ref CFG_DISK_STAGING_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_DISK_STAGING_SIZE);
 
     /// Uniform segment size for all pools (DRAMPool and NVMePool).
-    /// Growth unit for DRAMPool; NVMe segment count = nvme-staging-size / segment-size.
+    /// Growth unit for DRAMPool; NVMe segment count = disk-staging-size / segment-size.
     /// Default: 1 GiB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_SEGMENT_SIZE);
 
-    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
-    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(DEFAULT_NVME_MAXMEMORY);
+    /// Max disk usage in disk-dir. Default: 0 (unlimited).
+    static ref CFG_DISK_MAXMEMORY: AtomicI64 = AtomicI64::new(DEFAULT_DISK_MAXMEMORY);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_WORKER_THREADS);
@@ -283,7 +283,7 @@ lazy_static::lazy_static! {
     /// When true, the first multi-address EFA transfer injects a synthetic
     /// submit failure after the first successful post, exercising the inline
     /// drain path. Default: false. Hidden test hook.
-    static ref CFG_TEST_EFA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
+    static ref CFG_TEST_RDMA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -331,14 +331,14 @@ pub fn is_main_thread() -> bool {
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn nvme_dir() -> String {
-    CFG_NVME_DIR
+    CFG_DISK_DIR
         .lock()
-        .expect("CFG_NVME_DIR lock unavailable")
+        .expect("CFG_DISK_DIR lock unavailable")
         .clone()
 }
 
 pub fn nvme_staging_size() -> usize {
-    CFG_NVME_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+    CFG_DISK_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn dram_segment_size() -> usize {
@@ -351,7 +351,7 @@ pub fn segment_size() -> usize {
 }
 
 pub fn nvme_maxmemory() -> u64 {
-    CFG_NVME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
+    CFG_DISK_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn worker_threads() -> usize {
@@ -499,8 +499,8 @@ pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn test_efa_fail_partial() -> bool {
-    CFG_TEST_EFA_FAIL_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
+pub fn test_rdma_fail_partial() -> bool {
+    CFG_TEST_RDMA_FAIL_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -570,7 +570,7 @@ fn config_constraints() -> &'static [ConfigConstraint] {
     static CONSTRAINTS: LazyLock<Vec<ConfigConstraint>> = LazyLock::new(|| {
         vec![
             ConfigConstraint {
-                parent: &CFG_NVME_MAXMEMORY,
+                parent: &CFG_DISK_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 // 0 = unlimited; skip the check.
@@ -578,7 +578,7 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 error_msg: errors::ERR_NVME_GE_MAX_OBJ,
             },
             ConfigConstraint {
-                parent: &CFG_NVME_STAGING_SIZE,
+                parent: &CFG_DISK_STAGING_SIZE,
                 child: &CFG_SEGMENT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 validator: None,
@@ -691,14 +691,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Reset nvme-dir before use (Tiered mode only; a no-op in Dram, which never
+    // Reset disk-dir before use (Tiered mode only; a no-op in Dram, which never
     // touches disk): reclaim any object files a previous run left behind after an
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
     // If the reset fails we can't guarantee a clean slate, so refuse to load
     // rather than start dirty.
     if let Err(e) = storage::validate_and_clean_nvme_dir(mode, &dir) {
         ctx.log_warning(&format!(
-            "largeobj: startup failed to reset nvme-dir {}: {}; aborting module load",
+            "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
             dir, e
         ));
         return Status::Err;
@@ -778,7 +778,7 @@ fn deinitialize(_ctx: &Context) -> Status {
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
 /// signal the SMART log poller to stop, drop the fabric services, and — in Tiered
-/// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
+/// mode — wipe disk-dir so object files don't accumulate across server lifetimes.
 /// The io_uring engines live in process-lifetime statics and are not torn down here.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
@@ -790,7 +790,7 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
-            "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",
+            "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
             dir, e
         ));
     }
@@ -819,9 +819,9 @@ valkey_module! {
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, DEFAULT_SEGMENT_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, DEFAULT_NVME_STAGING_SIZE, MIN_NVME_STAGING_SIZE, MAX_NVME_STAGING_SIZE,
+            ["disk-staging-size", &*CFG_DISK_STAGING_SIZE, DEFAULT_DISK_STAGING_SIZE, MIN_DISK_STAGING_SIZE, MAX_DISK_STAGING_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, DEFAULT_NVME_MAXMEMORY, MIN_NVME_MAXMEMORY, MAX_NVME_MAXMEMORY,
+            ["disk-maxmemory", &*CFG_DISK_MAXMEMORY, DEFAULT_DISK_MAXMEMORY, MIN_DISK_MAXMEMORY, MAX_DISK_MAXMEMORY,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, MIN_WORKER_THREADS, MAX_WORKER_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
@@ -863,12 +863,12 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
-            ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
-            ["test-efa-fail-partial", &*CFG_TEST_EFA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
+            ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [
@@ -893,8 +893,8 @@ mod tests {
     /// Reset all constrained configs to their compile-time defaults. Other tests
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_constrained_defaults() {
-        CFG_NVME_MAXMEMORY.store(DEFAULT_NVME_MAXMEMORY, Relaxed);
-        CFG_NVME_STAGING_SIZE.store(DEFAULT_NVME_STAGING_SIZE, Relaxed);
+        CFG_DISK_MAXMEMORY.store(DEFAULT_DISK_MAXMEMORY, Relaxed);
+        CFG_DISK_STAGING_SIZE.store(DEFAULT_DISK_STAGING_SIZE, Relaxed);
         CFG_SEGMENT_SIZE.store(DEFAULT_SEGMENT_SIZE, Relaxed);
         CFG_CHUNK_SIZE.store(DEFAULT_CHUNK_SIZE, Relaxed);
         CFG_MAX_OBJECT_SIZE.store(DEFAULT_MAX_OBJECT_SIZE, Relaxed);
@@ -916,8 +916,8 @@ mod tests {
     /// their current value. Used to snapshot defaults and restore between cases.
     fn all_constrained_configs() -> Vec<(&'static AtomicI64, i64)> {
         vec![
-            (&CFG_NVME_MAXMEMORY, CFG_NVME_MAXMEMORY.load(Relaxed)),
-            (&CFG_NVME_STAGING_SIZE, CFG_NVME_STAGING_SIZE.load(Relaxed)),
+            (&CFG_DISK_MAXMEMORY, CFG_DISK_MAXMEMORY.load(Relaxed)),
+            (&CFG_DISK_STAGING_SIZE, CFG_DISK_STAGING_SIZE.load(Relaxed)),
             (&CFG_SEGMENT_SIZE, CFG_SEGMENT_SIZE.load(Relaxed)),
             (&CFG_CHUNK_SIZE, CFG_CHUNK_SIZE.load(Relaxed)),
             (&CFG_MAX_OBJECT_SIZE, CFG_MAX_OBJECT_SIZE.load(Relaxed)),
@@ -975,7 +975,7 @@ mod tests {
             (
                 "mode_conditional_constraint_skipped_when_inactive",
                 OperatingMode::Dram,
-                vec![(&CFG_NVME_MAXMEMORY, 1)],
+                vec![(&CFG_DISK_MAXMEMORY, 1)],
                 None,
             ),
             (
@@ -990,7 +990,7 @@ mod tests {
                 OperatingMode::Dram,
                 vec![
                     (&CFG_SEGMENT_SIZE, chunk - 1),
-                    (&CFG_NVME_STAGING_SIZE, chunk - 1),
+                    (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
                 Some("segment-size must be >= chunk-size"),
@@ -1000,7 +1000,7 @@ mod tests {
                 OperatingMode::Dram,
                 vec![
                     (&CFG_SEGMENT_SIZE, max_obj - 1),
-                    (&CFG_NVME_STAGING_SIZE, max_obj - 1),
+                    (&CFG_DISK_STAGING_SIZE, max_obj - 1),
                 ],
                 Some("segment-size is insufficient for max-object-size"),
             ),
@@ -1013,8 +1013,8 @@ mod tests {
             (
                 "staging_lt_segment_rejected",
                 OperatingMode::Tiered,
-                vec![(&CFG_NVME_STAGING_SIZE, segment - 1)],
-                Some("nvme-staging-size must be >= segment-size"),
+                vec![(&CFG_DISK_STAGING_SIZE, segment - 1)],
+                Some("disk-staging-size must be >= segment-size"),
             ),
             (
                 "buffers_max_lt_min_rejected",
@@ -1025,8 +1025,8 @@ mod tests {
             (
                 "tiered_mode_nvme_lt_max_obj_rejected",
                 OperatingMode::Tiered,
-                vec![(&CFG_NVME_MAXMEMORY, max_obj - 1)],
-                Some("nvme-maxmemory must be >= max-object-size in Tiered mode"),
+                vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
+                Some("disk-maxmemory must be >= max-object-size in Tiered mode"),
             ),
         ]
     }

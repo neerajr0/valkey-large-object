@@ -48,10 +48,10 @@ define_errors! {
 
     // Config Validation Errors
     ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
-    ERR_NVME_GE_MAX_OBJ => "ERR nvme-maxmemory must be >= max-object-size in Tiered mode",
+    ERR_NVME_GE_MAX_OBJ => "ERR disk-maxmemory must be >= max-object-size in Tiered mode",
     ERR_SEGMENT_GE_MAX_OBJ => "ERR segment-size is insufficient for max-object-size",
     ERR_SEGMENT_GE_PROMOTE => "ERR segment-size is insufficient for max-promote-size",
-    ERR_STAGING_GE_SEGMENT => "ERR nvme-staging-size must be >= segment-size",
+    ERR_STAGING_GE_SEGMENT => "ERR disk-staging-size must be >= segment-size",
     ERR_SEGMENT_GE_CHUNK => "ERR segment-size must be >= chunk-size",
     ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
 }

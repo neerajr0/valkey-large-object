@@ -49,11 +49,11 @@ valkey-server --port 7380 \
 valkey-server --port 7380 \
     --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
-        nvme-dir /mnt/nvme-data \
+        disk-dir /mnt/nvme-data \
         dram-maxmemory 1gb \
         segment-size 64mb \
-        nvme-maxmemory 10gb \
-        nvme-staging-size 64mb
+        disk-maxmemory 10gb \
+        disk-staging-size 64mb
 ```
 
 ## Configuration
@@ -61,10 +61,10 @@ valkey-server --port 7380 \
 | Parameter | Default | Mutable | Description |
 |-----------|---------|---------|-------------|
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
-| `nvme-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
+| `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
 | `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
-| `nvme-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. 0 = unlimited. |
-| `nvme-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
+| `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. 0 = unlimited. |
+| `disk-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
 | `chunk-size` | 8mb | Immutable | Chunk size for multi-buffer streaming I/O. Min 4kb, max 256mb. |
@@ -113,7 +113,7 @@ TEST_PATTERN=test_set_get_roundtrip ./build.sh test
 ./bench.sh --port 7380
 
 # All modes on NVMe stripe
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test
+./bench.sh --port 7380 --disk-dir /mnt/bigobj-data/bench-test
 ```
 
 See [BENCHMARK.md](BENCHMARK.md) for full documentation, parameters, and troubleshooting.
