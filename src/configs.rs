@@ -33,6 +33,7 @@ enum_configuration! {
 pub const DEFAULT_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 pub const MIN_SEGMENT_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MAX_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
+
 // disk-staging-size
 pub const DEFAULT_DISK_STAGING_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 pub const MIN_DISK_STAGING_SIZE: i64 = 1024 * 1024; // 1 MiB
@@ -93,6 +94,7 @@ pub const MAX_SCALING_SHRINK_WATERMARK: i64 = 95;
 pub const DEFAULT_CHUNK_SIZE: i64 = 8 * 1024 * 1024; // 8 MiB
 pub const MIN_CHUNK_SIZE: i64 = 4096;
 pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
+
 // max-buffers-per-op
 pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 8;
 pub const MIN_MAX_BUFFERS_PER_OP: i64 = 2;

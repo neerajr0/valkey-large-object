@@ -34,9 +34,7 @@
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{
-    valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString,
-};
+use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
