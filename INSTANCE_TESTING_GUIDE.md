@@ -188,7 +188,23 @@ SSH into the **server** instance (or use SSM Session Manager).
 ssh -i valkey-large-object-test-key.pem ec2-user@<SERVER_PUBLIC_IP>
 ```
 
-### 2.1 Install System Dependencies
+### 2.1 Mount an NVMe Drive
+
+The root volume is only 8 GB. Mount an NVMe instance-store drive first and use
+it for all heavy artifacts (Rust toolchain, cargo registry, repo clone, build
+output, and module data). Device names vary by instance type — use `lsblk`.
+
+```bash
+lsblk
+# Pick the first unmounted instance-store drive (not nvme0n1, that's root)
+NVME_DEV="/dev/nvme1n1"   # verify with lsblk
+sudo mkfs.xfs "$NVME_DEV"
+sudo mkdir -p /mnt/nvme0
+sudo mount "$NVME_DEV" /mnt/nvme0
+sudo chown -R ec2-user:ec2-user /mnt/nvme0
+```
+
+### 2.2 Install System Dependencies
 
 ```bash
 # Valkey server
@@ -200,7 +216,7 @@ sudo yum install -y gcc git
 # EFA installer (provides libfabric with efa-direct support)
 # The module's EfaDirect fabric provider requires libfabric-aws >= 2.6.0, which
 # ships in EFA installer >= 1.50.0. Download the latest installer:
-cd ~
+cd /mnt/nvme0
 curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
 tar xzf aws-efa-installer-latest.tar.gz
 cd aws-efa-installer
@@ -209,7 +225,7 @@ cd ~
 
 # If the installer fails (e.g. missing efa-config RPM for your OS version),
 # install the required RPMs manually from the installer's RPMS directory:
-#   cd aws-efa-installer/RPMS/ALINUX2023/aarch64   # adjust for your OS
+#   cd /mnt/nvme0/aws-efa-installer/RPMS/ALINUX2023/aarch64   # adjust for your OS
 #   sudo rpm -Uvh --nodeps \
 #     rdma-core/rdma-core-64.0amzn0-*.rpm \
 #     rdma-core/libibverbs-64.0amzn0-*.rpm \
@@ -226,39 +242,30 @@ cd ~
 export PATH=/opt/amazon/efa/bin:$PATH
 fi_info -f efa-direct   # should show provider: efa, fabric: efa-direct
 
-# Rust toolchain (for building the module)
+# Rust toolchain — install to NVMe to avoid filling the root volume
+export RUSTUP_HOME=/mnt/nvme0/.rustup
+export CARGO_HOME=/mnt/nvme0/.cargo
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
+source /mnt/nvme0/.cargo/env
 ```
 
-### 2.2 Mount an NVMe Drive
-
-i8g/i8ge instances have local NVMe drives. Mount one for object storage and build
-artifacts. Device names vary by instance type — use `lsblk` to find them.
-
-```bash
-# List NVMe drives (skip the root volume, usually nvme0n1)
-lsblk
-
-# Pick the first unmounted instance-store drive (adjust device name as needed)
-NVME_DEV="/dev/nvme1n1"   # verify with lsblk
-sudo mkfs.xfs "$NVME_DEV"
-sudo mkdir -p /mnt/nvme0
-sudo mount "$NVME_DEV" /mnt/nvme0
-sudo chown -R ec2-user:ec2-user /mnt/nvme0
-```
+> **Tip:** Add these to `~/.bashrc` so they persist across SSH sessions:
+> ```bash
+> echo 'export RUSTUP_HOME=/mnt/nvme0/.rustup' >> ~/.bashrc
+> echo 'export CARGO_HOME=/mnt/nvme0/.cargo' >> ~/.bashrc
+> echo 'source /mnt/nvme0/.cargo/env' >> ~/.bashrc
+> ```
 
 ### 2.3 Clone and Build the Module
 
 ```bash
-cd ~
+cd /mnt/nvme0
 git clone https://github.com/valkey-io/valkey-large-object.git
 cd valkey-large-object
 
 # Point pkg-config at the EFA-provided libfabric
 export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig
 
-# Build to NVMe to save root volume space
 export CARGO_TARGET_DIR=/mnt/nvme0/cargo-target
 cargo build --release
 ```
@@ -344,7 +351,18 @@ SSH into the **client** instance.
 ssh -i valkey-large-object-test-key.pem ec2-user@<CLIENT_PUBLIC_IP>
 ```
 
-### 3.1 Install Dependencies
+### 3.1 Mount NVMe and Install Dependencies
+
+Mount NVMe first (same as server section 2.1) to keep the root volume clear:
+
+```bash
+lsblk
+NVME_DEV="/dev/nvme1n1"   # verify with lsblk
+sudo mkfs.xfs "$NVME_DEV"
+sudo mkdir -p /mnt/nvme0
+sudo mount "$NVME_DEV" /mnt/nvme0
+sudo chown -R ec2-user:ec2-user /mnt/nvme0
+```
 
 ```bash
 # Valkey CLI (for manual interaction)
@@ -353,10 +371,13 @@ sudo yum install -y valkey python3-pip
 # Python client library (for the test script)
 pip3 install valkey
 
-# For EFA RDMA testing (section 5): Rust toolchain + EFA stack upgrade
-# Follow the same EFA upgrade steps as the server (section 2.1), then:
+# For EFA RDMA testing (section 5): upgrade the EFA stack
+# Follow the same EFA upgrade steps as the server (section 2.2), then
+# install Rust to NVMe:
+export RUSTUP_HOME=/mnt/nvme0/.rustup
+export CARGO_HOME=/mnt/nvme0/.cargo
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
+source /mnt/nvme0/.cargo/env
 ```
 
 ### 3.2 Verify Connectivity
@@ -368,21 +389,19 @@ valkey-cli -h <SERVER_PRIVATE_IP> PING
 
 ### 3.3 Deploy the Test Scripts
 
-Copy the test scripts to the client instance. From your local machine:
+Copy the test scripts to NVMe. From your local machine:
 
 ```bash
 scp -i valkey-large-object-test-key.pem instance_test_client.py efa_rdma_test.py \
-  ec2-user@<CLIENT_PUBLIC_IP>:~/
+  ec2-user@<CLIENT_PUBLIC_IP>:/mnt/nvme0/
 ```
-
-Or create it directly on the client — the full script is in [Appendix A](#appendix-a-test-script).
 
 ---
 
 ## 4. Running the Functional Test
 
 ```bash
-python3 instance_test_client.py --host <SERVER_PRIVATE_IP>
+python3 /mnt/nvme0/instance_test_client.py --host <SERVER_PRIVATE_IP>
 ```
 
 Expected output (66 checks, 0 failures):
@@ -447,12 +466,11 @@ that acts as a passive libfabric peer with EFA-registered memory.
 
 ### 5.1 Build `fabric_target` on the Client
 
-The client needs Rust, the upgraded EFA stack (same as section 2.1), and the
-module repo. The binary is gated behind a cargo feature flag:
+The client needs Rust, the upgraded EFA stack (same as section 2.2), and the
+module repo. These should already be set up from section 3.1. Build the binary:
 
 ```bash
-# On the client instance
-cd ~
+cd /mnt/nvme0
 git clone https://github.com/valkey-io/valkey-large-object.git
 cd valkey-large-object
 
@@ -465,15 +483,19 @@ The binary lands at `/mnt/nvme0/cargo-target/release/fabric_target`.
 
 ### 5.2 Get the Server's Fabric Address
 
-The server logs its EFA fabric address at startup:
+The server logs its EFA fabric address at startup. Retrieve it from the server
+(run this command on the **server** instance, or via SSM):
 
 ```bash
-# On the server
 grep "fabric service" /tmp/valkey.log
 # Output: largeobj: fabric service 0 address <64-char hex>
 ```
 
-Copy that hex string — the RDMA test script needs it.
+If you only have access to the client, use `valkey-cli` to trigger the
+address from the server log via SSM. It is printed once at startup and is stable for the lifetime
+of the server process.
+
+Copy the 64-character hex string — the RDMA test script needs it.
 
 ### 5.3 Run the EFA RDMA Test
 
@@ -481,7 +503,7 @@ Copy that hex string — the RDMA test script needs it.
 # On the client instance
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib64:$LD_LIBRARY_PATH
 
-python3 efa_rdma_test.py \
+python3 /mnt/nvme0/efa_rdma_test.py \
   --server-ip <SERVER_PRIVATE_IP> \
   --server-fabric-addr <SERVER_FABRIC_ADDRESS_HEX>
 ```
@@ -497,7 +519,7 @@ The script:
 6. Steady-state: 10 rounds of RDMA SET + GET with fresh sessions each round,
    verifying data integrity under sustained load
 
-Expected output (12 checks, 0 failures):
+Expected output (14 checks, 0 failures):
 
 ```
 EFA RDMA Transfer Test
@@ -508,24 +530,26 @@ EFA RDMA Transfer Test
   ✓ BLOB.RDMA_HELLO returns server addresses
   ✓ BLOB.RDMA_GET returns [len, crc]
   ✓   len=4096
-  ✓   crc matches
   ✓ fabric_target verified payload
+  ✓ Client-side CRC matches server CRC
 
 ── RDMA SET test ──
   ✓ BLOB.RDMA_HELLO (SET session)
   ✓ BLOB.RDMA_SET returns OK
   ✓ TCP readback matches pattern
+  ✓ Server stored CRC matches client source CRC
 
 ── RDMA roundtrip test ──
   ✓ RDMA SET for roundtrip
   ✓ RDMA GET for roundtrip returns [4096, crc]
   ✓ Roundtrip: fabric_target verified payload
+  ✓ Roundtrip: client CRC matches server CRC
 
 ── RDMA steady-state test ──
   ✓ 10 RDMA SET/GET rounds completed
 
 ══════════════════════════════════════════════════
-  EFA RDMA: 12 passed, 0 failed
+  EFA RDMA: 14 passed, 0 failed
 ══════════════════════════════════════════════════
 ```
 
@@ -610,8 +634,8 @@ files on disk.
 | `ERR disk-maxmemory must be >= max-object-size` | In Tiered mode, `disk-maxmemory` must be ≥ `max-object-size` |
 | `MISCONF ... unable to persist to disk` | The server can't write RDB. Start with `--save ""` to disable |
 | `Failed to write PID file` | Non-critical warning — server still runs. Set `--dir` to a writable path |
-| `fabric unavailable, EFA path disabled` | EFA not present or libfabric too old. Ensure libfabric-aws >= 2.6.0 is installed (see section 2.1). Set `LD_LIBRARY_PATH=/opt/amazon/efa/lib64` |
-| `fi_getinfo: No data available` for efa-direct | libfabric-aws < 2.6.0 doesn't include the efa-direct provider. Upgrade via the latest EFA installer RPMs (see section 2.1) |
+| `fabric unavailable, EFA path disabled` | EFA not present or libfabric too old. Ensure libfabric-aws >= 2.6.0 is installed (see section 2.2). Set `LD_LIBRARY_PATH=/opt/amazon/efa/lib64` |
+| `fi_getinfo: No data available` for efa-direct | libfabric-aws < 2.6.0 doesn't include the efa-direct provider. Upgrade via the latest EFA installer RPMs (see section 2.2) |
 | Module build fails with `libfabric not found` | `export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig` |
 | Root volume full during build | Set `export CARGO_TARGET_DIR=/mnt/nvme0/cargo-target` to build on NVMe |
 | Port 6379 in use | `pkill -9 -f valkey-server` then restart |

@@ -38,6 +38,16 @@ def check(label, condition, detail=""):
         print(msg)
 
 
+def parse_client_crc(output):
+    """Extract the CRC that fabric_target computed over the bytes in its buffer.
+    Write mode prints: 'received 4096 bytes, crc 0x9c5b5ed2 — payload verified'
+    Read mode prints:  'serving 4096 bytes ... crc 0x9c5b5ed2 — the initiator verifies'
+    Returns the integer CRC, or None if not found."""
+    import re
+    m = re.search(r'\bcrc (0x[0-9a-fA-F]+)\b', output)
+    return int(m.group(1), 16) if m else None
+
+
 def start_target(server_fabric_addr, read_mode=False):
     """Launch fabric_target --efa and parse its advertisement."""
     cmd = [FABRIC_TARGET, "--efa", server_fabric_addr]
@@ -64,7 +74,6 @@ def test_rdma_get(c, server_fabric_addr):
     print("\n── RDMA GET test ──")
     # Store a test object
     c.execute_command('BLOB.TCP_SET', 'rdma_get_key', PATTERN)
-    expected_crc = c.execute_command('BLOB.INFO', 'rdma_get_key', 'CRC')
     # Start passive peer
     proc, client_addr, rkey, remote_addr, length = start_target(server_fabric_addr)
     try:
@@ -80,15 +89,24 @@ def test_rdma_get(c, server_fabric_addr):
         check("BLOB.RDMA_GET returns [len, crc]",
               isinstance(get_reply, list) and len(get_reply) == 2,
               f"got {get_reply!r}")
-        if isinstance(get_reply, list) and len(get_reply) == 2:
+        server_crc = get_reply[1] if isinstance(get_reply, list) and len(get_reply) == 2 else None
+        if server_crc is not None:
             check(f"  len={get_reply[0]}", get_reply[0] == 4096)
-            check(f"  crc matches", get_reply[1] == expected_crc)
-        # Wait for fabric_target to verify bytes landed
+        # Wait for fabric_target to verify bytes and report its CRC
         time.sleep(2)
         proc.terminate()
         output = proc.communicate(timeout=10)[0]
         check("fabric_target verified payload", "payload verified" in output,
               output.strip().split('\n')[-1] if output else "no output")
+        # Cross-check: CRC computed by client over received bytes == server's reply CRC
+        client_crc = parse_client_crc(output)
+        if server_crc is not None and client_crc is not None:
+            check("Client-side CRC matches server CRC",
+                  client_crc == server_crc,
+                  f"client=0x{client_crc:08x} server=0x{server_crc:08x}")
+        else:
+            check("Client-side CRC matches server CRC", False,
+                  f"could not parse CRCs: server={server_crc!r} client={client_crc!r}")
     finally:
         proc.kill()
         proc.wait()
@@ -103,6 +121,9 @@ def test_rdma_set(server_ip, server_port, server_fabric_addr):
         server_fabric_addr, read_mode=True)
     try:
         print(f"  fabric_target addr={client_addr[:16]}... rkey={rkey} len={length}")
+        # Parse the CRC that fabric_target computed over its prefilled buffer
+        time.sleep(0.5)
+        # Read mode prints the CRC in its "serving" line before blocking
         # Fresh connection for a new HELLO
         c2 = valkey.Valkey(host=server_ip, port=server_port, decode_responses=False)
         hello_reply = c2.execute_command('BLOB.RDMA_HELLO', client_addr)
@@ -116,6 +137,18 @@ def test_rdma_set(server_ip, server_port, server_fabric_addr):
         tcp_data = c2.execute_command('BLOB.TCP_GET', 'rdma_set_key')
         check("TCP readback matches pattern", tcp_data == PATTERN,
               f"len={len(tcp_data) if tcp_data else 'None'}")
+        # Cross-check: server's stored CRC matches client's source CRC
+        server_crc = c2.execute_command('BLOB.INFO', 'rdma_set_key', 'CRC')
+        proc.kill()
+        output = proc.communicate(timeout=10)[0]
+        client_crc = parse_client_crc(output)
+        if server_crc is not None and client_crc is not None:
+            check("Server stored CRC matches client source CRC",
+                  client_crc == server_crc,
+                  f"client=0x{client_crc:08x} server=0x{server_crc:08x}")
+        else:
+            check("Server stored CRC matches client source CRC", False,
+                  f"could not parse CRCs: server={server_crc!r} client={client_crc!r}")
         c2.execute_command('DEL', 'rdma_set_key')
     finally:
         proc.kill()
@@ -145,6 +178,7 @@ def test_rdma_roundtrip(server_ip, server_port, server_fabric_addr):
         c2.execute_command('BLOB.RDMA_HELLO', client_addr2)
         get_reply = c2.execute_command('BLOB.RDMA_GET', 'rdma_rt_key',
                                         str(rkey2), str(remote_addr2), str(length2))
+        server_crc = get_reply[1] if isinstance(get_reply, list) and len(get_reply) == 2 else None
         check("RDMA GET for roundtrip returns [4096, crc]",
               isinstance(get_reply, list) and get_reply[0] == 4096)
         time.sleep(2)
@@ -153,6 +187,11 @@ def test_rdma_roundtrip(server_ip, server_port, server_fabric_addr):
         check("Roundtrip: fabric_target verified payload",
               "payload verified" in output,
               output.strip().split('\n')[-1] if output else "no output")
+        client_crc = parse_client_crc(output)
+        if server_crc is not None and client_crc is not None:
+            check("Roundtrip: client CRC matches server CRC",
+                  client_crc == server_crc,
+                  f"client=0x{client_crc:08x} server=0x{server_crc:08x}")
         c2.execute_command('DEL', 'rdma_rt_key')
     finally:
         proc_get.kill()
