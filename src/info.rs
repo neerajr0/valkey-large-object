@@ -286,6 +286,8 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "coalesced_reads",
             COALESCED_READS.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
             "efa_discarded_transfers",
             EFA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
         )?

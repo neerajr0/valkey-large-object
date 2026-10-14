@@ -438,14 +438,45 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         All should return correct data."""
         client = self.server.get_new_client()
         payload = os.urandom(16384)
-        client.execute_command('BLOB.SET', 'pipe_key', payload)
+        client.execute_command('BLOB.TCP_SET', 'pipe_key', payload)
         pipe = client.pipeline(transaction=False)
         num_gets = 10
         for _ in range(num_gets):
-            pipe.execute_command('BLOB.GET', 'pipe_key')
+            pipe.execute_command('BLOB.TCP_GET', 'pipe_key')
         results = pipe.execute()
         for i, r in enumerate(results):
             assert r == payload, f"Pipeline GET {i} data mismatch"
+
+    def test_delete_during_promotion(self):
+        """SET a multi-chunk object, then issue GET (starts promotion) + DEL
+        concurrently via pipeline. Verify no crash. GET may return data or error
+        depending on timing. Subsequent GET returns nil."""
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'delprom_key', payload)
+        pipe = client.pipeline(transaction=False)
+        pipe.execute_command('BLOB.TCP_GET', 'delprom_key')
+        pipe.execute_command('DEL', 'delprom_key')
+        results = pipe.execute()
+        # GET result: either the payload (promotion completed before DEL) or an
+        # error (DEL removed the fd). Both are valid — no crash is the assertion.
+        get_result = results[0]
+        if isinstance(get_result, bytes):
+            assert get_result == payload
+        # DEL result: 1 (key existed) or 0 (already gone).
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        # After both complete, key should be gone.
+        assert client.execute_command('BLOB.TCP_GET', 'delprom_key') is None
+
+
+class TestTieredCoalescing(ValkeyLargeObjTestCaseBase):
+    """Deterministic coalescing test with test-pause-during-promotion-ms set at
+    load time (immutable config). The 2s pause ensures concurrent GETs register
+    as coalesced waiters on the Filling ObjectContext."""
+
+    def get_module_args(self, data_dir, direct_io):
+        base = TestLargeObjTieredPromotion.get_module_args(self, data_dir, direct_io)
+        return base + " test-pause-during-promotion-ms 2000"
 
     def test_coalescing_deterministic(self):
         """Deterministic coalescing: pause the promotion leader so concurrent
@@ -459,11 +490,7 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         """
         client = self.server.get_new_client()
         payload = os.urandom(32768)
-        client.execute_command('BLOB.SET', 'det_coal_key', payload)
-        # Enable test hook: pause promotion for 2s before NVMe reads.
-        client.execute_command(
-            'CONFIG', 'SET', 'largeobj.test-pause-during-promotion-ms', '2000'
-        )
+        client.execute_command('BLOB.TCP_SET', 'det_coal_key', payload)
         waiters_before = int(
             client.info('largeobj').get('largeobj_coalesced_reads', 0)
         )
@@ -473,7 +500,7 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         def reader(idx):
             try:
                 c = self.server.get_new_client()
-                results[idx] = c.execute_command('BLOB.GET', 'det_coal_key')
+                results[idx] = c.execute_command('BLOB.TCP_GET', 'det_coal_key')
             except Exception as e:
                 errors[idx] = e
         # Fire all readers — the first becomes the leader, the rest arrive
@@ -487,10 +514,6 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         # Wait for all to return (leader unblocks after 2s pause + read).
         for t in threads:
             t.join(timeout=10)
-        # Disable the hook.
-        client.execute_command(
-            'CONFIG', 'SET', 'largeobj.test-pause-during-promotion-ms', '0'
-        )
         for i in range(num_readers):
             assert errors[i] is None, f"Reader {i} got error: {errors[i]}"
             assert results[i] == payload, (
@@ -506,27 +529,6 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
             f"got {waiters_after - waiters_before} "
             f"(before={waiters_before} after={waiters_after})"
         )
-
-    def test_delete_during_promotion(self):
-        """SET a multi-chunk object, then issue GET (starts promotion) + DEL
-        concurrently via pipeline. Verify no crash. GET may return data or error
-        depending on timing. Subsequent GET returns nil."""
-        client = self.server.get_new_client()
-        payload = os.urandom(32768)
-        client.execute_command('BLOB.SET', 'delprom_key', payload)
-        pipe = client.pipeline(transaction=False)
-        pipe.execute_command('BLOB.GET', 'delprom_key')
-        pipe.execute_command('DEL', 'delprom_key')
-        results = pipe.execute()
-        # GET result: either the payload (promotion completed before DEL) or an
-        # error (DEL removed the fd). Both are valid — no crash is the assertion.
-        get_result = results[0]
-        if isinstance(get_result, bytes):
-            assert get_result == payload
-        # DEL result: 1 (key existed) or 0 (already gone).
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
-        # After both complete, key should be gone.
-        assert client.execute_command('BLOB.GET', 'delprom_key') is None
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
