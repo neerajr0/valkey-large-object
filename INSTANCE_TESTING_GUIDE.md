@@ -352,6 +352,11 @@ sudo yum install -y valkey python3-pip
 
 # Python client library (for the test script)
 pip3 install valkey
+
+# For EFA RDMA testing (section 5): Rust toolchain + EFA stack upgrade
+# Follow the same EFA upgrade steps as the server (section 2.1), then:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
 ```
 
 ### 3.2 Verify Connectivity
@@ -361,12 +366,13 @@ valkey-cli -h <SERVER_PRIVATE_IP> PING
 # → PONG
 ```
 
-### 3.3 Deploy the Test Script
+### 3.3 Deploy the Test Scripts
 
-Copy `instance_test_client.py` to the client instance. From your local machine:
+Copy the test scripts to the client instance. From your local machine:
 
 ```bash
-scp -i valkey-large-object-test-key.pem instance_test_client.py ec2-user@<CLIENT_PUBLIC_IP>:~/
+scp -i valkey-large-object-test-key.pem instance_test_client.py efa_rdma_test.py \
+  ec2-user@<CLIENT_PUBLIC_IP>:~/
 ```
 
 Or create it directly on the client — the full script is in [Appendix A](#appendix-a-test-script).
@@ -432,7 +438,100 @@ Connected. Module loaded. Starting tests...
 
 ---
 
-## 5. Manual Exploration with valkey-cli
+## 5. EFA RDMA Transfer Validation
+
+The functional test script (`instance_test_client.py`) exercises the TCP command
+path. To validate that data actually moves over EFA RDMA, run `efa_rdma_test.py`
+on the **client** instance. This uses `fabric_target` — a Rust binary in the repo
+that acts as a passive libfabric peer with EFA-registered memory.
+
+### 5.1 Build `fabric_target` on the Client
+
+The client needs Rust, the upgraded EFA stack (same as section 2.1), and the
+module repo. The binary is gated behind a cargo feature flag:
+
+```bash
+# On the client instance
+cd ~
+git clone https://github.com/valkey-io/valkey-large-object.git
+cd valkey-large-object
+
+export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig
+export CARGO_TARGET_DIR=/mnt/nvme0/cargo-target
+cargo build --release --features test-harness --bin fabric_target
+```
+
+The binary lands at `/mnt/nvme0/cargo-target/release/fabric_target`.
+
+### 5.2 Get the Server's Fabric Address
+
+The server logs its EFA fabric address at startup:
+
+```bash
+# On the server
+grep "fabric service" /tmp/valkey.log
+# Output: largeobj: fabric service 0 address <64-char hex>
+```
+
+Copy that hex string — the RDMA test script needs it.
+
+### 5.3 Run the EFA RDMA Test
+
+```bash
+# On the client instance
+export LD_LIBRARY_PATH=/opt/amazon/efa/lib64:$LD_LIBRARY_PATH
+
+python3 efa_rdma_test.py \
+  --server-ip <SERVER_PRIVATE_IP> \
+  --server-fabric-addr <SERVER_FABRIC_ADDRESS_HEX>
+```
+
+The script:
+1. Starts `fabric_target --efa` as a passive peer with EFA-registered memory
+2. Calls `BLOB.RDMA_HELLO` to establish an RDMA session
+3. Calls `BLOB.RDMA_GET` — the server writes object data into the client's
+   registered buffer via EFA RDMA; `fabric_target` verifies the bytes byte-by-byte
+4. Calls `BLOB.RDMA_SET` — the server reads from the client's prefilled buffer
+   via EFA RDMA; verified by reading the object back over TCP
+5. Full roundtrip: SET via RDMA then GET via RDMA
+6. Steady-state: 10 rounds of RDMA SET + GET with fresh sessions each round,
+   verifying data integrity under sustained load
+
+Expected output (12 checks, 0 failures):
+
+```
+EFA RDMA Transfer Test
+  Server: <ip>:6379
+  Fabric: fe80000000000000...
+
+── RDMA GET test ──
+  ✓ BLOB.RDMA_HELLO returns server addresses
+  ✓ BLOB.RDMA_GET returns [len, crc]
+  ✓   len=4096
+  ✓   crc matches
+  ✓ fabric_target verified payload
+
+── RDMA SET test ──
+  ✓ BLOB.RDMA_HELLO (SET session)
+  ✓ BLOB.RDMA_SET returns OK
+  ✓ TCP readback matches pattern
+
+── RDMA roundtrip test ──
+  ✓ RDMA SET for roundtrip
+  ✓ RDMA GET for roundtrip returns [4096, crc]
+  ✓ Roundtrip: fabric_target verified payload
+
+── RDMA steady-state test ──
+  ✓ 10 RDMA SET/GET rounds completed
+
+══════════════════════════════════════════════════
+  EFA RDMA: 12 passed, 0 failed
+══════════════════════════════════════════════════
+```
+
+---
+
+## 6. Manual Exploration with valkey-cli
 
 From the client (or the server itself):
 
@@ -478,7 +577,7 @@ OK
 
 ---
 
-## 6. Dram-Only Mode
+## 7. Dram-Only Mode
 
 To test without NVMe (simpler, no disk-dir needed):
 
@@ -502,7 +601,7 @@ files on disk.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
