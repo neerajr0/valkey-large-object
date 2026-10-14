@@ -111,11 +111,13 @@ command. The address count is inferred from the argument count (must be a multip
 ### BLOB.RDMA_SET (DMA)
 
 ```
-BLOB.RDMA_SET <key> <total_len> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
+BLOB.RDMA_SET <key> <total_len> [CRC <crc32c>] <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
 
 `total_len` is the object's length; the addresses are where its bytes currently live.
 The address count is inferred from the argument count (must be a multiple of 3).
+When the optional `CRC` token is present, the server compares the post-transfer CRC32C
+against the client-supplied value and rejects the SET on mismatch.
 
 | Step | Who | Action |
 |------|-----|--------|
@@ -124,6 +126,7 @@ The address count is inferred from the argument count (must be a multiple of 3).
 | 3 | Server | Picks EFA device (least-loaded LB) |
 | 4 | Server | Per chunk, `fi_read(buf, len, dest_fi_addr, addr, rkey)` from each address that chunk spans, in address order |
 | 5 | Server | Waits for CQ completions, writes through to the configured tier, stores key mapping |
+| 5a | Server | If CRC was provided, verifies computed CRC32C matches; rejects with error on mismatch |
 | 6 | Server | Replies OK |
 
 

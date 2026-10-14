@@ -19,7 +19,7 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | Command | Description |
 |---------|-------------|
 | `BLOB.TCP_SET key <data>` | Store object (TCP). Data length is implicit. |
-| `BLOB.RDMA_SET key total_len rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
+| `BLOB.RDMA_SET key total_len [CRC crc32c] rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. Optional CRC for end-to-end verification. |
 | `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
 | `BLOB.RDMA_GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
 | `BLOB.RDMA_HELLO client_efa_addr_hex` | Establish RDMA session for GPU-direct DMA transfers. |

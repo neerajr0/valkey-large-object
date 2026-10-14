@@ -27,6 +27,7 @@ define_errors! {
     ERR_INVALID_ADDR_LEN => "ERR invalid addr len",
     ERR_INSUFFICIENT_ADDR_SPACE => "ERR client address space smaller than object length",
     ERR_INVALID_LEN => "ERR invalid len",
+    ERR_INVALID_CRC => "ERR invalid CRC value",
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
     ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.RDMA_HELLO first)",
     ERR_DMA_SESSION_EXISTS => "ERR DMA session already established (one BLOB.RDMA_HELLO per connection)",
@@ -40,6 +41,7 @@ define_errors! {
     ERR_EFA_WRITE => "ERR EFA write",
     ERR_EFA_READ => "ERR EFA read",
     ERR_SESSION_CREATE => "ERR session create",
+    ERR_CRC_MISMATCH => "ERR CRC mismatch after transfer",
 
     // Streaming Errors
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",

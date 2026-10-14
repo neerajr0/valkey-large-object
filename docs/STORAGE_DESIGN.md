@@ -263,7 +263,7 @@ All objects live exclusively in DRAM. No NVMe storage. Fastest possible reads. C
 
 ```
 BLOB.TCP_SET key <payload>
-BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]:
+BLOB.RDMA_SET key total_len [CRC crc32c] rkey1 addr1 len1 [...]:
   1. Alloc buffer (registered memory)
   2a. TCP: copy payload into buffer
   2b. RDMA: fi_read from client GPU into buffer (zero-copy)
@@ -288,7 +288,7 @@ All objects persist on NVMe (write-through). DRAM is a read cache — hot object
 
 ```
 BLOB.TCP_SET key <payload>
-BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]:
+BLOB.RDMA_SET key total_len [CRC crc32c] rkey1 addr1 len1 [...]:
   1. If key has existing DRAMPool entry: free that buffer (invalidate stale data)
   2. Alloc buffer (registered memory)
   3a. TCP: copy payload into buffer
@@ -606,7 +606,7 @@ The server decides chunk size — the client never specifies or sees it.
 
 **BLOB.TCP_SET / BLOB.RDMA_SET translation:**
 ```
-Client sends:  BLOB.TCP_SET key <payload>   (or BLOB.RDMA_SET key 50MB rkey addr len)
+Client sends:  BLOB.TCP_SET key <payload>   (or BLOB.RDMA_SET key 50MB [CRC crc32c] rkey addr len)
 Server sees:   total_len=50MB, chunk_size=8MB → N=7 chunks
 Server does:   alloc 7 buffers from shared segments
                partition incoming data into 8MB pieces
@@ -882,7 +882,7 @@ Two cases for how EFA handles large objects:
 The command includes multiple client addresses:
 
 ```
-BLOB.RDMA_SET key <total_len> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+BLOB.RDMA_SET key <total_len> [CRC <crc32c>] <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 BLOB.RDMA_GET key <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 

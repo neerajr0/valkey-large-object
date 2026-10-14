@@ -184,6 +184,39 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_set_with_matching_crc_succeeds(self):
+        """RDMA_SET with a correct CRC token succeeds and the stored CRC matches."""
+        expected_crc = crc32c.crc32c(PATTERN)
+        process, regions = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'key', TARGET_LEN,
+                'CRC', expected_crc, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            assert client.execute_command('BLOB.INFO', 'key', 'CRC') == expected_crc
+        finally:
+            process.kill()
+
+    def test_set_with_wrong_crc_is_rejected(self):
+        """RDMA_SET with a wrong CRC is rejected and the key is not created."""
+        wrong_crc = crc32c.crc32c(PATTERN) ^ 0xDEADBEEF
+        process, regions = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            before = info_largeobj(client).get('largeobj_crc_mismatch', 0)
+            with pytest.raises(ResponseError, match="CRC mismatch after transfer"):
+                client.execute_command(
+                    'BLOB.RDMA_SET', 'key', TARGET_LEN,
+                    'CRC', wrong_crc, *address_args(regions))
+            assert client.execute_command('EXISTS', 'key') == 0
+            after = info_largeobj(client)
+            assert after['largeobj_crc_mismatch'] - before == 1
+        finally:
+            process.kill()
+
     def test_multi_transfer_mixed_protocol(self):
         """Do mixed sets and gets, read the server value into the client, set it back, and
         read it back in the test"""

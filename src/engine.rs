@@ -87,6 +87,10 @@ struct SetObjectInfo {
     object_id: ObjectId,
     obj_len: u64,
     key_name: Vec<u8>,
+    /// Optional client-supplied CRC32C for end-to-end integrity verification.
+    /// When Some, the server compares the post-transfer CRC against this value
+    /// and rejects the SET on mismatch.
+    client_crc: Option<u32>,
 }
 
 // ─── Engine Result ────────────────────────────────────────────────────────────
@@ -665,6 +669,8 @@ pub enum DataSource {
         session: Arc<Session>,
         /// The client's memory regions, in the order it listed them.
         addrs: Vec<storage::ClientEFAAddress>,
+        /// Optional client-supplied CRC32C for end-to-end verification.
+        client_crc: Option<u32>,
     },
 }
 
@@ -699,7 +705,11 @@ fn cmd_set_dram_efa(
     };
     match data_source {
         DataSource::Tcp(_) => unreachable!("Dram+TCP SET routed to sync path"),
-        DataSource::Efa { session, addrs } => {
+        DataSource::Efa {
+            session,
+            addrs,
+            client_crc,
+        } => {
             // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
@@ -728,6 +738,19 @@ fn cmd_set_dram_efa(
                         return;
                     }
                 };
+                // Optional end-to-end CRC verification: reject before commit
+                // so no corrupted data is persisted.
+                if let Some(expected) = client_crc {
+                    if crc != expected {
+                        reply_err(
+                            &thread_ctx,
+                            &info::CRC_MISMATCH,
+                            ValkeyError::Str(errors::ERR_CRC_MISMATCH),
+                        );
+                        dram_pool.free_n(&buffers);
+                        return;
+                    }
+                }
                 let lo_value = LoValue::new(object_id, obj_len, crc, None);
                 // Insert and commit under one server-lock hold, so no shrink lands between.
                 let outcome = {
@@ -800,6 +823,7 @@ fn cmd_set_tiered(
                     object_id,
                     obj_len,
                     key_name,
+                    client_crc: None,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -811,7 +835,11 @@ fn cmd_set_tiered(
                 .await;
             });
         }
-        DataSource::Efa { session, addrs } => {
+        DataSource::Efa {
+            session,
+            addrs,
+            client_crc,
+        } => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
@@ -820,6 +848,7 @@ fn cmd_set_tiered(
                     object_id,
                     obj_len,
                     key_name,
+                    client_crc,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -860,6 +889,7 @@ async fn cmd_set_tiered_run(
         object_id,
         obj_len,
         key_name,
+        client_crc,
     } = set_info;
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
@@ -936,6 +966,20 @@ async fn cmd_set_tiered_run(
             return;
         }
     };
+    // Optional end-to-end CRC verification: reject before commit
+    // so no corrupted data is persisted. ObjectFile Drop handles
+    // NVMe file removal and disk budget; StreamingContext Drop
+    // returns staging buffers.
+    if let Some(expected) = client_crc {
+        if crc != expected {
+            reply_err(
+                &thread_ctx,
+                &info::CRC_MISMATCH,
+                ValkeyError::Str(errors::ERR_CRC_MISMATCH),
+            );
+            return;
+        }
+    }
     test_pause_before_finalize().await;
     // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
     let object_id = object_file.object_id();
