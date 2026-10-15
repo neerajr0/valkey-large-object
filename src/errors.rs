@@ -13,6 +13,10 @@ macro_rules! define_errors {
 }
 
 // ─── Error Definitions ───────────────────────────────────────────────────────
+//
+// Config validation errors include the "largeobj." module prefix so users know
+// the full CONFIG SET name (e.g. `CONFIG SET largeobj.disk-maxmemory`).
+// 'maxmemory' is a core Valkey config and has no module prefix.
 
 define_errors! {
     // Command Errors
@@ -36,7 +40,7 @@ define_errors! {
     // The INFO metric counters (dram_pool_exhausted, disk_staging_buffer_exhausted,
     // disk_capacity_exceeded) tell the operator which resource was exhausted.
     ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
-    ERR_OOM_DISK => "OOM command not allowed when used disk space > 'disk-maxmemory'.",
+    ERR_OOM_DISK => "OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.",
 
     // Storage/Engine Errors
     ERR_DISK_READ => "ERR disk read failed",
@@ -51,12 +55,12 @@ define_errors! {
 
     // Config Validation Errors
     ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
-    ERR_NVME_GE_MAX_OBJ => "ERR disk-maxmemory must be >= max-object-size in Tiered mode",
-    ERR_SEGMENT_GE_MAX_OBJ => "ERR segment-size is insufficient for max-object-size",
-    ERR_SEGMENT_GE_PROMOTE => "ERR segment-size is insufficient for max-promote-size",
-    ERR_STAGING_GE_SEGMENT => "ERR disk-staging-size must be >= segment-size",
-    ERR_SEGMENT_GE_CHUNK => "ERR segment-size must be >= chunk-size",
-    ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
+    ERR_NVME_GE_MAX_OBJ => "ERR largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode",
+    ERR_SEGMENT_GE_MAX_OBJ => "ERR largeobj.segment-size is insufficient for largeobj.max-object-size",
+    ERR_SEGMENT_GE_PROMOTE => "ERR largeobj.segment-size is insufficient for largeobj.max-promote-size",
+    ERR_STAGING_GE_SEGMENT => "ERR largeobj.disk-staging-size must be >= largeobj.segment-size",
+    ERR_SEGMENT_GE_CHUNK => "ERR largeobj.segment-size must be >= largeobj.chunk-size",
+    ERR_MAX_BUF_GE_MIN_BUF => "ERR largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
