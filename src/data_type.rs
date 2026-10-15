@@ -39,6 +39,15 @@ impl ObjectId {
     pub fn file_path(&self, disk_dir: &str) -> String {
         format!("{}/{:016x}.dat", disk_dir, self.0)
     }
+
+    /// The OID a `file_path` file name encodes. None for any other name.
+    pub fn from_filename(name: &str) -> Option<Self> {
+        let hex = name.strip_suffix(".dat")?;
+        if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok().map(Self)
+    }
 }
 
 // ─── Tier ────────────────────────────────────────────────────────────────────
@@ -145,7 +154,7 @@ impl LoValue {
 
     /// Deep-copy for the COPY command callback.
     /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
-    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
+    /// Returns None on capacity exhaustion (pool full or disk-maxmemory exceeded).
     pub fn create_copy(&self) -> Option<LoValue> {
         if self.reclaim_in_progress() {
             return None;
@@ -171,7 +180,7 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
+    /// Returns None if disk-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
         Some(LoValue::new(
@@ -302,6 +311,16 @@ mod tests {
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
         );
+
+        assert_eq!(ObjectId::from_filename("00000000000000ff.dat"), Some(oid));
+        for name in [
+            "00000000000000FF.dat",
+            "ff.dat",
+            "00000000000000ff.tmp",
+            "+0000000000000ff.dat",
+        ] {
+            assert_eq!(ObjectId::from_filename(name), None, "{name}");
+        }
     }
 
     // ─── free_effort tests ───────────────────────────────────────────────

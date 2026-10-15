@@ -26,6 +26,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     def test_set_creates_nvme_file(self):
@@ -185,58 +186,6 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     # ─── Streaming tests ─────────────────────────────────────────────────
     # CRC integrity, delete-during-SET, disk-maxmemory.
     # These use the same config as the promotion tests above.
-
-    def test_tiered_delete_during_set(self):
-        """Deterministic delete-during-SET: the test-pause hook freezes the
-        SET's tokio task after NVMe data writes complete but before set_finalize
-        commits the key. While the SET is paused we fire a DEL from a second
-        client, guaranteeing the interleaving:
-            Thread A (tokio):  write chunks → [PAUSE] → set_finalize (commits)
-            Thread B (main) :                  DEL key (removes v1)
-        The DEL removes the existing v1. The paused SET then resumes: set_finalize
-        finds no existing key (DEL cleared it), so it commits payload2 as a fresh
-        key. No crash, no corruption, and GET returns payload2."""
-        client = self.server.get_new_client()
-        del_client = self.server.get_new_client()
-        payload = b'D' * 32768
-        client.execute_command('BLOB.TCP_SET', 'delset_key', payload)
-        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload
-        # Enable the test hook: pause tiered SET for 2s after writing chunks.
-        client.execute_command(
-            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '2000'
-        )
-        payload2 = b'E' * 32768
-        set_result = [None]
-        set_error = [None]
-        def background_set():
-            try:
-                # This SET blocks for ~2s (paused after NVMe write, before commit).
-                set_result[0] = client.execute_command(
-                    'BLOB.TCP_SET', 'delset_key', payload2
-                )
-            except Exception as e:
-                set_error[0] = e
-        t = threading.Thread(target=background_set)
-        t.start()
-        # Wait long enough for the SET to begin its NVMe writes and enter the
-        # pause window (chunk writes are fast for 32KB at 4KB chunks).
-        time.sleep(0.5)
-        # DEL fires while SET is paused — deterministically hits the race window.
-        del_result = del_client.execute_command('DEL', 'delset_key')
-        assert del_result == 1, f"Expected DEL to find key, got {del_result}"
-        t.join(timeout=10)
-        assert not t.is_alive(), "SET thread did not finish"
-        assert set_error[0] is None, f"SET raised: {set_error[0]}"
-        # Disable the hook.
-        client.execute_command(
-            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
-        )
-        # The paused SET's set_finalize sees no existing key (DEL removed v1)
-        # and commits payload2 as a fresh key.
-        wait_for_equal(
-            lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
-        )
-        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
     def test_zero_length_object_rejected(self):
         """BLOB.TCP_SET with zero-length payload is rejected."""
@@ -430,6 +379,59 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: num_objects() == 0)
 
 
+class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
+    """Deterministic delete-during-SET race via the test-pause hook.
+
+    The hook is set at module load (immutable), so every SET pauses for 2s after
+    writing chunks but before commit. This class runs in its own server instance."""
+
+    def get_module_args(self, data_dir, direct_io):
+        base = TestLargeObjTieredPromotion.get_module_args(self, data_dir, direct_io)
+        return base + " test-pause-before-finalize-set-ms 2000"
+
+    def test_tiered_delete_during_set(self):
+        """The test-pause hook freezes the SET's tokio task after NVMe data
+        writes complete but before set_finalize commits the key. While the SET
+        is paused we fire a DEL from a second client, guaranteeing:
+            Thread A (tokio):  write chunks → [PAUSE] → set_finalize (commits)
+            Thread B (main) :                  DEL key (removes v1)
+        The DEL removes the existing v1. The paused SET then resumes: set_finalize
+        finds no existing key (DEL cleared it), so it commits payload2 as a fresh
+        key. No crash, no corruption, and GET returns payload2."""
+        client = self.server.get_new_client()
+        del_client = self.server.get_new_client()
+        payload = b'D' * 32768
+        client.execute_command('BLOB.TCP_SET', 'delset_key', payload)
+        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload
+        payload2 = b'E' * 32768
+        set_result = [None]
+        set_error = [None]
+        def background_set():
+            try:
+                set_result[0] = client.execute_command(
+                    'BLOB.TCP_SET', 'delset_key', payload2
+                )
+            except Exception as e:
+                set_error[0] = e
+        t = threading.Thread(target=background_set)
+        t.start()
+        # Wait long enough for the SET to begin its NVMe writes and enter the
+        # pause window (chunk writes are fast for 32KB at 4KB chunks).
+        time.sleep(0.5)
+        # DEL fires while SET is paused — deterministically hits the race window.
+        del_result = del_client.execute_command('DEL', 'delset_key')
+        assert del_result == 1, f"Expected DEL to find key, got {del_result}"
+        t.join(timeout=10)
+        assert not t.is_alive(), "SET thread did not finish"
+        assert set_error[0] is None, f"SET raised: {set_error[0]}"
+        # The paused SET's set_finalize sees no existing key (DEL removed v1)
+        # and commits payload2 as a fresh key.
+        wait_for_equal(
+            lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
+        )
+        assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
+
+
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
 
@@ -443,6 +445,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     def test_set_get_roundtrip_no_promotion(self):
@@ -601,6 +604,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             f" chunk-size {self.OBJ}"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_capacity_reclaimed_on_true_free(self):
@@ -680,6 +684,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
             f" chunk-size 1048576"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_padding_accounting(self):
@@ -727,6 +732,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
             f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_tiered_file_header_crc_mismatch(self):
@@ -761,6 +767,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_tiered_file_header_magic_corruption(self):
@@ -818,6 +825,7 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
             f" smartlog-poll-secs 0"
+            f" fabric-provider Emulated"
         )
 
     def test_smartlog_absent_when_disabled(self):
@@ -844,6 +852,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     def test_second_touch_promotes(self):
@@ -926,7 +935,7 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
     segment of headroom, see _block_expansion), so a promotion into a full pool
     must reclaim. promote-min-hits 1 so every GET
     promotes; decay off so scores are stable across a minute boundary. The
-    default reclaim-sample-size (5) exceeds the 3-entry map, so victim selection
+    default victim-sample-size (5) exceeds the 3-entry map, so victim selection
     scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
     fourth needs the remaining 256 KiB exactly, which any allocator overhead
     denies."""
@@ -942,10 +951,11 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def _block_expansion(self, client):
@@ -1003,7 +1013,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
     expands once for the fourth. Segment 1 then gets the coldest objects, so a
     reclaim that looked across the whole pool would take one of those. The
     target is segment 0 (768 KiB vs 832 KiB) and its 3 entries are fewer than
-    the default reclaim-sample-size (5), so the victim choice there is exact.
+    the default victim-sample-size (5), so the victim choice there is exact.
     The expand watermark is raised so the scaling cron never adds a third
     segment (2 MiB, at most 78% full)."""
 
@@ -1018,11 +1028,12 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" scaling-expand-watermark 95"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def _promote(self, client, key, payload):
@@ -1073,7 +1084,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
     """max-cached-fds 2 with promotion effectively off (promote-min-hits 255), so
     every GET reads through the fd pool. Decay off so scores are stable across
-    a minute boundary. The default reclaim-sample-size (5) exceeds the 2-entry
+    a minute boundary. The default victim-sample-size (5) exceeds the 2-entry
     map, so victim selection scans both entries and is exact."""
 
     OBJ = 64 * 1024
@@ -1087,11 +1098,12 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 983040"
             f" promote-min-hits 255"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" max-cached-fds 2"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def _payload(self, i):
@@ -1111,7 +1123,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 3
+        assert info['largeobj_fd_evictions'] == 3
         # Nothing was promoted, so these were all NVMe reads.
         dram = client.info('largeobj_dram')
         assert dram['largeobj_dram_objects'] == 0
@@ -1121,7 +1133,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.TCP_GET', k) == self._payload(i)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        reclaims = info['largeobj_fd_reclaims']
+        evictions = info['largeobj_fd_evictions']
 
         # DEL drops the pool's fd through ObjectFile::Drop, so the next open
         # takes the free slot instead of reclaiming. KEYS[4] was read last, so
@@ -1132,7 +1144,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == reclaims
+        assert info['largeobj_fd_evictions'] == evictions
 
     def test_reclaims_coldest_keeps_hot(self):
         """A full pool reclaims the lowest-scoring fd. KEYS[0] is read three
@@ -1149,18 +1161,18 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[1]) == self._payload(1)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 0
+        assert info['largeobj_fd_evictions'] == 0
 
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 1
+        assert info['largeobj_fd_evictions'] == 1
 
         # KEYS[0] survived, so reading it again needs no open and no reclaim.
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 1
+        assert info['largeobj_fd_evictions'] == 1
 
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap takes effect on the next open."""
@@ -1175,4 +1187,4 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
-        assert info['largeobj_fd_reclaims'] == 2
+        assert info['largeobj_fd_evictions'] == 2

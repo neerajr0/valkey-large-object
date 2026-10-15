@@ -65,7 +65,7 @@ Each term builds on the previous.
 
 ## 2. Option 2: Per-Request rkey with HELLO
 
-Client establishes a session once via `BLOB.RDMA_HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent RDMA_GET/RDMA_SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.RDMA_HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
+Client establishes a session once via `BLOB.RDMA_HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent RDMA_GET/RDMA_SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.RDMA_HELLO` on the same connection is refused (`ERR RDMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
 
 **Threading model:** The session holds routing handles for all N server EFA devices. Any thread can use any device for a given operation — the server picks the least-loaded device (least-loaded). Threads do not own specific devices.
 
@@ -157,10 +157,10 @@ BLOB.EFAINFO
 
 Client sends this to get the server's EFA address. Server returns one address (first thread's endpoint). Client calls `fi_av_insert(server_addr)` and registers memory regions. No handshake — ready immediately.
 
-### BLOB.GET (DMA)
+### BLOB.RDMA_GET (DMA)
 
 ```
-BLOB.GET <key> <client_efa_addr> <remote_addr> <rkey> [len]
+BLOB.RDMA_GET <key> <client_efa_addr> <remote_addr> <rkey> [len]
 ```
 
 | Step | Who | Action |
@@ -172,10 +172,10 @@ BLOB.GET <key> <client_efa_addr> <remote_addr> <rkey> [len]
 | 5 | Server | `fi_write(buf, len, dest_fi_addr, remote_addr, rkey)` from this thread's EFA device |
 | 6 | Server | Waits for CQ completion, replies with integer |
 
-### BLOB.SET (DMA)
+### BLOB.RDMA_SET (DMA)
 
 ```
-BLOB.SET <key> <client_efa_addr> <remote_addr> <rkey> <len>
+BLOB.RDMA_SET <key> <client_efa_addr> <remote_addr> <rkey> <len>
 ```
 
 | Step | Who | Action |

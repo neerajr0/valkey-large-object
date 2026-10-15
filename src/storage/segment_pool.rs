@@ -5,10 +5,11 @@
 //! ## Design
 //!
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
-//! `Some(segment)` (live) or `None` (empty/removed). Slot index == this pool's
-//! LOCAL iovec index in its own io_uring buffer table (each pool has its own
-//! ring). A segment's `iovec_index` is assigned at creation and recomputed on
-//! each dense table rebuild.
+//! `Some(segment)` (live) or `None` (empty/removed). Slot index is what
+//! `SegmentBuffer.segment_idx` names: it only locates the segment in `slots`.
+//! A segment's `iovec_index` is its position in this pool's own io_uring buffer
+//! table (each pool has its own ring) and is read from the segment itself. The
+//! two are independent; never derive one from the other.
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
@@ -37,19 +38,14 @@ use std::sync::Mutex;
 
 use allocator_api2::alloc::Allocator;
 
+use super::cache_policy::RECLAIM_MAX_SEGMENTS;
 use super::context::SegmentBuffer;
 use super::segment::Segment;
 
-/// Mutable segment state: the slot vector plus this pool's own io_uring iovec
-/// table.
+/// Mutable segment state: the slot vector.
 struct SegmentState {
     /// Segment slots. `None` = empty slot (a drained hole or unused capacity).
     slots: Vec<Option<Segment>>,
-    /// This pool's io_uring registered-buffer table as `(base, len)` pairs,
-    /// index-aligned with `slots`. The index is the pool-local `iovec_index` a
-    /// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index
-    /// reused by the next expand.
-    iovecs: Vec<Option<(usize, usize)>>,
 }
 
 pub struct SegmentPool {
@@ -63,33 +59,27 @@ pub struct SegmentPool {
 
 impl SegmentPool {
     /// Create a new SegmentPool with `segment_count` pre-allocated segments of
-    /// `segment_size` bytes. Each segment's iovec_index = its position in this
-    /// pool's own local iovec table (assigned in-order here), which lines
-    /// up with its position in the slot table.
+    /// `segment_size` bytes. `iovec_index` is assigned 0..n in slot order, so
+    /// the startup table is dense.
     pub fn new(segment_count: usize, segment_size: usize, pool_id: super::uring::PoolType) -> Self {
         assert!(
             segment_count >= 1,
             "SegmentPool requires at least 1 segment"
         );
+        assert!(
+            segment_count <= super::MAX_SEGMENTS,
+            "startup segment count exceeds MAX_SEGMENTS — init validation bypassed"
+        );
 
         let mut slots: Vec<Option<Segment>> = Vec::with_capacity(segment_count);
-        let mut iovecs: Vec<Option<(usize, usize)>> = Vec::with_capacity(segment_count);
-        for _ in 0..segment_count {
+        for idx in 0..segment_count {
             let mut seg = Segment::new(segment_size);
-            let iov = seg.iovec();
-            // Pool-local index: position in this pool's own iovec table.
-            let idx = iovecs.len();
-            assert!(
-                idx < super::MAX_SEGMENTS,
-                "startup segment count exceeds MAX_SEGMENTS — init validation bypassed"
-            );
-            iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
             seg.iovec_index = idx as u16;
             slots.push(Some(seg));
         }
 
         Self {
-            state: Mutex::new(SegmentState { slots, iovecs }),
+            state: Mutex::new(SegmentState { slots }),
             segment_size,
             pool_id,
         }
@@ -97,19 +87,12 @@ impl SegmentPool {
 
     // ─── io_uring iovec table (pool-local) ─────────────────────────────────────
 
-    /// Dense snapshot of this pool's iovec table (holes skipped) for the ring's
-    /// startup `IORING_REGISTER_BUFFERS`. Dense because 5.10 has no sparse table.
+    /// Dense iovec array for the ring's startup `IORING_REGISTER_BUFFERS`, one
+    /// entry per segment. Dense because 5.10 has no sparse table. Only called
+    /// from init.
     pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
         let st = self.state.lock().expect("state lock unavailable");
-        st.iovecs
-            .iter()
-            .filter_map(|opt| {
-                opt.map(|(ptr, len)| libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: len,
-                })
-            })
-            .collect()
+        st.slots.iter().flatten().map(|seg| seg.iovec()).collect()
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
@@ -121,7 +104,7 @@ impl SegmentPool {
     /// Single-segment is the invariant that enables shrink: an object touches one
     /// segment's refcount, so relocating it is one contiguous move. Corollary: no
     /// object can exceed `segment_size` — oversized ones are rejected at SET
-    /// admission (`lo_set`) and never reach here. Used for DRAM ObjectContext.
+    /// admission (`lo_tcp_set`/`lo_rdma_set`) and never reach here. Used for DRAM ObjectContext.
     pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), None)
     }
@@ -132,13 +115,15 @@ impl SegmentPool {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), Some(seg_idx))
     }
 
-    /// `(seg_idx, bytes_short)`: the segment `alloc_exact(size)` would pick
-    /// (least-loaded live one) and how many bytes it lacks for `size`. 0 means
-    /// the bytes fit and only talc overhead could block the alloc.
-    pub(super) fn segment_shortfall(&self, size: usize) -> Option<(usize, usize)> {
+    /// `(seg_idx, bytes_short)` for the `n` least-loaded live segments, emptiest
+    /// first. 0 means the bytes fit and only talc overhead could block the alloc.
+    pub(super) fn segment_shortfalls(&self, size: usize, n: usize) -> Vec<(usize, usize)> {
         let total: usize = Self::chunk_sizes(size).iter().sum();
-        let (i, cur) = self.find_shrink_victim()?;
-        Some((i, (cur + total).saturating_sub(self.segment_size)))
+        let st = self.state.lock().expect("state lock unavailable");
+        Self::least_loaded(&st, n)
+            .into_iter()
+            .map(|(i, cur)| (i, (cur + total).saturating_sub(self.segment_size)))
+            .collect()
     }
 
     /// Per-chunk aligned sizes: first N-1 are chunk_size, last is trimmed.
@@ -158,13 +143,12 @@ impl SegmentPool {
             .collect()
     }
 
-    /// Allocate every chunk of the object from ONE least-loaded eligible segment.
-    /// Single `min_by_key` pass, no fallback loop (same as `alloc_one`): segments
-    /// are uniform, so if the emptiest eligible one can't fit — only possible by
-    /// talc's per-chunk boundary-tag overhead — none can, and `None` = pool full,
-    /// which the caller handles via reactive expand. Keeps an object co-located —
-    /// see `alloc_exact`.
-    /// `target` pins the segment (reclaim retry); `None` picks the least-loaded.
+    /// Allocate every chunk of the object from ONE segment: `target` if set (reclaim
+    /// retry), else the first of the `RECLAIM_MAX_SEGMENTS` least-loaded eligible
+    /// segments that fits. The emptiest can have the bytes yet fail in talc
+    /// (fragmentation, per-chunk boundary tags) where a fuller one fits. `None` =
+    /// no candidate fits, which the caller handles via expand or eviction. Keeps an
+    /// object co-located — see `alloc_exact`.
     fn alloc_object_in_one_segment(
         &self,
         sizes: &[usize],
@@ -176,13 +160,26 @@ impl SegmentPool {
         );
         let total: usize = sizes.iter().sum();
         let st = self.state.lock().expect("state lock unavailable");
-        // Single O(N) pass: least-loaded eligible segment, checked against the
-        // object's TOTAL size. Segments are uniform, so if it can't fit, none
-        // can. `target` pins the segment instead.
-        let seg_idx = match target {
-            Some(i) => i,
-            None => Self::least_loaded(&st)?.0,
+        let candidates = match target {
+            Some(i) => vec![i],
+            None => Self::least_loaded(&st, RECLAIM_MAX_SEGMENTS)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect(),
         };
+        candidates
+            .into_iter()
+            .find_map(|seg_idx| self.alloc_object_in(&st, seg_idx, sizes, total))
+    }
+
+    /// `alloc_object_in_one_segment` in segment `seg_idx`, holding the state lock.
+    fn alloc_object_in(
+        &self,
+        st: &SegmentState,
+        seg_idx: usize,
+        sizes: &[usize],
+        total: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
         let seg = st.slots.get(seg_idx)?.as_ref()?;
         if seg.draining.load(std::sync::atomic::Ordering::Acquire)
             || seg
@@ -201,9 +198,8 @@ impl SegmentPool {
                 .expect("alloc_object_in_one_segment: invalid chunk layout");
             // TalcCell::allocate (Allocator trait) is safe and the all-or-nothing fit check.
             let Ok(ptr) = talc.allocate(layout) else {
-                // Partial failure by talc overhead: roll back what we took from
-                // this segment and report pool-full. No next-segment fallback —
-                // uniform segments mean no other segment would fit either.
+                // Partial failure by talc overhead or fragmentation: roll back
+                // what we took from this segment; the caller tries the next.
                 for buf in &buffers {
                     let l = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
                         .expect("alloc_object_in_one_segment: rollback layout");
@@ -469,67 +465,59 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment to the pool at the pool-local `iovec_index` that the
-    /// first-free-hole search assigns, so `slots[i]` and this pool's `iovecs[i]`
-    /// stay index-aligned by construction. Each new Segment carries its own fresh
-    /// talc allocator.
+    /// Add a new segment in the first empty slot (else append), with its own
+    /// fresh talc allocator. Its `iovec_index` is a placeholder until the
+    /// post-expand dense rebuild assigns the real one; it is unregistered until
+    /// then, so the placeholder never reaches the kernel.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
     ///
-    /// Returns `(iovec_index, segment_slice)` on success. The slice is `'static` (segment memory
+    /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
     /// is stable for the module's lifetime) so the caller can register it with the transport
-    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool's
-    /// iovec table is already at `MAX_SEGMENTS`.
+    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool
+    /// already has `MAX_SEGMENTS` live segments.
     pub fn expand(&self) -> Option<(u16, &'static [u8])> {
-        let seg = Segment::new(self.segment_size);
+        let mut seg = Segment::new(self.segment_size);
         // Segment memory is stable for the module's lifetime (never freed until
         // the segment is released, and a live segment is not released while a
         // registration references it). SAFETY: base/size describe the just-
         // allocated backing buffer.
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
-        let iov = seg.iovec();
 
         let mut st = self.state.lock().expect("state lock unavailable");
-        // Pool-local iovec index: reuse the first hole, else append (rejected at
-        // MAX_SEGMENTS). On None, `seg` drops here and nothing enters `slots`.
-        let entry = Some((iov.iov_base as usize, iov.iov_len));
-        let idx = match st.iovecs.iter().position(|s| s.is_none()) {
+        // On None, `seg` drops here and nothing enters `slots`.
+        let live = st.slots.iter().flatten().count();
+        if live >= super::MAX_SEGMENTS {
+            return None;
+        }
+        seg.iovec_index = live as u16; // placeholder
+        let slot = match st.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
-                st.iovecs[i] = entry;
+                st.slots[i] = Some(seg);
                 i
             }
             None => {
-                if st.iovecs.len() >= super::MAX_SEGMENTS {
-                    return None;
-                }
-                st.iovecs.push(entry);
-                st.iovecs.len() - 1
+                st.slots.push(Some(seg));
+                st.slots.len() - 1
             }
         };
-        let mut seg = seg;
-        seg.iovec_index = idx as u16;
-        // Place at slots[idx] so slots and iovecs stay index-aligned. Pad in case
-        // idx is past the current len.
-        if idx >= st.slots.len() {
-            st.slots.resize_with(idx + 1, || None);
-        }
-        st.slots[idx] = Some(seg);
 
-        Some((idx as u16, slice))
+        Some((slot as u16, slice))
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.
     /// Returns `(slot_idx, allocated_bytes)` without marking the segment draining.
     pub fn find_shrink_victim(&self) -> Option<(usize, usize)> {
         let st = self.state.lock().expect("state lock unavailable");
-        Self::least_loaded(&st)
+        Self::least_loaded(&st, 1).first().copied()
     }
 
-    /// Least-loaded non-draining segment as `(slot_idx, allocated_bytes)`.
-    /// Single O(N) pass; the caller holds the state lock so slots stay stable.
-    /// The allocator's pick, the shrink victim, and `segment_shortfall` use it.
-    fn least_loaded(st: &SegmentState) -> Option<(usize, usize)> {
-        st.slots
+    /// The `n` least-loaded non-draining segments as `(slot_idx, allocated_bytes)`,
+    /// emptiest first. The caller holds the state lock so slots stay stable.
+    /// The allocator's pick, the shrink victim, and `segment_shortfalls` use it.
+    fn least_loaded(st: &SegmentState, n: usize) -> Vec<(usize, usize)> {
+        let mut live: Vec<(usize, usize)> = st
+            .slots
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
@@ -542,7 +530,10 @@ impl SegmentPool {
                     )
                 })
             })
-            .min_by_key(|&(_, bytes)| bytes)
+            .collect();
+        live.sort_by_key(|&(_, bytes)| bytes);
+        live.truncate(n);
+        live
     }
 
     /// Mark a specific segment as draining by slot index.
@@ -579,19 +570,14 @@ impl SegmentPool {
         }
     }
 
-    /// Complete the drain: pull the Segment out of its slot, clear this pool's
-    /// iovec entry, drop it. Segment::drop deallocates the backing memory (its
-    /// talc's metadata lived inside that memory and vanishes with it).
+    /// Complete the drain: pull the Segment out of its slot and drop it.
+    /// Segment::drop deallocates the backing memory (its talc's metadata lived
+    /// inside that memory and vanishes with it).
     fn release_drained(&self, seg_idx: usize) {
         let mut st = self.state.lock().expect("state lock unavailable");
         let Some(seg) = st.slots[seg_idx].take() else {
             return; // already released
         };
-        let iovec_index = seg.iovec_index as usize;
-        // Null this pool's iovec slot so the ring's dense rebuild omits it.
-        if iovec_index < st.iovecs.len() {
-            st.iovecs[iovec_index] = None;
-        }
         drop(st);
         // seg dropped here → Segment::drop → talc drops (no external state) →
         // std::alloc::dealloc frees backing memory.
@@ -653,19 +639,11 @@ impl SegmentPool {
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
         let mut st = self.state.lock().expect("state lock unavailable");
         let mut out = Vec::new();
-        let mut next: u16 = 0;
-        let mut new_iovecs: Vec<Option<(usize, usize)>> = Vec::new();
-        for slot in st.slots.iter_mut() {
-            if let Some(seg) = slot.as_mut() {
-                seg.iovec_index = next;
-                next += 1;
-                let iov = seg.iovec();
-                out.push(iov);
-                new_iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
-                seg.mark_io_uring_registered();
-            }
+        for seg in st.slots.iter_mut().flatten() {
+            seg.iovec_index = out.len() as u16;
+            out.push(seg.iovec());
+            seg.mark_io_uring_registered();
         }
-        st.iovecs = new_iovecs; // compacted to match the dense reindex above
         out
     }
 
@@ -782,16 +760,18 @@ mod tests {
     // ── alloc_exact ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_segment_shortfall_picks_least_loaded() {
+    fn test_segment_shortfalls_pick_least_loaded() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         let a = pool.alloc_exact(4096 * 4).unwrap(); // seg 0: 16 KiB
         let b = pool.alloc_exact(4096 * 2).unwrap(); // seg 1: 8 KiB (least loaded)
         assert_eq!((a[0].segment_idx, b[0].segment_idx), (0, 1));
         // 60 KiB into seg 1 (8 KiB used of 64 KiB) is 4 KiB short.
-        assert_eq!(pool.segment_shortfall(4096 * 15), Some((1, 4096)));
+        assert_eq!(pool.segment_shortfalls(4096 * 15, 1), [(1, 4096)]);
         // Fits by bytes: nothing short.
-        assert_eq!(pool.segment_shortfall(4096), Some((1, 0)));
+        assert_eq!(pool.segment_shortfalls(4096, 1), [(1, 0)]);
+        // The `n` least loaded, emptiest first.
+        assert_eq!(pool.segment_shortfalls(4096, 2), [(1, 0), (0, 0)]);
         pool.free_n(&a);
         pool.free_n(&b);
     }
@@ -810,6 +790,32 @@ mod tests {
         assert!(pool.alloc_exact_in(5, 4096).is_none());
         pool.free_n(&a);
         pool.free_n(&b);
+    }
+
+    #[test]
+    fn test_alloc_falls_back_past_a_fragmented_segment() {
+        // Explicit chunk sizes: independent of the global chunk-size other tests set.
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
+        let alloc_in = |seg, size| pool.alloc_object_in_one_segment(&[size], Some(seg));
+        // Seg 0: 4 KiB objects with every other one freed, so no 16 KiB hole.
+        let mut small = Vec::new();
+        while let Some(b) = alloc_in(0, 4096) {
+            small.push(b);
+        }
+        let (freed, kept): (Vec<_>, Vec<_>) =
+            small.into_iter().enumerate().partition(|(i, _)| i % 2 == 0);
+        freed.iter().for_each(|(_, b)| pool.free_n(b));
+        // Seg 1: fuller than seg 0, but with one contiguous free tail.
+        let big: Vec<_> = (0..2).map(|_| alloc_in(1, 12288).unwrap()).collect();
+        let least = SegmentPool::least_loaded(&pool.state.lock().unwrap(), 1)[0].0;
+        assert_eq!(least, 0, "seg 0 is least loaded");
+        assert!(alloc_in(0, 16384).is_none(), "seg 0 is fragmented");
+
+        let bufs = pool.alloc_object_in_one_segment(&[16384], None).unwrap();
+        assert!(bufs.iter().all(|b| b.segment_idx == 1));
+        pool.free_n(&bufs);
+        kept.iter().for_each(|(_, b)| pool.free_n(b));
+        big.iter().for_each(|b| pool.free_n(b));
     }
 
     #[test]
