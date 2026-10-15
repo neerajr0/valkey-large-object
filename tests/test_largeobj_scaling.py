@@ -710,7 +710,7 @@ class DramBudget(Budget):
     BUDGET = 1024 * 1024
     OBJ = BUDGET // 4
     PER_BUDGET = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
-    FULL = 'pool exhausted'
+    FULL = 'maxmemory'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
@@ -737,7 +737,7 @@ class TieredBudget(Budget):
     DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
-    FULL = 'capacity exceeded'
+    FULL = 'disk-maxmemory'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
@@ -1044,7 +1044,7 @@ class TestTieredEvictionMixed(TieredBudget):
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         stop = time.time() + self.SECONDS
         failures = []
-        expected_errors = ('capacity exceeded', 'failed to copy', 'no such key')
+        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key')
 
         def worker(n):
             c = self.server.get_new_client()
