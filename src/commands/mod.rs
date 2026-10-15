@@ -494,7 +494,7 @@ mod tests {
             Err(ValkeyError::Str(msg)) => msg.to_string(),
             other => panic!("expected Str error, got {other:?}"),
         };
-        assert_eq!(err, errors::ERR_MALFORMED_ADDR_ARGS);
+        assert_eq!(err, errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
     }
 
     #[test]
