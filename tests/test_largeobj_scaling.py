@@ -898,7 +898,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
-        assert info['largeobj_nvme_capacity_exceeded'] == 2
+        assert info['largeobj_disk_capacity_exceeded'] == 2
         assert surviving(client, payloads) == payloads
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
@@ -908,7 +908,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 16
-        assert info['largeobj_nvme_capacity_exceeded'] == 1
+        assert info['largeobj_disk_capacity_exceeded'] == 1
         self.settle(client, 64 - 16)
 
     def test_files_that_are_not_objects_are_never_victims(self):

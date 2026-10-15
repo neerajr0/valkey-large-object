@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
             echo "  --maxmemory <BYTES>        Server maxmemory; DRAM pool scales toward it (default: 34359738368 = 32GB)"
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
-            echo "  --disk-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
+            echo "  --disk-maxmemory <BYTES>   Disk budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
             echo ""
             echo "Modes:"

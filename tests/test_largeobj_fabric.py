@@ -366,11 +366,11 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', payload)
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
-            before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
-            with pytest.raises(ResponseError, match="EFA write"):
+            before = info_largeobj(client).get('largeobj_rdma_discarded_transfers', 0)
+            with pytest.raises(ResponseError, match="RDMA write"):
                 client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             after = info_largeobj(client)
-            assert after['largeobj_efa_discarded_transfers'] - before == 1, \
-                f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
+            assert after['largeobj_rdma_discarded_transfers'] - before == 1, \
+                f"expected exactly 1 discarded transfer, got {after['largeobj_rdma_discarded_transfers'] - before}"
         finally:
             process.kill()
