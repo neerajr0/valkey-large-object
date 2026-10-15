@@ -190,12 +190,12 @@ print_scaling() {
     info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
     local live nvme_live util expands shrinks dram_uring nvme_uring rdma
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_live=$(echo  "$info" | grep -E "disk_staging_segments"           | awk -F: '{print $2}' | tr -d '[:space:]')
     util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
     expands=$(echo    "$info" | grep -E "scaling_expands"            | awk -F: '{print $2}' | tr -d '[:space:]')
     shrinks=$(echo    "$info" | grep -E "scaling_shrinks"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_uring=$(echo "$info" | grep -E "disk_staging_uring_registered_segments" | awk -F: '{print $2}' | tr -d '[:space:]')
     rdma=$(echo       "$info" | grep -E "rdma_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"

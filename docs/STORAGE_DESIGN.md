@@ -1423,7 +1423,7 @@ this section owns the semantics.
 
 | Config | Default | Min | Max | Live/Immutable | Governs |
 |---|---|---|---|---|---|
-| `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |dde
+| `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
 | `segment-size` | `1GiB` | `1MB` | `1GiB` | Immutable | Uniform segment size for both pools. DRAMPool growth unit |
 | `disk-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(disk-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
 | `disk-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
