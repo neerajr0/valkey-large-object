@@ -519,6 +519,33 @@ impl<'a> StreamJob<'a> {
 /// The single streaming driver. Moves every chunk from `source` to `target`,
 /// interleaving per chunk within a window, preserving all of main's semantics.
 ///
+/// Test hook: inject a synthetic promotion failure before any NVMe reads start.
+/// Mimics drive_window's source-error path (set_promotion_failure → remove_object)
+/// but inserts a configurable pause between the two to widen the race window so a
+/// concurrent GET deterministically sees the failed Filling entry before removal.
+/// Returns Ok(()) when the hook is disabled or not applicable; Err(NvmeRead) when
+/// it fires.
+async fn test_inject_promotion_failure(
+    progress: Option<&PromotionProgress<'_>>,
+) -> Result<(), StreamError> {
+    let p = match progress {
+        Some(p) if crate::test_fail_promotion_read() => p,
+        _ => return Ok(()),
+    };
+    p.obj_ctx
+        .set_promotion_failure(storage::PromotionFailureReason::ReadError);
+    let pause_ms = crate::test_pause_after_promotion_failure_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+    p.dram_pool.remove_object(&p.object_id);
+    Err(StreamError::NvmeRead)
+}
+
 /// The shared window loop for BOTH verbs: snapshot each batch, fan out
 /// `source.produce`, and as each chunk lands feed `target.consume` (the
 /// interleave), latching the first source and first target error. This is the
@@ -545,6 +572,7 @@ async fn drive_window(
     let mut target_err: Option<StreamError> = None;
 
     while chunks_done < total_chunks {
+        test_inject_promotion_failure(progress).await?;
         let batch_count = window.min((total_chunks - chunks_done) as usize);
 
         // Snapshot this batch's chunks (advances the iterator by batch_count).

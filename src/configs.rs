@@ -124,6 +124,10 @@ pub const MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 60_000;
 pub const DEFAULT_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 0;
 pub const MIN_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 0;
 pub const MAX_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 60_000;
+// test-pause-after-promotion-failure-ms
+pub const DEFAULT_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 0;
+pub const MIN_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 0;
+pub const MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 60_000;
 
 // ─── Runtime Config State (lazy_static) ──────────────────────────────────────
 
@@ -249,6 +253,18 @@ lazy_static::lazy_static! {
 
     /// Test-only: fail every NVMe unlink but the orphan retry's. false = disabled.
     pub static ref CFG_TEST_FAIL_UNLINK: AtomicBool = AtomicBool::new(false);
+
+    /// Test-only: fail the first NVMe source read during a DRAM promotion,
+    /// triggering set_promotion_failure. Used with
+    /// test-pause-after-promotion-failure-ms to deterministically exercise
+    /// the late-subscriber race in serve_filling_or_became_ready.
+    pub static ref CFG_TEST_FAIL_PROMOTION_READ: AtomicBool = AtomicBool::new(false);
+
+    /// Test-only: pause for this many ms between set_promotion_failure and
+    /// remove_object in the source-error path. Widens the race window so a
+    /// concurrent GET sees the failed Filling entry before it is removed.
+    /// 0 = disabled. Hidden test hook.
+    pub static ref CFG_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: AtomicI64 = AtomicI64::new(0);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -434,6 +450,14 @@ pub fn test_fail_unlink() -> bool {
 
 pub fn test_rdma_fail_partial() -> bool {
     CFG_TEST_RDMA_FAIL_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn test_fail_promotion_read() -> bool {
+    CFG_TEST_FAIL_PROMOTION_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn test_pause_after_promotion_failure_ms() -> u64 {
+    CFG_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {

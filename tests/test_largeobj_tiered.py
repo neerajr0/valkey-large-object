@@ -1350,3 +1350,110 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_evictions'] == 2
+
+
+class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
+    """Exercises the race where a GET arrives between set_promotion_failure and
+    remove_object.  Without the else-if guard in serve_filling_or_became_ready,
+    the late GET would try to serve half-filled DRAM buffers.
+
+    Hooks:
+        test-fail-promotion-read          — inject NvmeRead error on first promotion
+        test-pause-after-promotion-failure-ms — widen the window between
+            set_promotion_failure and remove_object so the second GET lands
+            in the race window deterministically
+        test-pause-during-promotion-ms    — hold the leader long enough for the
+            second GET to find the Filling entry (before the failure fires)
+    """
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
+            f" segment-size 4194304"
+            f" promote-min-hits 1"
+            f" max-promote-size 2093056"
+            f" max-object-size 1048576"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 4096"
+            f" fabric-provider Emulated"
+            f" test-fail-promotion-read yes"
+            f" test-pause-during-promotion-ms 1000"
+            f" test-pause-after-promotion-failure-ms 2000"
+        )
+
+    def test_late_get_during_promotion_failure_gets_error(self):
+        """A GET that arrives after set_promotion_failure but before
+        remove_object must receive an error, not corrupt data.
+
+        Timeline:
+            GET-A (leader): insert Filling → [PAUSE 1s] → NVMe read fails →
+                set_promotion_failure → [PAUSE 2s] → remove_object
+            GET-B (late):   arrives during the 2s pause → finds Filling entry →
+                subscribe() returns None → else-if returns disk read error
+        """
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'race_key', payload)
+
+        errors_before = int(
+            client.info('largeobj_error_metrics').get('largeobj_disk_read_errors', 0)
+        )
+
+        results = [None, None]
+        caught = [None, None]
+
+        def get_a():
+            """Leader GET — triggers promotion, hits injected failure."""
+            try:
+                c = self.server.get_new_client()
+                results[0] = c.execute_command('BLOB.TCP_GET', 'race_key')
+            except ResponseError as e:
+                caught[0] = e
+
+        def get_b():
+            """Late GET — arrives during the pause after promotion failure.
+            Wait long enough for the leader to enter the failure pause window
+            (1s promotion pause + a small margin), but before remove_object
+            runs (failure pause is 2s)."""
+            time.sleep(1.5)
+            try:
+                c = self.server.get_new_client()
+                results[1] = c.execute_command('BLOB.TCP_GET', 'race_key')
+            except ResponseError as e:
+                caught[1] = e
+
+        ta = threading.Thread(target=get_a)
+        tb = threading.Thread(target=get_b)
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+
+        # GET-A (leader) must get an error — the promotion read was injected to fail.
+        assert caught[0] is not None, (
+            f"GET-A should have received a disk read error, got: {results[0]}"
+        )
+        assert 'disk read failed' in str(caught[0]).lower(), (
+            f"GET-A unexpected error: {caught[0]}"
+        )
+
+        # GET-B (late subscriber) must also get an error — not corrupt DRAM data.
+        assert caught[1] is not None, (
+            f"GET-B should have received a disk read error, got: {results[1]}"
+        )
+        assert 'disk read failed' in str(caught[1]).lower(), (
+            f"GET-B unexpected error: {caught[1]}"
+        )
+
+        # disk_read_errors metric should have incremented for both GETs.
+        errors_after = int(
+            client.info('largeobj_error_metrics').get('largeobj_disk_read_errors', 0)
+        )
+        assert errors_after >= errors_before + 2, (
+            f"Expected disk_read_errors to increment by at least 2, "
+            f"got {errors_after - errors_before} "
+            f"(before={errors_before} after={errors_after})"
+        )

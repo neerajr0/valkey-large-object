@@ -1223,6 +1223,15 @@ fn serve_filling_or_became_ready(
         crate::runtime_handle().spawn(async move {
             serve_coalesced_waiter(obj_ctx, rx, obj_len, crc32c, transport, thread_ctx, file).await;
         });
+    } else if obj_ctx.promotion_failure() != storage::PromotionFailureReason::None {
+        // subscribe() returned None because the promotion leader failed and
+        // dropped the sender (set_promotion_failure) before remove_object ran.
+        // The DRAM buffers are half-filled — reply with a disk read error.
+        reply_err(
+            &thread_ctx,
+            &info::DISK_READ_ERRORS,
+            ValkeyError::Str(errors::ERR_DISK_READ),
+        );
     } else {
         // subscribe() returned None → transitioned to Ready between checks.
         cmd_get_from_dram(
