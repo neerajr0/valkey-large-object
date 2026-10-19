@@ -12,13 +12,14 @@ The server's fabric address is logged at startup:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
 
 import valkey
 
-FABRIC_TARGET = "/mnt/nvme0/cargo-target/release/fabric_target"
+FABRIC_TARGET = os.environ.get("FABRIC_TARGET", "/mnt/nvme0/cargo-target/release/fabric_target")
 PATTERN = bytes(i % 256 for i in range(4096))
 
 PASS = 0
@@ -43,13 +44,16 @@ def parse_client_crc(output):
     Write mode prints: 'received 4096 bytes, crc 0x9c5b5ed2 — payload verified'
     Read mode prints:  'serving 4096 bytes ... crc 0x9c5b5ed2 — the initiator verifies'
     Returns the integer CRC, or None if not found."""
-    import re
     m = re.search(r'\bcrc (0x[0-9a-fA-F]+)\b', output)
     return int(m.group(1), 16) if m else None
 
 
 def start_target(server_fabric_addr, read_mode=False):
-    """Launch fabric_target --efa and parse its advertisement."""
+    """Launch fabric_target --efa and parse its advertisement.
+    
+    Returns (proc, addr_hex, rkey, remote_addr, length, source_crc).
+    source_crc is the CRC of the prefilled buffer (read_mode only), else None.
+    """
     cmd = [FABRIC_TARGET, "--efa", server_fabric_addr]
     if read_mode:
         cmd.insert(1, "--read")
@@ -66,7 +70,16 @@ def start_target(server_fabric_addr, read_mode=False):
     rkey = int(parts[2])
     remote_addr = int(parts[3])
     length = int(parts[4])
-    return proc, addr_hex, rkey, remote_addr, length
+    
+    # In read mode, fabric_target prints a second line with the source CRC
+    source_crc = None
+    if read_mode:
+        crc_line = proc.stdout.readline()
+        m = re.search(r'\bcrc (0x[0-9a-fA-F]+)\b', crc_line)
+        if m:
+            source_crc = int(m.group(1), 16)
+    
+    return proc, addr_hex, rkey, remote_addr, length, source_crc
 
 
 def test_rdma_get(c, server_fabric_addr):
@@ -75,7 +88,7 @@ def test_rdma_get(c, server_fabric_addr):
     # Store a test object
     c.execute_command('BLOB.TCP_SET', 'rdma_get_key', PATTERN)
     # Start passive peer
-    proc, client_addr, rkey, remote_addr, length = start_target(server_fabric_addr)
+    proc, client_addr, rkey, remote_addr, length, _ = start_target(server_fabric_addr)
     try:
         print(f"  fabric_target addr={client_addr[:16]}... rkey={rkey} len={length}")
         # Establish RDMA session (must be on this connection)
@@ -117,13 +130,10 @@ def test_rdma_set(server_ip, server_port, server_fabric_addr):
     """BLOB.RDMA_SET: server reads from client's EFA-registered buffer."""
     print("\n── RDMA SET test ──")
     # Start passive peer in read mode (prefilled with pattern)
-    proc, client_addr, rkey, remote_addr, length = start_target(
+    proc, client_addr, rkey, remote_addr, length, source_crc = start_target(
         server_fabric_addr, read_mode=True)
     try:
         print(f"  fabric_target addr={client_addr[:16]}... rkey={rkey} len={length}")
-        # Parse the CRC that fabric_target computed over its prefilled buffer
-        time.sleep(0.5)
-        # Read mode prints the CRC in its "serving" line before blocking
         # Fresh connection for a new HELLO
         c2 = valkey.Valkey(host=server_ip, port=server_port, decode_responses=False)
         hello_reply = c2.execute_command('BLOB.RDMA_HELLO', client_addr)
@@ -139,16 +149,13 @@ def test_rdma_set(server_ip, server_port, server_fabric_addr):
               f"len={len(tcp_data) if tcp_data else 'None'}")
         # Cross-check: server's stored CRC matches client's source CRC
         server_crc = c2.execute_command('BLOB.INFO', 'rdma_set_key', 'CRC')
-        proc.kill()
-        output = proc.communicate(timeout=10)[0]
-        client_crc = parse_client_crc(output)
-        if server_crc is not None and client_crc is not None:
+        if server_crc is not None and source_crc is not None:
             check("Server stored CRC matches client source CRC",
-                  client_crc == server_crc,
-                  f"client=0x{client_crc:08x} server=0x{server_crc:08x}")
+                  source_crc == server_crc,
+                  f"client=0x{source_crc:08x} server=0x{server_crc:08x}")
         else:
             check("Server stored CRC matches client source CRC", False,
-                  f"could not parse CRCs: server={server_crc!r} client={client_crc!r}")
+                  f"could not parse CRCs: server={server_crc!r} client={source_crc!r}")
         c2.execute_command('DEL', 'rdma_set_key')
     finally:
         proc.kill()
@@ -159,7 +166,7 @@ def test_rdma_roundtrip(server_ip, server_port, server_fabric_addr):
     """Full roundtrip: SET via RDMA, GET via RDMA, verify bytes match."""
     print("\n── RDMA roundtrip test ──")
     # SET via RDMA
-    proc_set, client_addr, rkey, remote_addr, length = start_target(
+    proc_set, client_addr, rkey, remote_addr, length, _ = start_target(
         server_fabric_addr, read_mode=True)
     try:
         c = valkey.Valkey(host=server_ip, port=server_port, decode_responses=False)
@@ -171,7 +178,7 @@ def test_rdma_roundtrip(server_ip, server_port, server_fabric_addr):
         proc_set.kill()
         proc_set.wait()
     # GET via RDMA on a fresh connection
-    proc_get, client_addr2, rkey2, remote_addr2, length2 = start_target(
+    proc_get, client_addr2, rkey2, remote_addr2, length2, _ = start_target(
         server_fabric_addr)
     try:
         c2 = valkey.Valkey(host=server_ip, port=server_port, decode_responses=False)
@@ -207,7 +214,7 @@ def test_rdma_steady_state(server_ip, server_port, server_fabric_addr):
     for i in range(rounds):
         key = f"rdma_ss_{i}"
         # SET via RDMA: spin up a read-mode target, HELLO, SET, tear down.
-        proc_set, addr_set, rkey_set, raddr_set, len_set = start_target(
+        proc_set, addr_set, rkey_set, raddr_set, len_set, _ = start_target(
             server_fabric_addr, read_mode=True)
         try:
             c = valkey.Valkey(host=server_ip, port=server_port,
@@ -225,7 +232,7 @@ def test_rdma_steady_state(server_ip, server_port, server_fabric_addr):
             proc_set.kill()
             proc_set.wait()
         # GET via RDMA: spin up a write-mode target, HELLO, GET, verify.
-        proc_get, addr_get, rkey_get, raddr_get, len_get = start_target(
+        proc_get, addr_get, rkey_get, raddr_get, len_get, _ = start_target(
             server_fabric_addr)
         try:
             c2 = valkey.Valkey(host=server_ip, port=server_port,

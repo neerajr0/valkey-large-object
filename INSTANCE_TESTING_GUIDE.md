@@ -54,7 +54,10 @@ aws ec2 create-placement-group \
 
 ### 1.2 Create a Security Group
 
-Allow all traffic within the group (for EFA/RDMA) and SSH from anywhere.
+EFA RDMA requires a security group that allows **all traffic to and from itself**
+— both inbound AND outbound. The default `0.0.0.0/0` outbound rule is **not
+sufficient**; EFA uses link-local IPv6 addresses (`fe80::...`) and requires the
+explicit self-referencing outbound rule for the return path.
 
 ```bash
 VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
@@ -68,8 +71,17 @@ SG_ID=$(aws ec2 create-security-group \
   --region us-east-1 \
   --query 'GroupId' --output text)
 
-# All traffic within the security group (required for EFA)
+# Inbound: all traffic from the same group (required for EFA)
 aws ec2 authorize-security-group-ingress \
+  --group-id "$SG_ID" \
+  --protocol -1 \
+  --source-group "$SG_ID" \
+  --region us-east-1
+
+# Outbound: all traffic TO the same group (also required for EFA)
+# Without this, RDMA_HELLO works (plain TCP) but RDMA_SET/GET hang with
+# "No route to host (err=113)" in server logs.
+aws ec2 authorize-security-group-egress \
   --group-id "$SG_ID" \
   --protocol -1 \
   --source-group "$SG_ID" \
@@ -129,9 +141,33 @@ echo "Subnet: $SUBNET_ID"
 Launch two instances with EFA network interfaces. Any NVMe-backed instance type
 with EFA support works — `i8g.48xlarge` and `i8ge.48xlarge` are both tested.
 
+**Important:** Not all EFA-enabled instance types support full RDMA read+write.
+Some (e.g., `c7gn.16xlarge`) only support RDMA read, which is insufficient for
+`BLOB.RDMA_SET`. Verify capabilities on a running instance:
+
+```bash
+export PATH=/opt/amazon/efa/bin:$PATH
+
+# Read-only (should return exit 0):
+fi_info -p efa -f efa-direct -t FI_EP_RDM \
+  -c "FI_MSG|FI_RECV|FI_SEND|FI_READ|FI_REMOTE_READ"
+
+# Read+write (must return exit 0 for full RDMA support):
+fi_info -p efa -f efa-direct -t FI_EP_RDM \
+  -c "FI_MSG|FI_RECV|FI_SEND|FI_READ|FI_REMOTE_READ|FI_WRITE|FI_REMOTE_WRITE"
+```
+
+| Instance Type | RDMA Capabilities |
+|---------------|-------------------|
+| `c7gn.16xlarge` | Read only ✗ |
+| `c8g.24xlarge` | Read + Write ✓ |
+| `c8g.48xlarge` | Read + Write ✓ |
+| `i8g.48xlarge` | Read + Write ✓ |
+| `i8ge.48xlarge` | Read + Write ✓ |
+
 ```bash
 # Choose your instance type:
-INSTANCE_TYPE="i8g.48xlarge"    # or i8ge.48xlarge
+INSTANCE_TYPE="i8g.48xlarge"    # or i8ge.48xlarge, c8g.24xlarge
 ```
 
 **Server:**
@@ -392,7 +428,7 @@ valkey-cli -h <SERVER_PRIVATE_IP> PING
 Copy the test scripts to NVMe. From your local machine:
 
 ```bash
-scp -i valkey-large-object-test-key.pem instance_test_client.py efa_rdma_test.py \
+scp -i valkey-large-object-test-key.pem functional_test.py efa_rdma_test.py \
   ec2-user@<CLIENT_PUBLIC_IP>:/mnt/nvme0/
 ```
 
@@ -400,15 +436,17 @@ scp -i valkey-large-object-test-key.pem instance_test_client.py efa_rdma_test.py
 
 ## 4. Running the Functional Test
 
+### Against Standalone Valkey (Tiered mode)
+
 ```bash
-python3 /mnt/nvme0/instance_test_client.py --host <SERVER_PRIVATE_IP>
+python3 /mnt/nvme0/functional_test.py --host <SERVER_PRIVATE_IP>
 ```
 
 Expected output (66 checks, 0 failures):
 
 ```
-Connecting to 172.31.11.27:6379...
-Connected. Module loaded. Starting tests...
+Connecting to <SERVER_PRIVATE_IP>:6379...
+Storage mode: Tiered (NVMe -> DRAM)
 
 ────────────────────────────────────────────────────────────
   1. Basic SET/GET roundtrip
@@ -425,6 +463,45 @@ Connected. Module loaded. Starting tests...
   Results: 66 passed, 0 failed, 66 total
 ════════════════════════════════════════════════════════════
 ```
+
+### Against ElastiCache Managed Cluster (Devo)
+
+For cluster-mode enabled caches (e.g., Devo `cache.i8ge.48xlarge`), use the
+`--cluster-mode` flag. This prefixes all keys with a hash tag `{t}` so multi-key
+operations (COPY, concurrent tests) hash to the same slot.
+
+```bash
+python3 /mnt/nvme0/functional_test.py \
+  --host <CLUSTER_CONFIG_ENDPOINT> \
+  --port 6379 \
+  --tls \
+  --cluster-mode
+```
+
+Expected output (61 checks, 0 failures, 2 skipped):
+
+```
+Connecting to <CLUSTER_ENDPOINT>:6379 (TLS, cluster-mode)...
+Storage mode: Dram-only (tier=b'dram')
+
+...
+
+════════════════════════════════════════════════════════════
+  Results: 61 passed, 0 failed
+════════════════════════════════════════════════════════════
+```
+
+The 2 skipped tests (13 and 22) are tiered-mode specific and are automatically
+skipped when the script detects Dram-only mode.
+
+### Command-Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--host HOST` | Server hostname or IP (default: `127.0.0.1`) |
+| `--port PORT` | Server port (default: `6379`) |
+| `--tls` | Enable TLS (required for Devo) |
+| `--cluster-mode` | Use hash-tagged keys for cluster-mode compatibility |
 
 ### What the Test Script Covers
 
@@ -459,7 +536,7 @@ Connected. Module loaded. Starting tests...
 
 ## 5. EFA RDMA Transfer Validation
 
-The functional test script (`instance_test_client.py`) exercises the TCP command
+The functional test script (`functional_test.py`) exercises the TCP command
 path. To validate that data actually moves over EFA RDMA, run `efa_rdma_test.py`
 on the **client** instance. This uses `fabric_target` — a Rust binary in the repo
 that acts as a passive libfabric peer with EFA-registered memory.
@@ -634,9 +711,9 @@ files on disk.
 | `ERR disk-maxmemory must be >= max-object-size` | In Tiered mode, `disk-maxmemory` must be ≥ `max-object-size` |
 | `MISCONF ... unable to persist to disk` | The server can't write RDB. Start with `--save ""` to disable |
 | `Failed to write PID file` | Non-critical warning — server still runs. Set `--dir` to a writable path |
-| `fabric unavailable, EFA path disabled` | EFA not present or libfabric too old. Ensure libfabric-aws >= 2.6.0 is installed (see section 2.2). Set `LD_LIBRARY_PATH=/opt/amazon/efa/lib64` |
-| `fi_getinfo: No data available` for efa-direct | libfabric-aws < 2.6.0 doesn't include the efa-direct provider. Upgrade via the latest EFA installer RPMs (see section 2.2) |
-| Module build fails with `libfabric not found` | `export PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig` |
-| Root volume full during build | Set `export CARGO_TARGET_DIR=/mnt/nvme0/cargo-target` to build on NVMe |
+| `fi_getinfo: No data available` for read+write caps | Instance type lacks RDMA write capability. Use c8g, i8g, or i8ge instance types |
 | Port 6379 in use | `pkill -9 -f valkey-server` then restart |
+| RDMA_HELLO works but RDMA_SET/GET hangs | Missing outbound self-referencing SG rule. Add egress `-1` to self (see section 1.2) |
+| `No route to host (err=113)` in server logs | Same as above — EFA return path blocked |
+| `CROSSSLOT` error on COPY/multi-key ops | Running against cluster-mode without `--cluster-mode` flag |
 

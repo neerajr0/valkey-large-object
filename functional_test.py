@@ -25,6 +25,14 @@ import valkey
 PASS = 0
 FAIL = 0
 
+# Hash tag prefix for cluster mode — ensures multi-key ops hash to the same slot
+KEY_PREFIX = ""  # Set to "{t}" for cluster mode
+
+
+def key(name):
+    """Return key name with cluster-mode prefix if enabled."""
+    return f"{KEY_PREFIX}{name}"
+
 
 def check(label, condition, detail=""):
     global PASS, FAIL
@@ -66,39 +74,39 @@ def test_basic_set_get(c):
     ]
     for label, size in sizes:
         payload = make_payload(size, fill=bytes([size % 256 or 0x42]))
-        key = f"basic_{size}"
-        result = c.execute_command('BLOB.TCP_SET', key, payload)
+        k = key(f"basic_{size}")
+        result = c.execute_command('BLOB.TCP_SET', k, payload)
         check(f"SET {label}", result == b'OK', f"got {result!r}")
-        data = c.execute_command('BLOB.TCP_GET', key)
+        data = c.execute_command('BLOB.TCP_GET', k)
         check(f"GET {label} roundtrip", data == payload,
               f"len={len(data) if data else 'None'}, expected={size}")
-        c.execute_command('DEL', key)
+        c.execute_command('DEL', k)
 
 
 def test_get_nonexistent(c):
     """GET on a nonexistent key returns nil."""
     section("2. GET nonexistent key")
-    result = c.execute_command('BLOB.TCP_GET', 'no_such_key')
+    result = c.execute_command('BLOB.TCP_GET', key('no_such_key'))
     check("GET nonexistent → nil", result is None, f"got {result!r}")
 
 
 def test_overwrite(c):
     """SET same key twice replaces the value."""
     section("3. Overwrite semantics")
-    c.execute_command('BLOB.TCP_SET', 'ow_key', make_payload(4096, b'X'))
-    c.execute_command('BLOB.TCP_SET', 'ow_key', make_payload(8192, b'Y'))
-    data = c.execute_command('BLOB.TCP_GET', 'ow_key')
+    c.execute_command('BLOB.TCP_SET', key('ow_key'), make_payload(4096, b'X'))
+    c.execute_command('BLOB.TCP_SET', key('ow_key'), make_payload(8192, b'Y'))
+    data = c.execute_command('BLOB.TCP_GET', key('ow_key'))
     check("Overwrite returns new value", data == make_payload(8192, b'Y'),
           f"len={len(data) if data else 'None'}")
-    c.execute_command('DEL', 'ow_key')
+    c.execute_command('DEL', key('ow_key'))
 
 
 def test_delete(c):
     """DEL removes the key; subsequent GET returns nil."""
     section("4. DEL removes key")
-    c.execute_command('BLOB.TCP_SET', 'del_key', make_payload(4096))
-    c.execute_command('DEL', 'del_key')
-    result = c.execute_command('BLOB.TCP_GET', 'del_key')
+    c.execute_command('BLOB.TCP_SET', key('del_key'), make_payload(4096))
+    c.execute_command('DEL', key('del_key'))
+    result = c.execute_command('BLOB.TCP_GET', key('del_key'))
     check("GET after DEL → nil", result is None, f"got {result!r}")
 
 
@@ -106,9 +114,9 @@ def test_blob_info(c):
     """BLOB.INFO returns len, crc, and tier metadata."""
     section("5. BLOB.INFO metadata")
     payload = bytes(range(256)) * 16  # 4096 bytes, non-uniform
-    c.execute_command('BLOB.TCP_SET', 'info_key', payload)
+    c.execute_command('BLOB.TCP_SET', key('info_key'), payload)
     # Full info
-    info = c.execute_command('BLOB.INFO', 'info_key')
+    info = c.execute_command('BLOB.INFO', key('info_key'))
     check("BLOB.INFO returns array", isinstance(info, list) and len(info) == 6,
           f"got {info!r}")
     if isinstance(info, list) and len(info) == 6:
@@ -116,17 +124,17 @@ def test_blob_info(c):
         check("  crc field",  info[2] == b'crc' and isinstance(info[3], int))
         check("  tier field", info[4] == b'tier' and info[5] in (b'dram', b'nvme'))
     # Individual fields
-    length = c.execute_command('BLOB.INFO', 'info_key', 'LEN')
+    length = c.execute_command('BLOB.INFO', key('info_key'), 'LEN')
     check("BLOB.INFO LEN", length == len(payload), f"got {length}")
-    crc = c.execute_command('BLOB.INFO', 'info_key', 'CRC')
+    crc = c.execute_command('BLOB.INFO', key('info_key'), 'CRC')
     check("BLOB.INFO CRC is u32", isinstance(crc, int) and 0 <= crc <= 0xFFFFFFFF,
           f"got {crc!r}")
     # CRC is stable
-    crc2 = c.execute_command('BLOB.INFO', 'info_key', 'CRC')
+    crc2 = c.execute_command('BLOB.INFO', key('info_key'), 'CRC')
     check("CRC is deterministic", crc == crc2)
-    tier = c.execute_command('BLOB.INFO', 'info_key', 'TIER')
+    tier = c.execute_command('BLOB.INFO', key('info_key'), 'TIER')
     check("BLOB.INFO TIER", tier in (b'dram', b'nvme'), f"got {tier!r}")
-    c.execute_command('DEL', 'info_key')
+    c.execute_command('DEL', key('info_key'))
 
 
 def test_info_errors(c):
@@ -134,37 +142,37 @@ def test_info_errors(c):
     section("6. BLOB.INFO error handling")
     # Nonexistent key
     try:
-        c.execute_command('BLOB.INFO', 'no_key')
+        c.execute_command('BLOB.INFO', key('no_key'))
         check("BLOB.INFO nonexistent key → error", False, "no error raised")
     except valkey.ResponseError as e:
         check("BLOB.INFO nonexistent key → error", 'not found' in str(e).lower(),
               str(e))
     # Wrong type
-    c.execute_command('SET', 'str_key', 'hello')
+    c.execute_command('SET', key('str_key'), 'hello')
     try:
-        c.execute_command('BLOB.INFO', 'str_key')
+        c.execute_command('BLOB.INFO', key('str_key'))
         check("BLOB.INFO wrong type → WRONGTYPE", False, "no error raised")
     except valkey.ResponseError as e:
         check("BLOB.INFO wrong type → WRONGTYPE", str(e).startswith('WRONGTYPE'),
               str(e))
-    c.execute_command('DEL', 'str_key')
+    c.execute_command('DEL', key('str_key'))
     # Invalid field
-    c.execute_command('BLOB.TCP_SET', 'inf_key', make_payload(4096))
+    c.execute_command('BLOB.TCP_SET', key('inf_key'), make_payload(4096))
     try:
-        c.execute_command('BLOB.INFO', 'inf_key', 'BADFIELD')
+        c.execute_command('BLOB.INFO', key('inf_key'), 'BADFIELD')
         check("BLOB.INFO bad field → error", False, "no error raised")
     except valkey.ResponseError as e:
         check("BLOB.INFO bad field → error", 'invalid' in str(e).lower(), str(e))
-    c.execute_command('DEL', 'inf_key')
+    c.execute_command('DEL', key('inf_key'))
 
 
 def test_wrong_type_errors(c):
     """Module commands reject keys of a different type with WRONGTYPE."""
     section("7. WRONGTYPE on non-largeobj keys")
-    c.execute_command('SET', 'native_str', 'hello')
+    c.execute_command('SET', key('native_str'), 'hello')
     for cmd_args in [
-        ('BLOB.TCP_GET', 'native_str'),
-        ('BLOB.TCP_SET', 'native_str', b'data'),
+        ('BLOB.TCP_GET', key('native_str')),
+        ('BLOB.TCP_SET', key('native_str'), b'data'),
     ]:
         try:
             c.execute_command(*cmd_args)
@@ -172,14 +180,14 @@ def test_wrong_type_errors(c):
         except valkey.ResponseError as e:
             check(f"{cmd_args[0]} on string → WRONGTYPE",
                   str(e).startswith('WRONGTYPE'), str(e))
-    c.execute_command('DEL', 'native_str')
+    c.execute_command('DEL', key('native_str'))
 
 
 def test_zero_length_rejected(c):
     """BLOB.TCP_SET with empty payload is rejected."""
     section("8. Zero-length object rejected")
     try:
-        c.execute_command('BLOB.TCP_SET', 'empty_key', b'')
+        c.execute_command('BLOB.TCP_SET', key('empty_key'), b'')
         check("Zero-length SET rejected", False, "no error raised")
     except valkey.ResponseError as e:
         check("Zero-length SET rejected", 'length must be > 0' in str(e).lower(),
@@ -196,52 +204,52 @@ def test_max_object_size(c):
     c.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit))
     # Oversized SET rejected
     try:
-        c.execute_command('BLOB.TCP_SET', 'big_key', make_payload(limit + 1))
+        c.execute_command('BLOB.TCP_SET', key('big_key'), make_payload(limit + 1))
         check("Oversized SET rejected", False, "no error")
     except valkey.ResponseError as e:
         check("Oversized SET rejected", 'max object size' in str(e).lower(), str(e))
     # At-limit SET succeeds
-    result = c.execute_command('BLOB.TCP_SET', 'limit_key', make_payload(limit))
+    result = c.execute_command('BLOB.TCP_SET', key('limit_key'), make_payload(limit))
     check("At-limit SET succeeds", result == b'OK')
     # GET still works for existing objects after lowering limit
     c.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
-    data = c.execute_command('BLOB.TCP_GET', 'limit_key')
+    data = c.execute_command('BLOB.TCP_GET', key('limit_key'))
     check("GET unaffected after lowering limit", data == make_payload(limit))
     # Restore
     c.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', orig_val.decode())
-    c.execute_command('DEL', 'limit_key')
+    c.execute_command('DEL', key('limit_key'))
 
 
 def test_copy(c):
     """COPY creates an independent duplicate."""
     section("10. COPY semantics")
     payload = make_payload(4096, b'C')
-    c.execute_command('BLOB.TCP_SET', 'cp_src', payload)
-    result = c.execute_command('COPY', 'cp_src', 'cp_dst')
+    c.execute_command('BLOB.TCP_SET', key('cp_src'), payload)
+    result = c.execute_command('COPY', key('cp_src'), key('cp_dst'))
     check("COPY returns 1", result in (1, True), f"got {result!r}")
     check("Source intact after COPY",
-          c.execute_command('BLOB.TCP_GET', 'cp_src') == payload)
+          c.execute_command('BLOB.TCP_GET', key('cp_src')) == payload)
     check("Destination has same data",
-          c.execute_command('BLOB.TCP_GET', 'cp_dst') == payload)
+          c.execute_command('BLOB.TCP_GET', key('cp_dst')) == payload)
     # CRC matches
-    src_crc = c.execute_command('BLOB.INFO', 'cp_src', 'CRC')
-    dst_crc = c.execute_command('BLOB.INFO', 'cp_dst', 'CRC')
+    src_crc = c.execute_command('BLOB.INFO', key('cp_src'), 'CRC')
+    dst_crc = c.execute_command('BLOB.INFO', key('cp_dst'), 'CRC')
     check("CRC matches between source and copy", src_crc == dst_crc)
     # Delete source doesn't affect copy
-    c.execute_command('DEL', 'cp_src')
+    c.execute_command('DEL', key('cp_src'))
     check("Copy survives source deletion",
-          c.execute_command('BLOB.TCP_GET', 'cp_dst') == payload)
-    c.execute_command('DEL', 'cp_dst')
+          c.execute_command('BLOB.TCP_GET', key('cp_dst')) == payload)
+    c.execute_command('DEL', key('cp_dst'))
 
 
 def test_expiry(c):
     """TTL-based expiry removes the key."""
     section("11. TTL expiry")
-    c.execute_command('BLOB.TCP_SET', 'exp_key', make_payload(4096))
-    c.execute_command('PEXPIRE', 'exp_key', 200)
+    c.execute_command('BLOB.TCP_SET', key('exp_key'), make_payload(4096))
+    c.execute_command('PEXPIRE', key('exp_key'), 200)
     time.sleep(0.5)
     # Polling EXISTS drives passive expiry
-    exists = c.execute_command('EXISTS', 'exp_key')
+    exists = c.execute_command('EXISTS', key('exp_key'))
     check("Key expired after TTL", exists == 0, f"EXISTS={exists}")
 
 
@@ -249,7 +257,7 @@ def test_flushall(c):
     """FLUSHALL removes all module keys."""
     section("12. FLUSHALL cleanup")
     for i in range(5):
-        c.execute_command('BLOB.TCP_SET', f'flush_{i}', make_payload(4096))
+        c.execute_command('BLOB.TCP_SET', key(f'flush_{i}'), make_payload(4096))
     check("5 keys stored", c.execute_command('DBSIZE') >= 5)
     c.execute_command('FLUSHALL')
     check("DBSIZE=0 after FLUSHALL", c.execute_command('DBSIZE') == 0)
@@ -259,18 +267,18 @@ def test_tiered_promotion(c):
     """In Tiered mode, first GET(s) promote from NVMe to DRAM."""
     section("13. Tiered mode: NVMe → DRAM promotion")
     payload = make_payload(4096, b'T')
-    c.execute_command('BLOB.TCP_SET', 'tier_key', payload)
-    tier_after_set = c.execute_command('BLOB.INFO', 'tier_key', 'TIER')
+    c.execute_command('BLOB.TCP_SET', key('tier_key'), payload)
+    tier_after_set = c.execute_command('BLOB.INFO', key('tier_key'), 'TIER')
     check("Tier after SET is 'nvme'", tier_after_set == b'nvme',
           f"got {tier_after_set!r}")
     # GET triggers promotion (promote-min-hits may require >1 GET)
     for _ in range(3):
-        data = c.execute_command('BLOB.TCP_GET', 'tier_key')
+        data = c.execute_command('BLOB.TCP_GET', key('tier_key'))
         check("GET returns correct data", data == payload) if _ == 0 else None
-    tier_after_get = c.execute_command('BLOB.INFO', 'tier_key', 'TIER')
+    tier_after_get = c.execute_command('BLOB.INFO', key('tier_key'), 'TIER')
     check("Tier after GET(s) is 'dram'", tier_after_get == b'dram',
           f"got {tier_after_get!r}")
-    c.execute_command('DEL', 'tier_key')
+    c.execute_command('DEL', key('tier_key'))
 
 
 def test_multiple_objects(c):
@@ -278,18 +286,18 @@ def test_multiple_objects(c):
     section("14. Multiple concurrent objects")
     count = 20
     for i in range(count):
-        c.execute_command('BLOB.TCP_SET', f'multi_{i}',
+        c.execute_command('BLOB.TCP_SET', key(f'multi_{i}'),
                           make_payload(4096, bytes([i % 256 or 0x42])))
     all_ok = True
     for i in range(count):
-        data = c.execute_command('BLOB.TCP_GET', f'multi_{i}')
+        data = c.execute_command('BLOB.TCP_GET', key(f'multi_{i}'))
         expected = make_payload(4096, bytes([i % 256 or 0x42]))
         if data != expected:
             all_ok = False
             print(f"    Key multi_{i} mismatch: len={len(data) if data else 'None'}")
     check(f"All {count} objects round-trip correctly", all_ok)
     for i in range(count):
-        c.execute_command('DEL', f'multi_{i}')
+        c.execute_command('DEL', key(f'multi_{i}'))
 
 
 def test_info_section(c):
@@ -331,7 +339,7 @@ def test_acl_category(c):
                            decode_responses=False)
         c2.execute_command('AUTH', 'testdeny', 'pass123')
         try:
-            c2.execute_command('BLOB.TCP_GET', 'any_key')
+            c2.execute_command('BLOB.TCP_GET', key('any_key'))
             check("ACL -@largeobj blocks BLOB.TCP_GET", False, "no error")
         except valkey.ResponseError as e:
             check("ACL -@largeobj blocks BLOB.TCP_GET",
@@ -345,14 +353,14 @@ def test_memory_usage(c):
     """MEMORY USAGE returns a value for module keys."""
     section("17. MEMORY USAGE reporting")
     payload_size = 4096
-    c.execute_command('BLOB.TCP_SET', 'mem_key', make_payload(payload_size))
+    c.execute_command('BLOB.TCP_SET', key('mem_key'), make_payload(payload_size))
     # Trigger promotion so DRAM reports the payload
     for _ in range(3):
-        c.execute_command('BLOB.TCP_GET', 'mem_key')
-    mem = c.execute_command('MEMORY', 'USAGE', 'mem_key')
+        c.execute_command('BLOB.TCP_GET', key('mem_key'))
+    mem = c.execute_command('MEMORY', 'USAGE', key('mem_key'))
     check("MEMORY USAGE is non-nil", mem is not None)
     check("MEMORY USAGE > 0", isinstance(mem, int) and mem > 0, f"got {mem}")
-    c.execute_command('DEL', 'mem_key')
+    c.execute_command('DEL', key('mem_key'))
 
 
 def test_config_constraints(c):
@@ -398,7 +406,7 @@ def test_keyspace_events(c):
     msg = pubsub.get_message(timeout=1)
     check("Pubsub subscribed", msg is not None and msg['type'] == 'psubscribe')
     # CREATE event
-    c.execute_command('BLOB.TCP_SET', 'evt_key', make_payload(4096))
+    c.execute_command('BLOB.TCP_SET', key('evt_key'), make_payload(4096))
     msg = pubsub.get_message(timeout=1)
     if msg:
         event = msg['channel'].decode().split(':', 1)[1]
@@ -407,7 +415,7 @@ def test_keyspace_events(c):
     else:
         check("largeobj.create event fires", False, "no message received")
     # UPDATE event (overwrite)
-    c.execute_command('BLOB.TCP_SET', 'evt_key', make_payload(8192))
+    c.execute_command('BLOB.TCP_SET', key('evt_key'), make_payload(8192))
     msg = pubsub.get_message(timeout=1)
     if msg:
         event = msg['channel'].decode().split(':', 1)[1]
@@ -416,19 +424,19 @@ def test_keyspace_events(c):
     else:
         check("largeobj.update event fires", False, "no message received")
     pubsub.unsubscribe()
-    c.execute_command('DEL', 'evt_key')
+    c.execute_command('DEL', key('evt_key'))
 
 
 def test_crc_changes_on_overwrite(c):
     """Overwriting a key updates CRC."""
     section("21. CRC changes on overwrite")
-    c.execute_command('BLOB.TCP_SET', 'crc_key', make_payload(4096, b'A'))
-    crc1 = c.execute_command('BLOB.INFO', 'crc_key', 'CRC')
-    c.execute_command('BLOB.TCP_SET', 'crc_key', make_payload(8192, b'B'))
-    crc2 = c.execute_command('BLOB.INFO', 'crc_key', 'CRC')
+    c.execute_command('BLOB.TCP_SET', key('crc_key'), make_payload(4096, b'A'))
+    crc1 = c.execute_command('BLOB.INFO', key('crc_key'), 'CRC')
+    c.execute_command('BLOB.TCP_SET', key('crc_key'), make_payload(8192, b'B'))
+    crc2 = c.execute_command('BLOB.INFO', key('crc_key'), 'CRC')
     check("CRC changes after overwrite", crc1 != crc2,
           f"crc1={crc1}, crc2={crc2}")
-    c.execute_command('DEL', 'crc_key')
+    c.execute_command('DEL', key('crc_key'))
 
 
 def test_disk_maxmemory(c):
@@ -455,7 +463,7 @@ def test_disk_maxmemory(c):
     filled = 0
     for i in range(30):
         try:
-            c.execute_command('BLOB.TCP_SET', f'cap_{i}', payload)
+            c.execute_command('BLOB.TCP_SET', key(f'cap_{i}'), payload)
             filled += 1
         except valkey.ResponseError:
             break
@@ -477,12 +485,12 @@ def test_concurrent_set_get(c_factory):
         try:
             conn = c_factory()
             payload = make_payload(65536, bytes([idx % 256 or 0x42]))
-            key = f'conc_{idx}'
-            conn.execute_command('BLOB.TCP_SET', key, payload)
-            data = conn.execute_command('BLOB.TCP_GET', key)
+            k = key(f'conc_{idx}')
+            conn.execute_command('BLOB.TCP_SET', k, payload)
+            data = conn.execute_command('BLOB.TCP_GET', k)
             if data != payload:
-                errors.append(f"Key {key}: data mismatch")
-            conn.execute_command('DEL', key)
+                errors.append(f"Key {k}: data mismatch")
+            conn.execute_command('DEL', k)
         except Exception as e:
             errors.append(f"Worker {idx}: {e}")
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
@@ -513,41 +521,41 @@ def test_steady_state(c_factory):
             for op in range(OPS_PER_CLIENT):
                 action = random.choice(['set', 'set', 'get', 'get', 'overwrite',
                                         'info', 'del'])
-                key = f'ss_c{client_id}_k{random.randint(0, 9)}'
+                k = key(f'ss_c{client_id}_k{random.randint(0, 9)}')
                 if action == 'set' or (action in ('get', 'info', 'del')
-                                       and key not in local_keys):
+                                       and k not in local_keys):
                     size = random.choice(SIZES)
                     payload = make_payload(size, bytes([
                         (client_id * 37 + size) % 256 or 0x42]))
-                    conn.execute_command('BLOB.TCP_SET', key, payload)
-                    local_keys[key] = payload
+                    conn.execute_command('BLOB.TCP_SET', k, payload)
+                    local_keys[k] = payload
                 elif action == 'get':
-                    data = conn.execute_command('BLOB.TCP_GET', key)
-                    if data != local_keys[key]:
+                    data = conn.execute_command('BLOB.TCP_GET', k)
+                    if data != local_keys[k]:
                         errors.append(
-                            f"C{client_id} GET {key}: expected "
-                            f"len={len(local_keys[key])}, got "
+                            f"C{client_id} GET {k}: expected "
+                            f"len={len(local_keys[k])}, got "
                             f"len={len(data) if data else 'None'}")
                 elif action == 'overwrite':
                     size = random.choice(SIZES)
                     payload = make_payload(size, bytes([
                         (client_id * 41 + op) % 256 or 0x42]))
-                    conn.execute_command('BLOB.TCP_SET', key, payload)
-                    local_keys[key] = payload
-                elif action == 'info' and key in local_keys:
-                    info_len = conn.execute_command('BLOB.INFO', key, 'LEN')
-                    if info_len != len(local_keys[key]):
+                    conn.execute_command('BLOB.TCP_SET', k, payload)
+                    local_keys[k] = payload
+                elif action == 'info' and k in local_keys:
+                    info_len = conn.execute_command('BLOB.INFO', k, 'LEN')
+                    if info_len != len(local_keys[k]):
                         errors.append(
-                            f"C{client_id} INFO {key}: expected "
-                            f"len={len(local_keys[key])}, got {info_len}")
-                elif action == 'del' and key in local_keys:
-                    conn.execute_command('DEL', key)
-                    del local_keys[key]
+                            f"C{client_id} INFO {k}: expected "
+                            f"len={len(local_keys[k])}, got {info_len}")
+                elif action == 'del' and k in local_keys:
+                    conn.execute_command('DEL', k)
+                    del local_keys[k]
                 with lock:
                     ops_completed[0] += 1
             # Cleanup remaining keys
-            for key in list(local_keys):
-                conn.execute_command('DEL', key)
+            for k in list(local_keys):
+                conn.execute_command('DEL', k)
         except Exception as e:
             errors.append(f"C{client_id}: {e}")
     threads = [threading.Thread(target=worker, args=(i,))
@@ -566,13 +574,23 @@ def test_steady_state(c_factory):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global KEY_PREFIX
     parser = argparse.ArgumentParser(description="valkey-large-object functional test")
     parser.add_argument('--host', default='127.0.0.1', help='Valkey server host')
     parser.add_argument('--port', type=int, default=6379, help='Valkey server port')
+    parser.add_argument('--tls', action='store_true',
+                        help='Enable TLS (required for ElastiCache/DubDevo)')
+    parser.add_argument('--cluster-mode', action='store_true',
+                        help='Enable cluster mode (uses hash tags to ensure same-slot keys)')
     args = parser.parse_args()
 
-    print(f"Connecting to {args.host}:{args.port}...")
-    c = valkey.Valkey(host=args.host, port=args.port, decode_responses=False)
+    if args.cluster_mode:
+        KEY_PREFIX = "{t}"
+
+    tls_note = ", TLS" if args.tls else ""
+    cluster_note = ", cluster-mode" if args.cluster_mode else ""
+    print(f"Connecting to {args.host}:{args.port}{tls_note}{cluster_note}...")
+    c = valkey.Valkey(host=args.host, port=args.port, ssl=args.tls, decode_responses=False)
     try:
         c.ping()
     except Exception as e:
@@ -592,8 +610,18 @@ def main():
     c.execute_command('CONFIG', 'SET', 'save', '')
     c.execute_command('CONFIG', 'SET', 'stop-writes-on-bgsave-error', 'no')
 
+    # Detect storage mode: Tiered (NVMe+DRAM) vs Dram-only
+    c.execute_command('BLOB.TCP_SET', key('_mode_detect'), make_payload(1024))
+    mode_tier = c.execute_command('BLOB.INFO', key('_mode_detect'), 'TIER')
+    c.execute_command('DEL', key('_mode_detect'))
+    is_tiered_mode = (mode_tier == b'nvme')
+    if is_tiered_mode:
+        print("Storage mode: Tiered (NVMe → DRAM)\n")
+    else:
+        print(f"Storage mode: Dram-only (tier={mode_tier!r})\n")
+
     def client_factory():
-        return valkey.Valkey(host=args.host, port=args.port, decode_responses=False)
+        return valkey.Valkey(host=args.host, port=args.port, ssl=args.tls, decode_responses=False)
 
     test_basic_set_get(c)
     test_get_nonexistent(c)
@@ -607,7 +635,11 @@ def main():
     test_copy(c)
     test_expiry(c)
     test_flushall(c)
-    test_tiered_promotion(c)
+    if is_tiered_mode:
+        test_tiered_promotion(c)
+    else:
+        section("13. Tiered mode: NVMe → DRAM promotion")
+        print("  ⊘ SKIPPED (Dram-only mode — no NVMe tier)")
     test_multiple_objects(c)
     test_info_section(c)
     test_acl_category(c)
@@ -616,7 +648,11 @@ def main():
     test_wrong_arity(c)
     test_keyspace_events(c)
     test_crc_changes_on_overwrite(c)
-    test_disk_maxmemory(c)
+    if is_tiered_mode:
+        test_disk_maxmemory(c)
+    else:
+        section("22. disk-maxmemory enforcement")
+        print("  ⊘ SKIPPED (Dram-only mode — no disk cap)")
     test_concurrent_set_get(client_factory)
     test_steady_state(client_factory)
 
