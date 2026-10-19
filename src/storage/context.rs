@@ -18,7 +18,7 @@
 //! chunks arrive (`let mut crc: u32 = 0`) and compares against the client-provided
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::watch;
 
 use super::cache_policy::{now_minutes, AccessStats};
@@ -83,9 +83,7 @@ pub struct ObjectContext {
     /// Readers use is_ready() with Acquire ordering — guarantees visibility
     /// of the NVMe read data that was written before mark_ready().
     state: AtomicU8,
-    /// Chunks completed during promotion (only meaningful when state == Filling).
-    chunks_ready: AtomicU32,
-    /// Leader sends updated chunks_ready after each batch. Waiters subscribe via
+    /// Leader's watch channel for coalesced waiters. Waiters subscribe via
     /// Receiver. None when state is Ready (sender dropped in mark_ready).
     /// Wrapped in std::sync::Mutex so mark_ready/set_promotion_failure can drop through &self.
     progress_tx: std::sync::Mutex<Option<watch::Sender<u32>>>,
@@ -102,7 +100,6 @@ impl ObjectContext {
         Self {
             buffers,
             state: AtomicU8::new(ObjectState::Ready as u8),
-            chunks_ready: AtomicU32::new(0),
             progress_tx: std::sync::Mutex::new(None),
             promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
             stats: AccessStats::new(now_minutes()),
@@ -116,7 +113,6 @@ impl ObjectContext {
         Self {
             buffers,
             state: AtomicU8::new(ObjectState::Filling as u8),
-            chunks_ready: AtomicU32::new(0),
             progress_tx: std::sync::Mutex::new(Some(tx)),
             promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
             stats: AccessStats::new(now_minutes()),
@@ -147,41 +143,16 @@ impl ObjectContext {
         *self.progress_tx.lock().unwrap() = None;
     }
 
-    /// Get the number of chunks ready (contiguous from offset 0).
-    pub fn chunks_ready(&self) -> u32 {
-        if self.is_ready() {
-            self.buffers.len() as u32
-        } else {
-            self.chunks_ready.load(Ordering::Acquire)
-        }
-    }
-
-    /// Advance chunks_ready after a batch completes. Called from tokio promotion task.
-    pub fn advance_chunks_ready(&self, count: u32) {
-        assert!(
-            !self.is_ready(),
-            "advance_chunks_ready called on Ready ObjectContext"
-        );
-        self.chunks_ready.fetch_add(count, Ordering::Release);
-    }
-
-    /// Subscribe to progress updates. Returns None if object is already Ready
-    /// (sender was dropped in mark_ready). Waiters call changed().await on the
-    /// returned Receiver to wait for chunks_ready to advance.
+    /// Subscribe to promotion completion. Returns None if object is already Ready
+    /// (sender was dropped in mark_ready) or promotion failed (sender dropped in
+    /// set_promotion_failure). Waiters call changed().await on the returned
+    /// Receiver; the sender drop wakes them.
     pub fn subscribe(&self) -> Option<watch::Receiver<u32>> {
         self.progress_tx
             .lock()
             .unwrap()
             .as_ref()
             .map(|tx| tx.subscribe())
-    }
-
-    /// Notify waiters of progress. Called by the leader after advance_chunks_ready.
-    /// Sends the current chunks_ready value on the watch channel.
-    pub fn notify_progress(&self) {
-        if let Some(tx) = self.progress_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(self.chunks_ready.load(Ordering::Acquire));
-        }
     }
 
     /// Set promotion failure reason and drop the watch sender. Called by the leader
@@ -208,22 +179,14 @@ impl ObjectContext {
         &self,
         mut rx: watch::Receiver<u32>,
     ) -> Result<(), PromotionFailureReason> {
+        // The only event is the sender drop (mark_ready or set_promotion_failure).
+        // changed() returns Err(RecvError) when the sender is dropped.
         loop {
-            match rx.changed().await {
-                Ok(()) => {
-                    // Last notify_progress() can race ahead of mark_ready()'s
-                    // sender drop, so we may see Ok with is_ready() already true.
-                    if self.is_ready() {
-                        return Ok(());
-                    }
+            if rx.changed().await.is_err() {
+                if self.is_ready() {
+                    return Ok(());
                 }
-                Err(_) => {
-                    // Sender dropped — leader finished or failed.
-                    if self.is_ready() {
-                        return Ok(());
-                    }
-                    return Err(self.promotion_failure());
-                }
+                return Err(self.promotion_failure());
             }
         }
     }
@@ -325,7 +288,6 @@ mod tests {
         ];
         let ctx = ObjectContext::new_ready(bufs);
         assert!(ctx.is_ready());
-        assert_eq!(ctx.chunks_ready(), 2);
     }
 
     #[test]
@@ -349,14 +311,9 @@ mod tests {
         ];
         let ctx = ObjectContext::new_filling(bufs);
         assert!(!ctx.is_ready());
-        assert_eq!(ctx.chunks_ready(), 0);
         assert_eq!(ctx.promotion_failure(), PromotionFailureReason::None);
         // Subscription should succeed on Filling object.
         assert!(ctx.subscribe().is_some());
-        ctx.advance_chunks_ready(2);
-        assert_eq!(ctx.chunks_ready(), 2);
-        ctx.advance_chunks_ready(1);
-        assert_eq!(ctx.chunks_ready(), 3);
         // mark_ready drops the sender.
         ctx.mark_ready();
         assert!(ctx.is_ready());
@@ -408,9 +365,7 @@ mod tests {
             .expect("subscribe should succeed on Filling");
         let waiter_ctx = ctx.clone();
         let waiter = tokio::spawn(async move { waiter_ctx.await_promotion(rx).await });
-        // Leader: advance one batch, notify, then fail.
-        ctx.advance_chunks_ready(1);
-        ctx.notify_progress();
+        // Leader fails the promotion.
         tokio::task::yield_now().await;
         ctx.set_promotion_failure(PromotionFailureReason::ReadError);
         let result = waiter.await.unwrap();
@@ -430,8 +385,6 @@ mod tests {
             .expect("subscribe should succeed on Filling");
         let waiter_ctx = ctx.clone();
         let waiter = tokio::spawn(async move { waiter_ctx.await_promotion(rx).await });
-        ctx.advance_chunks_ready(1);
-        ctx.notify_progress();
         ctx.mark_ready();
         let result = waiter.await.unwrap();
         assert_eq!(result, Ok(()));

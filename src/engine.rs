@@ -452,24 +452,9 @@ fn cmd_get_tiered(
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
-    // Reaches here when try_promote_object returns None: pool full, object
-    // exceeds max-promote-size, or another GET is already promoting this OID.
-    // Re-check the map: if another GET inserted a Filling entry between our
-    // initial get_object and try_promote_object, coalesce on it instead of
-    // doing a redundant NVMe read.
-    let (transport, thread_ctx) = match try_serve_dram_hit(
-        dram_pool,
-        &object_id,
-        obj_len,
-        crc32c,
-        transport,
-        thread_ctx,
-        &file,
-        &unevictable,
-    ) {
-        None => return,
-        Some(args) => args,
-    };
+    // Reaches here when try_promote_object returns None: pool full or object
+    // exceeds segment capacity after reclaim. We are still on the main thread
+    // so no other GET can have modified the DRAMPool map since our first check.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();

@@ -378,7 +378,7 @@ pub(crate) fn reply_stream_err(
 }
 
 /// DRAM-promotion side effects run around the batch loop (GET only). When present,
-/// the driver advances chunks_ready / marks Ready and, on a source (NVMe) error,
+/// the driver marks Ready on completion and, on a source (NVMe) error,
 /// evicts the half-filled DRAM entry; on a target (EFA) error it keeps reading so
 /// the DRAM copy still fills for coalesced waiters, replying the error at the end.
 pub struct PromotionProgress<'a> {
@@ -553,8 +553,8 @@ async fn test_inject_promotion_failure(
 /// it with their own pre/post work.
 ///
 /// `progress` present ⇒ DRAM promotion (a GET): a target (EFA-write) error is
-/// latched but the loop keeps filling DRAM for coalesced waiters, and each batch
-/// advances `chunks_ready` / marks Ready. Absent ⇒ a target error aborts at once.
+/// latched but the loop keeps filling DRAM for coalesced waiters, and the loop
+/// marks Ready on completion. Absent ⇒ a target error aborts at once.
 /// A source error always aborts (evicting the half-filled DRAM entry under `progress`).
 ///
 /// Returns the (advanced) iterator — so the caller can compute the object CRC from
@@ -651,10 +651,6 @@ async fn drive_window(
             }
         }
 
-        if let Some(p) = progress {
-            p.obj_ctx.advance_chunks_ready(batch_count as u32);
-            p.obj_ctx.notify_progress();
-        }
         chunks_done += batch_count as u32;
     }
 
