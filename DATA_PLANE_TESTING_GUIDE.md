@@ -49,7 +49,7 @@ Both instances must be in the same placement group for EFA connectivity.
 aws ec2 create-placement-group \
   --group-name valkey-large-object-test \
   --strategy cluster \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 ### 1.2 Create a Security Group
@@ -60,7 +60,7 @@ sufficient**; EFA uses link-local IPv6 addresses (`fe80::...`) and requires the
 explicit self-referencing outbound rule for the return path.
 
 ```bash
-VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
+VPC_ID=$(aws ec2 describe-vpcs --region eu-west-1 \
   --filters "Name=isDefault,Values=true" \
   --query 'Vpcs[0].VpcId' --output text)
 
@@ -68,7 +68,7 @@ SG_ID=$(aws ec2 create-security-group \
   --group-name valkey-large-object-test-sg \
   --description "valkey-large-object test - allow all traffic within group" \
   --vpc-id "$VPC_ID" \
-  --region us-east-1 \
+  --region eu-west-1 \
   --query 'GroupId' --output text)
 
 # Inbound: all traffic from the same group (required for EFA)
@@ -76,7 +76,7 @@ aws ec2 authorize-security-group-ingress \
   --group-id "$SG_ID" \
   --protocol -1 \
   --source-group "$SG_ID" \
-  --region us-east-1
+  --region eu-west-1
 
 # Outbound: all traffic TO the same group (also required for EFA)
 # Without this, RDMA_HELLO works (plain TCP) but RDMA_SET/GET hang with
@@ -85,7 +85,7 @@ aws ec2 authorize-security-group-egress \
   --group-id "$SG_ID" \
   --protocol -1 \
   --source-group "$SG_ID" \
-  --region us-east-1
+  --region eu-west-1
 
 # SSH from anywhere
 aws ec2 authorize-security-group-ingress \
@@ -93,7 +93,7 @@ aws ec2 authorize-security-group-ingress \
   --protocol tcp \
   --port 22 \
   --cidr 0.0.0.0/0 \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 ### 1.3 Create a Key Pair
@@ -104,7 +104,7 @@ aws ec2 create-key-pair \
   --key-type ed25519 \
   --query 'KeyMaterial' \
   --output text \
-  --region us-east-1 > valkey-large-object-test-key.pem
+  --region eu-west-1 > valkey-large-object-test-key.pem
 
 chmod 400 valkey-large-object-test-key.pem
 ```
@@ -118,21 +118,21 @@ AMI_ID=$(aws ec2 describe-images \
             "Name=state,Values=available" \
   --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
   --output text \
-  --region us-east-1)
+  --region eu-west-1)
 echo "AMI: $AMI_ID"
 ```
 
 ### 1.5 Pick a Subnet
 
-Use a public subnet in `us-east-1a` (placement group and EFA require same AZ).
+Use a public subnet in `eu-west-1a` (placement group and EFA require same AZ).
 
 ```bash
 SUBNET_ID=$(aws ec2 describe-subnets \
   --filters "Name=vpc-id,Values=$VPC_ID" \
-            "Name=availability-zone,Values=us-east-1a" \
+            "Name=availability-zone,Values=eu-west-1a" \
             "Name=map-public-ip-on-launch,Values=true" \
   --query 'Subnets[0].SubnetId' --output text \
-  --region us-east-1)
+  --region eu-west-1)
 echo "Subnet: $SUBNET_ID"
 ```
 
@@ -180,7 +180,7 @@ aws ec2 run-instances \
   --placement "GroupName=valkey-large-object-test" \
   --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET_ID,Groups=[$SG_ID],InterfaceType=efa" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=valkey-large-object-server}]" \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 **Client:**
@@ -193,7 +193,7 @@ aws ec2 run-instances \
   --placement "GroupName=valkey-large-object-test" \
   --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET_ID,Groups=[$SG_ID],InterfaceType=efa" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=valkey-large-object-client}]" \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 > **Note:** Both i8g and i8ge instances come with local NVMe instance storage.
@@ -209,7 +209,7 @@ aws ec2 describe-instances \
             "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value|[0],PrivateIpAddress,PublicIpAddress]' \
   --output table \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 Note the **server private IP** — the client uses it to connect on port 6379.
