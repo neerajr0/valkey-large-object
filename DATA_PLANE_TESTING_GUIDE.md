@@ -1,10 +1,10 @@
-# valkey-large-object — Local Development & Instance Testing Guide
+# valkey-large-object — Data Plane Testing Guide
 
-This guide walks through provisioning two EC2 instances (i8g.48xlarge or
-i8ge.48xlarge), installing Valkey with the `valkey-large-object` module, and
-running a functional test script that exercises all client-facing commands. This
-setup provides a standalone reference environment for testing beyond
-creating a cluster in the development environment.
+This guide walks through provisioning EC2 instances with EFA support,
+installing Valkey with the `valkey-large-object` module, and running
+functional test scripts that exercise all client-facing commands over
+TCP and EFA RDMA. Covers both self-managed standalone instances and
+DubDevo managed clusters.
 
 ---
 
