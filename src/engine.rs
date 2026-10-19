@@ -374,7 +374,6 @@ fn cmd_get_tiered(
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     let (transport, thread_ctx) = match try_serve_dram_hit(
         dram_pool,
-        cache,
         &object_id,
         obj_len,
         crc32c,
@@ -460,7 +459,6 @@ fn cmd_get_tiered(
     // doing a redundant NVMe read.
     let (transport, thread_ctx) = match try_serve_dram_hit(
         dram_pool,
-        cache,
         &object_id,
         obj_len,
         crc32c,
@@ -1104,6 +1102,15 @@ fn cmd_get_from_dram(
     thread_ctx: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
+    // Tiered mode: every DRAM serve is a cache hit — record it once here so
+    // all paths (already-ready, subscribe-race, coalesced waiter) are covered.
+    if let Some(cache) = &dram_pool.cache {
+        cache.stats.record_hit(&obj_ctx.stats);
+        obj_ctx.stats.touch(
+            storage::cache_policy::now_minutes(),
+            crate::blob_decay_time(),
+        );
+    }
     match transport {
         Transport::Tcp => {
             if crate::bench_mode() {
@@ -1162,7 +1169,6 @@ fn cmd_get_from_dram(
 #[allow(clippy::too_many_arguments)]
 fn try_serve_dram_hit(
     dram_pool: &'static storage::DRAMPool,
-    cache: &storage::cache_policy::TieredCache,
     object_id: &ObjectId,
     obj_len: u64,
     crc32c: Crc,
@@ -1176,11 +1182,6 @@ fn try_serve_dram_hit(
         None => return Some((transport, thread_ctx)), // cache miss — caller continues
     };
     if obj_ctx.is_ready() {
-        cache.stats.record_hit(&obj_ctx.stats);
-        obj_ctx.stats.touch(
-            storage::cache_policy::now_minutes(),
-            crate::blob_decay_time(),
-        );
         cmd_get_from_dram(
             dram_pool,
             &obj_ctx,
