@@ -1220,16 +1220,7 @@ fn serve_filling_or_became_ready(
     if let Some(rx) = obj_ctx.subscribe() {
         info::COALESCED_READS.fetch_add(1, Ordering::Relaxed);
         crate::runtime_handle().spawn(async move {
-            serve_coalesced_waiter(
-                obj_ctx,
-                rx,
-                obj_len,
-                crc32c,
-                transport,
-                thread_ctx,
-                file,
-            )
-            .await;
+            serve_coalesced_waiter(obj_ctx, rx, obj_len, crc32c, transport, thread_ctx, file).await;
         });
     } else {
         // subscribe() returned None → transitioned to Ready between checks.
