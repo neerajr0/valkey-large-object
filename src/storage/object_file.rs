@@ -11,7 +11,7 @@
 //!
 //! Safety of deletion under a concurrent read rests on two facts:
 //!   1. Reference counting on two independent Arcs — a reader pins `Arc<ObjectFile>`
-//!      (existence) AND holds an `Arc<OwnedFd>` clone (the open fd). Neither the file
+//!      (existence) AND holds an `Arc<ObjectFd>` clone (the open fd). Neither the file
 //!      nor its fd can be reclaimed while that reader is alive, no matter which thread
 //!      drops the last ObjectFile ref (a tokio worker, a lazyfree BIO thread, or the
 //!      main thread on a synchronous free).
@@ -30,9 +30,9 @@
 //! fd opens lazily on the first GET.
 
 use std::collections::HashMap;
-use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+use super::fd_placement::ObjectFd;
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
@@ -94,9 +94,10 @@ pub fn unevictable_count() -> usize {
 }
 
 /// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
-/// unless it is in either already. One `UNEVICTABLE` critical section, so a
-/// teardown either adds `oid` to the unevictable list first (the claim fails) or
-/// finds it in the reclaim list. Call under the server lock.
+/// unless it is in either already, and take it off the eviction candidates. One
+/// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
+/// list first (the claim fails) or finds it in the reclaim list. Call under the server
+/// lock.
 #[must_use]
 pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
@@ -105,6 +106,8 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     {
         return None;
     }
+    // Claimed: no later eviction may pick it.
+    super::eviction_candidates::remove(oid);
     Some(UnevictableOID::insert(&mut unevictable, oid))
 }
 
@@ -128,6 +131,7 @@ impl ObjectFile {
     /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
     /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
+        super::eviction_candidates::insert(object_id);
         Self {
             object_id,
             disk_len,
@@ -142,10 +146,10 @@ impl ObjectFile {
         self.disk_len
     }
 
-    /// Returns a cloned `Arc<OwnedFd>`. Calls into the `FdPool`, which owns the fd and
+    /// Returns a cloned `Arc<ObjectFd>`. Calls into the `FdPool`, which owns the fd and
     /// caches it for reuse. The returned reference should be used to protect the
     /// fd from being closed while there are inflight read requests.
-    pub fn ensure_open(&self, pool: &FdPool, dir: &str) -> Option<Arc<OwnedFd>> {
+    pub fn ensure_open(&self, pool: &FdPool, dir: &str) -> Option<Arc<ObjectFd>> {
         pool.get_or_open(self.object_id, dir)
     }
 
@@ -212,11 +216,13 @@ impl Drop for ObjectFile {
         // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
+        // Eviction must not pick a file that is being torn down.
+        super::eviction_candidates::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
         let unevictable = UnevictableOID::new(object_id);
 
-        // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
-        // holds a clone, the fd's OwnedFd closes at this time.
+        // Deregistering drops the pool's Arc<ObjectFd>; if no in-flight reader
+        // holds a clone, the fd closes at this time.
         let teardown = move || {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
@@ -241,5 +247,21 @@ impl Drop for ObjectFile {
         } else {
             teardown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{eviction_candidates, reclaim::RECLAIM_LIST};
+    use super::*;
+
+    #[test]
+    fn a_claimed_victim_leaves_the_eviction_candidates() {
+        let oid = ObjectId(9_500);
+        eviction_candidates::insert(oid);
+        let claim = claim_victim(oid).expect("not claimed yet");
+        assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
+        drop(claim);
+        RECLAIM_LIST.remove(&oid);
     }
 }

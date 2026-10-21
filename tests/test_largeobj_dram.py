@@ -222,7 +222,9 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         rdma = client.info('largeobj_rdma')
         for field in ('sessions', 'read_bytes', 'write_bytes'):
             assert rdma[f'largeobj_rdma_{field}'] == 0, field
-        assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
+        core = client.info('largeobj_core_metrics')
+        assert not any(field.startswith('largeobj_disk_') for field in core)
+        assert core['largeobj_inflight_requests'] == 0
 
     def test_info_reports_dram_utilization(self):
         """INFO reports allocated bytes as a percentage of capacity, to two decimals."""

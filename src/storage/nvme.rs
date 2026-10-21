@@ -5,8 +5,9 @@
 //! channels, and completion streams; this module handles everything that
 //! knows what an NVMe object file *is*.
 
+use super::fd_placement::ObjectFd;
 use std::mem::size_of;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -75,7 +76,7 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Directory entries read per eviction.
+/// Candidates picked per eviction.
 const EVICT_BATCH: usize = 64;
 
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
@@ -108,7 +109,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in victim_batch(EVICT_BATCH) {
+    for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
@@ -121,9 +122,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                 covered += len;
                 victims.push((unevictable, len));
             }
-            // We collect our victim candidates via a readdir snapshot. Between the
-            // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
-            // file may be deleted by an ObjectFile's drop.
+            // Torn down between the pick and the claim, so its key is gone.
             Ok(None) => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
             }
@@ -147,16 +146,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
         decrease_nvme_disk_usage(taken + freed);
     }
     reserved
-}
-
-/// The first `n` object files in `disk_dir`.
-fn victim_batch(n: usize) -> Vec<ObjectId> {
-    let Ok(dir) = std::fs::read_dir(crate::disk_dir()) else {
-        return Vec::new();
-    };
-    dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
-        .take(n)
-        .collect()
 }
 
 /// Unlink claimed `victims` and remove them from the unevictable list,
@@ -513,24 +502,18 @@ pub async fn read_and_verify_file_header(
 }
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
-/// Returns an `OwnedFd` that closes the file descriptor on drop.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<OwnedFd, super::StorageError> {
+/// Returns an `ObjectFd` that closes the file descriptor on drop.
+pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
     let c_path = std::ffi::CString::new(file_path).expect("file_path null");
     let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
         flags |= libc::O_DIRECT;
     }
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644) };
-    if fd < 0 {
-        Err(super::StorageError::IoError {
-            code: std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        })
-    } else {
-        // SAFETY: fd is a valid, newly opened file descriptor owned exclusively by us.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
+    super::fd_placement::open_object_file(&c_path, flags, 0o644).map_err(|e| {
+        super::StorageError::IoError {
+            code: e.raw_os_error().unwrap_or(libc::EIO),
+        }
+    })
 }
 
 /// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.

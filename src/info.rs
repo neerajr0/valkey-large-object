@@ -30,8 +30,7 @@ pub static CRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Objects evicted to make room for a write, or by a Dram shrink: Dram objects or
-/// Tiered files. Cached copies Tiered drops are demotions, not evictions.
+/// Objects evicted to make room for a write: Dram objects or Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
@@ -58,9 +57,9 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
-    disk_staging_section(ctx)?;
     disk_section(ctx)?;
-    fd_pool_section(ctx)?;
+    disk_staging_section(ctx)?;
+    fd_section(ctx)?;
     smartlog_section(ctx)?;
     rdma_section(ctx)?;
     error_metrics_section(ctx)?;
@@ -81,19 +80,6 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
-        .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
-        .field(
-            "disk_orphaned_files",
-            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_orphaned_bytes",
-            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_unevictable_objects",
-            storage::object_file::unevictable_count() as i64,
-        )?
         .field(
             "inflight_requests",
             crate::engine::inflight_requests() as i64,
@@ -103,16 +89,36 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     Ok(())
 }
 
-/// Tiered only: absent in Dram mode, where no FdPool exists.
-fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
+/// Tiered only: absent in Dram mode, where no FdPool exists. Object-file fd placement
+/// first, then the fd cache.
+fn fd_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(fds) = storage::FD_POOL.get() else {
         return Ok(());
     };
     ctx.builder()
         .add_section("fd")
-        .field("open_fds", fds.len() as i64)?
+        // Placement. open_object_fds counts cached fds and those held by running GETs
+        // and SETs.
         .field(
-            "fd_evictions",
+            "open_object_fds",
+            storage::fd_placement::open_object_fds() as i64,
+        )?
+        .field(
+            "fd_placement_enabled",
+            storage::fd_placement::placement_enabled() as i64,
+        )?
+        .field(
+            "fd_placement_failures",
+            storage::fd_placement::placement_failures() as i64,
+        )?
+        // Cache: the fds kept open between GETs.
+        .field(
+            "fd_cache_max_entries",
+            storage::fd_placement::fd_cache_max_entries() as i64,
+        )?
+        .field("fd_cache_entries", fds.len() as i64)?
+        .field(
+            "fd_cache_evictions",
             fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
@@ -177,8 +183,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(
-            "rdma_registered_segments",
-            crate::efa_registered_segment_count() as i64,
+            "dram_rdma_registered_segments",
+            dram.rdma_registered_count() as i64,
         )?
         .field(
             "dram_uring_registered_segments",
@@ -189,6 +195,35 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
+/// Object files on disk, Tiered mode only.
+fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let used = storage::nvme::nvme_disk_usage();
+
+    ctx.builder()
+        .add_section("disk")
+        .field("disk_used_bytes", used as i64)?
+        .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
+        .field(
+            "disk_orphaned_files",
+            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_orphaned_bytes",
+            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_unevictable_objects",
+            storage::object_file::unevictable_count() as i64,
+        )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// NVMe staging pool, Tiered mode only.
 fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(nvme) = storage::NVME_POOL.get() else {
         return Ok(());
@@ -207,24 +242,13 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
             crate::dram_segment_size() as i64,
         )?
         .field(
+            "disk_staging_rdma_registered_segments",
+            nvme.rdma_registered_count() as i64,
+        )?
+        .field(
             "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
-        .build_section()?
-        .build_info()
-        .map(|_| ())
-}
-
-/// Object files on disk, Tiered mode only: how full the disk budget is.
-fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
-    if operating_mode() != OperatingMode::Tiered {
-        return Ok(());
-    }
-    let util_pct = pct(storage::nvme::nvme_disk_usage(), crate::nvme_maxmemory());
-
-    ctx.builder()
-        .add_section("disk")
-        .field("disk_utilization_pct", util_pct)?
         .build_section()?
         .build_info()
         .map(|_| ())
