@@ -1,0 +1,1205 @@
+#!/usr/bin/env python3
+"""
+EFA RDMA scale test — long-running workload against an ElastiCache cluster
+(or standalone server) to shake out bugs under sustained load, saturate EFA
+bandwidth, provoke race conditions, and validate DRAM pool scaling toward the
+384 GiB EFA registration limit.
+
+Requires:
+  - valkey Python package (pip install valkey)
+  - fabric_target binary (compiled from tests/harness/fabric_target.rs)
+  - EFA drivers + libfabric on the client instance
+
+Usage (cluster mode):
+    python3 efa_scale_test.py \\
+        --cluster-endpoint clustercfg.xxx.euw1devo.cache.amazonaws.com \\
+        --tls --cluster-mode \\
+        --duration 3600 --concurrency 8 --client-id 1
+
+Usage (standalone mode):
+    python3 efa_scale_test.py \\
+        --host <server-ip> --port 6379 \\
+        --duration 300 --concurrency 4
+"""
+
+import argparse
+import json
+import logging
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+
+import valkey
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+FABRIC_TARGET = os.environ.get(
+    "FABRIC_TARGET", "/mnt/nvme0/cargo-target/release/fabric_target"
+)
+
+OBJECT_SIZES = [4096, 65536, 1048576, 10485760, 52428800]  # 4KB → 50MB
+
+WORKLOAD_RATIOS = {
+    "write_heavy": (0.90, 0.10),   # (SET%, GET%)
+    "read_heavy":  (0.10, 0.90),
+    "balanced":    (0.50, 0.50),
+    "burst_write": (0.95, 0.05),
+}
+
+# EFA device can register ~384 GiB in 4 KiB pages. Use 380 GiB safety margin.
+EFA_REGISTRATION_LIMIT_BYTES = 380 * 1024 * 1024 * 1024
+
+HEALTH_PULSE_INTERVAL = 30  # seconds
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+log = logging.getLogger("efa_scale")
+
+
+def setup_logging(logfile, max_size_mb, backups):
+    fmt = logging.Formatter(
+        "%(asctime)s.%(msecs)03dZ [%(threadName)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    fmt.converter = time.gmtime
+    log.setLevel(logging.DEBUG)
+    # Rotating file handler
+    fh = RotatingFileHandler(
+        logfile, maxBytes=max_size_mb * 1024 * 1024, backupCount=backups
+    )
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    # Stdout handler
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+
+
+# ─── Graceful Shutdown ────────────────────────────────────────────────────────
+
+
+class GracefulShutdown:
+    def __init__(self):
+        self.shutdown_requested = threading.Event()
+        signal.signal(signal.SIGINT, self._handle)
+        signal.signal(signal.SIGTERM, self._handle)
+
+    def _handle(self, signum, frame):
+        log.warning("Shutdown requested (signal %d), finishing in-flight ops...", signum)
+        self.shutdown_requested.set()
+
+    def should_continue(self):
+        return not self.shutdown_requested.is_set()
+
+
+# ─── fabric_target helpers ────────────────────────────────────────────────────
+
+
+def start_fabric_target(server_fabric_addr, size, read_mode=False):
+    """Launch fabric_target --efa --size=<size> and parse its advertisement.
+
+    Returns (proc, addr_hex, rkey, remote_addr, length, source_crc).
+    source_crc is the CRC of the prefilled buffer (read_mode only), else None.
+    """
+    cmd = [FABRIC_TARGET, "--efa", f"--size={size}", server_fabric_addr]
+    if read_mode:
+        cmd.insert(1, "--read")
+    env = dict(
+        os.environ,
+        LD_LIBRARY_PATH="/opt/amazon/efa/lib64:"
+        + os.environ.get("LD_LIBRARY_PATH", ""),
+    )
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    line = proc.stdout.readline()
+    if not line.startswith("advertisement:"):
+        rest = proc.stdout.read()
+        proc.kill()
+        raise RuntimeError(f"fabric_target failed to advertise: {line}{rest}")
+    parts = line.split()
+    addr_hex = parts[1]
+    rkey = int(parts[2])
+    remote_addr = int(parts[3])
+    length = int(parts[4])
+    source_crc = None
+    if read_mode:
+        crc_line = proc.stdout.readline()
+        m = re.search(r"\bcrc (0x[0-9a-fA-F]+)\b", crc_line)
+        if m:
+            source_crc = int(m.group(1), 16)
+    return proc, addr_hex, rkey, remote_addr, length, source_crc
+
+
+def parse_client_crc(output):
+    """Extract the CRC that fabric_target computed over the bytes in its buffer."""
+    m = re.search(r"\bcrc (0x[0-9a-fA-F]+)\b", output)
+    return int(m.group(1), 16) if m else None
+
+
+def kill_target(proc):
+    """Terminate fabric_target and drain its output."""
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+# ─── Cluster Topology ─────────────────────────────────────────────────────────
+
+
+def discover_cluster(endpoint, port, tls):
+    """Discover shard primaries via CLUSTER NODES."""
+    conn = valkey.Valkey(
+        host=endpoint, port=port, ssl=tls,
+        ssl_cert_reqs=None if tls else None,
+        decode_responses=True, socket_timeout=10,
+    )
+    nodes_raw = conn.execute_command("CLUSTER", "NODES")
+    shards = {}
+    for line in nodes_raw.strip().split("\n"):
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        node_id, addr, flags = parts[0], parts[1], parts[2]
+        if "master" not in flags or "fail" in flags:
+            continue
+        host_port = addr.split("@")[0]
+        host, node_port = host_port.rsplit(":", 1)
+        slots = parts[8:]
+        shard_id = slots[0].split("-")[0] if slots else node_id[:8]
+        shards[shard_id] = {
+            "host": host,
+            "port": int(node_port),
+            "slots": slots,
+            "node_id": node_id,
+        }
+    conn.close()
+    log.info("Discovered %d shard(s)", len(shards))
+    for sid, info in shards.items():
+        log.info(
+            "  shard=%s node=%s:%d slots=%s",
+            sid, info["host"], info["port"], ",".join(info["slots"]),
+        )
+    return shards
+
+
+def connect_standalone(host, port, tls):
+    """Single-node mode: one 'shard' covering all slots."""
+    return {
+        "0": {
+            "host": host,
+            "port": port,
+            "slots": ["0-16383"],
+            "node_id": "standalone",
+        }
+    }
+
+
+# ─── Hash-Tagged Key Routing ─────────────────────────────────────────────────
+
+# CRC16-CCITT lookup table for Valkey cluster hash slot computation.
+_CRC16_TABLE = None
+
+
+def _crc16_init():
+    global _CRC16_TABLE
+    _CRC16_TABLE = []
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+        _CRC16_TABLE.append(crc & 0xFFFF)
+
+
+def crc16(data: bytes) -> int:
+    if _CRC16_TABLE is None:
+        _crc16_init()
+    crc = 0
+    for b in data:
+        crc = ((_CRC16_TABLE[((crc >> 8) ^ b) & 0xFF]) ^ (crc << 8)) & 0xFFFF
+    return crc
+
+
+def compute_shard_hash_tags(shards):
+    """Find a short hash tag for each shard that maps to its slot range."""
+    tags = {}
+    for shard_id, info in shards.items():
+        slot_range = info["slots"][0]
+        if "-" in slot_range:
+            start, end = map(int, slot_range.split("-"))
+        else:
+            start = end = int(slot_range)
+        for i in range(200000):
+            tag = f"s{shard_id}_{i}"
+            slot = crc16(tag.encode()) % 16384
+            if start <= slot <= end:
+                tags[shard_id] = tag
+                log.info("  shard=%s hash_tag={%s} → slot %d", shard_id, tag, slot)
+                break
+        else:
+            raise RuntimeError(
+                f"Could not find hash tag for shard {shard_id} slots {slot_range}"
+            )
+    return tags
+
+
+# ─── Per-Shard RDMA Session Setup ────────────────────────────────────────────
+
+
+def setup_shard_connections(shards, tls):
+    """Create a Valkey connection to each shard primary."""
+    connections = {}
+    for shard_id, info in shards.items():
+        conn = valkey.Valkey(
+            host=info["host"], port=info["port"],
+            ssl=tls, ssl_cert_reqs=None if tls else None,
+            decode_responses=False, socket_timeout=30,
+        )
+        conn.ping()
+        connections[shard_id] = conn
+        log.info(
+            "  shard=%s connected to %s:%d", shard_id, info["host"], info["port"]
+        )
+    return connections
+
+
+def discover_server_fabric_addr(shard_info, tls):
+    """Discover the server's fabric address via RDMA_HELLO.
+
+    Starts a throwaway fabric_target (without the server address — it can't do
+    transfers, but it opens an EFA endpoint and advertises its own address).
+    Sends BLOB.RDMA_HELLO with that address on a throwaway connection. The
+    server returns its fabric address(es). Kills the throwaway target and
+    connection — they can't be reused for transfers.
+    """
+    env = dict(
+        os.environ,
+        LD_LIBRARY_PATH="/opt/amazon/efa/lib64:"
+        + os.environ.get("LD_LIBRARY_PATH", ""),
+    )
+    # Start fabric_target without the server address positional — just to get
+    # a valid EFA endpoint address for HELLO.
+    cmd = [FABRIC_TARGET, "--efa", f"--size={DEFAULT_BUFFER_LEN}"]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    try:
+        line = proc.stdout.readline()
+        if not line.startswith("advertisement:"):
+            rest = proc.stdout.read()
+            raise RuntimeError(
+                f"fabric_target discovery failed to advertise: {line}{rest}"
+            )
+        client_addr = line.split()[1]
+        # HELLO on a throwaway connection
+        conn = valkey.Valkey(
+            host=shard_info["host"], port=shard_info["port"],
+            ssl=tls, ssl_cert_reqs=None if tls else None,
+            decode_responses=False, socket_timeout=10,
+        )
+        hello_reply = conn.execute_command("BLOB.RDMA_HELLO", client_addr)
+        conn.close()
+        if isinstance(hello_reply, list) and len(hello_reply) > 0:
+            # Return the first server fabric address (hex-encoded bytes)
+            addr = hello_reply[0]
+            if isinstance(addr, bytes):
+                return addr.decode("ascii")
+            return str(addr)
+        raise RuntimeError(f"RDMA_HELLO returned unexpected reply: {hello_reply!r}")
+    finally:
+        kill_target(proc)
+
+# Default buffer size for the discovery handshake (matches fabric_target default).
+DEFAULT_BUFFER_LEN = 4096
+
+
+# ─── Startup Verification ────────────────────────────────────────────────────
+
+
+def verify_cluster_state(connections, shards):
+    """Read INFO from each shard and log config. Abort on fatal misconfig."""
+    cluster_info = {}
+    for shard_id, conn in connections.items():
+        info = {}
+        # INFO memory for maxmemory
+        try:
+            mem = conn.info("memory")
+            info["used_memory"] = mem.get("used_memory", 0)
+            info["maxmemory"] = mem.get("maxmemory", 0)
+        except Exception as e:
+            log.warning("shard=%s INFO memory failed: %s", shard_id, e)
+        # INFO largeobj for module config
+        try:
+            lo = conn.info("largeobj")
+            info["segment_size"] = lo.get("largeobj_dram_segment_size_bytes", 0)
+            info["efa_registered"] = lo.get("largeobj_efa_registered_segments", 0)
+            info["dram_segments"] = lo.get("largeobj_dram_segments", 0)
+            info["dram_capacity"] = lo.get("largeobj_dram_capacity_bytes", 0)
+            info["dram_pool_exhausted"] = lo.get("largeobj_dram_pool_exhausted", 0)
+        except Exception as e:
+            log.warning("shard=%s INFO largeobj failed: %s", shard_id, e)
+        # Read max-object-size via CONFIG GET (may fail on managed clusters)
+        info["max_object_size"] = 0
+        try:
+            cfg = conn.execute_command("CONFIG", "GET", "largeobj.max-object-size")
+            if cfg and len(cfg) >= 2:
+                info["max_object_size"] = int(cfg[1])
+        except Exception:
+            # Managed cluster may block CONFIG. Estimate from segment_size.
+            info["max_object_size"] = info.get("segment_size", 0)
+        cluster_info[shard_id] = info
+        log.info(
+            "shard=%s maxmemory=%s segment_size=%s efa_registered=%s "
+            "max_object_size=%s dram_segments=%s",
+            shard_id,
+            _human_bytes(info.get("maxmemory", 0)),
+            _human_bytes(info.get("segment_size", 0)),
+            info.get("efa_registered", "?"),
+            _human_bytes(info.get("max_object_size", 0)),
+            info.get("dram_segments", "?"),
+        )
+        if info.get("maxmemory", 0) == 0:
+            log.warning(
+                "shard=%s has maxmemory=0 (unbounded). "
+                "DRAM pool will grow without limit.",
+                shard_id,
+            )
+    return cluster_info
+
+
+def filter_object_sizes(sizes, max_object_size):
+    """Remove sizes that exceed the server's max-object-size."""
+    if max_object_size <= 0:
+        return sizes
+    filtered = [s for s in sizes if s <= max_object_size]
+    if len(filtered) < len(sizes):
+        removed = [s for s in sizes if s > max_object_size]
+        log.warning(
+            "Filtered object sizes exceeding max-object-size=%s: %s",
+            _human_bytes(max_object_size),
+            [_human_bytes(s) for s in removed],
+        )
+    return filtered
+
+
+# ─── Health Monitor ───────────────────────────────────────────────────────────
+
+
+class HealthMonitor:
+    """Background thread polling INFO on each shard every HEALTH_PULSE_INTERVAL."""
+
+    def __init__(self, connections, shards, shutdown, segment_size):
+        self.connections = connections
+        self.shards = shards
+        self.shutdown = shutdown
+        self.segment_size = segment_size
+        self.prev_samples = {}
+        self.eviction_stall_count = defaultdict(int)
+        self.thread = threading.Thread(
+            target=self._run, name="health-monitor", daemon=True
+        )
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        while self.shutdown.should_continue():
+            self._pulse()
+            # Sleep in small increments so shutdown is responsive
+            for _ in range(HEALTH_PULSE_INTERVAL * 10):
+                if not self.shutdown.should_continue():
+                    return
+                time.sleep(0.1)
+
+    def _pulse(self):
+        for shard_id, conn in self.connections.items():
+            try:
+                self._poll_shard(shard_id, conn)
+            except Exception as e:
+                log.warning("[health] shard=%s poll failed: %s", shard_id, e)
+
+    def _poll_shard(self, shard_id, conn):
+        node = f"{self.shards[shard_id]['host']}:{self.shards[shard_id]['port']}"
+        mem = conn.info("memory")
+        lo = conn.info("largeobj")
+        used = mem.get("used_memory", 0)
+        maxmem = mem.get("maxmemory", 0)
+        evictions = lo.get("largeobj_evictions", 0)
+        pending = lo.get("largeobj_pending_evictions", 0)
+        exhausted = lo.get("largeobj_dram_pool_exhausted", 0)
+        registered = lo.get("largeobj_efa_registered_segments", 0)
+        dram_segs = lo.get("largeobj_dram_segments", 0)
+        dram_util = lo.get("largeobj_dram_utilization_pct", 0)
+        expands = lo.get("largeobj_dram_scaling_expands", 0)
+        shrinks = lo.get("largeobj_dram_scaling_shrinks", 0)
+        efa_read_errs = lo.get("largeobj_efa_read_errors", 0)
+        efa_write_errs = lo.get("largeobj_efa_write_errors", 0)
+        # RDMA byte counters (may not exist on older builds)
+        rdma_read = lo.get("largeobj_rdma_read_bytes", 0)
+        rdma_write = lo.get("largeobj_rdma_write_bytes", 0)
+        # Throughput from RDMA byte counter diffs
+        throughput_gbps = 0.0
+        prev = self.prev_samples.get(shard_id)
+        if prev:
+            dt = time.monotonic() - prev["time"]
+            if dt > 0:
+                total_delta = (
+                    (rdma_read - prev.get("rdma_read", 0))
+                    + (rdma_write - prev.get("rdma_write", 0))
+                )
+                throughput_gbps = (total_delta * 8) / (dt * 1e9)
+        self.prev_samples[shard_id] = {
+            "time": time.monotonic(),
+            "rdma_read": rdma_read,
+            "rdma_write": rdma_write,
+            "evictions": evictions,
+            "used_memory": used,
+        }
+        # Registration pressure check
+        reg_bytes = registered * self.segment_size if self.segment_size else 0
+        reg_pct = (reg_bytes / EFA_REGISTRATION_LIMIT_BYTES) * 100 if reg_bytes else 0
+        reg_tag = ""
+        if reg_pct > 90:
+            reg_tag = " CRITICAL_REG_PRESSURE"
+        elif reg_pct > 70:
+            reg_tag = " HIGH_REG_PRESSURE"
+        # Eviction stall detection
+        stall_tag = ""
+        if maxmem > 0 and used > maxmem * 0.95:
+            if prev and evictions == prev.get("evictions", 0):
+                self.eviction_stall_count[shard_id] += 1
+                if self.eviction_stall_count[shard_id] >= 3:
+                    stall_tag = " EVICTION_STALL"
+            else:
+                self.eviction_stall_count[shard_id] = 0
+        log.info(
+            "[health] shard=%s node=%s used=%s maxmem=%s evictions=%d "
+            "pending=%d exhausted=%d dram_segs=%d util=%d%% expand=%d "
+            "shrink=%d efa_reg=%d/%s(%.0f%%) efa_errs=r%d/w%d "
+            "throughput=%.1fGbps%s%s",
+            shard_id, node, _human_bytes(used), _human_bytes(maxmem),
+            evictions, pending, exhausted, dram_segs, dram_util,
+            expands, shrinks, registered,
+            _human_bytes(reg_bytes), reg_pct,
+            efa_read_errs, efa_write_errs, throughput_gbps,
+            reg_tag, stall_tag,
+        )
+
+
+# ─── Worker ───────────────────────────────────────────────────────────────────
+
+
+class WorkerStats:
+    """Thread-safe per-worker statistics."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ops = 0
+        self.gets = 0
+        self.sets = 0
+        self.errors = 0
+        self.crc_mismatches = 0
+        self.latencies = []  # (op_type, latency_ms)
+
+    def record(self, op_type, latency_ms, error=False, crc_mismatch=False):
+        with self.lock:
+            self.ops += 1
+            if op_type == "GET":
+                self.gets += 1
+            else:
+                self.sets += 1
+            if error:
+                self.errors += 1
+            if crc_mismatch:
+                self.crc_mismatches += 1
+            # Cap stored latencies to avoid unbounded memory growth on long runs.
+            # Keep all if < 100K, then sample 1-in-10.
+            if len(self.latencies) < 100_000 or random.random() < 0.1:
+                self.latencies.append((op_type, latency_ms))
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "ops": self.ops,
+                "gets": self.gets,
+                "sets": self.sets,
+                "errors": self.errors,
+                "crc_mismatches": self.crc_mismatches,
+                "latencies": list(self.latencies),
+            }
+
+
+def worker_loop(
+    worker_id, shard_id, shard_info, hash_tag, server_fabric_addr,
+    tls, object_sizes, workload, transition_interval, shutdown, stats,
+):
+    """Main worker loop: pick op, execute RDMA transfer, verify, log."""
+    node = f"{shard_info['host']}:{shard_info['port']}"
+    current_workload = workload
+    last_transition = time.monotonic()
+    key_counter = 0
+    while shutdown.should_continue():
+        # Workload transition
+        if transition_interval > 0:
+            elapsed = time.monotonic() - last_transition
+            if elapsed >= transition_interval:
+                choices = [w for w in WORKLOAD_RATIOS if w != current_workload]
+                current_workload = random.choice(choices)
+                last_transition = time.monotonic()
+                log.debug(
+                    "[%s] shard=%s transitioned to workload=%s",
+                    worker_id, shard_id, current_workload,
+                )
+        set_ratio, get_ratio = WORKLOAD_RATIOS[current_workload]
+        obj_size = random.choice(object_sizes)
+        is_set = random.random() < set_ratio
+        key_counter += 1
+        key = f"{{{hash_tag}}}obj_{worker_id}_{key_counter}"
+        try:
+            if is_set:
+                _do_rdma_set(
+                    worker_id, shard_id, shard_info, node, key, obj_size,
+                    server_fabric_addr, tls, stats,
+                )
+            else:
+                _do_rdma_get(
+                    worker_id, shard_id, shard_info, node, key, obj_size,
+                    server_fabric_addr, tls, stats,
+                )
+        except Exception as e:
+            stats.record("SET" if is_set else "GET", 0, error=True)
+            log.error(
+                "[%s] shard=%s node=%s key=%s error=%s",
+                worker_id, shard_id, node, key, e,
+            )
+
+
+def _do_rdma_set(worker_id, shard_id, shard_info, node, key, obj_size,
+                 server_fabric_addr, tls, stats):
+    """Execute one RDMA SET: spawn fabric_target (read mode), HELLO, SET, verify CRC."""
+    # Each SET needs its own connection + fabric_target (one HELLO per connection).
+    conn = valkey.Valkey(
+        host=shard_info["host"], port=shard_info["port"],
+        ssl=tls, ssl_cert_reqs=None if tls else None,
+        decode_responses=False, socket_timeout=60,
+    )
+    proc = None
+    try:
+        proc, client_addr, rkey, remote_addr, length, source_crc = (
+            start_fabric_target(server_fabric_addr, obj_size, read_mode=True)
+        )
+        # Establish RDMA session
+        hello_reply = conn.execute_command("BLOB.RDMA_HELLO", client_addr)
+        if not isinstance(hello_reply, list) or len(hello_reply) == 0:
+            raise RuntimeError(f"RDMA_HELLO unexpected reply: {hello_reply!r}")
+        # RDMA SET
+        t0 = time.monotonic()
+        set_reply = conn.execute_command(
+            "BLOB.RDMA_SET", key, str(obj_size),
+            str(rkey), str(remote_addr), str(length),
+        )
+        lat_ms = (time.monotonic() - t0) * 1000
+        if set_reply != b"OK":
+            stats.record("SET", lat_ms, error=True)
+            log.error(
+                "[%s] shard=%s node=%s RDMA_SET key=%s size=%s reply=%r",
+                worker_id, shard_id, node, key, _human_bytes(obj_size), set_reply,
+            )
+            return
+        # CRC verification via BLOB.INFO
+        crc_match = True
+        server_crc = None
+        try:
+            server_crc = conn.execute_command("BLOB.INFO", key, "CRC")
+        except Exception:
+            pass
+        if source_crc is not None and server_crc is not None:
+            crc_match = source_crc == server_crc
+        stats.record("SET", lat_ms, crc_mismatch=not crc_match)
+        if not crc_match:
+            log.error(
+                "[%s] shard=%s node=%s RDMA_SET CRC MISMATCH key=%s "
+                "client=0x%08x server=0x%08x",
+                worker_id, shard_id, node, key, source_crc or 0, server_crc or 0,
+            )
+            _capture_error_context(conn, key, "CRC mismatch", worker_id, node, shard_id)
+        else:
+            log.debug(
+                "[%s] shard=%s node=%s RDMA_SET key=%s size=%s lat_ms=%.1f OK",
+                worker_id, shard_id, node, key, _human_bytes(obj_size), lat_ms,
+            )
+    finally:
+        if proc:
+            kill_target(proc)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _do_rdma_get(worker_id, shard_id, shard_info, node, key, obj_size,
+                 server_fabric_addr, tls, stats):
+    """Execute one RDMA GET: first ensure key exists (TCP SET), then RDMA GET + CRC verify."""
+    conn = valkey.Valkey(
+        host=shard_info["host"], port=shard_info["port"],
+        ssl=tls, ssl_cert_reqs=None if tls else None,
+        decode_responses=False, socket_timeout=60,
+    )
+    proc = None
+    try:
+        # Ensure the key exists. For GET-heavy workloads, we SET first via TCP
+        # (fast, no fabric_target needed) so the RDMA GET has something to read.
+        # Use a minimal pattern — the RDMA GET buffer size is what matters, not
+        # the stored object size. The server will transfer min(stored_len, buffer_len).
+        prep_size = min(obj_size, 65536)  # Cap TCP prep at 64KB to avoid large allocs
+        pattern = bytes(i % 256 for i in range(prep_size))
+        try:
+            conn.execute_command("BLOB.TCP_SET", key, pattern)
+        except Exception as e:
+            # Key may already exist from a prior SET, or OOM — log and try GET anyway
+            log.debug("[%s] TCP_SET for GET prep failed: %s", worker_id, e)
+        # Now do the RDMA GET
+        proc, client_addr, rkey, remote_addr, length, _ = start_fabric_target(
+            server_fabric_addr, obj_size, read_mode=False
+        )
+        hello_reply = conn.execute_command("BLOB.RDMA_HELLO", client_addr)
+        if not isinstance(hello_reply, list) or len(hello_reply) == 0:
+            raise RuntimeError(f"RDMA_HELLO unexpected reply: {hello_reply!r}")
+        t0 = time.monotonic()
+        get_reply = conn.execute_command(
+            "BLOB.RDMA_GET", key, str(rkey), str(remote_addr), str(length),
+        )
+        lat_ms = (time.monotonic() - t0) * 1000
+        if not isinstance(get_reply, list) or len(get_reply) != 2:
+            # Key may not exist (nil reply)
+            if get_reply is None:
+                stats.record("GET", lat_ms)
+                log.debug(
+                    "[%s] shard=%s node=%s RDMA_GET key=%s nil (key not found)",
+                    worker_id, shard_id, node, key,
+                )
+                return
+            stats.record("GET", lat_ms, error=True)
+            log.error(
+                "[%s] shard=%s node=%s RDMA_GET key=%s unexpected reply=%r",
+                worker_id, shard_id, node, key, get_reply,
+            )
+            return
+        server_len = get_reply[0]
+        server_crc = get_reply[1]
+        # Wait briefly for fabric_target to receive bytes and compute CRC
+        time.sleep(min(2, obj_size / (50 * 1024 * 1024) + 0.5))
+        proc.terminate()
+        try:
+            stdout, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate(timeout=5)
+        client_crc = parse_client_crc(stdout)
+        crc_match = True
+        if client_crc is not None and server_crc is not None:
+            crc_match = client_crc == server_crc
+        verified = "payload verified" in (stdout or "")
+        stats.record("GET", lat_ms, crc_mismatch=not crc_match)
+        if not crc_match:
+            log.error(
+                "[%s] shard=%s node=%s RDMA_GET CRC MISMATCH key=%s "
+                "client=0x%08x server=0x%08x",
+                worker_id, shard_id, node, key,
+                client_crc or 0, server_crc or 0,
+            )
+            _capture_error_context(conn, key, "CRC mismatch", worker_id, node, shard_id)
+        elif not verified and client_crc is not None:
+            log.warning(
+                "[%s] shard=%s node=%s RDMA_GET key=%s CRC OK but payload not verified",
+                worker_id, shard_id, node, key,
+            )
+        else:
+            log.debug(
+                "[%s] shard=%s node=%s RDMA_GET key=%s size=%s lat_ms=%.1f OK",
+                worker_id, shard_id, node, key, _human_bytes(obj_size), lat_ms,
+            )
+    finally:
+        if proc:
+            kill_target(proc)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _capture_error_context(conn, key, error, worker_id, node, shard_id):
+    """Capture server-side state on failure for correlation."""
+    ctx = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "worker": worker_id,
+        "node": node,
+        "shard": shard_id,
+        "key": key,
+        "error": error,
+    }
+    try:
+        ctx["blob_info"] = conn.execute_command("BLOB.INFO", key)
+    except Exception:
+        ctx["blob_info"] = None
+    try:
+        lo = conn.info("largeobj")
+        ctx["info_largeobj"] = {
+            k: v for k, v in lo.items()
+            if isinstance(k, str) and k.startswith("largeobj_")
+        }
+    except Exception:
+        ctx["info_largeobj"] = None
+    try:
+        mem = conn.info("memory")
+        ctx["used_memory"] = mem.get("used_memory")
+        ctx["maxmemory"] = mem.get("maxmemory")
+    except Exception:
+        pass
+    log.error("[error_context] %s", json.dumps(ctx, default=str))
+
+
+# ─── Race Provocation Tests ──────────────────────────────────────────────────
+
+
+def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shutdown):
+    """Run race provocation tests against one shard."""
+    node = f"{shard_info['host']}:{shard_info['port']}"
+    log.info("[race] Starting race tests on shard=%s node=%s", shard_id, node)
+
+    def make_conn():
+        return valkey.Valkey(
+            host=shard_info["host"], port=shard_info["port"],
+            ssl=tls, ssl_cert_reqs=None if tls else None,
+            decode_responses=False, socket_timeout=30,
+        )
+
+    passed = 0
+    failed = 0
+
+    def check(label, condition, detail=""):
+        nonlocal passed, failed
+        if condition:
+            passed += 1
+            log.info("[race] ✓ %s", label)
+        else:
+            failed += 1
+            msg = f"[race] ✗ {label}"
+            if detail:
+                msg += f" — {detail}"
+            log.error(msg)
+
+    # ── Concurrent GET same key ──
+    if shutdown.should_continue():
+        log.info("[race] ── Concurrent GET same key ──")
+        key = f"{{{hash_tag}}}race_cget"
+        c = make_conn()
+        pattern = bytes(i % 256 for i in range(4096))
+        c.execute_command("BLOB.TCP_SET", key, pattern)
+        errors = []
+        results = [None] * 8
+
+        def concurrent_get(idx):
+            try:
+                gc = make_conn()
+                val = gc.execute_command("BLOB.TCP_GET", key)
+                results[idx] = val
+                gc.close()
+            except Exception as e:
+                errors.append(f"thread-{idx}: {e}")
+
+        threads = [threading.Thread(target=concurrent_get, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        valid = [r for r in results if r is not None]
+        check(
+            f"Concurrent GET: {len(valid)}/8 got data",
+            len(valid) == 8 and all(r == pattern for r in valid),
+            f"errors={errors[:3]}" if errors else
+            f"mismatches={sum(1 for r in valid if r != pattern)}",
+        )
+        c.execute_command("DEL", key)
+        c.close()
+
+    # ── Concurrent SET same key ──
+    if shutdown.should_continue():
+        log.info("[race] ── Concurrent SET same key ──")
+        key = f"{{{hash_tag}}}race_cset"
+        errors = []
+        payloads = [bytes([i] * 4096) for i in range(8)]
+
+        def concurrent_set(idx):
+            try:
+                sc = make_conn()
+                sc.execute_command("BLOB.TCP_SET", key, payloads[idx])
+                sc.close()
+            except Exception as e:
+                errors.append(f"thread-{idx}: {e}")
+
+        threads = [threading.Thread(target=concurrent_set, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        # Last writer wins — verify key exists and is one of the payloads
+        vc = make_conn()
+        final = vc.execute_command("BLOB.TCP_GET", key)
+        check(
+            "Concurrent SET: last writer wins",
+            final in payloads,
+            f"final not in any payload, len={len(final) if final else 'None'}"
+            if final not in payloads else "",
+        )
+        check("Concurrent SET: no errors", len(errors) == 0, "; ".join(errors[:3]))
+        vc.execute_command("DEL", key)
+        vc.close()
+
+    # ── GET during SET (same key) ──
+    if shutdown.should_continue():
+        log.info("[race] ── GET during SET (same key) ──")
+        key = f"{{{hash_tag}}}race_gds"
+        old_pattern = bytes([0xAA] * 4096)
+        new_pattern = bytes([0xBB] * 65536)
+        c = make_conn()
+        c.execute_command("BLOB.TCP_SET", key, old_pattern)
+        get_results = []
+        set_done = threading.Event()
+
+        def setter():
+            sc = make_conn()
+            sc.execute_command("BLOB.TCP_SET", key, new_pattern)
+            set_done.set()
+            sc.close()
+
+        def getter():
+            gc = make_conn()
+            for _ in range(20):
+                try:
+                    val = gc.execute_command("BLOB.TCP_GET", key)
+                    get_results.append(len(val) if val else 0)
+                except Exception:
+                    get_results.append(-1)
+                time.sleep(0.001)
+            gc.close()
+
+        gt = threading.Thread(target=getter)
+        st = threading.Thread(target=setter)
+        gt.start()
+        time.sleep(0.005)
+        st.start()
+        gt.join(timeout=30)
+        st.join(timeout=30)
+        # Every GET should return old value, new value, or nil — never garbage
+        valid_lens = {len(old_pattern), len(new_pattern), 0, -1}
+        all_valid = all(r in valid_lens for r in get_results)
+        check(
+            "GET during SET: no corruption",
+            all_valid,
+            f"unexpected sizes: {[r for r in get_results if r not in valid_lens]}",
+        )
+        c.execute_command("DEL", key)
+        c.close()
+
+    # ── Buffer reuse stress ──
+    if shutdown.should_continue():
+        log.info("[race] ── Buffer reuse stress ──")
+        errors = []
+        rounds = 50
+        c = make_conn()
+        for i in range(rounds):
+            key = f"{{{hash_tag}}}race_buf_{i}"
+            pattern = bytes([(i + j) % 256 for j in range(4096)])
+            try:
+                c.execute_command("BLOB.TCP_SET", key, pattern)
+                got = c.execute_command("BLOB.TCP_GET", key)
+                if got != pattern:
+                    errors.append(f"round {i}: data mismatch")
+                c.execute_command("DEL", key)
+            except Exception as e:
+                errors.append(f"round {i}: {e}")
+        c.close()
+        check(
+            f"Buffer reuse: {rounds} SET/GET/DEL rounds",
+            len(errors) == 0,
+            "; ".join(errors[:5]),
+        )
+
+    log.info("[race] Race tests complete: %d passed, %d failed", passed, failed)
+    return passed, failed
+
+
+# ─── Results & Summary ────────────────────────────────────────────────────────
+
+
+def compute_summary(all_stats, duration, num_shards):
+    """Aggregate per-worker stats into a final summary."""
+    total_ops = 0
+    total_gets = 0
+    total_sets = 0
+    total_errors = 0
+    total_crc = 0
+    all_latencies = []
+    for ws in all_stats:
+        snap = ws.snapshot()
+        total_ops += snap["ops"]
+        total_gets += snap["gets"]
+        total_sets += snap["sets"]
+        total_errors += snap["errors"]
+        total_crc += snap["crc_mismatches"]
+        all_latencies.extend(snap["latencies"])
+    lat_values = [lat for _, lat in all_latencies]
+    lat_values.sort()
+    p50 = lat_values[len(lat_values) // 2] if lat_values else 0
+    p99 = lat_values[int(len(lat_values) * 0.99)] if lat_values else 0
+    p_max = lat_values[-1] if lat_values else 0
+    return {
+        "duration_s": duration,
+        "shards": num_shards,
+        "total_ops": total_ops,
+        "gets": total_gets,
+        "sets": total_sets,
+        "errors": total_errors,
+        "crc_mismatches": total_crc,
+        "latency_p50_ms": round(p50, 2),
+        "latency_p99_ms": round(p99, 2),
+        "latency_max_ms": round(p_max, 2),
+    }
+
+
+def print_summary(summary, race_results=None):
+    """Print human-readable final summary."""
+    print(f"\n{'═' * 60}")
+    print("  EFA Scale Test Summary")
+    print(f"{'═' * 60}")
+    print(f"  Duration:     {summary['duration_s']}s")
+    print(f"  Shards:       {summary['shards']}")
+    print(f"  Total ops:    {summary['total_ops']:,}")
+    print(f"    RDMA_GET:   {summary['gets']:,}")
+    print(f"    RDMA_SET:   {summary['sets']:,}")
+    print(f"  Errors:       {summary['errors']:,}")
+    print(f"  CRC mismatch: {summary['crc_mismatches']:,}")
+    print(f"  Latency p50/p99/max: {summary['latency_p50_ms']:.1f}ms / "
+          f"{summary['latency_p99_ms']:.1f}ms / {summary['latency_max_ms']:.1f}ms")
+    if race_results:
+        rp, rf = race_results
+        print(f"  Race tests:   {rp} passed, {rf} failed")
+    print(f"{'═' * 60}\n")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _human_bytes(n):
+    if n is None or n == 0:
+        return "0"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.0f}{unit}" if n == int(n) else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="EFA RDMA scale test for valkey-large-object"
+    )
+    # Connection
+    conn_group = parser.add_argument_group("connection")
+    conn_group.add_argument("--cluster-endpoint", help="ElastiCache config endpoint")
+    conn_group.add_argument("--host", default="127.0.0.1", help="Standalone host")
+    conn_group.add_argument("--port", type=int, default=6379)
+    conn_group.add_argument("--tls", action="store_true", help="Enable TLS")
+    conn_group.add_argument("--cluster-mode", action="store_true")
+    conn_group.add_argument(
+        "--server-fabric-addr",
+        help="Server fabric address hex (required for standalone RDMA)",
+    )
+    # Workload
+    wl_group = parser.add_argument_group("workload")
+    wl_group.add_argument("--duration", type=int, default=3600, help="Seconds to run")
+    wl_group.add_argument(
+        "--concurrency", type=int, default=8, help="Workers per shard"
+    )
+    wl_group.add_argument("--client-id", type=int, default=1, help="Client instance ID")
+    wl_group.add_argument(
+        "--workload", default="balanced", choices=list(WORKLOAD_RATIOS.keys()),
+        help="Initial workload pattern (default: balanced)",
+    )
+    wl_group.add_argument(
+        "--transition-interval", type=int, default=60,
+        help="Seconds between random workload transitions (0=disable)",
+    )
+    wl_group.add_argument(
+        "--object-sizes", help="Comma-separated object sizes in bytes",
+    )
+    wl_group.add_argument(
+        "--skip-race-tests", action="store_true", help="Skip race provocation tests",
+    )
+    # Logging
+    log_group = parser.add_argument_group("logging")
+    log_group.add_argument("--logfile", default="efa_scale_test.log")
+    log_group.add_argument("--max-log-size", type=int, default=50, help="MB")
+    log_group.add_argument("--log-backups", type=int, default=5)
+    log_group.add_argument("--results-file", default="results.json")
+
+    args = parser.parse_args()
+
+    # ── Setup logging ──
+    setup_logging(args.logfile, args.max_log_size, args.log_backups)
+    shutdown = GracefulShutdown()
+
+    log.info("EFA Scale Test starting")
+    log.info("  client_id=%d duration=%ds concurrency=%d workload=%s",
+             args.client_id, args.duration, args.concurrency, args.workload)
+
+    # ── Discover topology ──
+    endpoint = args.cluster_endpoint or args.host
+    if args.cluster_mode:
+        shards = discover_cluster(endpoint, args.port, args.tls)
+    else:
+        shards = connect_standalone(args.host, args.port, args.tls)
+
+    if not shards:
+        log.error("No shards discovered — aborting")
+        sys.exit(1)
+
+    # ── Connect to each shard ──
+    connections = setup_shard_connections(shards, args.tls)
+
+    # ── Verify cluster state ──
+    cluster_info = verify_cluster_state(connections, shards)
+    # Get segment_size from the first shard
+    first_info = next(iter(cluster_info.values()))
+    segment_size = first_info.get("segment_size", 0)
+    max_obj_size = first_info.get("max_object_size", 0)
+
+    # ── Compute hash tags ──
+    hash_tags = compute_shard_hash_tags(shards)
+
+    # ── Filter object sizes ──
+    if args.object_sizes:
+        object_sizes = [int(s) for s in args.object_sizes.split(",")]
+    else:
+        object_sizes = list(OBJECT_SIZES)
+    object_sizes = filter_object_sizes(object_sizes, max_obj_size)
+    if not object_sizes:
+        log.error("No valid object sizes after filtering — aborting")
+        sys.exit(1)
+    log.info("Object sizes: %s", [_human_bytes(s) for s in object_sizes])
+
+    # ── Resolve server fabric address ──
+    # For RDMA, we need the server's fabric address for fabric_target's positional arg.
+    # Discovery: start a throwaway fabric_target, do RDMA_HELLO, get server addr.
+    server_fabric_addr = args.server_fabric_addr
+    if not server_fabric_addr:
+        first_shard_id = next(iter(shards.keys()))
+        try:
+            server_fabric_addr = discover_server_fabric_addr(
+                shards[first_shard_id], args.tls
+            )
+        except Exception as e:
+            log.error("Fabric address discovery failed: %s", e)
+    if not server_fabric_addr:
+        log.error(
+            "Could not determine server fabric address. Pass --server-fabric-addr "
+            "or ensure EFA is available on both client and server."
+        )
+        sys.exit(1)
+    log.info("Server fabric address: %s...", server_fabric_addr[:16])
+
+    # ── Start health monitor ──
+    health = HealthMonitor(connections, shards, shutdown, segment_size)
+    health.start()
+
+    # ── Run race tests (before workload, to catch bugs early) ──
+    race_results = None
+    if not args.skip_race_tests:
+        first_shard = next(iter(shards.keys()))
+        race_results = run_race_tests(
+            first_shard, shards[first_shard], hash_tags[first_shard],
+            server_fabric_addr, args.tls, shutdown,
+        )
+
+    # ── Spawn workers ──
+    all_stats = []
+    worker_threads = []
+    for shard_id, shard_info in shards.items():
+        for i in range(args.concurrency):
+            wid = f"c{args.client_id}-s{shard_id}-w{i}"
+            ws = WorkerStats()
+            all_stats.append(ws)
+            t = threading.Thread(
+                target=worker_loop,
+                name=wid,
+                args=(
+                    wid, shard_id, shard_info, hash_tags[shard_id],
+                    server_fabric_addr, args.tls, object_sizes,
+                    args.workload, args.transition_interval, shutdown, ws,
+                ),
+                daemon=True,
+            )
+            worker_threads.append(t)
+
+    log.info(
+        "Spawning %d workers (%d per shard × %d shards)",
+        len(worker_threads), args.concurrency, len(shards),
+    )
+    start_time = time.monotonic()
+    for t in worker_threads:
+        t.start()
+
+    # ── Wait for duration or shutdown ──
+    deadline = start_time + args.duration
+    while time.monotonic() < deadline and shutdown.should_continue():
+        time.sleep(1)
+
+    # ── Signal shutdown and wait ──
+    shutdown.shutdown_requested.set()
+    log.info("Duration complete, waiting for workers to finish...")
+    for t in worker_threads:
+        t.join(timeout=30)
+
+    elapsed = time.monotonic() - start_time
+
+    # ── Summary ──
+    summary = compute_summary(all_stats, round(elapsed), len(shards))
+    print_summary(summary, race_results)
+
+    # ── Write results JSON ──
+    results = {
+        "client_id": args.client_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "race_tests": {"passed": race_results[0], "failed": race_results[1]}
+        if race_results else None,
+    }
+    with open(args.results_file, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    log.info("Results written to %s", args.results_file)
+
+    # Exit with failure if any errors or CRC mismatches
+    if summary["errors"] > 0 or summary["crc_mismatches"] > 0:
+        sys.exit(1)
+    if race_results and race_results[1] > 0:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
