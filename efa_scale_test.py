@@ -1172,7 +1172,8 @@ def _human_bytes(n):
 
 
 def snapshot_rdma_bytes(connections):
-    """Read rdma_read_bytes + rdma_write_bytes from each shard, return total."""
+    """Read rdma_read_bytes + rdma_write_bytes from each shard (server-side).
+    Returns 0 if the counters are not present (older deployed builds)."""
     total = 0
     for conn in connections.values():
         try:
@@ -1185,21 +1186,23 @@ def snapshot_rdma_bytes(connections):
 
 
 def snapshot_client_efa_bytes():
-    """Read RDMA byte counters from the local EFA device via sysfs."""
+    """Read RDMA byte counters from the local EFA device via sysfs.
+
+    The client is the passive RDMA target: the server fi_read pulls from our
+    memory (SET path) and fi_write pushes into it (GET path). The matching
+    sysfs counters on the client side are:
+      rdma_read_resp_bytes  — bytes the server read FROM us (SET)
+      rdma_write_recv_bytes — bytes the server wrote INTO us (GET)
+    """
     total = 0
     import glob as _glob
-    for path in _glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/rdma_read_bytes"):
-        try:
-            with open(path) as f:
-                total += int(f.read().strip())
-        except Exception:
-            pass
-    for path in _glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/rdma_write_bytes"):
-        try:
-            with open(path) as f:
-                total += int(f.read().strip())
-        except Exception:
-            pass
+    for counter in ("rdma_read_resp_bytes", "rdma_write_recv_bytes"):
+        for path in _glob.glob(f"/sys/class/infiniband/*/ports/1/hw_counters/{counter}"):
+            try:
+                with open(path) as f:
+                    total += int(f.read().strip())
+            except Exception:
+                pass
     return total
 
 
