@@ -48,10 +48,11 @@ FABRIC_TARGET = os.environ.get(
 OBJECT_SIZES = [4096, 65536, 1048576, 10485760, 52428800]  # 4KB → 50MB
 
 WORKLOAD_RATIOS = {
-    "write_heavy": (0.90, 0.10),   # (SET%, GET%)
-    "read_heavy":  (0.10, 0.90),
-    "balanced":    (0.50, 0.50),
-    "burst_write": (0.95, 0.05),
+    "write_heavy":       (0.90, 0.10),   # (SET%, GET%)
+    "read_heavy":        (0.10, 0.90),
+    "balanced":          (0.50, 0.50),
+    "burst_write":       (0.95, 0.05),
+    "staging_pressure":  (1.00, 0.00),   # 100% SET to saturate NVMe staging buffers
 }
 
 # EFA device can register ~384 GiB in 4 KiB pages. Use 380 GiB safety margin.
@@ -471,6 +472,7 @@ class HealthMonitor:
         evictions = lo.get("largeobj_evictions", 0)
         pending = lo.get("largeobj_pending_evictions", 0)
         exhausted = lo.get("largeobj_dram_pool_exhausted", 0)
+        staging_exhausted = lo.get("largeobj_disk_staging_buffer_exhausted", 0)
         registered = lo.get("largeobj_efa_registered_segments", 0)
         dram_segs = lo.get("largeobj_dram_segments", 0)
         dram_util = lo.get("largeobj_dram_utilization_pct", 0)
@@ -522,12 +524,12 @@ class HealthMonitor:
                 self.eviction_stall_count[shard_id] = 0
         log.info(
             "[health] shard=%s node=%s used=%s maxmem=%s evictions=%d "
-            "pending=%d exhausted=%d dram_segs=%d util=%d%% expand=%d "
-            "shrink=%d efa_reg=%d/%s(%.0f%%) efa_errs=r%d/w%d "
-            "throughput=%.1fGbps%s%s",
+            "pending=%d exhausted=%d staging_exhausted=%d dram_segs=%d "
+            "util=%d%% expand=%d shrink=%d efa_reg=%d/%s(%.0f%%) "
+            "efa_errs=r%d/w%d throughput=%.1fGbps%s%s",
             shard_id, node, _human_bytes(used), _human_bytes(maxmem),
-            evictions, pending, exhausted, dram_segs, dram_util,
-            expands, shrinks, registered,
+            evictions, pending, exhausted, staging_exhausted, dram_segs,
+            dram_util, expands, shrinks, registered,
             _human_bytes(reg_bytes), reg_pct,
             efa_read_errs, efa_write_errs, throughput_gbps,
             reg_tag, stall_tag,
@@ -547,11 +549,13 @@ class WorkerStats:
         self.sets = 0
         self.errors = 0
         self.crc_mismatches = 0
+        self.staging_exhausted = 0
         self.latencies = []  # (op_type, latency_ms)
         self.latencies_by_size = defaultdict(list)  # size -> [latency_ms]
         self.latencies_by_op = defaultdict(list)    # "GET"/"SET" -> [latency_ms]
 
-    def record(self, op_type, latency_ms, obj_size=0, error=False, crc_mismatch=False):
+    def record(self, op_type, latency_ms, obj_size=0, error=False, crc_mismatch=False,
+               staging_exhausted=False):
         with self.lock:
             self.ops += 1
             if op_type == "GET":
@@ -562,6 +566,8 @@ class WorkerStats:
                 self.errors += 1
             if crc_mismatch:
                 self.crc_mismatches += 1
+            if staging_exhausted:
+                self.staging_exhausted += 1
             # Cap stored latencies to avoid unbounded memory growth on long runs.
             # Keep all if < 100K, then sample 1-in-10.
             if len(self.latencies) < 100_000 or random.random() < 0.1:
@@ -583,6 +589,7 @@ class WorkerStats:
                 "sets": self.sets,
                 "errors": self.errors,
                 "crc_mismatches": self.crc_mismatches,
+                "staging_exhausted": self.staging_exhausted,
                 "latencies": list(self.latencies),
                 "latencies_by_size": {
                     k: list(v) for k, v in self.latencies_by_size.items()
@@ -644,7 +651,11 @@ def worker_loop(
                     server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
         except Exception as e:
-            stats.record("SET" if is_set else "GET", 0, obj_size=obj_size, error=True)
+            is_staging = "staging buffer pool exhausted" in str(e)
+            stats.record(
+                "SET" if is_set else "GET", 0, obj_size=obj_size,
+                error=True, staging_exhausted=is_staging,
+            )
             log.error(
                 "[%s] shard=%s node=%s key=%s error=%s",
                 worker_id, shard_id, node, key, e,
@@ -1046,6 +1057,7 @@ def compute_summary(all_stats, duration, num_shards):
     total_sets = 0
     total_errors = 0
     total_crc = 0
+    total_staging_exhausted = 0
     all_latencies = []
     merged_by_size = defaultdict(list)
     merged_by_op = defaultdict(list)
@@ -1056,6 +1068,7 @@ def compute_summary(all_stats, duration, num_shards):
         total_sets += snap["sets"]
         total_errors += snap["errors"]
         total_crc += snap["crc_mismatches"]
+        total_staging_exhausted += snap["staging_exhausted"]
         all_latencies.extend(snap["latencies"])
         for size, lats in snap["latencies_by_size"].items():
             merged_by_size[size].extend(lats)
@@ -1095,6 +1108,7 @@ def compute_summary(all_stats, duration, num_shards):
         "sets": total_sets,
         "errors": total_errors,
         "crc_mismatches": total_crc,
+        "staging_exhausted": total_staging_exhausted,
         "latency_p50_ms": round(p50, 2),
         "latency_p99_ms": round(p99, 2),
         "latency_max_ms": round(p_max, 2),
@@ -1115,6 +1129,7 @@ def print_summary(summary, race_results=None):
     print(f"    RDMA_SET:   {summary['sets']:,}")
     print(f"  Errors:       {summary['errors']:,}")
     print(f"  CRC mismatch: {summary['crc_mismatches']:,}")
+    print(f"  Staging exhausted: {summary['staging_exhausted']:,}")
     print(f"  Latency p50/p99/max: {summary['latency_p50_ms']:.1f}ms / "
           f"{summary['latency_p99_ms']:.1f}ms / {summary['latency_max_ms']:.1f}ms")
     if summary.get("by_op"):
