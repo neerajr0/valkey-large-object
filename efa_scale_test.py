@@ -104,6 +104,18 @@ class GracefulShutdown:
 # ─── fabric_target helpers ────────────────────────────────────────────────────
 
 
+# ─── fabric_target helpers ────────────────────────────────────────────────────
+#
+# Each RDMA transfer requires a registered memory region on the client for the
+# server to read from (SET) or write into (GET). fabric_target is a one-shot
+# Rust binary that opens an EFA endpoint, allocates and registers a buffer via
+# fi_mr_reg, and advertises its rkey/addr/len. A new process + endpoint +
+# registration is created per operation because fabric_target does not yet
+# support persistent mode. This is the main throughput bottleneck: a production
+# client (e.g. GPU inference) would hold long-lived RDMA sessions with
+# pre-registered memory (see vdma's FabricService + registered_arena pattern).
+
+
 def start_fabric_target(server_fabric_addr, size, read_mode=False, num_regions=1):
     """Launch fabric_target --efa --size=<size> and parse its advertisement.
 
