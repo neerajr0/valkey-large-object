@@ -360,7 +360,8 @@ def verify_cluster_state(connections, shards):
         try:
             lo = conn.info("largeobj")
             info["segment_size"] = lo.get("largeobj_dram_segment_size_bytes", 0)
-            info["efa_registered"] = lo.get("largeobj_efa_registered_segments", 0)
+            info["efa_registered"] = lo.get("largeobj_dram_rdma_registered_segments",
+                                            lo.get("largeobj_efa_registered_segments", 0))
             info["dram_segments"] = lo.get("largeobj_dram_segments", 0)
             info["dram_capacity"] = lo.get("largeobj_dram_capacity_bytes", 0)
             info["dram_pool_exhausted"] = lo.get("largeobj_dram_pool_exhausted", 0)
@@ -472,14 +473,18 @@ class HealthMonitor:
         evictions = lo.get("largeobj_evictions", 0)
         pending = lo.get("largeobj_pending_evictions", 0)
         exhausted = lo.get("largeobj_dram_pool_exhausted", 0)
-        staging_exhausted = lo.get("largeobj_disk_staging_buffer_exhausted", 0)
-        registered = lo.get("largeobj_efa_registered_segments", 0)
+        staging_exhausted = lo.get("largeobj_nvme_buffer_exhausted",
+                                   lo.get("largeobj_disk_staging_buffer_exhausted", 0))
+        registered = lo.get("largeobj_dram_rdma_registered_segments",
+                            lo.get("largeobj_efa_registered_segments", 0))
         dram_segs = lo.get("largeobj_dram_segments", 0)
         dram_util = lo.get("largeobj_dram_utilization_pct", 0)
         expands = lo.get("largeobj_dram_scaling_expands", 0)
         shrinks = lo.get("largeobj_dram_scaling_shrinks", 0)
-        efa_read_errs = lo.get("largeobj_efa_read_errors", 0)
-        efa_write_errs = lo.get("largeobj_efa_write_errors", 0)
+        efa_read_errs = lo.get("largeobj_rdma_read_errors",
+                               lo.get("largeobj_efa_read_errors", 0))
+        efa_write_errs = lo.get("largeobj_rdma_write_errors",
+                                lo.get("largeobj_efa_write_errors", 0))
         # RDMA byte counters (may not exist on older builds)
         rdma_read = lo.get("largeobj_rdma_read_bytes", 0)
         rdma_write = lo.get("largeobj_rdma_write_bytes", 0)
@@ -638,7 +643,8 @@ def worker_loop(
                     server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
         except Exception as e:
-            is_staging = "staging buffer pool exhausted" in str(e)
+            is_staging = ("staging buffer pool exhausted" in str(e)
+                         or "NVMe staging buffer" in str(e))
             stats.record(
                 "SET" if is_set else "GET", 0, obj_size=obj_size,
                 error=True, staging_exhausted=is_staging,
@@ -1133,8 +1139,11 @@ def print_summary(summary, race_results=None):
                   f"{data['p50_ms']:>7.1f}ms  {data['p99_ms']:>7.1f}ms  "
                   f"{data['max_ms']:>7.1f}ms")
     if summary.get("throughput_gbps"):
-        print(f"  RDMA throughput: {summary['throughput_gbps']:.1f} Gbps "
+        print(f"  RDMA throughput (server): {summary['throughput_gbps']:.1f} Gbps "
               f"({_human_bytes(summary.get('rdma_bytes', 0))} transferred)")
+    if summary.get("client_throughput_gbps"):
+        print(f"  RDMA throughput (client EFA): {summary['client_throughput_gbps']:.1f} Gbps "
+              f"({_human_bytes(summary.get('client_efa_bytes', 0))} transferred)")
     if summary.get("peak_throughput_gbps"):
         print(f"  Peak RDMA throughput: {summary['peak_throughput_gbps']:.1f} Gbps")
     if summary.get("peak_efa_registered_segments"):
@@ -1170,6 +1179,25 @@ def snapshot_rdma_bytes(connections):
             lo = conn.info("largeobj")
             total += lo.get("largeobj_rdma_read_bytes", 0)
             total += lo.get("largeobj_rdma_write_bytes", 0)
+        except Exception:
+            pass
+    return total
+
+
+def snapshot_client_efa_bytes():
+    """Read RDMA byte counters from the local EFA device via sysfs."""
+    total = 0
+    import glob as _glob
+    for path in _glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/rdma_read_bytes"):
+        try:
+            with open(path) as f:
+                total += int(f.read().strip())
+        except Exception:
+            pass
+    for path in _glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/rdma_write_bytes"):
+        try:
+            with open(path) as f:
+                total += int(f.read().strip())
         except Exception:
             pass
     return total
@@ -1337,6 +1365,7 @@ def main():
     phase_summaries = []
     overall_start = time.monotonic()
     overall_rdma_before = snapshot_rdma_bytes(connections)
+    overall_client_efa_before = snapshot_client_efa_bytes()
 
     for phase_idx, workload_name in enumerate(workload_phases):
         if not shutdown.should_continue():
@@ -1353,6 +1382,7 @@ def main():
         print(f"{'═' * 60}")
 
         rdma_bytes_before = snapshot_rdma_bytes(connections)
+        client_efa_before = snapshot_client_efa_bytes()
         phase_stats = []
         phase_shutdown = GracefulShutdown()
         worker_threads = []
@@ -1398,14 +1428,19 @@ def main():
 
         phase_elapsed = time.monotonic() - phase_start
         rdma_bytes_after = snapshot_rdma_bytes(connections)
+        client_efa_after = snapshot_client_efa_bytes()
         rdma_bytes_delta = rdma_bytes_after - rdma_bytes_before
+        client_efa_delta = client_efa_after - client_efa_before
         phase_throughput_gbps = (rdma_bytes_delta * 8) / (phase_elapsed * 1e9) if phase_elapsed > 0 else 0.0
+        client_throughput_gbps = (client_efa_delta * 8) / (phase_elapsed * 1e9) if phase_elapsed > 0 else 0.0
         phase_summary = compute_summary(phase_stats, round(phase_elapsed), len(shards))
         phase_summary["workload"] = workload_name
         phase_summary["set_pct"] = set_pct * 100
         phase_summary["get_pct"] = get_pct * 100
         phase_summary["rdma_bytes"] = rdma_bytes_delta
         phase_summary["throughput_gbps"] = round(phase_throughput_gbps, 1)
+        phase_summary["client_efa_bytes"] = client_efa_delta
+        phase_summary["client_throughput_gbps"] = round(client_throughput_gbps, 1)
         phase_summaries.append(phase_summary)
         print_summary(phase_summary)
         log.info("Phase %d/%d complete: %s", phase_idx + 1, len(workload_phases), workload_name)
@@ -1417,11 +1452,16 @@ def main():
 
     # ── Aggregate summary ──
     overall_rdma_after = snapshot_rdma_bytes(connections)
+    overall_client_efa_after = snapshot_client_efa_bytes()
     overall_rdma_delta = overall_rdma_after - overall_rdma_before
+    overall_client_efa_delta = overall_client_efa_after - overall_client_efa_before
     overall_throughput_gbps = (overall_rdma_delta * 8) / (overall_elapsed * 1e9) if overall_elapsed > 0 else 0.0
+    overall_client_throughput_gbps = (overall_client_efa_delta * 8) / (overall_elapsed * 1e9) if overall_elapsed > 0 else 0.0
     aggregate = compute_summary(all_stats, round(overall_elapsed), len(shards))
     aggregate["rdma_bytes"] = overall_rdma_delta
     aggregate["throughput_gbps"] = round(overall_throughput_gbps, 1)
+    aggregate["client_efa_bytes"] = overall_client_efa_delta
+    aggregate["client_throughput_gbps"] = round(overall_client_throughput_gbps, 1)
     aggregate["peak_throughput_gbps"] = round(health.peak_throughput_gbps, 1)
     aggregate["peak_efa_registered_segments"] = health.peak_registered_segments
     aggregate["peak_efa_registered_bytes"] = (
