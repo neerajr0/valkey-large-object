@@ -320,6 +320,8 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["max-rdma-registered-bytes", &*CFG_MAX_RDMA_REGISTERED_BYTES, DEFAULT_MAX_RDMA_REGISTERED_BYTES, MIN_MAX_RDMA_REGISTERED_BYTES, MAX_MAX_RDMA_REGISTERED_BYTES,
+             ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
             ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
@@ -330,6 +332,7 @@ valkey_module! {
             ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
+            ["enabled", &*CFG_MODULE_ENABLED, DEFAULT_MODULE_ENABLED, ConfigurationFlags::DEFAULT, None],
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,

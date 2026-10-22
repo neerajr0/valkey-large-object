@@ -130,6 +130,10 @@ pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
 pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
 pub const MIN_MAX_OBJECT_SIZE: i64 = 1;
 pub const MAX_MAX_OBJECT_SIZE: i64 = i64::MAX;
+// max-rdma-registered-bytes
+pub const DEFAULT_MAX_RDMA_REGISTERED_BYTES: i64 = 380 * 1024 * 1024 * 1024; // 380 GiB
+pub const MIN_MAX_RDMA_REGISTERED_BYTES: i64 = 0; // no limit
+pub const MAX_MAX_RDMA_REGISTERED_BYTES: i64 = i64::MAX;
 // fabric-max-in-flight
 pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
@@ -138,6 +142,8 @@ pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
+
+pub const DEFAULT_MODULE_ENABLED: bool = true;
 // ─── Test Hooks ──────────────────────────────────────────────────────────────
 // test-pause-before-finalize-set-ms
 pub const DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 0;
@@ -229,6 +235,10 @@ lazy_static::lazy_static! {
     /// DEFAULT: yes (production path — always use O_DIRECT on XFS/NVMe instance store).
     pub static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
 
+    /// When false, BLOB.* commands from clients are rejected. Existing keys are kept and
+    /// replicated commands still apply. Default: true.
+    pub static ref CFG_MODULE_ENABLED: AtomicBool = AtomicBool::new(DEFAULT_MODULE_ENABLED);
+
     /// Operating mode. Immutable after module load.
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
@@ -250,6 +260,10 @@ lazy_static::lazy_static! {
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     pub static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_CRC_POOL_THREADS);
+
+    /// Cap on segment bytes EFA-registered (DRAM pool + staging), kept under the EFA
+    /// device's registration limit. 0 = no limit. Default: 380 GiB.
+    pub static ref CFG_MAX_RDMA_REGISTERED_BYTES: AtomicI64 = AtomicI64::new(DEFAULT_MAX_RDMA_REGISTERED_BYTES);
 
     // ─── Test Hooks ──────────────────────────────────────────────────────
 
@@ -420,6 +434,10 @@ pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub fn module_enabled() -> bool {
+    CFG_MODULE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn operating_mode() -> OperatingMode {
     *CFG_OPERATING_MODE
         .lock()
@@ -479,6 +497,10 @@ pub fn fabric_max_in_flight() -> usize {
 
 pub fn fabric_crc_pool_threads() -> usize {
     CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_rdma_registered_bytes() -> u64 {
+    CFG_MAX_RDMA_REGISTERED_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn max_object_size() -> u64 {
