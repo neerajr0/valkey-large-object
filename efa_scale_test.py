@@ -1269,24 +1269,44 @@ def main():
     log.info("Object sizes: %s", [_human_bytes(s) for s in object_sizes])
 
     # ── Resolve server fabric address ──
-    # For RDMA, we need the server's fabric address for fabric_target's positional arg.
-    # Discovery: start a throwaway fabric_target, do RDMA_HELLO, get server addr.
-    server_fabric_addr = args.server_fabric_addr
-    if not server_fabric_addr:
-        first_shard_id = next(iter(shards.keys()))
-        try:
-            server_fabric_addr = discover_server_fabric_addr(
-                shards[first_shard_id], args.tls
-            )
-        except Exception as e:
-            log.error("Fabric address discovery failed: %s", e)
-    if not server_fabric_addr:
+    # For RDMA, we need each shard's fabric address for fabric_target's positional arg.
+    # Each shard node has its own EFA device with a unique fabric address.
+    # Discovery: start a throwaway fabric_target, do RDMA_HELLO per shard, get server addr.
+    server_fabric_addrs = {}  # shard_id -> fabric_addr
+    if args.server_fabric_addr:
+        # Manual override: use the same address for all shards (standalone or single-shard).
+        for shard_id in shards:
+            server_fabric_addrs[shard_id] = args.server_fabric_addr
+    else:
+        for shard_id, shard_info in shards.items():
+            try:
+                addr = discover_server_fabric_addr(shard_info, args.tls)
+                server_fabric_addrs[shard_id] = addr
+                log.info(
+                    "  shard=%s fabric address: %s...", shard_id, addr[:16]
+                )
+            except Exception as e:
+                log.error("shard=%s fabric address discovery failed: %s", shard_id, e)
+    if not server_fabric_addrs:
         log.error(
-            "Could not determine server fabric address. Pass --server-fabric-addr "
+            "Could not determine any server fabric address. Pass --server-fabric-addr "
             "or ensure EFA is available on both client and server."
         )
         sys.exit(1)
-    log.info("Server fabric address: %s...", server_fabric_addr[:16])
+    if len(server_fabric_addrs) < len(shards):
+        log.warning(
+            "Fabric address discovered for %d/%d shards — workers on missing shards "
+            "will fail RDMA ops",
+            len(server_fabric_addrs), len(shards),
+        )
+
+    # ── Flush existing keys for a clean start ──
+    for shard_id, conn in connections.items():
+        try:
+            conn.execute_command("FLUSHALL")
+            log.info("shard=%s FLUSHALL OK", shard_id)
+        except Exception as e:
+            log.warning("shard=%s FLUSHALL failed: %s", shard_id, e)
 
     # ── Start health monitor ──
     # all_stats is populated below when workers are created; the monitor reads
@@ -1301,12 +1321,18 @@ def main():
         first_shard = next(iter(shards.keys()))
         race_results = run_race_tests(
             first_shard, shards[first_shard], hash_tags[first_shard],
-            server_fabric_addr, args.tls, shutdown,
+            server_fabric_addrs[first_shard], args.tls, shutdown,
         )
 
     # ── Spawn workers ──
     worker_threads = []
     for shard_id, shard_info in shards.items():
+        shard_fabric_addr = server_fabric_addrs.get(shard_id)
+        if not shard_fabric_addr:
+            log.warning(
+                "shard=%s has no fabric address — skipping workers", shard_id
+            )
+            continue
         for i in range(args.concurrency):
             wid = f"c{args.client_id}-s{shard_id}-w{i}"
             ws = WorkerStats()
@@ -1316,7 +1342,7 @@ def main():
                 name=wid,
                 args=(
                     wid, shard_id, shard_info, hash_tags[shard_id],
-                    server_fabric_addr, args.tls, object_sizes,
+                    shard_fabric_addr, args.tls, object_sizes,
                     args.workload, args.transition_interval, shutdown, ws,
                     args.multi_region,
                 ),
