@@ -103,15 +103,27 @@ class GracefulShutdown:
 # ─── fabric_target helpers ────────────────────────────────────────────────────
 
 
-def start_fabric_target(server_fabric_addr, size, read_mode=False):
+def start_fabric_target(server_fabric_addr, size, read_mode=False, num_regions=1):
     """Launch fabric_target --efa --size=<size> and parse its advertisement.
 
-    Returns (proc, addr_hex, rkey, remote_addr, length, source_crc).
+    Returns (proc, advertisements, source_crc) where advertisements is a list
+    of (addr_hex, rkey, remote_addr, length) tuples (one per region).
     source_crc is the CRC of the prefilled buffer (read_mode only), else None.
     """
     cmd = [FABRIC_TARGET, "--efa", f"--size={size}", server_fabric_addr]
     if read_mode:
         cmd.insert(1, "--read")
+    if num_regions > 1:
+        # Split the buffer into num_regions randomly-sized regions.
+        # Generate random cut points, sort them, and derive region sizes.
+        cuts = sorted(random.randint(1, size - 1) for _ in range(num_regions - 1))
+        # Deduplicate: if two cuts land on the same byte, a region would be 0.
+        cuts = sorted(set(cuts))
+        # If dedup reduced the count, fall back to fewer regions.
+        boundaries = [0] + cuts + [size]
+        parts = [str(boundaries[i + 1] - boundaries[i]) for i in range(len(boundaries) - 1)]
+        cmd.insert(1, f"--split={','.join(parts)}")
+        num_regions = len(parts)  # actual count after dedup
     env = dict(
         os.environ,
         LD_LIBRARY_PATH="/opt/amazon/efa/lib64:"
@@ -120,23 +132,28 @@ def start_fabric_target(server_fabric_addr, size, read_mode=False):
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
     )
-    line = proc.stdout.readline()
-    if not line.startswith("advertisement:"):
-        rest = proc.stdout.read()
-        proc.kill()
-        raise RuntimeError(f"fabric_target failed to advertise: {line}{rest}")
-    parts = line.split()
-    addr_hex = parts[1]
-    rkey = int(parts[2])
-    remote_addr = int(parts[3])
-    length = int(parts[4])
+    # Read one advertisement line per region.
+    advertisements = []
+    for _ in range(num_regions):
+        line = proc.stdout.readline()
+        if not line.startswith("advertisement:"):
+            rest = proc.stdout.read()
+            proc.kill()
+            raise RuntimeError(f"fabric_target failed to advertise: {line}{rest}")
+        parts = line.split()
+        advertisements.append((
+            parts[1],       # addr_hex (same for all regions)
+            int(parts[2]),  # rkey
+            int(parts[3]),  # remote_addr
+            int(parts[4]),  # length
+        ))
     source_crc = None
     if read_mode:
         crc_line = proc.stdout.readline()
         m = re.search(r"\bcrc (0x[0-9a-fA-F]+)\b", crc_line)
         if m:
             source_crc = int(m.group(1), 16)
-    return proc, addr_hex, rkey, remote_addr, length, source_crc
+    return proc, advertisements, source_crc
 
 
 def parse_client_crc(output):
@@ -398,13 +415,18 @@ def filter_object_sizes(sizes, max_object_size):
 class HealthMonitor:
     """Background thread polling INFO on each shard every HEALTH_PULSE_INTERVAL."""
 
-    def __init__(self, connections, shards, shutdown, segment_size):
+    def __init__(self, connections, shards, shutdown, segment_size, all_stats):
         self.connections = connections
         self.shards = shards
         self.shutdown = shutdown
         self.segment_size = segment_size
+        self.all_stats = all_stats
         self.prev_samples = {}
+        self.prev_ops_snapshot = 0
+        self.prev_ops_time = time.monotonic()
         self.eviction_stall_count = defaultdict(int)
+        self.peak_throughput_gbps = 0.0
+        self.peak_registered_segments = 0
         self.thread = threading.Thread(
             target=self._run, name="health-monitor", daemon=True
         )
@@ -427,6 +449,18 @@ class HealthMonitor:
                 self._poll_shard(shard_id, conn)
             except Exception as e:
                 log.warning("[health] shard=%s poll failed: %s", shard_id, e)
+        # Periodic ops/s snapshot from worker stats
+        now = time.monotonic()
+        total_ops = sum(ws.ops for ws in self.all_stats)
+        dt = now - self.prev_ops_time
+        if dt > 0:
+            ops_per_sec = (total_ops - self.prev_ops_snapshot) / dt
+            log.info(
+                "[perf] ops_total=%d interval_ops/s=%.0f",
+                total_ops, ops_per_sec,
+            )
+        self.prev_ops_snapshot = total_ops
+        self.prev_ops_time = now
 
     def _poll_shard(self, shard_id, conn):
         node = f"{self.shards[shard_id]['host']}:{self.shards[shard_id]['port']}"
@@ -473,6 +507,10 @@ class HealthMonitor:
             reg_tag = " CRITICAL_REG_PRESSURE"
         elif reg_pct > 70:
             reg_tag = " HIGH_REG_PRESSURE"
+        if registered > self.peak_registered_segments:
+            self.peak_registered_segments = registered
+        if throughput_gbps > self.peak_throughput_gbps:
+            self.peak_throughput_gbps = throughput_gbps
         # Eviction stall detection
         stall_tag = ""
         if maxmem > 0 and used > maxmem * 0.95:
@@ -510,8 +548,10 @@ class WorkerStats:
         self.errors = 0
         self.crc_mismatches = 0
         self.latencies = []  # (op_type, latency_ms)
+        self.latencies_by_size = defaultdict(list)  # size -> [latency_ms]
+        self.latencies_by_op = defaultdict(list)    # "GET"/"SET" -> [latency_ms]
 
-    def record(self, op_type, latency_ms, error=False, crc_mismatch=False):
+    def record(self, op_type, latency_ms, obj_size=0, error=False, crc_mismatch=False):
         with self.lock:
             self.ops += 1
             if op_type == "GET":
@@ -526,6 +566,14 @@ class WorkerStats:
             # Keep all if < 100K, then sample 1-in-10.
             if len(self.latencies) < 100_000 or random.random() < 0.1:
                 self.latencies.append((op_type, latency_ms))
+            if obj_size > 0:
+                size_lats = self.latencies_by_size[obj_size]
+                if len(size_lats) < 50_000 or random.random() < 0.1:
+                    size_lats.append(latency_ms)
+            # Per-op-type latencies for separate GET vs SET reporting
+            op_lats = self.latencies_by_op[op_type]
+            if len(op_lats) < 100_000 or random.random() < 0.1:
+                op_lats.append(latency_ms)
 
     def snapshot(self):
         with self.lock:
@@ -536,12 +584,19 @@ class WorkerStats:
                 "errors": self.errors,
                 "crc_mismatches": self.crc_mismatches,
                 "latencies": list(self.latencies),
+                "latencies_by_size": {
+                    k: list(v) for k, v in self.latencies_by_size.items()
+                },
+                "latencies_by_op": {
+                    k: list(v) for k, v in self.latencies_by_op.items()
+                },
             }
 
 
 def worker_loop(
     worker_id, shard_id, shard_info, hash_tag, server_fabric_addr,
     tls, object_sizes, workload, transition_interval, shutdown, stats,
+    multi_region,
 ):
     """Main worker loop: pick op, execute RDMA transfer, verify, log."""
     node = f"{shard_info['host']}:{shard_info['port']}"
@@ -569,15 +624,15 @@ def worker_loop(
             if is_set:
                 _do_rdma_set(
                     worker_id, shard_id, shard_info, node, key, obj_size,
-                    server_fabric_addr, tls, stats,
+                    server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
             else:
                 _do_rdma_get(
                     worker_id, shard_id, shard_info, node, key, obj_size,
-                    server_fabric_addr, tls, stats,
+                    server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
         except Exception as e:
-            stats.record("SET" if is_set else "GET", 0, error=True)
+            stats.record("SET" if is_set else "GET", 0, obj_size=obj_size, error=True)
             log.error(
                 "[%s] shard=%s node=%s key=%s error=%s",
                 worker_id, shard_id, node, key, e,
@@ -585,9 +640,11 @@ def worker_loop(
 
 
 def _do_rdma_set(worker_id, shard_id, shard_info, node, key, obj_size,
-                 server_fabric_addr, tls, stats):
+                 server_fabric_addr, tls, stats, multi_region=False):
     """Execute one RDMA SET: spawn fabric_target (read mode), HELLO, SET, verify CRC."""
-    # Each SET needs its own connection + fabric_target (one HELLO per connection).
+    # Randomly split across 1-5 regions when multi_region is enabled and size allows.
+    # Each region must be at least 1 byte; skip split for tiny objects.
+    num_regions = random.randint(1, 5) if (multi_region and obj_size >= 5) else 1
     conn = valkey.Valkey(
         host=shard_info["host"], port=shard_info["port"],
         ssl=tls, ssl_cert_reqs=None if tls else None,
@@ -595,22 +652,24 @@ def _do_rdma_set(worker_id, shard_id, shard_info, node, key, obj_size,
     )
     proc = None
     try:
-        proc, client_addr, rkey, remote_addr, length, source_crc = (
-            start_fabric_target(server_fabric_addr, obj_size, read_mode=True)
+        proc, advertisements, source_crc = start_fabric_target(
+            server_fabric_addr, obj_size, read_mode=True, num_regions=num_regions,
         )
+        client_addr = advertisements[0][0]  # same for all regions
         # Establish RDMA session
         hello_reply = conn.execute_command("BLOB.RDMA_HELLO", client_addr)
         if not isinstance(hello_reply, list) or len(hello_reply) == 0:
             raise RuntimeError(f"RDMA_HELLO unexpected reply: {hello_reply!r}")
+        # Build RDMA SET args: key total_len [rkey addr len] per region
+        set_args = ["BLOB.RDMA_SET", key, str(obj_size)]
+        for _, rkey, remote_addr, length in advertisements:
+            set_args.extend([str(rkey), str(remote_addr), str(length)])
         # RDMA SET
         t0 = time.monotonic()
-        set_reply = conn.execute_command(
-            "BLOB.RDMA_SET", key, str(obj_size),
-            str(rkey), str(remote_addr), str(length),
-        )
+        set_reply = conn.execute_command(*set_args)
         lat_ms = (time.monotonic() - t0) * 1000
         if set_reply != b"OK":
-            stats.record("SET", lat_ms, error=True)
+            stats.record("SET", lat_ms, obj_size=obj_size, error=True)
             log.error(
                 "[%s] shard=%s node=%s RDMA_SET key=%s size=%s reply=%r",
                 worker_id, shard_id, node, key, _human_bytes(obj_size), set_reply,
@@ -625,7 +684,7 @@ def _do_rdma_set(worker_id, shard_id, shard_info, node, key, obj_size,
             pass
         if source_crc is not None and server_crc is not None:
             crc_match = source_crc == server_crc
-        stats.record("SET", lat_ms, crc_mismatch=not crc_match)
+        stats.record("SET", lat_ms, obj_size=obj_size, crc_mismatch=not crc_match)
         if not crc_match:
             log.error(
                 "[%s] shard=%s node=%s RDMA_SET CRC MISMATCH key=%s "
@@ -648,8 +707,9 @@ def _do_rdma_set(worker_id, shard_id, shard_info, node, key, obj_size,
 
 
 def _do_rdma_get(worker_id, shard_id, shard_info, node, key, obj_size,
-                 server_fabric_addr, tls, stats):
+                 server_fabric_addr, tls, stats, multi_region=False):
     """Execute one RDMA GET: first ensure key exists (TCP SET), then RDMA GET + CRC verify."""
+    num_regions = random.randint(1, 5) if (multi_region and obj_size >= 5) else 1
     conn = valkey.Valkey(
         host=shard_info["host"], port=shard_info["port"],
         ssl=tls, ssl_cert_reqs=None if tls else None,
@@ -669,27 +729,30 @@ def _do_rdma_get(worker_id, shard_id, shard_info, node, key, obj_size,
             # Key may already exist from a prior SET, or OOM — log and try GET anyway
             log.debug("[%s] TCP_SET for GET prep failed: %s", worker_id, e)
         # Now do the RDMA GET
-        proc, client_addr, rkey, remote_addr, length, _ = start_fabric_target(
-            server_fabric_addr, obj_size, read_mode=False
+        proc, advertisements, _ = start_fabric_target(
+            server_fabric_addr, obj_size, read_mode=False, num_regions=num_regions,
         )
+        client_addr = advertisements[0][0]
         hello_reply = conn.execute_command("BLOB.RDMA_HELLO", client_addr)
         if not isinstance(hello_reply, list) or len(hello_reply) == 0:
             raise RuntimeError(f"RDMA_HELLO unexpected reply: {hello_reply!r}")
+        # Build RDMA GET args: key [rkey addr len] per region
+        get_args = ["BLOB.RDMA_GET", key]
+        for _, rkey, remote_addr, length in advertisements:
+            get_args.extend([str(rkey), str(remote_addr), str(length)])
         t0 = time.monotonic()
-        get_reply = conn.execute_command(
-            "BLOB.RDMA_GET", key, str(rkey), str(remote_addr), str(length),
-        )
+        get_reply = conn.execute_command(*get_args)
         lat_ms = (time.monotonic() - t0) * 1000
         if not isinstance(get_reply, list) or len(get_reply) != 2:
             # Key may not exist (nil reply)
             if get_reply is None:
-                stats.record("GET", lat_ms)
+                stats.record("GET", lat_ms, obj_size=obj_size)
                 log.debug(
                     "[%s] shard=%s node=%s RDMA_GET key=%s nil (key not found)",
                     worker_id, shard_id, node, key,
                 )
                 return
-            stats.record("GET", lat_ms, error=True)
+            stats.record("GET", lat_ms, obj_size=obj_size, error=True)
             log.error(
                 "[%s] shard=%s node=%s RDMA_GET key=%s unexpected reply=%r",
                 worker_id, shard_id, node, key, get_reply,
@@ -710,7 +773,7 @@ def _do_rdma_get(worker_id, shard_id, shard_info, node, key, obj_size,
         if client_crc is not None and server_crc is not None:
             crc_match = client_crc == server_crc
         verified = "payload verified" in (stdout or "")
-        stats.record("GET", lat_ms, crc_mismatch=not crc_match)
+        stats.record("GET", lat_ms, obj_size=obj_size, crc_mismatch=not crc_match)
         if not crc_match:
             log.error(
                 "[%s] shard=%s node=%s RDMA_GET CRC MISMATCH key=%s "
@@ -951,6 +1014,8 @@ def compute_summary(all_stats, duration, num_shards):
     total_errors = 0
     total_crc = 0
     all_latencies = []
+    merged_by_size = defaultdict(list)
+    merged_by_op = defaultdict(list)
     for ws in all_stats:
         snap = ws.snapshot()
         total_ops += snap["ops"]
@@ -959,11 +1024,36 @@ def compute_summary(all_stats, duration, num_shards):
         total_errors += snap["errors"]
         total_crc += snap["crc_mismatches"]
         all_latencies.extend(snap["latencies"])
-    lat_values = [lat for _, lat in all_latencies]
-    lat_values.sort()
+        for size, lats in snap["latencies_by_size"].items():
+            merged_by_size[size].extend(lats)
+        for op, lats in snap["latencies_by_op"].items():
+            merged_by_op[op].extend(lats)
+    lat_values = sorted(lat for _, lat in all_latencies)
     p50 = lat_values[len(lat_values) // 2] if lat_values else 0
     p99 = lat_values[int(len(lat_values) * 0.99)] if lat_values else 0
     p_max = lat_values[-1] if lat_values else 0
+    # Per-size breakdown
+    by_size = {}
+    for size in sorted(merged_by_size.keys()):
+        lats = sorted(merged_by_size[size])
+        count = len(lats)
+        by_size[size] = {
+            "ops": count,
+            "p50_ms": round(lats[count // 2], 2) if lats else 0,
+            "p99_ms": round(lats[int(count * 0.99)], 2) if lats else 0,
+            "max_ms": round(lats[-1], 2) if lats else 0,
+        }
+    # Per-op breakdown
+    by_op = {}
+    for op in ("GET", "SET"):
+        lats = sorted(merged_by_op.get(op, []))
+        count = len(lats)
+        by_op[op] = {
+            "ops": count,
+            "p50_ms": round(lats[count // 2], 2) if lats else 0,
+            "p99_ms": round(lats[int(count * 0.99)], 2) if lats else 0,
+            "max_ms": round(lats[-1], 2) if lats else 0,
+        }
     return {
         "duration_s": duration,
         "shards": num_shards,
@@ -975,6 +1065,8 @@ def compute_summary(all_stats, duration, num_shards):
         "latency_p50_ms": round(p50, 2),
         "latency_p99_ms": round(p99, 2),
         "latency_max_ms": round(p_max, 2),
+        "by_size": by_size,
+        "by_op": by_op,
     }
 
 
@@ -992,6 +1084,26 @@ def print_summary(summary, race_results=None):
     print(f"  CRC mismatch: {summary['crc_mismatches']:,}")
     print(f"  Latency p50/p99/max: {summary['latency_p50_ms']:.1f}ms / "
           f"{summary['latency_p99_ms']:.1f}ms / {summary['latency_max_ms']:.1f}ms")
+    if summary.get("by_op"):
+        for op in ("GET", "SET"):
+            d = summary["by_op"].get(op, {})
+            if d.get("ops", 0) > 0:
+                print(f"    {op} p50/p99/max: {d['p50_ms']:.1f}ms / "
+                      f"{d['p99_ms']:.1f}ms / {d['max_ms']:.1f}ms ({d['ops']:,} ops)")
+    if summary.get("by_size"):
+        print(f"  {'─' * 56}")
+        print(f"  {'Size':>10s}  {'Ops':>8s}  {'p50':>8s}  {'p99':>8s}  {'max':>8s}")
+        for size, data in summary["by_size"].items():
+            print(f"  {_human_bytes(size):>10s}  {data['ops']:>8,}  "
+                  f"{data['p50_ms']:>7.1f}ms  {data['p99_ms']:>7.1f}ms  "
+                  f"{data['max_ms']:>7.1f}ms")
+    if summary.get("peak_throughput_gbps"):
+        print(f"  Peak RDMA throughput: {summary['peak_throughput_gbps']:.1f} Gbps")
+    if summary.get("peak_efa_registered_segments"):
+        reg_bytes = summary.get("peak_efa_registered_bytes", 0)
+        reg_pct = (reg_bytes / EFA_REGISTRATION_LIMIT_BYTES * 100) if reg_bytes else 0
+        print(f"  Peak EFA registered: {summary['peak_efa_registered_segments']} segments "
+              f"({_human_bytes(reg_bytes)}, {reg_pct:.0f}% of 380GiB limit)")
     if race_results:
         rp, rf = race_results
         print(f"  Race tests:   {rp} passed, {rf} failed")
@@ -1050,6 +1162,11 @@ def main():
     )
     wl_group.add_argument(
         "--skip-race-tests", action="store_true", help="Skip race provocation tests",
+    )
+    wl_group.add_argument(
+        "--multi-region", action="store_true",
+        help="Split large objects across multiple memory regions (exercises "
+             "multi-triple rkey/addr/len code path in RDMA_GET/SET)",
     )
     # Logging
     log_group = parser.add_argument_group("logging")
@@ -1124,7 +1241,10 @@ def main():
     log.info("Server fabric address: %s...", server_fabric_addr[:16])
 
     # ── Start health monitor ──
-    health = HealthMonitor(connections, shards, shutdown, segment_size)
+    # all_stats is populated below when workers are created; the monitor reads
+    # it on each pulse, so it sees 0 ops until workers start.
+    all_stats = []
+    health = HealthMonitor(connections, shards, shutdown, segment_size, all_stats)
     health.start()
 
     # ── Run race tests (before workload, to catch bugs early) ──
@@ -1137,7 +1257,6 @@ def main():
         )
 
     # ── Spawn workers ──
-    all_stats = []
     worker_threads = []
     for shard_id, shard_info in shards.items():
         for i in range(args.concurrency):
@@ -1151,6 +1270,7 @@ def main():
                     wid, shard_id, shard_info, hash_tags[shard_id],
                     server_fabric_addr, args.tls, object_sizes,
                     args.workload, args.transition_interval, shutdown, ws,
+                    args.multi_region,
                 ),
                 daemon=True,
             )
@@ -1179,6 +1299,11 @@ def main():
 
     # ── Summary ──
     summary = compute_summary(all_stats, round(elapsed), len(shards))
+    summary["peak_throughput_gbps"] = round(health.peak_throughput_gbps, 1)
+    summary["peak_efa_registered_segments"] = health.peak_registered_segments
+    summary["peak_efa_registered_bytes"] = (
+        health.peak_registered_segments * segment_size if segment_size else 0
+    )
     print_summary(summary, race_results)
 
     # ── Write results JSON ──
