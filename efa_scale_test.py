@@ -602,30 +602,17 @@ class WorkerStats:
 
 def worker_loop(
     worker_id, shard_id, shard_info, hash_tag, server_fabric_addr,
-    tls, object_sizes, workload, transition_interval, shutdown, stats,
+    tls, object_sizes, workload, shutdown, stats,
     multi_region,
 ):
     """Main worker loop: pick op, execute RDMA transfer, verify, log."""
     node = f"{shard_info['host']}:{shard_info['port']}"
-    current_workload = workload
-    last_transition = time.monotonic()
+    set_ratio, _ = WORKLOAD_RATIOS[workload]
     key_counter = 0
     # Pool of keys this worker has SET, keyed by size. GETs pick from here.
     written_keys = defaultdict(list)
     MAX_KEY_POOL = 200  # Cap per size to bound memory
     while shutdown.should_continue():
-        # Workload transition
-        if transition_interval > 0:
-            elapsed = time.monotonic() - last_transition
-            if elapsed >= transition_interval:
-                choices = [w for w in WORKLOAD_RATIOS if w != current_workload]
-                current_workload = random.choice(choices)
-                last_transition = time.monotonic()
-                log.debug(
-                    "[%s] shard=%s transitioned to workload=%s",
-                    worker_id, shard_id, current_workload,
-                )
-        set_ratio, get_ratio = WORKLOAD_RATIOS[current_workload]
         obj_size = random.choice(object_sizes)
         is_set = random.random() < set_ratio
         # For GET: only attempt if we have previously SET a key of this size.
@@ -1119,10 +1106,10 @@ def compute_summary(all_stats, duration, num_shards):
 
 def print_summary(summary, race_results=None):
     """Print human-readable final summary."""
-    print(f"\n{'═' * 60}")
-    print("  EFA Scale Test Summary")
-    print(f"{'═' * 60}")
     print(f"  Duration:     {summary['duration_s']}s")
+    if summary.get("workload"):
+        print(f"  Workload:     {summary['workload']} "
+              f"(SET {summary['set_pct']:.0f}% / GET {summary['get_pct']:.0f}%)")
     print(f"  Shards:       {summary['shards']}")
     print(f"  Total ops:    {summary['total_ops']:,}")
     print(f"    RDMA_GET:   {summary['gets']:,}")
@@ -1145,6 +1132,9 @@ def print_summary(summary, race_results=None):
             print(f"  {_human_bytes(size):>10s}  {data['ops']:>8,}  "
                   f"{data['p50_ms']:>7.1f}ms  {data['p99_ms']:>7.1f}ms  "
                   f"{data['max_ms']:>7.1f}ms")
+    if summary.get("throughput_gbps"):
+        print(f"  RDMA throughput: {summary['throughput_gbps']:.1f} Gbps "
+              f"({_human_bytes(summary.get('rdma_bytes', 0))} transferred)")
     if summary.get("peak_throughput_gbps"):
         print(f"  Peak RDMA throughput: {summary['peak_throughput_gbps']:.1f} Gbps")
     if summary.get("peak_efa_registered_segments"):
@@ -1170,6 +1160,19 @@ def _human_bytes(n):
             return f"{n:.0f}{unit}" if n == int(n) else f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}PB"
+
+
+def snapshot_rdma_bytes(connections):
+    """Read rdma_read_bytes + rdma_write_bytes from each shard, return total."""
+    total = 0
+    for conn in connections.values():
+        try:
+            lo = conn.info("largeobj")
+            total += lo.get("largeobj_rdma_read_bytes", 0)
+            total += lo.get("largeobj_rdma_write_bytes", 0)
+        except Exception:
+            pass
+    return total
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1198,12 +1201,10 @@ def main():
     )
     wl_group.add_argument("--client-id", type=int, default=1, help="Client instance ID")
     wl_group.add_argument(
-        "--workload", default="balanced", choices=list(WORKLOAD_RATIOS.keys()),
-        help="Initial workload pattern (default: balanced)",
-    )
-    wl_group.add_argument(
-        "--transition-interval", type=int, default=60,
-        help="Seconds between random workload transitions (0=disable)",
+        "--workload", nargs="+", default=["balanced"],
+        choices=list(WORKLOAD_RATIOS.keys()) + ["all"],
+        help="Workload phase(s) to run in order (default: balanced). "
+             "Use 'all' to run every workload sequentially.",
     )
     wl_group.add_argument(
         "--object-sizes", help="Comma-separated object sizes in bytes",
@@ -1232,6 +1233,14 @@ def main():
     log.info("EFA Scale Test starting")
     log.info("  client_id=%d duration=%ds concurrency=%d workload=%s",
              args.client_id, args.duration, args.concurrency, args.workload)
+
+    # ── Resolve workload phases ──
+    if "all" in args.workload:
+        workload_phases = list(WORKLOAD_RATIOS.keys())
+    else:
+        workload_phases = args.workload
+    phase_duration = args.duration // len(workload_phases)
+    log.info("  phases=%s (%ds each)", workload_phases, phase_duration)
 
     # ── Discover topology ──
     endpoint = args.cluster_endpoint or args.host
@@ -1324,67 +1333,120 @@ def main():
             server_fabric_addrs[first_shard], args.tls, shutdown,
         )
 
-    # ── Spawn workers ──
-    worker_threads = []
-    for shard_id, shard_info in shards.items():
-        shard_fabric_addr = server_fabric_addrs.get(shard_id)
-        if not shard_fabric_addr:
-            log.warning(
-                "shard=%s has no fabric address — skipping workers", shard_id
-            )
-            continue
-        for i in range(args.concurrency):
-            wid = f"c{args.client_id}-s{shard_id}-w{i}"
-            ws = WorkerStats()
-            all_stats.append(ws)
-            t = threading.Thread(
-                target=worker_loop,
-                name=wid,
-                args=(
-                    wid, shard_id, shard_info, hash_tags[shard_id],
-                    shard_fabric_addr, args.tls, object_sizes,
-                    args.workload, args.transition_interval, shutdown, ws,
-                    args.multi_region,
-                ),
-                daemon=True,
-            )
-            worker_threads.append(t)
+    # ── Run workload phases ──
+    phase_summaries = []
+    overall_start = time.monotonic()
+    overall_rdma_before = snapshot_rdma_bytes(connections)
 
-    log.info(
-        "Spawning %d workers (%d per shard × %d shards)",
-        len(worker_threads), args.concurrency, len(shards),
-    )
-    start_time = time.monotonic()
-    for t in worker_threads:
-        t.start()
+    for phase_idx, workload_name in enumerate(workload_phases):
+        if not shutdown.should_continue():
+            break
+        set_pct, get_pct = WORKLOAD_RATIOS[workload_name]
+        log.info(
+            "═══ Phase %d/%d: %s (SET %.0f%% / GET %.0f%%, %ds) ═══",
+            phase_idx + 1, len(workload_phases), workload_name,
+            set_pct * 100, get_pct * 100, phase_duration,
+        )
+        print(f"\n{'═' * 60}")
+        print(f"  Phase {phase_idx + 1}/{len(workload_phases)}: {workload_name} "
+              f"(SET {set_pct*100:.0f}% / GET {get_pct*100:.0f}%, {phase_duration}s)")
+        print(f"{'═' * 60}")
 
-    # ── Wait for duration or shutdown ──
-    deadline = start_time + args.duration
-    while time.monotonic() < deadline and shutdown.should_continue():
-        time.sleep(1)
+        rdma_bytes_before = snapshot_rdma_bytes(connections)
+        phase_stats = []
+        phase_shutdown = GracefulShutdown()
+        worker_threads = []
+        for shard_id, shard_info in shards.items():
+            shard_fabric_addr = server_fabric_addrs.get(shard_id)
+            if not shard_fabric_addr:
+                continue
+            for i in range(args.concurrency):
+                wid = f"c{args.client_id}-s{shard_id}-w{i}"
+                ws = WorkerStats()
+                phase_stats.append(ws)
+                all_stats.append(ws)
+                t = threading.Thread(
+                    target=worker_loop,
+                    name=wid,
+                    args=(
+                        wid, shard_id, shard_info, hash_tags[shard_id],
+                        shard_fabric_addr, args.tls, object_sizes,
+                        workload_name, phase_shutdown, ws,
+                        args.multi_region,
+                    ),
+                    daemon=True,
+                )
+                worker_threads.append(t)
 
-    # ── Signal shutdown and wait ──
+        log.info(
+            "Spawning %d workers (%d per shard × %d shards)",
+            len(worker_threads), args.concurrency, len(shards),
+        )
+        phase_start = time.monotonic()
+        for t in worker_threads:
+            t.start()
+
+        # Wait for phase duration or global shutdown
+        phase_deadline = phase_start + phase_duration
+        while time.monotonic() < phase_deadline and shutdown.should_continue():
+            time.sleep(1)
+
+        # Signal phase workers to stop
+        phase_shutdown.shutdown_requested.set()
+        for t in worker_threads:
+            t.join(timeout=30)
+
+        phase_elapsed = time.monotonic() - phase_start
+        rdma_bytes_after = snapshot_rdma_bytes(connections)
+        rdma_bytes_delta = rdma_bytes_after - rdma_bytes_before
+        phase_throughput_gbps = (rdma_bytes_delta * 8) / (phase_elapsed * 1e9) if phase_elapsed > 0 else 0.0
+        phase_summary = compute_summary(phase_stats, round(phase_elapsed), len(shards))
+        phase_summary["workload"] = workload_name
+        phase_summary["set_pct"] = set_pct * 100
+        phase_summary["get_pct"] = get_pct * 100
+        phase_summary["rdma_bytes"] = rdma_bytes_delta
+        phase_summary["throughput_gbps"] = round(phase_throughput_gbps, 1)
+        phase_summaries.append(phase_summary)
+        print_summary(phase_summary)
+        log.info("Phase %d/%d complete: %s", phase_idx + 1, len(workload_phases), workload_name)
+
+    overall_elapsed = time.monotonic() - overall_start
+
+    # ── Signal global shutdown ──
     shutdown.shutdown_requested.set()
-    log.info("Duration complete, waiting for workers to finish...")
-    for t in worker_threads:
-        t.join(timeout=30)
 
-    elapsed = time.monotonic() - start_time
-
-    # ── Summary ──
-    summary = compute_summary(all_stats, round(elapsed), len(shards))
-    summary["peak_throughput_gbps"] = round(health.peak_throughput_gbps, 1)
-    summary["peak_efa_registered_segments"] = health.peak_registered_segments
-    summary["peak_efa_registered_bytes"] = (
+    # ── Aggregate summary ──
+    overall_rdma_after = snapshot_rdma_bytes(connections)
+    overall_rdma_delta = overall_rdma_after - overall_rdma_before
+    overall_throughput_gbps = (overall_rdma_delta * 8) / (overall_elapsed * 1e9) if overall_elapsed > 0 else 0.0
+    aggregate = compute_summary(all_stats, round(overall_elapsed), len(shards))
+    aggregate["rdma_bytes"] = overall_rdma_delta
+    aggregate["throughput_gbps"] = round(overall_throughput_gbps, 1)
+    aggregate["peak_throughput_gbps"] = round(health.peak_throughput_gbps, 1)
+    aggregate["peak_efa_registered_segments"] = health.peak_registered_segments
+    aggregate["peak_efa_registered_bytes"] = (
         health.peak_registered_segments * segment_size if segment_size else 0
     )
-    print_summary(summary, race_results)
+    print(f"\n{'═' * 60}")
+    print("  AGGREGATE (all phases)")
+    print(f"{'═' * 60}")
+    print_summary(aggregate, race_results)
 
     # ── Write results JSON ──
     results = {
         "client_id": args.client_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "summary": summary,
+        "config": {
+            "duration": args.duration,
+            "phase_duration": phase_duration,
+            "concurrency": args.concurrency,
+            "workload_phases": workload_phases,
+            "object_sizes": [_human_bytes(s) for s in object_sizes],
+            "multi_region": args.multi_region,
+            "shards": len(shards),
+        },
+        "phases": phase_summaries,
+        "aggregate": aggregate,
         "race_tests": {"passed": race_results[0], "failed": race_results[1]}
         if race_results else None,
     }
@@ -1393,7 +1455,7 @@ def main():
     log.info("Results written to %s", args.results_file)
 
     # Exit with failure if any errors or CRC mismatches
-    if summary["errors"] > 0 or summary["crc_mismatches"] > 0:
+    if aggregate["errors"] > 0 or aggregate["crc_mismatches"] > 0:
         sys.exit(1)
     if race_results and race_results[1] > 0:
         sys.exit(1)
