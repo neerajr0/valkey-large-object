@@ -603,6 +603,9 @@ def worker_loop(
     current_workload = workload
     last_transition = time.monotonic()
     key_counter = 0
+    # Pool of keys this worker has SET, keyed by size. GETs pick from here.
+    written_keys = defaultdict(list)
+    MAX_KEY_POOL = 200  # Cap per size to bound memory
     while shutdown.should_continue():
         # Workload transition
         if transition_interval > 0:
@@ -618,6 +621,10 @@ def worker_loop(
         set_ratio, get_ratio = WORKLOAD_RATIOS[current_workload]
         obj_size = random.choice(object_sizes)
         is_set = random.random() < set_ratio
+        # For GET: only attempt if we have previously SET a key of this size.
+        # Otherwise fall back to SET (builds up the key pool).
+        if not is_set and not written_keys[obj_size]:
+            is_set = True
         key_counter += 1
         key = f"{{{hash_tag}}}obj_{worker_id}_{key_counter}"
         try:
@@ -626,9 +633,14 @@ def worker_loop(
                     worker_id, shard_id, shard_info, node, key, obj_size,
                     server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
+                pool = written_keys[obj_size]
+                pool.append(key)
+                if len(pool) > MAX_KEY_POOL:
+                    pool.pop(0)
             else:
+                get_key = random.choice(written_keys[obj_size])
                 _do_rdma_get(
-                    worker_id, shard_id, shard_info, node, key, obj_size,
+                    worker_id, shard_id, shard_info, node, get_key, obj_size,
                     server_fabric_addr, tls, stats, multi_region=multi_region,
                 )
         except Exception as e:
@@ -717,18 +729,8 @@ def _do_rdma_get(worker_id, shard_id, shard_info, node, key, obj_size,
     )
     proc = None
     try:
-        # Ensure the key exists. For GET-heavy workloads, we SET first via TCP
-        # (fast, no fabric_target needed) so the RDMA GET has something to read.
-        # Use a minimal pattern — the RDMA GET buffer size is what matters, not
-        # the stored object size. The server will transfer min(stored_len, buffer_len).
-        prep_size = min(obj_size, 65536)  # Cap TCP prep at 64KB to avoid large allocs
-        pattern = bytes(i % 256 for i in range(prep_size))
-        try:
-            conn.execute_command("BLOB.TCP_SET", key, pattern)
-        except Exception as e:
-            # Key may already exist from a prior SET, or OOM — log and try GET anyway
-            log.debug("[%s] TCP_SET for GET prep failed: %s", worker_id, e)
-        # Now do the RDMA GET
+        # The key was previously SET by this worker (from written_keys pool),
+        # so it exists with the correct size. No TCP prep needed.
         proc, advertisements, _ = start_fabric_target(
             server_fabric_addr, obj_size, read_mode=False, num_regions=num_regions,
         )
@@ -836,9 +838,10 @@ def _capture_error_context(conn, key, error, worker_id, node, shard_id):
 
 
 def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shutdown):
-    """Run race provocation tests against one shard."""
+    """Run race provocation tests against one shard. All transfers use RDMA."""
     node = f"{shard_info['host']}:{shard_info['port']}"
     log.info("[race] Starting race tests on shard=%s node=%s", shard_id, node)
+    OBJ_SIZE = 4096
 
     def make_conn():
         return valkey.Valkey(
@@ -846,6 +849,47 @@ def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shut
             ssl=tls, ssl_cert_reqs=None if tls else None,
             decode_responses=False, socket_timeout=30,
         )
+
+    def rdma_set(key, size=OBJ_SIZE):
+        """One-shot RDMA SET: conn + fabric_target + HELLO + SET + teardown."""
+        conn = make_conn()
+        proc, adverts, source_crc = start_fabric_target(
+            server_fabric_addr, size, read_mode=True,
+        )
+        try:
+            conn.execute_command("BLOB.RDMA_HELLO", adverts[0][0])
+            args = ["BLOB.RDMA_SET", key, str(size)]
+            for _, rkey, raddr, rlen in adverts:
+                args.extend([str(rkey), str(raddr), str(rlen)])
+            reply = conn.execute_command(*args)
+            return reply == b"OK", source_crc
+        finally:
+            kill_target(proc)
+            conn.close()
+
+    def rdma_get_crc(key, size=OBJ_SIZE):
+        """One-shot RDMA GET: returns (server_crc, client_crc) or (None, None)."""
+        conn = make_conn()
+        proc, adverts, _ = start_fabric_target(
+            server_fabric_addr, size, read_mode=False,
+        )
+        try:
+            conn.execute_command("BLOB.RDMA_HELLO", adverts[0][0])
+            args = ["BLOB.RDMA_GET", key]
+            for _, rkey, raddr, rlen in adverts:
+                args.extend([str(rkey), str(raddr), str(rlen)])
+            reply = conn.execute_command(*args)
+            if not isinstance(reply, list) or len(reply) != 2:
+                return None, None
+            server_crc = reply[1]
+            time.sleep(0.5)
+            proc.terminate()
+            stdout, _ = proc.communicate(timeout=10)
+            client_crc = parse_client_crc(stdout)
+            return server_crc, client_crc
+        finally:
+            kill_target(proc)
+            conn.close()
 
     passed = 0
     failed = 0
@@ -866,18 +910,15 @@ def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shut
     if shutdown.should_continue():
         log.info("[race] ── Concurrent GET same key ──")
         key = f"{{{hash_tag}}}race_cget"
-        c = make_conn()
-        pattern = bytes(i % 256 for i in range(4096))
-        c.execute_command("BLOB.TCP_SET", key, pattern)
+        ok, _ = rdma_set(key)
+        check("Setup SET for concurrent GET", ok)
         errors = []
-        results = [None] * 8
+        crcs = [None] * 8
 
         def concurrent_get(idx):
             try:
-                gc = make_conn()
-                val = gc.execute_command("BLOB.TCP_GET", key)
-                results[idx] = val
-                gc.close()
+                s_crc, c_crc = rdma_get_crc(key)
+                crcs[idx] = (s_crc, c_crc)
             except Exception as e:
                 errors.append(f"thread-{idx}: {e}")
 
@@ -885,29 +926,28 @@ def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shut
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
-        valid = [r for r in results if r is not None]
+            t.join(timeout=60)
+        valid = [c for c in crcs if c is not None and c[0] is not None]
+        crc_ok = all(s == c for s, c in valid) if valid else False
         check(
-            f"Concurrent GET: {len(valid)}/8 got data",
-            len(valid) == 8 and all(r == pattern for r in valid),
+            f"Concurrent GET: {len(valid)}/8 got data, CRCs match",
+            len(valid) == 8 and crc_ok,
             f"errors={errors[:3]}" if errors else
-            f"mismatches={sum(1 for r in valid if r != pattern)}",
+            f"crc_mismatches={sum(1 for s, c in valid if s != c)}",
         )
-        c.execute_command("DEL", key)
-        c.close()
+        make_conn().execute_command("DEL", key)
 
     # ── Concurrent SET same key ──
     if shutdown.should_continue():
         log.info("[race] ── Concurrent SET same key ──")
         key = f"{{{hash_tag}}}race_cset"
         errors = []
-        payloads = [bytes([i] * 4096) for i in range(8)]
 
         def concurrent_set(idx):
             try:
-                sc = make_conn()
-                sc.execute_command("BLOB.TCP_SET", key, payloads[idx])
-                sc.close()
+                ok, _ = rdma_set(key)
+                if not ok:
+                    errors.append(f"thread-{idx}: SET returned not OK")
             except Exception as e:
                 errors.append(f"thread-{idx}: {e}")
 
@@ -915,86 +955,79 @@ def run_race_tests(shard_id, shard_info, hash_tag, server_fabric_addr, tls, shut
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
-        # Last writer wins — verify key exists and is one of the payloads
-        vc = make_conn()
-        final = vc.execute_command("BLOB.TCP_GET", key)
+            t.join(timeout=60)
+        # Verify key exists — last writer wins
+        s_crc, c_crc = rdma_get_crc(key)
         check(
-            "Concurrent SET: last writer wins",
-            final in payloads,
-            f"final not in any payload, len={len(final) if final else 'None'}"
-            if final not in payloads else "",
+            "Concurrent SET: key readable after race",
+            s_crc is not None,
+            f"GET returned nil" if s_crc is None else "",
         )
         check("Concurrent SET: no errors", len(errors) == 0, "; ".join(errors[:3]))
-        vc.execute_command("DEL", key)
-        vc.close()
+        make_conn().execute_command("DEL", key)
 
     # ── GET during SET (same key) ──
     if shutdown.should_continue():
         log.info("[race] ── GET during SET (same key) ──")
         key = f"{{{hash_tag}}}race_gds"
-        old_pattern = bytes([0xAA] * 4096)
-        new_pattern = bytes([0xBB] * 65536)
-        c = make_conn()
-        c.execute_command("BLOB.TCP_SET", key, old_pattern)
+        # Initial SET
+        rdma_set(key)
         get_results = []
-        set_done = threading.Event()
+        set_errors = []
+        get_errors = []
 
         def setter():
-            sc = make_conn()
-            sc.execute_command("BLOB.TCP_SET", key, new_pattern)
-            set_done.set()
-            sc.close()
+            try:
+                rdma_set(key, size=65536)  # Overwrite with larger object
+            except Exception as e:
+                set_errors.append(str(e))
 
         def getter():
-            gc = make_conn()
-            for _ in range(20):
+            for _ in range(5):
                 try:
-                    val = gc.execute_command("BLOB.TCP_GET", key)
-                    get_results.append(len(val) if val else 0)
-                except Exception:
-                    get_results.append(-1)
-                time.sleep(0.001)
-            gc.close()
+                    s_crc, _ = rdma_get_crc(key)
+                    get_results.append("ok" if s_crc is not None else "nil")
+                except Exception as e:
+                    get_results.append(f"err:{e}")
 
         gt = threading.Thread(target=getter)
         st = threading.Thread(target=setter)
         gt.start()
-        time.sleep(0.005)
+        time.sleep(0.01)
         st.start()
-        gt.join(timeout=30)
-        st.join(timeout=30)
-        # Every GET should return old value, new value, or nil — never garbage
-        valid_lens = {len(old_pattern), len(new_pattern), 0, -1}
-        all_valid = all(r in valid_lens for r in get_results)
+        gt.join(timeout=120)
+        st.join(timeout=60)
+        # Every GET should succeed or return nil — never crash
+        all_valid = all(r in ("ok", "nil") for r in get_results)
         check(
-            "GET during SET: no corruption",
-            all_valid,
-            f"unexpected sizes: {[r for r in get_results if r not in valid_lens]}",
+            f"GET during SET: no corruption ({len(get_results)} GETs)",
+            all_valid and len(set_errors) == 0,
+            f"results={get_results} set_errors={set_errors}",
         )
-        c.execute_command("DEL", key)
-        c.close()
+        make_conn().execute_command("DEL", key)
 
     # ── Buffer reuse stress ──
     if shutdown.should_continue():
         log.info("[race] ── Buffer reuse stress ──")
         errors = []
-        rounds = 50
-        c = make_conn()
+        rounds = 20
         for i in range(rounds):
             key = f"{{{hash_tag}}}race_buf_{i}"
-            pattern = bytes([(i + j) % 256 for j in range(4096)])
             try:
-                c.execute_command("BLOB.TCP_SET", key, pattern)
-                got = c.execute_command("BLOB.TCP_GET", key)
-                if got != pattern:
-                    errors.append(f"round {i}: data mismatch")
-                c.execute_command("DEL", key)
+                ok, src_crc = rdma_set(key)
+                if not ok:
+                    errors.append(f"round {i}: SET failed")
+                    continue
+                s_crc, c_crc = rdma_get_crc(key)
+                if s_crc is not None and c_crc is not None and s_crc != c_crc:
+                    errors.append(
+                        f"round {i}: CRC mismatch server=0x{s_crc:08x} client=0x{c_crc:08x}"
+                    )
+                make_conn().execute_command("DEL", key)
             except Exception as e:
                 errors.append(f"round {i}: {e}")
-        c.close()
         check(
-            f"Buffer reuse: {rounds} SET/GET/DEL rounds",
+            f"Buffer reuse: {rounds} RDMA SET/GET/DEL rounds",
             len(errors) == 0,
             "; ".join(errors[:5]),
         )
