@@ -1105,10 +1105,6 @@ fn cmd_get_from_dram(
     // all paths (already-ready, subscribe-race, coalesced waiter) are covered.
     if let Some(cache) = &dram_pool.cache {
         cache.stats.record_hit(&obj_ctx.stats);
-        obj_ctx.stats.touch(
-            storage::cache_policy::now_minutes(),
-            crate::blob_decay_time(),
-        );
     }
     match transport {
         Transport::Tcp => {
