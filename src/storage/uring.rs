@@ -131,6 +131,15 @@ impl PendingOp {
 static DRAM_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
+/// True while the DRAM ring's poller is mid-rebuild (re-register window open).
+/// Never set to true by the NVMe poller (fixed-size pool, no re-registers).
+/// The DRAM poller is the single writer; readers outside the poller use
+/// `is_registration_pending` to skip promotion during the window and fall
+/// back to the NVMe streaming path. Relaxed suffices: a stale `false` just
+/// promotes into a window the poller's kill-switch handles; a stale `true`
+/// skips one promotion that would have gone unfixed anyway.
+static REGISTRATION_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Install the engine for `pool`. Panics if already set (init runs once).
 pub fn set_engine(pool: PoolType, engine: UringEngine) {
     let slot = match pool {
@@ -212,13 +221,11 @@ pub fn submit_reregister(pool: PoolType) {
     });
 }
 
-/// Whether `pool`'s ring is mid-rebuild (iovec table being re-registered).
-/// Callers use this to skip DRAM promotion during the window and fall back to
-/// the NVMe streaming path, avoiding unfixed reads. Always false for the NVMe
-/// pool (fixed-size, never re-registers) and when no engine exists (Dram-only
-/// mode / not yet initialized).
-pub fn is_reregistering(pool: PoolType) -> bool {
-    engine(pool).is_some_and(|e| e.reregistering.load(Ordering::Relaxed))
+/// Whether the DRAM ring is mid-rebuild (iovec table being re-registered).
+/// Callers use this to skip promotion during the window and fall back to the
+/// NVMe streaming path, avoiding unfixed reads.
+pub fn is_registration_pending() -> bool {
+    REGISTRATION_PENDING.load(Ordering::Relaxed)
 }
 
 // ─── UringEngine ─────────────────────────────────────────────────────────────
@@ -226,13 +233,6 @@ pub fn is_reregistering(pool: PoolType) -> bool {
 pub struct UringEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
-    /// True while the poller is mid-rebuild (registration_pending window open).
-    /// Readers outside the poller use this to skip promotion during the window
-    /// and fall back to the NVMe streaming path whose ring never rebuilds.
-    /// Single writer (poller thread), many readers — Relaxed suffices: a stale
-    /// `false` just promotes into a window the poller's kill-switch handles; a
-    /// stale `true` skips one promotion that would have gone unfixed anyway.
-    reregistering: Arc<AtomicBool>,
     _poller: Option<thread::JoinHandle<()>>,
 }
 
@@ -261,19 +261,16 @@ impl UringEngine {
         let (tx, rx) = bounded::<IoRequest>(4096);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-        let reregistering = Arc::new(AtomicBool::new(false));
-        let reregistering_clone = reregistering.clone();
         // Pass the fully initialized ring to the poller thread.
         let poller = thread::Builder::new()
             .name(format!("lo-uring-poller-{:?}", pool))
             .spawn(move || {
-                Self::poller_loop(pool, rx, shutdown_clone, reregistering_clone, ring);
+                Self::poller_loop(pool, rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
         Ok(Self {
             tx,
             shutdown,
-            reregistering,
             _poller: Some(poller),
         })
     }
@@ -285,16 +282,12 @@ impl UringEngine {
         pool: PoolType,
         rx: Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
-        reregistering: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
     ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
-        // Re-registration state: while pending, ops go non-fixed; the re-register fires
-        // once in-flight fixed ops drain to 0.
-        let mut registration_pending = false;
         let mut fixed_in_flight: usize = 0;
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
@@ -303,7 +296,8 @@ impl UringEngine {
             }
             // Re-register: once in-flight fixed ops have drained, rebuild + re-register
             // the table. In-window ops went non-fixed, so stale indices are unused.
-            if registration_pending && fixed_in_flight == 0 {
+            // Only the DRAM ring rebuilds (NVMe is fixed-size, never re-registers).
+            if REGISTRATION_PENDING.load(Ordering::Relaxed) && fixed_in_flight == 0 {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
                     let _ = ring.submitter().unregister_buffers();
@@ -313,8 +307,7 @@ impl UringEngine {
                             .expect("largeobj: io_uring re-register_buffers failed");
                     }
                 }
-                registration_pending = false;
-                reregistering.store(false, Ordering::Relaxed);
+                REGISTRATION_PENDING.store(false, Ordering::Relaxed);
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
             // in an OnceLock for the entire process lifetime. If it's gone without
@@ -362,20 +355,19 @@ impl UringEngine {
                 let (sqe, op) = match req {
                     IoRequest::Reregister => {
                         // Enter the re-register window. New promotions are skipped
-                        // (external `reregistering` flag); ops already in the channel
+                        // (REGISTRATION_PENDING); ops already in the channel
                         // are forced non-fixed below until `fixed_in_flight` drains
                         // and the top-of-loop re-register rebuilds the table. No SQE
                         // to build.
-                        registration_pending = true;
-                        reregistering.store(true, Ordering::Relaxed);
+                        REGISTRATION_PENDING.store(true, Ordering::Relaxed);
                         // When no fixed ops are in flight, break out of Phase 1
                         // so the outer loop hits the rebuild check immediately.
                         // Otherwise continue draining — the rebuild fires once
-                        // in-flight fixed ops complete. Without this break, recv()
+                        // in-flight fixed ops complete. (Without this break, recv()
                         // blocks waiting for a message that never comes: reads
-                        // falling through to the NVMe pool during the rebuild go
-                        // NVMe ring, not this one, so reregistering stays true
-                        // and promotion never comes back through the DRAM pool.
+                        // falling through to the NVMe pool during the rebuild go to the
+                        // NVMe ring, not this one, so registration_pending stays true
+                        // and promotion never comes back through the DRAM pool.)
                         if fixed_in_flight == 0 {
                             break;
                         }
@@ -385,7 +377,8 @@ impl UringEngine {
                         let read_len = super::align_up(op.len as usize) as u32;
                         // Kill-switch: while a re-register is pending, issue non-fixed so a
                         // stale iovec_index against the about-to-change table is never used.
-                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let issue_fixed =
+                            op.use_fixed && !REGISTRATION_PENDING.load(Ordering::Relaxed);
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
@@ -423,7 +416,8 @@ impl UringEngine {
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let issue_fixed =
+                            op.use_fixed && !REGISTRATION_PENDING.load(Ordering::Relaxed);
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
