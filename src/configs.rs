@@ -223,6 +223,13 @@ lazy_static::lazy_static! {
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     pub static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
+    /// When true (default), skip DRAM promotion while the DRAM ring's iovec
+    /// table is being re-registered (expand/release). Promotion reads would go
+    /// unfixed (Readv instead of ReadFixed); falling back to the NVMe
+    /// streaming path avoids the penalty since the NVMe ring never re-registers.
+    /// Immutable after load.
+    pub static ref CFG_SKIP_PROMOTION_ON_IOVEC_REREGISTER: AtomicBool = AtomicBool::new(true);
+
     /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
     ///
     /// WHY: Large objects (4KB-50MB) would thrash the page cache if buffered. O_DIRECT ensures
@@ -342,6 +349,10 @@ pub fn max_promote_size() -> u64 {
 
 pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn skip_promotion_on_iovec_reregister() -> bool {
+    CFG_SKIP_PROMOTION_ON_IOVEC_REREGISTER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn scaling_poll_ms() -> u64 {
