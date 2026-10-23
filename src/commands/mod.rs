@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use dma_libfabric_protocol::{decode_hex, encode_hex};
-use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{Context, ContextFlags, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, LO_TYPE};
 use crate::engine::{self, DataSource, Transport};
@@ -21,6 +21,14 @@ use crate::transport::{self, session, Session};
 
 /// Upper bound on client memory addresses in one EFA command.
 const MAX_EFA_ADDRESSES: usize = 256;
+
+/// Reject client commands while `largeobj.enabled` is no.
+fn check_module_enabled(ctx: &Context) -> Result<(), ValkeyError> {
+    if !crate::module_enabled() && !ctx.get_flags().contains(ContextFlags::REPLICATED) {
+        return Err(ValkeyError::Str(errors::ERR_MODULE_DISABLED));
+    }
+    Ok(())
+}
 
 /// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
@@ -107,6 +115,7 @@ fn parse_optional_crc(
 // so both sides hold each other before the first transfer.
 
 pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
@@ -152,6 +161,7 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // BLOB.TCP_GET key — returns object bytes inline via RESP.
 
 pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     if args.len() != 2 {
         return Err(ValkeyError::WrongArity);
     }
@@ -182,6 +192,7 @@ pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // Writes object data directly to client-registered memory via RDMA.
 
 pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     // At least: cmd + key + one (rkey, addr, len) triple = 5 args.
     // Incomplete triples are caught by parse_efa_addresses with a clearer error.
     if args.len() < 5 {
@@ -218,6 +229,7 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // BLOB.TCP_SET key <data> — stores inline bytes from the RESP payload.
 
 pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
     }
@@ -228,8 +240,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::WrongType)?
         .map(|v| v.object_id);
     // TCP path: data.len() IS the authoritative length. No user-provided len needed.
-    let data = args[2].as_slice().to_vec();
-    let obj_len = data.len() as u64;
+    let obj_len = args[2].as_slice().len() as u64;
     // Reject zero-length values.
     if obj_len == 0 {
         return Err(ValkeyError::Str(errors::ERR_ZERO_LENGTH_OBJECT));
@@ -241,8 +252,9 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
+    let data = args[2].as_slice();
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data), old_oid) {
+    match engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -256,6 +268,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // client-supplied value and rejects the SET on mismatch.
 
 pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     // At least: cmd + key + total_len + one (rkey, addr, len) triple = 6 args.
     // Incomplete triples are caught by parse_efa_addresses with a clearer error.
     if args.len() < 6 {
@@ -294,7 +307,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         client_crc,
     };
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
+    match engine::execute_set_rdma(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -307,6 +320,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 // Parse args → resolve key → return metadata field or all fields as array.
 
 pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    check_module_enabled(ctx)?;
     if !(2..=3).contains(&args.len()) {
         return Err(ValkeyError::WrongArity);
     }

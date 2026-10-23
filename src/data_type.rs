@@ -3,12 +3,13 @@
 //! The data type layer owns:
 //! - LoValue struct in keyspace (accessed via ValkeyModule_OpenKey)
 //! - OID generation (monotonic counter)
-//! - RDB callbacks (save/load references) (TODO)
+//! - RDB/AOF callbacks: persistence is not supported. Save writes nothing; loading an RDB
+//!   yields placeholders that read as missing until the scaling cron deletes them.
 //! - Replication (TODO)
 //! - Native Valkey DEL triggers free callback → deletes NVMe file.
 //! - Callbacks: MEMORY USAGE, FREE EFFORT, COPY, DEBUG DIGEST.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
@@ -38,15 +39,6 @@ impl ObjectId {
     /// Deterministic file path from OID.
     pub fn file_path(&self, disk_dir: &str) -> String {
         format!("{}/{:016x}.dat", disk_dir, self.0)
-    }
-
-    /// The OID a `file_path` file name encodes. None for any other name.
-    pub fn from_filename(name: &str) -> Option<Self> {
-        let hex = name.strip_suffix(".dat")?;
-        if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return None;
-        }
-        u64::from_str_radix(hex, 16).ok().map(Self)
     }
 }
 
@@ -159,10 +151,12 @@ impl LoValue {
         if self.reclaim_in_progress() {
             return None;
         }
-        match crate::operating_mode() {
+        let copy = match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(),
             crate::OperatingMode::Tiered => self.create_copy_tiered(),
-        }
+        }?;
+        crate::storage::eviction_candidates::inherit_ttl(self.object_id, copy.object_id);
+        Some(copy)
     }
 
     /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
@@ -211,6 +205,11 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     // Drop the DRAM cache entry.
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    // A Tiered oid leaves the reclaim list when its file is torn down, but an `lo_rdb_load`
+    // placeholder has no file. (Dram: `remove_object` already removed it.)
+    if crate::operating_mode() == crate::OperatingMode::Tiered && lo.file.is_none() {
+        crate::storage::reclaim::RECLAIM_LIST.remove(&lo.object_id);
+    }
     // `lo` (and its Option<Arc<ObjectFile>>) drops here; teardown fires on last ref.
 }
 
@@ -258,6 +257,73 @@ unsafe extern "C" fn lo_digest(md: *mut raw::RedisModuleDigest, value: *mut std:
     dig.end_sequence();
 }
 
+/// Whether `lo_rdb_save` / `lo_rdb_load` / `lo_aof_rewrite` have warned. They run once per
+/// key (and RESTORE once per client command), so each warns only the first time.
+static RDB_SAVE_WARNED: AtomicBool = AtomicBool::new(false);
+static RDB_LOAD_WARNED: AtomicBool = AtomicBool::new(false);
+static RESTORE_WARNED: AtomicBool = AtomicBool::new(false);
+static AOF_REWRITE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// RDB save callback — no-op: persistence (RDB, DUMP, MIGRATE, full sync) is not supported.
+/// Valkey calls `rdb_save` unconditionally, so leaving it unset crashes the server on DUMP or
+/// BGSAVE. Writes nothing; core still frames the value with the type id and EOF marker.
+unsafe extern "C" fn lo_rdb_save(_rdb: *mut raw::RedisModuleIO, _value: *mut std::ffi::c_void) {
+    if !RDB_SAVE_WARNED.swap(true, Ordering::Relaxed) {
+        valkey_module::logging::log_warning(
+            "largeobj: persistence is not supported: blobs are saved to RDB/DUMP without their data",
+        );
+    }
+}
+
+/// RDB load callback — persistence is not supported, so there is never data to load
+/// (`lo_rdb_save` writes none, so there is nothing to read either).
+///
+/// Loading an RDB (startup, DEBUG RELOAD, AOF preamble, replica full sync): returns a
+/// placeholder already on the reclaim list. Returning null would fail the whole load, and a
+/// placeholder off the list would reach code that needs the object's data. On the list,
+/// every command treats the key as missing, and the scaling cron deletes it once loading ends.
+///
+/// RESTORE, which also covers the target of MIGRATE: returns null, failing it with
+/// "Bad data format". A placeholder there would let MIGRATE succeed and delete the source's
+/// blob.
+unsafe extern "C" fn lo_rdb_load(
+    rdb: *mut raw::RedisModuleIO,
+    _encver: std::os::raw::c_int,
+) -> *mut std::ffi::c_void {
+    let ctx = raw::RedisModule_GetContextFromIO.unwrap()(rdb);
+    let flags = raw::RedisModule_GetContextFlags.unwrap()(ctx) as u32;
+    if flags & raw::REDISMODULE_CTX_FLAGS_LOADING == 0 {
+        if !RESTORE_WARNED.swap(true, Ordering::Relaxed) {
+            valkey_module::logging::log_warning(
+                "largeobj: cannot RESTORE a blob: persistence is not supported",
+            );
+        }
+        return std::ptr::null_mut();
+    }
+    if !RDB_LOAD_WARNED.swap(true, Ordering::Relaxed) {
+        valkey_module::logging::log_warning(
+            "largeobj: persistence is not supported: blobs in the loaded data read as missing and are deleted",
+        );
+    }
+    let placeholder = LoValue::new(ObjectId::next(), 0, 0, None);
+    crate::storage::reclaim::RECLAIM_LIST.insert(placeholder.object_id);
+    Box::into_raw(Box::new(placeholder)) as *mut std::ffi::c_void
+}
+
+/// AOF rewrite callback — no-op: persistence is not supported, so blobs are left out of
+/// the rewritten AOF.
+unsafe extern "C" fn lo_aof_rewrite(
+    _aof: *mut raw::RedisModuleIO,
+    _key: *mut raw::RedisModuleString,
+    _value: *mut std::ffi::c_void,
+) {
+    if !AOF_REWRITE_WARNED.swap(true, Ordering::Relaxed) {
+        valkey_module::logging::log_warning(
+            "largeobj: persistence is not supported: blobs are left out of the AOF rewrite",
+        );
+    }
+}
+
 // ─── Type Registration ───────────────────────────────────────────────────────
 
 pub static LO_TYPE: ValkeyType = ValkeyType::new(
@@ -265,9 +331,9 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
     0,           // encoding version
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
-        rdb_load: None,    // TODO
-        rdb_save: None,    // TODO
-        aof_rewrite: None, // TODO
+        rdb_load: Some(lo_rdb_load),       // TODO
+        rdb_save: Some(lo_rdb_save),       // TODO
+        aof_rewrite: Some(lo_aof_rewrite), // TODO
         free: Some(lo_free),
         mem_usage: Some(lo_mem_usage),
         digest: Some(lo_digest),
@@ -311,16 +377,6 @@ mod tests {
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
         );
-
-        assert_eq!(ObjectId::from_filename("00000000000000ff.dat"), Some(oid));
-        for name in [
-            "00000000000000FF.dat",
-            "ff.dat",
-            "00000000000000ff.tmp",
-            "+0000000000000ff.dat",
-        ] {
-            assert_eq!(ObjectId::from_filename(name), None, "{name}");
-        }
     }
 
     // ─── free_effort tests ───────────────────────────────────────────────

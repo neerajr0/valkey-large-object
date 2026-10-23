@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, disk_dir)
+//   2. storage::init(ctx, mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -112,12 +112,6 @@ pub fn efa_release_segment(base: usize) {
     }
 }
 
-/// Count of EFA-registered segments (0 when no fabric). Equals the live segment count when the
-/// fabric is up (every live segment is registered); surfaced in INFO to assert that invariant.
-pub fn efa_registered_segment_count() -> usize {
-    transport::fabric::registered_segment_count()
-}
-
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
@@ -182,7 +176,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
     // On failure, locals drop naturally — no cleanup needed.
-    let storage_summary = match storage::init(mode, &dir) {
+    let storage_summary = match storage::init(ctx, mode, &dir) {
         Ok(summary) => summary,
         Err(e) => {
             ctx.log_warning(&format!("largeobj: storage init failed: {}", e));
@@ -211,6 +205,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
+
+    // Cache maxmemory-policy; `CONFIG SET` keeps it current.
+    storage::eviction_candidates::refresh_policy(ctx);
 
     // Mark module as initialized so runtime CONFIG SET validation is enabled.
     MODULE_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -274,6 +271,9 @@ valkey_module! {
         ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
+    event_handlers: [
+        [@GENERIC: storage::eviction_candidates::on_keyspace_event],
+    ],
     configurations: [
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, DEFAULT_SEGMENT_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE,
@@ -319,11 +319,13 @@ valkey_module! {
             ["victim-sample-size", &*CFG_VICTIM_SAMPLE_SIZE, DEFAULT_VICTIM_SAMPLE_SIZE, MIN_VICTIM_SAMPLE_SIZE, MAX_VICTIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, Some(Box::new(on_max_cached_fds_changed)), Some(Box::new(validate_max_cached_fds))],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["max-rdma-registered-bytes", &*CFG_MAX_RDMA_REGISTERED_BYTES, DEFAULT_MAX_RDMA_REGISTERED_BYTES, MIN_MAX_RDMA_REGISTERED_BYTES, MAX_MAX_RDMA_REGISTERED_BYTES,
+             ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
             ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
@@ -335,11 +337,14 @@ valkey_module! {
             ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["test-fail-promotion-read", &*CFG_TEST_FAIL_PROMOTION_READ, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
+            ["enabled", &*CFG_MODULE_ENABLED, DEFAULT_MODULE_ENABLED, ConfigurationFlags::DEFAULT, None],
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
              ConfigurationFlags::IMMUTABLE, None],
             ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::EfaDirect,
+             ConfigurationFlags::IMMUTABLE, None],
+            ["fd-reserve", &*CFG_FD_RESERVE, FdReserve::Lenient,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

@@ -13,6 +13,8 @@ pub type Crc = u32;
 pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
+pub mod eviction_candidates;
+pub mod fd_placement;
 pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
@@ -144,7 +146,11 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// All OnceLock statics are set at the very end after everything succeeds.
 /// On failure, local variables drop naturally — no cleanup needed, module load retryable.
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
-pub fn init(mode: crate::OperatingMode, disk_dir: &str) -> Result<String, String> {
+pub fn init(
+    ctx: &valkey_module::Context,
+    mode: crate::OperatingMode,
+    disk_dir: &str,
+) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
     let nvme_staging = crate::nvme_staging_size();
     // DRAMPool always starts with 1 segment and grows on demand — reactively
@@ -167,6 +173,11 @@ pub fn init(mode: crate::OperatingMode, disk_dir: &str) -> Result<String, String
              Increase segment-size or decrease disk-staging-size",
             dram_segment_count, nvme_segments, MAX_SEGMENTS,
         ));
+    }
+    // Tiered keeps object files open (fd cache + command fds). Place those fds in the
+    // module range before any is opened, or they stop new clients being served.
+    if mode == crate::OperatingMode::Tiered {
+        fd_placement::raise_module_start(ctx)?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
@@ -252,21 +263,33 @@ pub fn init(mode: crate::OperatingMode, disk_dir: &str) -> Result<String, String
     ))
 }
 
+/// Whether EFA-registering `extra_bytes` more would exceed `max-rdma-registered-bytes`.
+/// False without a fabric (TCP-only registers nothing) or with the limit at 0.
+pub fn would_exceed_rdma_limit(extra_bytes: u64) -> bool {
+    let limit = crate::max_rdma_registered_bytes();
+    if limit == 0 || crate::transport::fabric::fabric().is_none() {
+        return false;
+    }
+    let segments = DRAM_POOL.get().map_or(0, DRAMPool::rdma_registered_count)
+        + NVME_POOL.get().map_or(0, NVMePool::rdma_registered_count);
+    (segments as u64 * crate::segment_size() as u64).saturating_add(extra_bytes) > limit
+}
+
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
     if let Some(nvme_pool) = NVME_POOL.get() {
-        nvme_pool.with_live_segment_slices(|base, size| {
+        nvme_pool.with_segment_slices(|base, size| {
             slices.push(unsafe { std::slice::from_raw_parts(base, size) });
         });
     }
-    get_dram_pool().with_live_segment_slices(|base, size| {
+    get_dram_pool().with_segment_slices(|base, size| {
         slices.push(unsafe { std::slice::from_raw_parts(base, size) });
     });
     slices
 }
 
-/// Rebuild ONE pool's dense io_uring fixed-buffer table from its live segments,
+/// Rebuild ONE pool's dense io_uring fixed-buffer table from its segments,
 /// reassigning each a dense pool-local `iovec_index`, marking it registered, and
 /// returning the iovec array for that ring's `register_buffers`. Dense because
 /// 5.10 can only re-register the whole table. Only `PoolType::Dram` re-registers
