@@ -384,7 +384,6 @@ fn cmd_get_tiered(
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both if another GET is already promoting this OID (Filling).
     let promoted = if cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
@@ -447,9 +446,10 @@ fn cmd_get_tiered(
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
-    // Reaches here when try_promote_object returns None: pool full or object
-    // exceeds segment capacity after reclaim. We are still on the main thread
-    // so no other GET can have modified the DRAMPool map since our first check.
+    // Reaches here when admission is rejected or try_promote_object returns
+    // None (pool full or object exceeds segment capacity after reclaim).
+    // We are still on the main thread so no other GET can have modified the
+    // DRAMPool map since our first check.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -1255,12 +1255,9 @@ async fn serve_coalesced_waiter(
             );
         }
         Err(_reason) => {
-            // Promotion failed or leader crashed — reply disk read error.
-            reply_err(
-                &thread_ctx,
-                &info::DISK_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_DISK_READ),
-            );
+            // Promotion leader failed — reply error without bumping
+            // DISK_READ_ERRORS (the leader already counted the real failure).
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_DISK_READ)));
         }
     }
 }
