@@ -380,8 +380,9 @@ impl UringEngine {
                         let read_len = super::align_up(op.len as usize) as u32;
                         // Kill-switch: while a re-register is pending, issue non-fixed so a
                         // stale iovec_index against the about-to-change table is never used.
-                        let issue_fixed =
-                            op.use_fixed && !REGISTRATION_PENDING.load(Ordering::Relaxed);
+                        let issue_fixed = op.use_fixed
+                            && !(pool == PoolType::Dram
+                                && REGISTRATION_PENDING.load(Ordering::Relaxed));
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
@@ -419,8 +420,9 @@ impl UringEngine {
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let issue_fixed =
-                            op.use_fixed && !REGISTRATION_PENDING.load(Ordering::Relaxed);
+                        let issue_fixed = op.use_fixed
+                            && !(pool == PoolType::Dram
+                                && REGISTRATION_PENDING.load(Ordering::Relaxed));
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
