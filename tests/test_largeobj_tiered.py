@@ -433,43 +433,6 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         )
         assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
-    # ─── Coalescing tests ────────────────────────────────────────────
-
-    def test_concurrent_gets_pipeline(self):
-        """Use a pipeline to fire N GETs for the same key in a single round-trip.
-        All should return correct data."""
-        client = self.server.get_new_client()
-        payload = os.urandom(16384)
-        client.execute_command('BLOB.TCP_SET', 'pipe_key', payload)
-        pipe = client.pipeline(transaction=False)
-        num_gets = 10
-        for _ in range(num_gets):
-            pipe.execute_command('BLOB.TCP_GET', 'pipe_key')
-        results = pipe.execute()
-        for i, r in enumerate(results):
-            assert r == payload, f"Pipeline GET {i} data mismatch"
-
-    def test_delete_during_promotion(self):
-        """SET a multi-chunk object, then issue GET (starts promotion) + DEL
-        concurrently via pipeline. Verify no crash. GET may return data or error
-        depending on timing. Subsequent GET returns nil."""
-        client = self.server.get_new_client()
-        payload = os.urandom(32768)
-        client.execute_command('BLOB.TCP_SET', 'delprom_key', payload)
-        pipe = client.pipeline(transaction=False)
-        pipe.execute_command('BLOB.TCP_GET', 'delprom_key')
-        pipe.execute_command('DEL', 'delprom_key')
-        results = pipe.execute()
-        # GET result: either the payload (promotion completed before DEL) or an
-        # error (DEL removed the fd). Both are valid — no crash is the assertion.
-        get_result = results[0]
-        if isinstance(get_result, bytes):
-            assert get_result == payload
-        # DEL result: 1 (key existed) or 0 (already gone).
-        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
-        # After both complete, key should be gone.
-        assert client.execute_command('BLOB.TCP_GET', 'delprom_key') is None
-
     def test_info_sets_in_flight(self):
         """Concurrent Tiered SETs each count in inflight_requests until they reply. The
         pause holds their commits long enough to observe them."""
@@ -573,6 +536,61 @@ class TestTieredCoalescing(ValkeyLargeObjTestCaseBase):
             f"Expected {num_readers - 1} coalesced reads, "
             f"got {waiters_after - waiters_before} "
             f"(before={waiters_before} after={waiters_after})"
+        )
+
+    def test_delete_during_promotion(self):
+        """DEL a key while a promotion leader and a coalesced waiter are both
+        in-flight. The 2s pause holds the leader mid-promotion so the waiter
+        registers as coalesced and the DEL lands while both are blocked.
+        Timeline:
+            t=0.0s  Leader GET starts promotion, enters 2s pause
+            t=0.3s  Waiter GET arrives, subscribes as coalesced waiter
+            t=0.6s  DEL arrives on a third client
+            t=2.0s  Pause ends, leader + waiter complete or error
+        No crash. Both GETs return either correct data or an error. The key
+        must be gone afterwards. coalesced_reads must increment by 1."""
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'delprom_key', payload)
+        coalesced_before = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        num_readers = 2
+        results = [None] * num_readers
+        errors = [None] * num_readers
+        def background_get(idx):
+            try:
+                c = self.server.get_new_client()
+                results[idx] = c.execute_command('BLOB.TCP_GET', 'delprom_key')
+            except Exception as e:
+                errors[idx] = e
+        # Reader 0 becomes the promotion leader and enters the 2s pause.
+        threads = [threading.Thread(target=background_get, args=(i,)) for i in range(num_readers)]
+        threads[0].start()
+        # Reader 1 arrives during the pause — becomes a coalesced waiter.
+        time.sleep(0.3)
+        threads[1].start()
+        # DEL arrives while both readers are blocked on the paused promotion.
+        time.sleep(0.3)
+        del_client = self.server.get_new_client()
+        del_result = del_client.execute_command('DEL', 'delprom_key')
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads), "GET threads did not finish"
+        # Both GETs: either correct payload or error — no crash, no corruption.
+        for i in range(num_readers):
+            if errors[i] is None and isinstance(results[i], bytes):
+                assert results[i] == payload, f"Reader {i} data mismatch"
+        assert del_result in (0, 1)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
+        # Key must be gone.
+        assert client.execute_command('BLOB.TCP_GET', 'delprom_key') is None
+        # Confirm the waiter actually coalesced (promotion path was taken).
+        coalesced_after = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        assert coalesced_after - coalesced_before == 1, (
+            f"Expected 1 coalesced read, got {coalesced_after - coalesced_before}"
         )
 
 
