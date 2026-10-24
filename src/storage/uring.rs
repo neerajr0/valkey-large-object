@@ -297,7 +297,10 @@ impl UringEngine {
             // Re-register: once in-flight fixed ops have drained, rebuild + re-register
             // the table. In-window ops went non-fixed, so stale indices are unused.
             // Only the DRAM ring rebuilds (NVMe is fixed-size, never re-registers).
-            if REGISTRATION_PENDING.load(Ordering::Relaxed) && fixed_in_flight == 0 {
+            if pool == PoolType::Dram
+                && REGISTRATION_PENDING.load(Ordering::Relaxed)
+                && fixed_in_flight == 0
+            {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
                     let _ = ring.submitter().unregister_buffers();
