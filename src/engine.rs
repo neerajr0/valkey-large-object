@@ -1240,7 +1240,7 @@ fn serve_filling_or_became_ready(
 /// (collect_dram_bytes) and EFA (run_get with Source::DramResident + Target::EfaWrite).
 async fn serve_coalesced_waiter(
     obj_ctx: Arc<ObjectContext>,
-    rx: tokio::sync::watch::Receiver<u32>,
+    rx: tokio::sync::watch::Receiver<()>,
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,

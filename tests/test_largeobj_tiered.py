@@ -489,7 +489,7 @@ class TestTieredCoalescing(ValkeyLargeObjTestCaseBase):
     def test_coalescing_deterministic(self):
         """Deterministic coalescing: pause the promotion leader so concurrent
         GETs are guaranteed to register as waiters on the Filling ObjectContext.
-        Asserts the coalesced_waiters metric incremented and all readers get
+        Asserts the coalesced_reads metric incremented and all readers get
         correct data.
 
         Timeline:

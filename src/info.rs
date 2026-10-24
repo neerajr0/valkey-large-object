@@ -21,7 +21,6 @@ pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static DISK_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
-pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 pub static CRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
@@ -33,6 +32,9 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Objects evicted to make room for a write: Dram objects or Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// GETs that coalesced behind a promotion leader instead of issuing their own read.
+pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
 
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
 /// path); writes push into it (the GET path).
@@ -175,6 +177,10 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             .field(
                 "cache_demotions",
                 cache.stats.demotions.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "coalesced_reads",
+                COALESCED_READS.load(Ordering::Relaxed) as i64,
             )?;
     }
     section
@@ -376,10 +382,6 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "set_value_failures",
             SET_VALUE_FAILURES.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "coalesced_reads",
-            COALESCED_READS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "rdma_discarded_transfers",

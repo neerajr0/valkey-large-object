@@ -86,7 +86,7 @@ pub struct ObjectContext {
     /// Leader's watch channel for coalesced waiters. Waiters subscribe via
     /// Receiver. None when state is Ready (sender dropped in mark_ready).
     /// Wrapped in std::sync::Mutex so mark_ready/set_promotion_failure can drop through &self.
-    progress_tx: std::sync::Mutex<Option<watch::Sender<u32>>>,
+    progress_tx: std::sync::Mutex<Option<watch::Sender<()>>>,
     /// Set by leader on promotion failure before dropping progress_tx.
     /// Waiters check this on RecvError to distinguish failure mode.
     promotion_failure: AtomicU8,
@@ -109,7 +109,7 @@ impl ObjectContext {
     /// Create a new ObjectContext in Filling state (Tiered promotion path).
     /// Creates a watch channel so coalesced waiters can subscribe to progress.
     pub fn new_filling(buffers: Vec<SegmentBuffer>) -> Self {
-        let (tx, _rx) = watch::channel(0u32);
+        let (tx, _rx) = watch::channel(());
         Self {
             buffers,
             state: AtomicU8::new(ObjectState::Filling as u8),
@@ -147,7 +147,7 @@ impl ObjectContext {
     /// (sender was dropped in mark_ready) or promotion failed (sender dropped in
     /// set_promotion_failure). Waiters call changed().await on the returned
     /// Receiver; the sender drop wakes them.
-    pub fn subscribe(&self) -> Option<watch::Receiver<u32>> {
+    pub fn subscribe(&self) -> Option<watch::Receiver<()>> {
         self.progress_tx
             .lock()
             .unwrap()
@@ -177,7 +177,7 @@ impl ObjectContext {
     /// Called by coalesced waiters; the caller handles reply dispatch.
     pub async fn await_promotion(
         &self,
-        mut rx: watch::Receiver<u32>,
+        mut rx: watch::Receiver<()>,
     ) -> Result<(), PromotionFailureReason> {
         // The only event is the sender drop (mark_ready or set_promotion_failure).
         // changed() returns Err(RecvError) when the sender is dropped.
