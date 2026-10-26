@@ -223,11 +223,13 @@ lazy_static::lazy_static! {
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     pub static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
-    /// Controls whether non-fixed uring ops (Readv/Writev) are allowed during
-    /// a rebuild of the iovec table. When false (default), promotions are
-    /// skipped when the DRAM pool is changing size and the iovec table is being
-    /// fully rebuilt. Immutable after load.
-    pub static ref CFG_ALLOW_NON_FIXED_OPS: AtomicBool = AtomicBool::new(false);
+    /// Controls whether DRAM promotion is attempted while the DRAM pool is
+    /// scaling (expand/shrink). When false (default), promotion is skipped
+    /// during the scaling window and reads fall through to the NVMe streaming
+    /// path, which always uses fixed I/O because its pool never changes in size.
+    /// When true, promotion proceeds and the poller forces any in-window
+    /// reads to non-fixed I/O. Immutable after load.
+    pub static ref CFG_PROMOTE_DURING_DRAM_SCALING: AtomicBool = AtomicBool::new(false);
 
     /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
     ///
@@ -350,8 +352,8 @@ pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn allow_non_fixed_ops() -> bool {
-    CFG_ALLOW_NON_FIXED_OPS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn promote_during_dram_scaling() -> bool {
+    CFG_PROMOTE_DURING_DRAM_SCALING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn scaling_poll_ms() -> u64 {
