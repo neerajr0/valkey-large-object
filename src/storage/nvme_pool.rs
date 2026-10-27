@@ -187,8 +187,9 @@ impl NVMePool {
     fn unregister_cancel_if_last(&self, client_id: u64) {
         let mut cancels = self.cancels.lock().expect("cancels lock unavailable");
         if let Some(notify) = cancels.get(&client_id) {
-            // strong_count includes the map entry; if it's 1, we're the last holder.
-            if Arc::strong_count(notify) == 1 {
+            // strong_count 2 = the map's Arc + the caller's local clone (which
+            // drops after this guard). A concurrent sibling request keeps it > 2.
+            if Arc::strong_count(notify) <= 2 {
                 cancels.remove(&client_id);
             }
         }
@@ -285,10 +286,71 @@ impl Drop for CancelGuard<'_> {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    // Note: Full integration tests with actual segment allocation require
-    // the module's pool infrastructure. These unit tests verify the queue
-    // mechanics in isolation.
+    /// Below the 8 MiB default chunk-size, so every window is one buffer.
+    const OBJ: usize = 1000;
+    const CLIENT: u64 = 7;
+
+    impl AllocOutcome {
+        fn is_got(&self) -> bool {
+            matches!(self, AllocOutcome::Got(_))
+        }
+        fn is_cancelled(&self) -> bool {
+            matches!(self, AllocOutcome::Cancelled)
+        }
+    }
+
+    /// A one-segment pool with every buffer allocated, plus the windows holding it full.
+    fn exhausted_pool() -> (Arc<NVMePool>, Vec<Vec<SegmentBuffer>>) {
+        let pool = Arc::new(NVMePool::new(1, 65536, 1024));
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
+        assert!(!held.is_empty(), "pool should fit at least one window");
+        (pool, held)
+    }
+
+    /// Multi-thread runtime matching production (wait runs on a tokio worker,
+    /// frees/cancels arrive from another thread).
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("test runtime")
+    }
+
+    /// Spin until the pool has at least `n` queued requests for `client_id`.
+    /// Each request adds one Arc strong ref beyond the map's own.
+    fn wait_registered(pool: &NVMePool, client_id: u64, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let registered = pool
+                .cancels
+                .lock()
+                .unwrap()
+                .get(&client_id)
+                .map(|s| Arc::strong_count(s) > n)
+                .unwrap_or(false);
+            if registered {
+                return;
+            }
+            assert!(Instant::now() < deadline, "waiter(s) never registered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_empty_registry(pool: &NVMePool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pool.cancels.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "registry never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // ─── Existing mechanic tests ─────────────────────────────────────────
 
     #[test]
     fn test_queue_capacity_enforcement() {
@@ -334,5 +396,96 @@ mod tests {
         // The notified future should be ready (we can't easily test this
         // synchronously, but we can verify no panic).
         drop(notified);
+    }
+
+    // ─── Async alloc flow tests ──────────────────────────────────────────
+
+    /// A free unblocks a queued waiter, which then allocates the freed window.
+    #[test]
+    fn test_waiter_succeeds_when_another_op_frees() {
+        let (pool, mut held) = exhausted_pool();
+        runtime().block_on(async {
+            let waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(waiter.await.expect("waiter task").is_got());
+            assert_eq!(pool.queue_len(), 0);
+        });
+    }
+
+    /// A disconnect cancels a queued waiter: it leaves the queue allocating
+    /// nothing, and its registry entry is cleaned up.
+    #[test]
+    fn test_disconnect_cancels_waiter() {
+        let (pool, _held) = exhausted_pool();
+        runtime().block_on(async {
+            let waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            pool.cancel_client(CLIENT);
+            assert!(waiter.await.expect("waiter task").is_cancelled());
+            wait_empty_registry(&pool);
+            assert_eq!(pool.queue_len(), 0);
+        });
+    }
+
+    /// Cancelling the head-of-queue waiter releases the FIFO lock so the next
+    /// waiter behind it can proceed when buffers free up.
+    #[test]
+    fn test_cancel_head_unblocks_next_waiter() {
+        let (pool, mut held) = exhausted_pool();
+        runtime().block_on(async {
+            // Head enters the queue, acquires the FIFO lock, parks on freed/cancelled.
+            let head = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            // Tail queues behind the head, waiting to acquire the lock.
+            let tail = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT + 1, 1);
+            // Cancel the head. Its lock_guard drops, tail acquires the lock.
+            pool.cancel_client(CLIENT);
+            assert!(head.await.expect("head task").is_cancelled());
+            // Free a buffer. The tail — now the lock holder — takes it.
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(tail.await.expect("tail task").is_got());
+            assert_eq!(pool.queue_len(), 0);
+        });
+    }
+
+    /// FIFO fairness: a newcomer cannot take a buffer freed for the waiting head.
+    /// The head holds the queue lock while parked on `freed`, so the newcomer's
+    /// try_lock fails and it enters the FIFO behind the head.
+    #[test]
+    fn test_newcomer_cannot_jump_the_queue() {
+        let (pool, mut held) = exhausted_pool();
+        runtime().block_on(async {
+            let head = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            // Free one buffer. The head holds the queue lock and will take it.
+            pool.free_n(&held.pop().expect("held window"));
+            // A newcomer (different client) queues behind the head.
+            let newcomer = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT + 1, 1);
+            // Cancel the newcomer so the test doesn't hang — it must NOT have allocated.
+            pool.cancel_client(CLIENT + 1);
+            assert!(newcomer.await.expect("newcomer task").is_cancelled());
+            assert!(head.await.expect("head task").is_got());
+        });
     }
 }

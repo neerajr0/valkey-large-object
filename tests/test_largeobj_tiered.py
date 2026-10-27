@@ -1744,6 +1744,9 @@ class TestStagingQueue(ValkeyLargeObjTestCaseBase):
             lambda: client.info('largeobj_disk_staging')['largeobj_disk_staging_queue_depth'], 0
         )
 
+        # Waiting is not an error — the queue_full counter must not have incremented.
+        assert client.info('largeobj_error_metrics')['largeobj_disk_staging_queue_full'] == 0
+
         # All objects readable.
         for i in range(3):
             assert client.execute_command('BLOB.TCP_GET', f'q{i}') == payload
@@ -1790,6 +1793,94 @@ class TestStagingQueue(ValkeyLargeObjTestCaseBase):
         for i, (r, e) in enumerate(zip(results, errors)):
             assert e[0] is None, f"SET fill{i} raised: {e[0]}"
             assert r[0] == b'OK', f"SET fill{i} returned {r[0]}"
+
+
+class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
+    """GATE TEST: a client disconnect cancels its queued staging waiter. Valkey
+    fires the module client-disconnect event even for a client blocked inside the
+    module, so the disconnect handler cancels the queued request. The request
+    leaves the queue without allocating, never wedging the FIFO behind it.
+
+    Config: 1 MiB staging (1 segment), 512 KiB objects hold the full pool.
+    test-pause-before-finalize-set-ms 3000 keeps the holder's buffers locked."""
+
+    OBJ = 524288  # 512 KiB
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
+            f" segment-size 1048576"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 262144"
+            f" max-buffers-per-op 2"
+            f" min-buffers-per-op 2"
+            f" disk-staging-queue-capacity 1024"
+            f" test-pause-before-finalize-set-ms 3000"
+            f" fabric-provider Emulated"
+        )
+
+    def test_disconnect_cancels_queued_waiter(self):
+        """A hard-disconnect while a SET is queued for staging buffers must
+        cancel the queued request, leave the FIFO unwedged, and never commit
+        the cancelled key."""
+        client = self.server.get_new_client()
+        contender = self.server.get_new_client()
+
+        # Fill the staging pool with two SETs that pause holding buffers.
+        holders = []
+        for i in range(2):
+            h = self.server.get_new_client()
+            h.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000'
+            )
+            t = threading.Thread(
+                target=h.execute_command,
+                args=('BLOB.TCP_SET', f'holder{i}', b'H' * self.OBJ)
+            )
+            t.start()
+            holders.append((h, t))
+        time.sleep(1.0)  # both holders have their windows and are paused
+
+        # Clear the hook so later SETs won't pause.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
+        )
+
+        # The contender's SET queues behind the full pool.
+        err = [None]
+        def contender_set():
+            try:
+                contender.execute_command('BLOB.TCP_SET', 'contender', b'C' * self.OBJ)
+            except Exception as e:
+                err[0] = e
+        ct = threading.Thread(target=contender_set)
+        ct.start()
+        time.sleep(0.5)  # contender is now queued
+
+        # Hard-disconnect the contender while it is blocked in the module.
+        contender.connection_pool.disconnect()
+        ct.join(timeout=10)
+        assert not ct.is_alive(), "contender thread did not finish after disconnect"
+
+        # The holders' SETs still complete normally.
+        for _, t in holders:
+            t.join(timeout=10)
+            assert not t.is_alive(), "holder SET did not finish"
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_GET', f'holder{i}') == b'H' * self.OBJ
+
+        # The cancelled waiter never committed its key.
+        assert client.execute_command('EXISTS', 'contender') == 0
+
+        # The FIFO is not wedged: a fresh SET on a healthy client succeeds.
+        fresh = self.server.get_new_client()
+        assert fresh.execute_command('BLOB.TCP_SET', 'after', b'A' * self.OBJ) == b'OK'
+        assert fresh.execute_command('BLOB.TCP_GET', 'after') == b'A' * self.OBJ
+
 
 class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
     """Exercises the race where a GET arrives between set_promotion_failure and
