@@ -64,6 +64,7 @@ define_errors! {
     ERR_STAGING_GE_SEGMENT => "ERR largeobj.disk-staging-size must be >= largeobj.segment-size",
     ERR_SEGMENT_GE_CHUNK => "ERR largeobj.segment-size must be >= largeobj.chunk-size",
     ERR_MAX_BUF_GE_MIN_BUF => "ERR largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op",
+    ERR_STAGING_FITS_WINDOW => "ERR largeobj.disk-staging-size must be >= largeobj.max-buffers-per-op * largeobj.chunk-size",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

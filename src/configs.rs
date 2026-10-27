@@ -652,6 +652,13 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 validator: None,
                 error_msg: errors::ERR_MAX_BUF_GE_MIN_BUF,
             },
+            ConfigConstraint {
+                parent: &CFG_DISK_STAGING_SIZE,
+                child: &CFG_MAX_BUFFERS_PER_OP,
+                enforce_condition: || operating_mode() == OperatingMode::Tiered,
+                validator: Some(staging_fits_max_window),
+                error_msg: errors::ERR_STAGING_FITS_WINDOW,
+            },
         ]
     });
     &CONSTRAINTS
@@ -663,6 +670,15 @@ fn config_constraints() -> &'static [ConfigConstraint] {
 fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
     let chunk_size = CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize;
     storage::object_fits_segment(segment_size as usize, object_size as usize, chunk_size)
+}
+
+/// The largest staging window (max-buffers-per-op × align_up(chunk-size)) must
+/// fit in the total NVMe staging pool. If it doesn't, a request requiring the
+/// full window can never be satisfied and would hold the FIFO lock forever.
+fn staging_fits_max_window(staging_size: u64, max_buffers: u64) -> bool {
+    let chunk = CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    let aligned_chunk = storage::align_up(chunk as usize) as u64;
+    aligned_chunk.saturating_mul(max_buffers) <= staging_size
 }
 
 /// Validate all config constraints. Returns the first violated constraint or Ok(()).
@@ -897,6 +913,28 @@ mod tests {
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
                 Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
+            ),
+            // ── Staging window constraint ────────────────────────────────
+            (
+                "staging_fits_max_window_ok",
+                OperatingMode::Tiered,
+                vec![],
+                None,
+            ),
+            (
+                "staging_too_small_for_window_rejected",
+                OperatingMode::Tiered,
+                vec![
+                    // 1 MiB staging, 1 MiB chunk, max-buffers 2 → needs 2 MiB > 1 MiB.
+                    (&CFG_DISK_STAGING_SIZE, 1024 * 1024),
+                    (&CFG_SEGMENT_SIZE, 1024 * 1024),
+                    (&CFG_CHUNK_SIZE, 1024 * 1024),
+                    (&CFG_MAX_BUFFERS_PER_OP, 2),
+                    (&CFG_MIN_BUFFERS_PER_OP, 2),
+                    (&CFG_MAX_PROMOTE_SIZE, 0),
+                    (&CFG_MAX_OBJECT_SIZE, 1024 * 1024),
+                ],
+                Some("largeobj.disk-staging-size must be >= largeobj.max-buffers-per-op * largeobj.chunk-size"),
             ),
         ]
     }
