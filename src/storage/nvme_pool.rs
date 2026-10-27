@@ -39,7 +39,9 @@ pub struct NVMePool {
     queue: tokio::sync::Mutex<()>,
     /// One cancel signal per client with queued request(s). A disconnect
     /// fires notify_waiters, waking all of that client's queued requests.
-    cancels: Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>,
+    /// The usize is the number of live waiters for this client; the entry is
+    /// removed when it reaches zero.
+    cancels: Mutex<HashMap<u64, (Arc<tokio::sync::Notify>, usize)>>,
     /// Current number of waiters in the queue. Also the INFO metric.
     queue_len: AtomicU64,
     /// Maximum queue depth. Rejects with QueueFull above this.
@@ -167,29 +169,30 @@ impl NVMePool {
             .lock()
             .expect("cancels lock unavailable")
             .get(&client_id)
-            .cloned();
+            .map(|(n, _)| n.clone());
         if let Some(signal) = signal {
             signal.notify_waiters();
         }
     }
 
-    /// Get or create the cancel signal for a client.
+    /// Get or create the cancel signal for a client. Increments the waiter
+    /// count so the entry stays alive until the last waiter unregisters.
     fn register_cancel(&self, client_id: u64) -> Arc<tokio::sync::Notify> {
-        self.cancels
-            .lock()
-            .expect("cancels lock unavailable")
+        let mut cancels = self.cancels.lock().expect("cancels lock unavailable");
+        let entry = cancels
             .entry(client_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-            .clone()
+            .or_insert_with(|| (Arc::new(tokio::sync::Notify::new()), 0));
+        entry.1 += 1;
+        entry.0.clone()
     }
 
-    /// Remove the client's cancel entry if no other holders remain.
-    fn unregister_cancel_if_last(&self, client_id: u64) {
+    /// Decrement the waiter count for a client. Removes the entry when it
+    /// reaches zero, so the map does not grow with connection churn.
+    fn unregister_cancel(&self, client_id: u64) {
         let mut cancels = self.cancels.lock().expect("cancels lock unavailable");
-        if let Some(notify) = cancels.get(&client_id) {
-            // strong_count 2 = the map's Arc + the caller's local clone (which
-            // drops after this guard). A concurrent sibling request keeps it > 2.
-            if Arc::strong_count(notify) <= 2 {
+        if let Some((_, count)) = cancels.get_mut(&client_id) {
+            *count -= 1;
+            if *count == 0 {
                 cancels.remove(&client_id);
             }
         }
@@ -268,7 +271,7 @@ impl CancelGuard<'_> {
     /// the cancel entry, and disarms Drop so it doesn't double-decrement.
     fn disarm(mut self) {
         self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
-        self.pool.unregister_cancel_if_last(self.client_id);
+        self.pool.unregister_cancel(self.client_id);
         self.armed = false;
     }
 }
@@ -277,7 +280,7 @@ impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
-            self.pool.unregister_cancel_if_last(self.client_id);
+            self.pool.unregister_cancel(self.client_id);
         }
     }
 }
@@ -323,7 +326,6 @@ mod tests {
     }
 
     /// Spin until the pool has at least `n` queued requests for `client_id`.
-    /// Each request adds one Arc strong ref beyond the map's own.
     fn wait_registered(pool: &NVMePool, client_id: u64, n: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -332,7 +334,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&client_id)
-                .map(|s| Arc::strong_count(s) > n)
+                .map(|(_, count)| *count >= n)
                 .unwrap_or(false);
             if registered {
                 return;
@@ -371,12 +373,13 @@ mod tests {
     fn test_cancel_registration() {
         let pool = NVMePool::new(1, 1024 * 1024, 100);
 
-        // Register a cancel signal.
+        // Register a cancel signal — same client gets the same Arc.
         let cancel1 = pool.register_cancel(42);
         let cancel2 = pool.register_cancel(42);
-
-        // Should be the same Arc.
         assert!(Arc::ptr_eq(&cancel1, &cancel2));
+
+        // Waiter count should be 2 after two registrations.
+        assert_eq!(pool.cancels.lock().unwrap().get(&42).unwrap().1, 2);
 
         // Different client gets different signal.
         let cancel3 = pool.register_cancel(43);
