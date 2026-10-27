@@ -1802,7 +1802,9 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
     leaves the queue without allocating, never wedging the FIFO behind it.
 
     Config: 1 MiB staging (1 segment), 512 KiB objects hold the full pool.
-    test-pause-before-finalize-set-ms 3000 keeps the holder's buffers locked."""
+    test-pause-before-finalize-set-ms 3000 keeps the holder's buffers locked.
+    The pause is immutable so ALL SETs pause, but the contender is disconnected
+    while still queued (before it gets buffers), so it never reaches the pause."""
 
     OBJ = 524288  # 512 KiB
 
@@ -1834,9 +1836,6 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
         holders = []
         for i in range(2):
             h = self.server.get_new_client()
-            h.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000'
-            )
             t = threading.Thread(
                 target=h.execute_command,
                 args=('BLOB.TCP_SET', f'holder{i}', b'H' * self.OBJ)
@@ -1844,11 +1843,6 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
             t.start()
             holders.append((h, t))
         time.sleep(1.0)  # both holders have their windows and are paused
-
-        # Clear the hook so later SETs won't pause.
-        client.execute_command(
-            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
-        )
 
         # The contender's SET queues behind the full pool.
         err = [None]
@@ -1866,7 +1860,7 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
         ct.join(timeout=10)
         assert not ct.is_alive(), "contender thread did not finish after disconnect"
 
-        # The holders' SETs still complete normally.
+        # The holders' SETs still complete normally (they pause 3s then commit).
         for _, t in holders:
             t.join(timeout=10)
             assert not t.is_alive(), "holder SET did not finish"
@@ -1877,9 +1871,15 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('EXISTS', 'contender') == 0
 
         # The FIFO is not wedged: a fresh SET on a healthy client succeeds.
+        # It will also pause (immutable config), so allow time for it.
         fresh = self.server.get_new_client()
-        assert fresh.execute_command('BLOB.TCP_SET', 'after', b'A' * self.OBJ) == b'OK'
-        assert fresh.execute_command('BLOB.TCP_GET', 'after') == b'A' * self.OBJ
+        t_fresh = threading.Thread(
+            target=lambda: fresh.execute_command('BLOB.TCP_SET', 'after', b'A' * self.OBJ)
+        )
+        t_fresh.start()
+        t_fresh.join(timeout=10)
+        assert not t_fresh.is_alive(), "fresh SET did not finish"
+        assert client.execute_command('BLOB.TCP_GET', 'after') == b'A' * self.OBJ
 
 
 class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):

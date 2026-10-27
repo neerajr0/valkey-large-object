@@ -368,12 +368,12 @@ fn cmd_get_tiered(
     storage::eviction_candidates::touch(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
-    // ─── DRAMPool hit ────────────────────────────────────────────────────  
-    // Pin the object early — try_serve_dram_hit clones the Arc into  
-    // whichever DRAM path serves the request.  The NVMe queueing path  
-    // drops this pin when cmd_get_tiered returns and creates a fresh one  
-    // after the staging-buffer wait (queued requests are eviction-eligible  
-    // while waiting).  
+    // ─── DRAMPool hit ────────────────────────────────────────────────────
+    // Pin the object early — try_serve_dram_hit clones the Arc into
+    // whichever DRAM path serves the request.  The NVMe queueing path
+    // drops this pin when cmd_get_tiered returns and creates a fresh one
+    // after the staging-buffer wait (queued requests are eviction-eligible
+    // while waiting).
     let unevictable = storage::UnevictableOID::new(object_id);
     let (transport, thread_ctx) = match try_serve_dram_hit(
         dram_pool,
