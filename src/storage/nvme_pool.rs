@@ -84,10 +84,8 @@ impl NVMePool {
         min_buffers: usize,
     ) -> AllocOutcome {
         // Step 1: Queue cap check (CAS loop for exact enforcement).
-        // A simple load + fetch_add has a TOCTOU gap where up to worker_threads
-        // requests can all read below-capacity and all increment, overshooting.
-        // compare_exchange_weak is sufficient: spurious failures just retry the
-        // loop, and it avoids the extra LL/SC retry that _strong adds on ARM.
+        // A simple load + fetch_add has a TOCTOU gap where multiple requests
+        // overshoot. compare_exchange_weak retries on spurious failures.
         loop {
             let current = self.queue_len.load(Ordering::Relaxed);
             if current >= self.queue_capacity {
