@@ -1538,3 +1538,138 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         self.set_objects(client, 80)
         self.get_objects(client, 80)
         assert self.fd_stat(client, 'fd_cache_entries') == 72
+
+
+# ─── NVMe Staging Queue ──────────────────────────────────────────────────────
+
+
+class TestStagingQueue(ValkeyLargeObjTestCaseBase):
+    """NVMe staging queue: queueing, depth metrics, and QueueFull rejection.
+
+    Config: 1 MiB staging pool (1 segment), chunk-size 256 KiB, max/min-buffers 2.
+    Each SET of 512 KiB holds 2 × 256 KiB = 512 KiB of staging, so 2 SETs fill the pool.
+    test-pause-before-finalize-set-ms 3000 holds staging buffers for 3s after
+    the NVMe write completes but before commit, creating a deterministic window
+    where additional requests must queue for buffers.
+    disk-staging-queue-capacity 2: the 3rd and 4th requests queue; the 5th is
+    rejected with ERR too many pending disk requests."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
+            f" segment-size 1048576"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 262144"
+            f" max-buffers-per-op 2"
+            f" min-buffers-per-op 2"
+            f" disk-staging-queue-capacity 2"
+            f" test-pause-before-finalize-set-ms 3000"
+            f" fabric-provider Emulated"
+        )
+
+    def _background_set(self, key, payload):
+        """Launch a SET in a background thread, return (thread, result, error)."""
+        result = [None]
+        error = [None]
+        client = self.server.get_new_client()
+
+        def run():
+            try:
+                result[0] = client.execute_command('BLOB.TCP_SET', key, payload)
+            except Exception as e:
+                error[0] = e
+
+        t = threading.Thread(target=run)
+        t.start()
+        return t, result, error
+
+    def test_staging_queue_depth_under_pressure(self):
+        """Two SETs fill the staging pool; a third queues for buffers.
+        Assert queue depth == 1 while all three are in flight, then drains to 0."""
+        client = self.server.get_new_client()
+        payload = b'Q' * 524288  # 512 KiB → 2 chunks, holds 2 staging buffers
+
+        # Launch 2 SETs to fill the staging pool.
+        threads, results, errors = [], [], []
+        for i in range(2):
+            t, r, e = self._background_set(f'q{i}', payload)
+            threads.append(t)
+            results.append(r)
+            errors.append(e)
+        # Wait for both to reach the pause window (buffers held).
+        time.sleep(1.0)
+
+        # Launch a 3rd SET — staging is full, so it queues.
+        t3, r3, e3 = self._background_set('q2', payload)
+        threads.append(t3)
+        results.append(r3)
+        errors.append(e3)
+        time.sleep(0.5)
+
+        # While the first two hold buffers and the third is queued:
+        info = client.info('largeobj_disk_staging')
+        assert info['largeobj_disk_staging_queue_depth'] == 1
+
+        # Wait for all to complete (pause expires, buffers freed, queued request proceeds).
+        for t in threads:
+            t.join(timeout=15)
+        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
+        for i, (r, e) in enumerate(zip(results, errors)):
+            assert e[0] is None, f"SET q{i} raised: {e[0]}"
+            assert r[0] == b'OK', f"SET q{i} returned {r[0]}"
+
+        # Queue should have drained.
+        wait_for_equal(
+            lambda: client.info('largeobj_disk_staging')['largeobj_disk_staging_queue_depth'], 0
+        )
+
+        # All objects readable.
+        for i in range(3):
+            assert client.execute_command('BLOB.TCP_GET', f'q{i}') == payload
+
+    def test_staging_queue_full_rejection(self):
+        """With queue capacity 2, the 5th concurrent SET is rejected.
+        Two SETs hold staging buffers (paused), two queue, the fifth overflows."""
+        client = self.server.get_new_client()
+        payload = b'F' * 524288
+
+        # Fill staging pool (2 SETs holding buffers) + fill queue (2 more waiting).
+        threads, results, errors = [], [], []
+        for i in range(2):
+            t, r, e = self._background_set(f'fill{i}', payload)
+            threads.append(t)
+            results.append(r)
+            errors.append(e)
+        time.sleep(1.0)
+        for i in range(2, 4):
+            t, r, e = self._background_set(f'fill{i}', payload)
+            threads.append(t)
+            results.append(r)
+            errors.append(e)
+        time.sleep(0.5)
+
+        # The 5th SET should be rejected — queue is at capacity.
+        overflow_client = self.server.get_new_client()
+        with pytest.raises(ResponseError, match='too many pending disk requests'):
+            overflow_client.execute_command('BLOB.TCP_SET', 'overflow', payload)
+
+        # Verify the error counter incremented.
+        info = client.info('largeobj_error_metrics')
+        assert info['largeobj_disk_staging_queue_full'] == 1
+
+        # Let everything drain.
+        for t in threads:
+            t.join(timeout=15)
+        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
+        for i, (r, e) in enumerate(zip(results, errors)):
+            assert e[0] is None, f"SET fill{i} raised: {e[0]}"
+            assert r[0] == b'OK', f"SET fill{i} returned {r[0]}"
+        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
+        # The first 4 should succeed (2 immediate + 2 queued).
+        for i, (r, e) in enumerate(zip(results, errors)):
+            assert e[0] is None, f"SET fill{i} raised: {e[0]}"
+            assert r[0] == b'OK', f"SET fill{i} returned {r[0]}"

@@ -259,6 +259,7 @@ pub fn execute_get(
         }
         _ => {
             // Async — block client, dispatch to tokio.
+            let client_id = ctx.get_client_id();
             let thread_ctx = BlockedRequest::new(ctx);
             match mode {
                 OperatingMode::Dram => {
@@ -267,7 +268,9 @@ pub fn execute_get(
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
+                    cmd_get_tiered(
+                        client_id, object_id, obj_len, crc32c, file, transport, thread_ctx,
+                    );
                 }
             }
             EngineResult::Async
@@ -339,6 +342,7 @@ fn cmd_get_dram_efa(
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
 /// open fd is a separate `Arc<ObjectFd>` obtained via `ensure_open`.
 fn cmd_get_tiered(
+    client_id: u64,
     object_id: ObjectId,
     obj_len: u64,
     crc32c: Crc,
@@ -346,8 +350,7 @@ fn cmd_get_tiered(
     transport: Transport,
     thread_ctx: BlockedRequest,
 ) {
-    // We do not allow the eviction of files that are inflight.
-    let unevictable = storage::UnevictableOID::new(object_id);
+    // Touch eviction candidates so recently-accessed objects rank higher.
     storage::eviction_candidates::touch(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
@@ -356,6 +359,8 @@ fn cmd_get_tiered(
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             cache.stats.record_hit(&obj_ctx.stats);
+            // Pin the object for the duration of the serve.
+            let unevictable = storage::UnevictableOID::new(object_id);
             cmd_get_from_dram(
                 dram_pool,
                 &obj_ctx,
@@ -388,6 +393,8 @@ fn cmd_get_tiered(
         None
     };
     if let Some(obj_ctx) = promoted {
+        // Pin the object for the duration of the promotion + serve.
+        let unevictable = storage::UnevictableOID::new(object_id);
         let fd_pool = storage::get_fd_pool();
         let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
             Some(fd) => fd,
@@ -447,18 +454,65 @@ fn cmd_get_tiered(
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
+    let get_info = GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c,
+    };
+    crate::runtime_handle().spawn(async move {
+        cmd_get_tiered_nvme_queueing(
+            client_id,
+            get_info,
+            file,
+            transport,
+            thread_ctx,
+            nvme_pool,
+            max_buffers,
+            min_buffers,
+        )
+        .await;
+    });
+}
+
+/// NVMe staging allocation + dispatch for Tiered GET: allocate staging buffers
+/// (with queueing), open the file, and stream the object to the client.
+/// Symmetric with `cmd_set_tiered_nvme_queueing`.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_get_tiered_nvme_queueing(
+    client_id: u64,
+    get_info: GetObjectInfo,
+    file: Arc<ObjectFile>,
+    transport: Transport,
+    thread_ctx: BlockedRequest,
+    nvme_pool: &'static storage::NVMePool,
+    max_buffers: usize,
+    min_buffers: usize,
+) {
+    let obj_len = get_info.obj_len;
+    let object_id = get_info.object_id;
+    // Allocate staging buffers with queueing support.
+    let buffers = match nvme_pool
+        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .await
+    {
+        storage::nvme_pool::AllocOutcome::Got(bufs) => bufs,
+        storage::nvme_pool::AllocOutcome::Cancelled => {
+            // Client disconnected while waiting — nothing to reply to.
+            return;
+        }
+        storage::nvme_pool::AllocOutcome::QueueFull => {
             reply_err(
                 &thread_ctx,
-                &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
+                &info::DISK_STAGING_QUEUE_FULL,
+                ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
             );
             return;
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
+    // Pin the object now that we have buffers. A queued request is eviction-eligible
+    // while waiting; if eviction removed the file, ensure_open fails below.
+    let unevictable = storage::UnevictableOID::new(object_id);
     let fd_pool = storage::get_fd_pool();
     let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
@@ -473,32 +527,25 @@ fn cmd_get_tiered(
     };
     let raw_fd = fd.as_raw_fd();
     let batch_width = stream_ctx.buffers.len();
-    let get_info = GetObjectInfo {
-        object_id,
-        obj_len,
-        crc32c,
-    };
     let nvme_pool = storage::get_nvme_pool();
     let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
-    crate::runtime_handle().spawn(async move {
-        // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
-        // open fd are held alive for the read's duration. No promotion → no cache,
-        // source reads straight from the NVMe pool window.
-        // Drops before the captured thread_ctx (see the promotion path).
-        let _keep_alive = (file, fd, unevictable);
-        cmd_get_tiered_run(
-            get_info,
-            &stream_ctx.buffers,
-            crate::stream::Pool::Nvme(nvme_pool),
-            None,
-            raw_fd,
-            batch_width,
-            chunk_iter,
-            &thread_ctx,
-            target,
-        )
-        .await;
-    });
+    // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
+    // open fd are held alive for the read's duration. No promotion → no cache,
+    // source reads straight from the NVMe pool window.
+    // Drops before the captured thread_ctx (see the promotion path).
+    let _keep_alive = (file, fd, unevictable);
+    cmd_get_tiered_run(
+        get_info,
+        &stream_ctx.buffers,
+        crate::stream::Pool::Nvme(nvme_pool),
+        None,
+        raw_fd,
+        batch_width,
+        chunk_iter,
+        &thread_ctx,
+        target,
+    )
+    .await;
 }
 
 /// The per-transport variant of a GET's target — the ONLY thing that differs
@@ -614,9 +661,11 @@ pub fn execute_set_tcp(
     if crate::operating_mode() == OperatingMode::Dram {
         return EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id));
     }
+    let client_id = ctx.get_client_id();
     let thread_ctx = BlockedRequest::new(ctx);
     let key_name_bytes = key_name.as_slice().to_vec();
     cmd_set_tiered(
+        client_id,
         key_name_bytes,
         obj_len,
         DataSource::Tcp(data.to_vec()),
@@ -641,6 +690,7 @@ pub fn execute_set_rdma(
     // ordering by arrival, not completion. Used for version checks on async paths.
     let object_id = ObjectId::next();
     // Async — block client, dispatch to tokio.
+    let client_id = ctx.get_client_id();
     let thread_ctx = BlockedRequest::new(ctx);
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
@@ -656,6 +706,7 @@ pub fn execute_set_rdma(
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
+                client_id,
                 key_name_bytes,
                 obj_len,
                 data_source,
@@ -849,6 +900,7 @@ fn cmd_set_dram_efa(
 
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
 fn cmd_set_tiered(
+    client_id: u64,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -859,19 +911,66 @@ fn cmd_set_tiered(
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
     let nvme_pool = storage::get_nvme_pool();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
+    let chunk_size = crate::chunk_size();
+
+    // Spawn task first, then do async allocation inside it.
+    // This allows the request to queue and wait for staging buffers rather than
+    // failing immediately when the pool is exhausted.
+    crate::runtime_handle().spawn(async move {
+        cmd_set_tiered_nvme_queueing(
+            client_id,
+            key_name,
+            obj_len,
+            data_source,
+            thread_ctx,
+            object_id,
+            old_oid,
+            nvme_pool,
+            max_buffers,
+            min_buffers,
+            chunk_size,
+        )
+        .await;
+    });
+}
+
+/// NVMe staging allocation + dispatch for Tiered SET. Allocates staging buffers
+/// (with queueing), pins the object, and delegates to `cmd_set_tiered_run`.
+/// Symmetric with `cmd_get_tiered_nvme_queueing`.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_set_tiered_nvme_queueing(
+    client_id: u64,
+    key_name: Vec<u8>,
+    obj_len: u64,
+    data_source: DataSource,
+    thread_ctx: BlockedRequest,
+    object_id: ObjectId,
+    old_oid: Option<ObjectId>,
+    nvme_pool: &'static storage::NVMePool,
+    max_buffers: usize,
+    min_buffers: usize,
+    chunk_size: usize,
+) {
+    // Async allocation: may wait for buffers to become available.
+    let buffers = match nvme_pool
+        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .await
+    {
+        storage::AllocOutcome::Got(bufs) => bufs,
+        storage::AllocOutcome::Cancelled => {
+            // Client disconnected while waiting — silently drop.
+            return;
+        }
+        storage::AllocOutcome::QueueFull => {
             reply_err(
                 &thread_ctx,
-                &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
+                &info::DISK_STAGING_QUEUE_FULL,
+                ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
             );
             return;
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
-    let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
     // We do not allow the eviction of the new file until it is committed, nor of
     // the one it replaces.
@@ -881,48 +980,44 @@ fn cmd_set_tiered(
     );
     match data_source {
         DataSource::Tcp(data) => {
+            let _unevictable = unevictable;
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
-            crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
-                    key_name,
-                    client_crc: None,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
-                    thread_ctx,
-                    SetSource::Tcp(data),
-                )
-                .await;
-            });
+            let set_info = SetObjectInfo {
+                object_id,
+                obj_len,
+                key_name,
+                client_crc: None,
+            };
+            cmd_set_tiered_run(
+                set_info,
+                stream_ctx,
+                chunk_iter,
+                thread_ctx,
+                SetSource::Tcp(data),
+            )
+            .await;
         }
         DataSource::Efa {
             session,
             addrs,
             client_crc,
         } => {
+            let _unevictable = unevictable;
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
-            crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
-                    key_name,
-                    client_crc,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
-                    thread_ctx,
-                    SetSource::Efa(session),
-                )
-                .await;
-            });
+            let set_info = SetObjectInfo {
+                object_id,
+                obj_len,
+                key_name,
+                client_crc,
+            };
+            cmd_set_tiered_run(
+                set_info,
+                stream_ctx,
+                chunk_iter,
+                thread_ctx,
+                SetSource::Efa(session),
+            )
+            .await;
         }
     }
 }

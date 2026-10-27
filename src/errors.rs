@@ -53,7 +53,7 @@ define_errors! {
     ERR_CRC_MISMATCH => "ERR CRC mismatch after transfer",
 
     // Streaming Errors
-    ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
+    ERR_TOO_MANY_DISK_REQUESTS => "ERR too many pending disk requests",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors

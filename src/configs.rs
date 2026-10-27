@@ -126,6 +126,10 @@ pub const MAX_MAX_BUFFERS_PER_OP: i64 = 64;
 pub const DEFAULT_MIN_BUFFERS_PER_OP: i64 = 2;
 pub const MIN_MIN_BUFFERS_PER_OP: i64 = 1;
 pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
+// disk-staging-queue-capacity
+pub const DEFAULT_DISK_STAGING_QUEUE_CAPACITY: i64 = 1024;
+pub const MIN_DISK_STAGING_QUEUE_CAPACITY: i64 = 1;
+pub const MAX_DISK_STAGING_QUEUE_CAPACITY: i64 = i64::MAX;
 // max-object-size
 pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
 pub const MIN_MAX_OBJECT_SIZE: i64 = 1;
@@ -301,6 +305,13 @@ lazy_static::lazy_static! {
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
     pub static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(DEFAULT_MIN_BUFFERS_PER_OP);
 
+    /// Maximum queue depth for NVMe staging buffer waits. When the queue is full,
+    /// new requests are rejected with ERR_TOO_MANY_DISK_REQUESTS. Default: 1024.
+    /// With defaults (1 GiB staging, 8 buffers × 8 MiB chunk = 64 MiB window) only
+    /// 16 requests hold buffers concurrently; 1024 is a safety net for clients
+    /// with no timeout, not a tight bound.
+    pub static ref CFG_DISK_STAGING_QUEUE_CAPACITY: AtomicI64 = AtomicI64::new(DEFAULT_DISK_STAGING_QUEUE_CAPACITY);
+
     /// Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Rejects writes exceeding this limit.
     /// Default: 512 MiB. Must fit in one segment in Dram mode (object_fits_segment
     /// check). Supports memory notation (e.g., "512mb").
@@ -472,6 +483,10 @@ pub fn max_buffers_per_op() -> usize {
 
 pub fn min_buffers_per_op() -> usize {
     CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn disk_staging_queue_capacity() -> u64 {
+    CFG_DISK_STAGING_QUEUE_CAPACITY.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
@@ -717,6 +732,7 @@ mod tests {
         CFG_MAX_PROMOTE_SIZE.store(DEFAULT_MAX_PROMOTE_SIZE, Relaxed);
         CFG_MAX_BUFFERS_PER_OP.store(DEFAULT_MAX_BUFFERS_PER_OP, Relaxed);
         CFG_MIN_BUFFERS_PER_OP.store(DEFAULT_MIN_BUFFERS_PER_OP, Relaxed);
+        CFG_DISK_STAGING_QUEUE_CAPACITY.store(DEFAULT_DISK_STAGING_QUEUE_CAPACITY, Relaxed);
     }
 
     fn set_cfgs(cfgs: &[(&AtomicI64, i64)]) {
