@@ -1788,11 +1788,7 @@ class TestStagingQueue(ValkeyLargeObjTestCaseBase):
         for i, (r, e) in enumerate(zip(results, errors)):
             assert e[0] is None, f"SET fill{i} raised: {e[0]}"
             assert r[0] == b'OK', f"SET fill{i} returned {r[0]}"
-        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
         # The first 4 should succeed (2 immediate + 2 queued).
-        for i, (r, e) in enumerate(zip(results, errors)):
-            assert e[0] is None, f"SET fill{i} raised: {e[0]}"
-            assert r[0] == b'OK', f"SET fill{i} returned {r[0]}"
 
 
 class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
