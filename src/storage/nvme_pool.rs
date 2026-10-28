@@ -102,10 +102,9 @@ impl NVMePool {
 
         // Step 2: Register cancel signal for this client.
         let cancel = self.register_cancel(client_id);
-        let guard = CancelGuard {
+        let _guard = CancelGuard {
             pool: self,
             client_id,
-            armed: true,
         };
 
         // Pre-register as a waiter so a disconnect mid-wait is not lost.
@@ -117,7 +116,6 @@ impl NVMePool {
             Ok(lock) => {
                 // Nobody waiting. Try immediate allocation.
                 if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
-                    guard.disarm();
                     return AllocOutcome::Got(buffers);
                 }
                 // No buffers available; we already hold the lock, proceed to alloc loop.
@@ -143,7 +141,6 @@ impl NVMePool {
 
             if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
                 drop(lock_guard); // Release lock → next waiter proceeds.
-                guard.disarm();
                 return AllocOutcome::Got(buffers);
             }
 
@@ -257,29 +254,18 @@ impl NVMePool {
 }
 
 /// RAII guard that decrements queue_len and cleans up cancel registry on drop.
-/// On the success path, call `disarm()` to do cleanup explicitly and suppress Drop.
+/// Covers both the success path (guard drops when the function returns with
+/// buffers) and the cancellation path (guard drops when the function returns
+/// Cancelled). No explicit disarm needed — Drop always fires exactly once.
 struct CancelGuard<'a> {
     pool: &'a NVMePool,
     client_id: u64,
-    armed: bool,
-}
-
-impl CancelGuard<'_> {
-    /// Explicit cleanup on the success path. Decrements queue_len, unregisters
-    /// the cancel entry, and disarms Drop so it doesn't double-decrement.
-    fn disarm(mut self) {
-        self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
-        self.pool.unregister_cancel(self.client_id);
-        self.armed = false;
-    }
 }
 
 impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
-            self.pool.unregister_cancel(self.client_id);
-        }
+        self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
+        self.pool.unregister_cancel(self.client_id);
     }
 }
 
