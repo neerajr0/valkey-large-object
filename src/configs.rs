@@ -300,9 +300,6 @@ lazy_static::lazy_static! {
     /// drain path. Default: false. Hidden test hook.
     pub static ref CFG_TEST_RDMA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
-    /// Test-only: fail every NVMe unlink but the orphan retry's. false = disabled.
-    pub static ref CFG_TEST_FAIL_UNLINK: AtomicBool = AtomicBool::new(false);
-
     /// Test-only: fail the first NVMe source read during a DRAM promotion,
     /// triggering set_promotion_failure. Used with
     /// test-pause-after-promotion-failure-ms to deterministically exercise
@@ -502,10 +499,6 @@ pub fn test_pause_before_finalize_set_ms() -> u64 {
 
 pub fn test_pause_during_promotion_ms() -> u64 {
     CFG_TEST_PAUSE_DURING_PROMOTION_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
-}
-
-pub fn test_fail_unlink() -> bool {
-    CFG_TEST_FAIL_UNLINK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn test_rdma_fail_partial() -> bool {

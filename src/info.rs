@@ -218,14 +218,6 @@ fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("disk_used_bytes", used as i64)?
         .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
         .field(
-            "disk_orphaned_files",
-            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_orphaned_bytes",
-            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
         )?
