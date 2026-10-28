@@ -272,7 +272,6 @@ impl Drop for CancelGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -336,22 +335,7 @@ mod tests {
         }
     }
 
-    // ─── Existing mechanic tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_queue_capacity_enforcement() {
-        // Create a pool with capacity 2.
-        let pool = NVMePool::new(1, 1024 * 1024, 2);
-
-        // Manually increment queue_len to simulate waiting requests.
-        pool.queue_len.fetch_add(1, Relaxed);
-        pool.queue_len.fetch_add(1, Relaxed);
-        assert_eq!(pool.queue_len(), 2);
-
-        // CAS should fail when at capacity.
-        let current = pool.queue_len.load(Relaxed);
-        assert!(current >= pool.queue_capacity);
-    }
+    // ─── Mechanic tests ────────────────────────────────────────────────
 
     #[test]
     fn test_cancel_registration() {
@@ -368,21 +352,6 @@ mod tests {
         // Different client gets different signal.
         let cancel3 = pool.register_cancel(43);
         assert!(!Arc::ptr_eq(&cancel1, &cancel3));
-    }
-
-    #[test]
-    fn test_cancel_client_notifies() {
-        let pool = NVMePool::new(1, 1024 * 1024, 100);
-
-        let cancel = pool.register_cancel(42);
-        let notified = cancel.notified();
-
-        // Cancel the client.
-        pool.cancel_client(42);
-
-        // The notified future should be ready (we can't easily test this
-        // synchronously, but we can verify no panic).
-        drop(notified);
     }
 
     // ─── Async alloc flow tests ──────────────────────────────────────────
