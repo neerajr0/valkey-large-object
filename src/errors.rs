@@ -39,7 +39,7 @@ define_errors! {
 
     // OOM — matches the standard Valkey OOM error prefix so clients can
     // distinguish memory exhaustion from other errors programmatically.
-    // The INFO metric counters (dram_pool_exhausted, disk_staging_buffer_exhausted,
+    // The INFO metric counters (dram_pool_exhausted, disk_staging_queue_full,
     // disk_capacity_exceeded) tell the operator which resource was exhausted.
     ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
     ERR_OOM_DISK => "OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.",
