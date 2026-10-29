@@ -524,27 +524,24 @@ async fn cmd_get_tiered_nvme_queueing(
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
-    // Pin the object now that we have buffers. A queued request is eviction-eligible
-    // while waiting; if eviction removed the file, ensure_open fails below.
+    // The object may have been evicted while this request was queued for staging
+    // buffers (no UnevictableOID held during the wait). Eviction's try_unlink
+    // removes the .dat directly even though we still hold Arc<ObjectFile>. Check
+    // the reclaim list — the authoritative record — before attempting the open.
+    if storage::reclaim::RECLAIM_LIST.contains(&object_id) {
+        thread_ctx.reply(Ok(ValkeyValue::Null));
+        return;
+    }
     let unevictable = storage::UnevictableOID::new(object_id);
     let fd_pool = storage::get_fd_pool();
     let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
         None => {
-            // The file may have been evicted while this request was queued for
-            // staging buffers (no UnevictableOID held during the wait). If the
-            // .dat is gone, the key was evicted — reply nil like a missing key.
-            // If the file exists but couldn't be opened, that's a real I/O error.
-            let path = object_id.file_path(&crate::disk_dir());
-            if std::path::Path::new(&path).exists() {
-                reply_err(
-                    &thread_ctx,
-                    &info::DISK_READ_ERRORS,
-                    ValkeyError::Str(errors::ERR_DISK_READ),
-                );
-            } else {
-                thread_ctx.reply(Ok(ValkeyValue::Null));
-            }
+            reply_err(
+                &thread_ctx,
+                &info::DISK_READ_ERRORS,
+                ValkeyError::Str(errors::ERR_DISK_READ),
+            );
             return;
         }
     };
