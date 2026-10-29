@@ -308,7 +308,8 @@ mod tests {
             .expect("test runtime")
     }
 
-    /// Spin until the pool has at least `n` queued requests for `client_id`.
+    /// Spin until the pool has at least `n` queued requests for `client_id`
+    /// and the FIFO lock is held (the waiter has reached the alloc loop).
     fn wait_registered(pool: &NVMePool, client_id: u64, n: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -319,7 +320,8 @@ mod tests {
                 .get(&client_id)
                 .map(|(_, count)| *count >= n)
                 .unwrap_or(false);
-            if registered {
+            let lock_held = pool.queue.try_lock().is_err();
+            if registered && lock_held {
                 return;
             }
             assert!(Instant::now() < deadline, "waiter(s) never registered");
