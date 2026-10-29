@@ -304,9 +304,6 @@ lazy_static::lazy_static! {
     /// drain path. Default: false. Hidden test hook.
     pub static ref CFG_TEST_RDMA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
-    /// Test-only: fail every NVMe unlink but the orphan retry's. false = disabled.
-    pub static ref CFG_TEST_FAIL_UNLINK: AtomicBool = AtomicBool::new(false);
-
     /// Test-only: fail the first NVMe source read during a DRAM promotion,
     /// triggering set_promotion_failure. Used with
     /// test-pause-after-promotion-failure-ms to deterministically exercise
@@ -364,11 +361,7 @@ pub fn nvme_staging_size() -> usize {
     CFG_DISK_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn dram_segment_size() -> usize {
-    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
-}
-
-/// Alias for symmetry — both pools use the same segment size.
+/// The `segment-size` config, shared by the DRAM and NVMe staging pools.
 pub fn segment_size() -> usize {
     CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -523,10 +516,6 @@ pub fn test_pause_during_promotion_ms() -> u64 {
     CFG_TEST_PAUSE_DURING_PROMOTION_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn test_fail_unlink() -> bool {
-    CFG_TEST_FAIL_UNLINK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 pub fn test_rdma_fail_partial() -> bool {
     CFG_TEST_RDMA_FAIL_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -600,10 +589,6 @@ struct ConfigConstraint {
     validator: Option<fn(u64, u64) -> bool>,
     error_msg: &'static str,
 }
-
-// SAFETY: All AtomicI64 references are to lazy_static statics with 'static lifetime.
-// The fn pointers and &str are inherently Send+Sync.
-unsafe impl Sync for ConfigConstraint {}
 
 fn config_constraints() -> &'static [ConfigConstraint] {
     use std::sync::LazyLock;
