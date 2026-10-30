@@ -71,6 +71,22 @@ impl NVMePool {
         self.freed.notify_waiters();
     }
 
+    /// Synchronous allocation without queueing. Returns `None` if staging is full
+    /// or if async requests are queued (FIFO fairness).
+    pub fn alloc_window(
+        &self,
+        size: usize,
+        max_buffers: usize,
+        min_buffers: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
+        // Respect FIFO fairness: if async requests are queued, don't let sync
+        // callers jump ahead. This prevents TCP from starving queued EFA requests.
+        if self.queue_len.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        self.pool.alloc_window(size, max_buffers, min_buffers)
+    }
+
     /// Async allocation with FIFO queueing and cancellation support.
     ///
     /// If staging is full, the request waits in a FIFO queue until buffers free up.
@@ -449,6 +465,52 @@ mod tests {
             pool.cancel_client(CLIENT + 1);
             assert!(newcomer.await.expect("newcomer task").is_cancelled());
             assert!(head.await.expect("head task").is_got());
+        });
+    }
+
+    // ─── Sync vs Async allocation path tests ─────────────────────────────
+
+    /// Sync `alloc_window` returns `None` immediately when staging is full.
+    ///
+    /// This is the path TCP uses — fail fast without queueing, because TCP
+    /// holds an inline `Vec<u8>` copy that would consume unbounded memory if
+    /// queued requests accumulated.
+    #[test]
+    fn test_sync_alloc_returns_none_when_full() {
+        let (pool, _held) = exhausted_pool();
+        // Sync path: returns None immediately, does not block or queue.
+        let result = pool.alloc_window(OBJ, 1, 1);
+        assert!(result.is_none(), "sync alloc should return None when full");
+        // No waiters registered — sync path never touches the queue.
+        assert_eq!(pool.queue_len(), 0);
+        assert!(pool.cancels.lock().unwrap().is_empty());
+    }
+
+    /// Sync and async paths respect FIFO fairness: a sync alloc fails when
+    /// async requests are queued, preventing starvation.
+    #[test]
+    fn test_sync_alloc_respects_queued_waiters() {
+        let (pool, mut held) = exhausted_pool();
+        runtime().block_on(async {
+            // An async waiter queues up.
+            let waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+
+            // Free one buffer.
+            pool.free_n(&held.pop().expect("held window"));
+
+            // Sync alloc MUST fail — it cannot jump ahead of the queued waiter.
+            let sync_result = pool.alloc_window(OBJ, 1, 1);
+            assert!(
+                sync_result.is_none(),
+                "sync alloc must fail when async requests are queued"
+            );
+
+            // The queued waiter gets the buffer.
+            assert!(waiter.await.expect("waiter task").is_got());
         });
     }
 }
