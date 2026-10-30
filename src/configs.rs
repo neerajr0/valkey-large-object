@@ -657,14 +657,16 @@ fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
     storage::object_fits_segment(segment_size as usize, object_size as usize, chunk_size)
 }
 
-/// The minimum staging window (min-buffers-per-op × align_up(chunk-size)) must
-/// fit in the total NVMe staging pool. If it doesn't, even the smallest
-/// multi-chunk streaming request can never be satisfied and would hold the
-/// FIFO lock forever.
+/// The minimum staging window must fit in the total NVMe staging pool. Each
+/// buffer costs align_up(chunk-size) plus one IO_ALIGN boundary tag for talc's
+/// per-allocation overhead. If min-buffers can't be satisfied, even the smallest
+/// multi-chunk streaming request can never allocate and would hold the FIFO lock
+/// forever.
 fn staging_fits_min_window(staging_size: u64, min_buffers: u64) -> bool {
     let chunk = CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64;
     let aligned_chunk = storage::align_up(chunk as usize) as u64;
-    aligned_chunk.saturating_mul(min_buffers) <= staging_size
+    let per_buffer = aligned_chunk.saturating_add(storage::IO_ALIGN as u64);
+    per_buffer.saturating_mul(min_buffers) <= staging_size
 }
 
 /// Validate all config constraints. Returns the first violated constraint or Ok(()).
