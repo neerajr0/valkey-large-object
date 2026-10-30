@@ -524,15 +524,15 @@ async fn cmd_get_tiered_nvme_queueing(
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
-    // The object may have been evicted while this request was queued for staging
-    // buffers (no UnevictableOID held during the wait). Eviction's try_unlink
-    // removes the .dat directly even though we still hold Arc<ObjectFile>. Check
-    // the reclaim list — the authoritative record — before attempting the open.
+    // Pin the oid before checking the reclaim list so claim_victim cannot race
+    // between the check and the pin. If eviction already claimed the oid, the
+    // pin is harmless and the reclaim check below returns Null; if it hasn't,
+    // the live Arc<UnevictableOID> makes claim_victim skip this oid.
+    let unevictable = storage::UnevictableOID::new(object_id);
     if storage::reclaim::RECLAIM_LIST.contains(&object_id) {
         thread_ctx.reply(Ok(ValkeyValue::Null));
         return;
     }
-    let unevictable = storage::UnevictableOID::new(object_id);
     let fd_pool = storage::get_fd_pool();
     let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
