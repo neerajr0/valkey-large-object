@@ -613,7 +613,7 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
-                validator: None,
+                validator: Some(chunk_fits_segment),
                 error_msg: errors::ERR_SEGMENT_GE_CHUNK,
             },
             ConfigConstraint {
@@ -655,6 +655,16 @@ fn config_constraints() -> &'static [ConfigConstraint] {
 fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
     let chunk_size = CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize;
     storage::object_fits_segment(segment_size as usize, object_size as usize, chunk_size)
+}
+
+/// Constraint validator: a single aligned chunk plus talc's per-allocation and
+/// per-segment overhead must fit in one segment. Streaming I/O allocates one
+/// buffer at a time from the pool, and talc cannot span allocations across
+/// segments — if a single chunk+tags doesn't fit, no buffer can ever allocate.
+fn chunk_fits_segment(segment_size: u64, chunk_size: u64) -> bool {
+    let aligned_chunk = storage::align_up(chunk_size as usize) as u64;
+    // 2 * IO_ALIGN: one allocation boundary tag + one segment heap header.
+    aligned_chunk.saturating_add(2 * storage::IO_ALIGN as u64) <= segment_size
 }
 
 /// The minimum staging window must fit in the total NVMe staging pool. Each
@@ -867,7 +877,18 @@ mod tests {
                     (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
-                Some("largeobj.segment-size must be >= largeobj.chunk-size"),
+                Some("largeobj.segment-size is insufficient for largeobj.chunk-size"),
+            ),
+            (
+                // chunk == segment fails: aligned_chunk + 2*IO_ALIGN > segment.
+                "segment_eq_chunk_rejected",
+                OperatingMode::Dram,
+                vec![
+                    (&CFG_SEGMENT_SIZE, chunk),
+                    (&CFG_DISK_STAGING_SIZE, chunk),
+                    (&CFG_MAX_OBJECT_SIZE, chunk - 16384),
+                ],
+                Some("largeobj.segment-size is insufficient for largeobj.chunk-size"),
             ),
             (
                 "segment_lt_max_obj_rejected",
@@ -913,14 +934,16 @@ mod tests {
                 "staging_too_small_for_window_rejected",
                 OperatingMode::Tiered,
                 vec![
-                    // 1 MiB staging, 1 MiB chunk, min-buffers 2 → needs 2 MiB > 1 MiB.
+                    // 1 MiB staging/segment, 512 KiB chunk, min-buffers 2.
+                    // Each buffer costs aligned_chunk + IO_ALIGN = 516 KiB + 4 KiB = 528384.
+                    // 2 buffers need 1056768 > 1 MiB staging → rejected.
                     (&CFG_DISK_STAGING_SIZE, 1024 * 1024),
                     (&CFG_SEGMENT_SIZE, 1024 * 1024),
-                    (&CFG_CHUNK_SIZE, 1024 * 1024),
+                    (&CFG_CHUNK_SIZE, 512 * 1024),
                     (&CFG_MAX_BUFFERS_PER_OP, 2),
                     (&CFG_MIN_BUFFERS_PER_OP, 2),
                     (&CFG_MAX_PROMOTE_SIZE, 0),
-                    (&CFG_MAX_OBJECT_SIZE, 1024 * 1024),
+                    (&CFG_MAX_OBJECT_SIZE, 512 * 1024),
                 ],
                 Some("largeobj.disk-staging-size must be >= largeobj.min-buffers-per-op * largeobj.chunk-size"),
             ),
