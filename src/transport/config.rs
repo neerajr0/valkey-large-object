@@ -15,6 +15,11 @@ enum_configuration! {
         Emulated = 0,
         /// Use EFA hardware, the libfabric efa provider via efa-direct path.
         EfaDirect = 1,
+        /// Use EFA hardware via the rxr (reliable datagram) fabric, which implements wire protocols
+        /// for features beyond device capabilities. This includes software-level delivery
+        /// acknowledgment via RECEIPT packets and "unsolicited write recv" for FI_REMOTE_CQ_DATA
+        /// without posted receive buffers. Use this for confirmed data visibility at the client.
+        Efa = 2,
     }
 }
 
@@ -23,6 +28,7 @@ impl From<FabricProvider> for Provider {
         match provider {
             FabricProvider::Emulated => Provider::Tcp,
             FabricProvider::EfaDirect => Provider::EfaDirect,
+            FabricProvider::Efa => Provider::Efa,
         }
     }
 }

@@ -145,6 +145,13 @@ impl Fabric {
         self.services.iter().map(FabricService::local_address)
     }
 
+    /// Ack buffer info (rkey, remote_addr) for each service, in service order.
+    /// Clients use this to send acknowledgements back to the server via fi_writemsg
+    /// with FI_REMOTE_CQ_DATA after receiving RDMA data.
+    pub fn ack_buffer_infos(&self) -> impl Iterator<Item = Option<dma_libfabric::AckBufferInfo>> + '_ {
+        self.services.iter().map(FabricService::ack_buffer_info)
+    }
+
     /// Release the client's address-vector entry on every service once its transfers drain.
     pub fn remove_peer(&self, client_id: u64) {
         for service in &self.services {

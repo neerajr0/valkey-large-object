@@ -22,6 +22,14 @@ use crate::transport::{self, session, Session};
 /// Upper bound on client memory addresses in one EFA command.
 const MAX_EFA_ADDRESSES: usize = 256;
 
+/// Per-service RDMA info returned in BLOB.RDMA_HELLO: the server's fabric address
+/// and optional ack buffer descriptor (rkey, remote_addr) for client acknowledgements.
+struct ServiceHelloInfo {
+    address_hex: String,
+    ack_rkey: Option<u64>,
+    ack_addr: Option<u64>,
+}
+
 /// Reject client commands while `largeobj.enabled` is no.
 fn check_module_enabled(ctx: &Context) -> Result<(), ValkeyError> {
     if !crate::module_enabled() && !ctx.get_flags().contains(ContextFlags::REPLICATED) {
@@ -140,13 +148,13 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
     // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
     match crate::fabric_provider() {
-        FabricProvider::EfaDirect if rdma_address.len() != 32 => {
+        FabricProvider::EfaDirect | FabricProvider::Efa if rdma_address.len() != 32 => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
         }
         FabricProvider::Emulated if rdma_address.is_empty() => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
         }
-        FabricProvider::EfaDirect | FabricProvider::Emulated => {}
+        FabricProvider::EfaDirect | FabricProvider::Efa | FabricProvider::Emulated => {}
     }
 
     let client_id = ctx.get_client_id();
@@ -161,9 +169,20 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::Str(errors::ERR_SESSION_CREATE))?;
     session::insert(client_id, Session::new(client_id, rdma_address));
 
+    // Build the reply: for each service, return [address_hex, ack_rkey, ack_addr].
+    // The ack buffer info allows clients to send acknowledgements back to the server
+    // via fi_writemsg with FI_REMOTE_CQ_DATA after receiving RDMA data.
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
-        .map(|address| ValkeyValue::BulkString(encode_hex(address)))
+        .zip(fabric.ack_buffer_infos())
+        .map(|(address, ack_info)| {
+            let mut entry = vec![ValkeyValue::BulkString(encode_hex(address))];
+            if let Some(info) = ack_info {
+                entry.push(ValkeyValue::Integer(info.rkey as i64));
+                entry.push(ValkeyValue::Integer(info.remote_addr as i64));
+            }
+            ValkeyValue::Array(entry)
+        })
         .collect();
     Ok(ValkeyValue::Array(reply))
 }
